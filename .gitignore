@@ -1,0 +1,6 @@
+/target/
+**/target/
+*.pdb
+/*.exe
+/scratch/*.exe
+*.log

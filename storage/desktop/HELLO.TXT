@@ -1,0 +1,2 @@
+Greetings from VEIL OS!
+You can now push files directly into this 'storage' folder to see them in your virtual OS.

@@ -1,0 +1,145 @@
+-----| MASTER LIST |-----
+=====| Core UX Foundations |=====
+Unified Settings Hub — One consistent, searchable control centre. (done)
+
+Consistent Window Manager — Predictable snapping, tiling, animations. (Done - Added Tile snapping, Snap lines, Magnetic Edges)
+
+Global Search Palette — Apps, files, settings, commands, all in one.
+
+Notification Centre — Grouped notifications, per‑app controls.
+
+Package Manager Integration — GUI for installing/updating apps.
+
+User Profiles & Permissions — Sandboxing, elevation, per‑app permissions.
+
+=====| Premium UX Enhancements |=====
+Universal Command Palette — Run any OS action from a single palette.
+
+Adaptive Theming Engine — Dynamic colours, transparency, per‑app themes. 
+
+Unified File Dialogs — Clean, modern open/save dialogs.
+
+Quick Actions Bar — Screenshots, clipboard history, screen recording.
+
+Multi‑Desktop Workspaces — Per‑desktop layouts and wallpapers.
+
+Smart Window Layouts — Golden ratio, grids, 70/30, etc.
+
+=====| Experimental / Unique Features |=====
+Per‑App Sandboxing Controls — Toggle filesystem, network, GPU access.
+
+Live System Introspection — Visualise threads, syscalls, memory maps.
+
+Modular Shell Layers — Switch between desktop modes instantly.
+
+Native Overlay System — FPS, logs, widgets over any app.
+
+Task‑Oriented Workflows — Launch “tasks” instead of apps.
+
+AI‑Assisted System Tuning — Detect bottlenecks, auto‑optimise.
+
+Deep Customisation Profiles — Gaming, Privacy, Creator, Low‑Power.
+
+Unified Clipboard Timeline — Clipboard history with previews.
+
+VEIL-MESH - giving the ability to create a mesh network of consumer grade computers to share resources and data. with multiple node types;
+1. delegate nodes - a seperate device that stays seperate, takes: input data ie mouse/keybord or commands. returns: output data ie screen output or a response to a command. with an option to swap delegate nodes on the fly or on startup with a small gui or command line.
+2. compute nodes - a direct piece of the cluster system, takes: batch proccesses or partial tasks. returns: completed batch data or completed partial tasks data.
+3. offload nodes - a node thats directly part of the cluster system, takes: whole proccesses or tasks. returns: completed proccess or task data.
+4. storage nodes - a node that directly part of the cluster system surrendering storage space to the cluster.
+5. controller nodes - a director of the cluster system, managing and orchestrating the other nodes, the thing the user directly controls.
+6. hub node - a device that behaves as a controller node for sub networks allowing the controller to send it a whole proccess and the hub to share it out amungst connected nodes in that sub network.
+
+3 phase ledger - a ledger system allowwing for easy backups, rollbacks and recoveries of data and files in a 3 pronged approach. 
+1. local directory ledger file, lists hashes of a user configured length of versions (ie 3,5,10 ect) of the files and directories inside the directory.
+2. directory metadata ledger, an aditional part of the metadata of the directory that lists the last 3 versions of hashes of all files and directories that are in the directory above the current directory.
+3. a system ledger file for the whole system, with a hash of root directory in each of the storage drives with versioning going back 10 times and user configuration for specific files or conditions, this system ledger is stored on the main drive.
+
+custom v brand file types - allowing for the ability of files to be encrypted and decrypted nativley with levels of security the user can configure.
+=====| Developer‑Focused Features |=====
+Syscall Inspector — See what apps call in real time.
+
+Rust Tooling Integration — Cargo integration, native debugging.
+
+Unified Logging Framework — Kernel, driver, app logs unified.
+
+Virtualised Test Environments — Instant sandboxes for testing.
+
+Custom File Format Integration — Previews, metadata, encryption.
+
+-----| Distinctive, Market‑Differentiating Features |-----
+=====| Personality & Behaviour Systems |=====
+Personality Profiles — Creator, Gaming, Privacy, etc.
+
+Predictive Workspace Flow — OS anticipates your next action.
+
+Zero‑Latency Windowing — <5ms input‑to‑pixel latency.
+
+Deep Freeze Sessions — Save/restore entire OS state instantly.
+
+Semantic File System — Browse by project, tags, content.
+
+Per‑Window Security Zones — Different security per window.
+
+Live Kernel Controls — Tune scheduler, memory, I/O live.
+
+Composable UI Blocks — Build your own desktop layout.
+
+Context‑Aware Command Palette — Smart suggestions based on context.
+
+Instant App Virtualisation — No installers, no pollution.
+
+Self‑Healing System — Auto‑repair configs, drivers, leaks.
+
+Native Game Overlay Framework — OS‑level overlays for games.
+
+-----| Security‑Focused, User‑Friendly Features |-----
+=====| Clipboard & Data Safety |=====
+Secure Clipboard Channels — Public, Private, Sensitive, App‑restricted. (Done)
+
+Secure Drag‑and‑Drop Channels — Same idea, but for drag‑and‑drop. (Done)
+
+=====| Smart Security UX |=====
+Smart Error Explanations — Human‑readable error messages.
+
+Live File Metadata Inspector — Hashes, permissions, metadata.
+
+Process Personality Profiles — Behaviour‑based process modes.
+
+=====| System Hygiene & Stability |=====
+True App Uninstallation — Remove everything an app created.
+
+System Hygiene Dashboard — Orphaned files, leaks, startup impact.
+
+Automatic Workspace Cleanup — Remove stale tasks, temp files.
+
+Cold‑Boot Resume — Fresh boot + restored session.
+
+=====| Windowing & Interaction Improvements |=====
+Universal Back/Forward Navigation — Works across apps, settings, explorer.
+
+Drag‑Anywhere Window Movement — Move windows from any surface.
+
+Magnetic Window Edges — Windows align, space, and tile intelligently.
+
+Window Intent Modes — Focus, Precision, Reading, Secure modes.
+
+=====| File Explorer & Workflow Enhancements |=====
+Predictive File Actions — Learns what you do with each file type.
+
+Intent‑Based File Actions — “What do you want to do?” instead of “Open with”.
+
+Smart File Explorer Tabs — Project grouping, previews, pinned tabs.
+
+Cross‑App Panels — Drag panels between apps.
+
+Cross‑App Undo History — Undo file moves, settings changes, layouts.
+
+=====| Predictive & Adaptive Systems |=====
+Predictive Performance Boosts — Pre‑warm caches, GPU, scheduler.
+
+Adaptive Performance Scheduler — Detect CPU/GPU/I/O/latency needs.
+
+Adaptive UI Density — Compact for coding, spacious for reading.
+
+Intent‑Based Notifications — Important‑only, silent, persistent.

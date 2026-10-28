@@ -1,0 +1,25 @@
+# -----| build configuration |-----
+[build]
+target = "x86_64-unknown-none"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+# -----| target runner (QEMU) |-----
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=--omagic",
+    # Disable CPU features that cause SIMD intrinsics the bare-metal target can't lower.
+    "-C", "target-feature=-sse4.1,-sse4.2,-avx,-avx2,-aes,-pclmulqdq,-sha",
+    "-C", "no-redzone",
+    # Force pure-Rust software backends for all RustCrypto crates.
+    "--cfg", "polyval_force_soft",
+    "--cfg", "aes_force_soft",
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
+]
+
+
+

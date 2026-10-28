@@ -1,0 +1,321 @@
+{
+  "pbtResults": {
+    "1. Write bug condition exploration test": {
+      "status": "unexpected_pass",
+      "failingExample": "Both test cases (Case A: Settings-focus silent drop, Case B: Stale Win32 focus silent drop) would PASS on the current code because the fix is already applied in dispatch_key. The design doc explicitly states: \"Both bugs are confirmed fixed in the current codebase.\" The dispatch_key function already has: (1) TERMINAL_POOL[0].lock().on_key(ch) in the Settings branch instead of bare return, (2) a Win32 liveness check via find_hwnd_by_veilos_id, (3) DESKTOP_WM.lock().focused_id = None for stale focus cleanup, and (4) a fallback route to TERMINAL_POOL[0] in all bug-condition paths. The exploration test was written but the bug condition no longer exists in the codebase to cause a failure.",
+      "lastRunTimestamp": 1788368585210
+    },
+    "3.4 Verify bug condition exploration test now passes": {
+      "status": "passed",
+      "lastRunTimestamp": 1788369304726
+    },
+    "1. Write bug condition exploration tests (BEFORE implementing any fix)": {
+      "status": "passed",
+      "failingExample": "Sub-test A: get_message(tid=1, remove=true) returns None when hwnd=1 exists with visible=false and queue is empty — synthesis predicate `&& w.visible` skips the window. isBugCondition_1 holds.\nSub-test B: WindowEntry.wnd_proc == 0 when class_name=\"\" and one class with wnd_proc=0xDEAD_0000 is registered — no fallback exists in 0x4001 handler. isBugCondition_3 holds.\nSub-test C: LAST_USER_MODE_TICK == 50000 after simulated on_process_exit cleanup (expected 0) — cleanup block never stores 0. ticks_since_user=16 < 2000 → recently_in_user_mode=true → double-paint for ~2s. isBugCondition_2 holds.",
+      "lastRunTimestamp": 1791406462489
+    }
+  },
+  "executionHistory": {
+    "1. Write bug condition exploration test": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367670673
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367677153
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788368670775
+      }
+    ],
+    "2. Write preservation property tests (BEFORE implementing fix)": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367670921
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788368723452
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369145695
+      }
+    ],
+    "3.1 Implement fix in `src/desktop.rs` — `dispatch_key` function (4 targeted changes)": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367670990
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369152727
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369199716
+      }
+    ],
+    "3.2 Implement fix in `src/loader.rs` — `process_execution_task` post-exit cleanup (1 addition)": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367671069
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369202503
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369232285
+      }
+    ],
+    "3.3 Run `cargo check` to verify the build compiles without errors": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367671123
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369235218
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369259350
+      }
+    ],
+    "3.4 Verify bug condition exploration test now passes": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367671192
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369264609
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369314741
+      }
+    ],
+    "3.5 Verify preservation tests still pass": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367671278
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369317991
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369383125
+      }
+    ],
+    "4. Checkpoint — Ensure all tests pass": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788367671335
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369387377
+      },
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369430020
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835574
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407611178
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407673779
+      }
+    ],
+    "3. Fix for silent key drop and missing terminal re-focus after Win32 EXE exit": [
+      {
+        "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
+        "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
+        "timestamp": 1788369383238
+      }
+    ],
+    "1. Write bug condition exploration tests (BEFORE implementing any fix)": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405834630
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405840259
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791406473164
+      }
+    ],
+    "2. Write preservation property tests (BEFORE implementing any fix)": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835096
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791406478479
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791406624466
+      }
+    ],
+    "3.1 Bug 1 fix — remove `&& w.visible` predicate in `0x4009` empty-queue synthesis (`src/win32_user.rs`)": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835187
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791406634082
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791406675434
+      }
+    ],
+    "3.2 Bug 3 fix — add `wnd_proc` fallback in `0x4001` CreateWindowExW (`src/win32_user.rs`)": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835257
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791406680411
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407018430
+      }
+    ],
+    "3.3 Bug 2 fix — reset `LAST_USER_MODE_TICK` to `0` after cleanup in `on_process_exit` (`src/loader.rs`)": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835322
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407023129
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407061855
+      }
+    ],
+    "3.4 Run `cargo check` to verify zero compiler errors": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835394
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407070217
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407089917
+      }
+    ],
+    "3.5 Verify bug condition exploration tests now pass": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835472
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407094617
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407212648
+      }
+    ],
+    "3.6 Verify preservation tests still pass": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791405835521
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407217367
+      },
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407605744
+      }
+    ],
+    "3. Fix all three bugs": [
+      {
+        "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
+        "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
+        "timestamp": 1791407605797
+      }
+    ]
+  }
+}

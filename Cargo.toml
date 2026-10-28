@@ -1,0 +1,84 @@
+[package]
+name = "VEIL-OS"
+version = "0.1.0"
+edition = "2024"
+authors = ["Baily Hyslop"]
+
+# -----| dependencies |-----
+[dependencies]
+bootloader = { version = "0.9", features = ["map_physical_memory"] }
+conquer-once = { version = "0.2.0", default-features = false }
+crossbeam-queue = { version = "0.3.11", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3.4", default-features = false, features = ["alloc"] }
+linked_list_allocator = "0.10.5"
+spin = "0.9"
+uart_16550 = "0.3"
+volatile = "0.2.6"
+x86_64 = "0.14"
+pic8259 = "0.10.1"
+pc-keyboard = "0.7.0"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+orion = { version = "0.17", default-features = false, features = ["alloc"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = { version = "0.12", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
+smoltcp = { version = "0.13", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "proto-dhcpv4",
+    "proto-dns",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+    "socket-dhcpv4",
+    "socket-dns",
+    "assembler-max-segment-count-4",
+    "dns-max-name-size-255",
+    "dns-max-result-count-4",
+    "dns-max-server-count-2",
+]}
+embedded-tls = { version = "0.18", default-features = false, features = ["alloc"] }
+embedded-io = { version = "0.7", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+x509-cert = { version = "0.2.5", default-features = false }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+tinybmp = { version = "0.7.0", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false }
+zune-png = { version = "0.5.2", default-features = false }
+blake3 = { version = "1.5.1", default-features = false }
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
+
+
+[dependencies.lazy_static]
+version = "1.4.0"
+features = ["spin_no_std"]
+
+
+# -----| profile configuration |-----
+[profile.dev]
+panic = "abort"
+opt-level = 2
+
+[profile.release]
+panic = "abort"
+
+# -----| bootimage configuration |-----
+[package.metadata.bootimage]
+test-args = ["-serial", "stdio"]
+run-args = [
+    "-serial", "stdio",
+    "-cpu", "qemu64",
+    "-smp", "4",
+    "-m", "512M",
+    "-accel", "tcg,thread=multi",
+    "-device", "usb-ehci,id=usb",
+    "-device", "usb-tablet,bus=usb.0",
+    "-device", "bochs-display",
+    "-drive", "id=disk,file=fat:rw:storage,if=none,format=raw",
+    "-device", "ahci,id=ahci",
+    "-device", "ide-hd,drive=disk,bus=ahci.0",
+    "-netdev", "socket,id=net0,udp=127.0.0.1:1235,localaddr=127.0.0.1:1234",
+    "-device", "e1000,netdev=net0"
+]
