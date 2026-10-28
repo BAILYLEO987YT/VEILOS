@@ -952,15 +952,17 @@ pub static WIN32_USER: Mutex<Win32UserState> = Mutex::new(Win32UserState::new())
 pub fn dispatch_win32_user_syscall(syscall_id: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     use crate::process::PROCESSOR;
 
-    // ── Diagnostic trace ────────────────────────────────────────────────────
+    // ── Diagnostic trace (interrupts::SYSCALL_TRACE) ────────────────────────
     // Every Win32 syscall that reaches this dispatcher is logged to the serial
     // console so we can see exactly which API the EXE is calling and in what
     // order. Particularly useful for spotting where execution stops before
     // CreateWindow (0x4001) is ever reached.
-    crate::serial_println!(
-        "[WIN32] >> {:#06x}  args=({:#010x}, {:#010x}, {:#010x}, {:#010x})",
-        syscall_id, arg0, arg1, arg2, arg3
-    );
+    if crate::interrupts::syscall_trace() {
+        crate::serial_println!(
+            "[WIN32] >> {:#06x}  args=({:#010x}, {:#010x}, {:#010x}, {:#010x})",
+            syscall_id, arg0, arg1, arg2, arg3
+        );
+    }
 
     let process = match PROCESSOR.lock().get_active() {
         Some(p) => p,

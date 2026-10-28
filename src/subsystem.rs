@@ -819,7 +819,9 @@ impl Subsystem for WindowsSubsystem {
                         let lparam  = *(base.add(0x18) as *const u64);
                         (hwnd, message, wparam, lparam)
                     };
-                    crate::serial_println!("[DISPATCH] hwnd={} msg={:#X} wp={:#X} lp={:#X}", hwnd, message, wparam, lparam);
+                    if crate::interrupts::syscall_trace() {
+                        crate::serial_println!("[DISPATCH] hwnd={} msg={:#X} wp={:#X} lp={:#X}", hwnd, message, wparam, lparam);
+                    }
                     match message {
                         crate::win32_user::WM_PAINT => {
                             // Trigger a compositor repaint for this window.

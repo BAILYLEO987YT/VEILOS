@@ -359,19 +359,37 @@ pub fn syscall_stack_arg(index: usize) -> Option<u64> {
     Some(unsafe { core::ptr::read_unaligned(addr as *const u64) })
 }
 
+/// Per-call serial tracing for user-mode programs: syscall entry/return,
+/// Win32 API calls and window-message dispatch.
+///
+/// Off by default. A Win32 message loop makes ~100k syscalls a run, and at
+/// two serial lines each (written with interrupts off) the app crawls and the
+/// desktop starves on the serial lock until it exits. Turn it on while
+/// debugging an EXE. Errors, faults and process start/exit are always logged.
+pub static SYSCALL_TRACE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn syscall_trace() -> bool {
+    SYSCALL_TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Pure Rust syscall dispatcher — called from the naked stub above with a valid
 /// kernel stack.  Arguments follow Windows x64 ABI (rescued by thunk + asm):
 ///   id=RDI, a0=RSI, a1=RDX, a2=RCX, a3=R8  →  return value in RAX.
 extern "C" fn syscall_dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    // ── Universal syscall trace ──────────────────────────────────────────────
+    // ── Universal syscall trace (SYSCALL_TRACE) ─────────────────────────────
     // Every syscall from every subsystem (NT native, Win32, kernel32, etc.)
     // passes through here. This lets us see exactly what the EXE is calling
     // and in what order — including the early MSVC CRT NT calls that happen
     // before any Win32 API (CreateWindow etc.) is ever reached.
-    crate::serial_println!(
-        "[SYSCALL] id={:#08x}  a0={:#010x}  a1={:#010x}  a2={:#010x}  a3={:#010x}",
-        id, a0, a1, a2, a3
-    );
+    let trace = syscall_trace();
+    if trace {
+        crate::serial_println!(
+            "[SYSCALL] id={:#08x}  a0={:#010x}  a1={:#010x}  a2={:#010x}  a3={:#010x}",
+            id, a0, a1, a2, a3
+        );
+    }
 
     // !! CRITICAL: Clone the Arc BEFORE releasing the lock. !!
     //
@@ -389,7 +407,9 @@ extern "C" fn syscall_dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u
 
     if let Some(proc) = proc_opt {
         let result = proc.handle_syscall(id, a0, a1, a2, a3);
-        crate::serial_println!("[SYSCALL] id={:#08x}  → ret={:#010x}", id, result);
+        if trace {
+            crate::serial_println!("[SYSCALL] id={:#08x}  -> ret={:#010x}", id, result);
+        }
         result
     } else {
         crate::println!("\n[SYSCALL] ERROR: No active process for dispatch (id={})!", id);
@@ -754,8 +774,18 @@ fn x86_64_hlt() {
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// System-wide high-precision tick counter (1kHz).
+/// Kernel time in milliseconds, updated by the BSP's timer interrupt.
+///
+/// Read from the TSC (`time::now_ms`) rather than counted one per interrupt:
+/// PIT interrupts that arrive while the previous one is still pending are
+/// merged, so a counted clock runs slow whenever the CPU falls behind. Under
+/// QEMU TCG it measured 150-700 ticks/s instead of 1000, which stretched every
+/// SleepFuture, frame interval and UI timeout (double-clicks stopped
+/// registering). Consumers may see it advance by more than 1 between reads.
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// TICKS value of the last ISR-driven desktop repaint (see the timer ISR).
+static LAST_ISR_PAINT_TICK: AtomicU64 = AtomicU64::new(0);
 
 /// Set to true by the loader when a user process is launched via iretq.
 /// The timer ISR uses this to decide whether to drive the display pipeline.
@@ -896,8 +926,13 @@ extern "x86-interrupt" fn timer_interrupt_handler(
 {
     crate::sampler::sample(stack_frame.instruction_pointer.as_u64());
     
-    TICKS.fetch_add(1, Ordering::Relaxed);
-    let tick = TICKS.load(Ordering::Relaxed);
+    let tick = if crate::time::is_calibrated() {
+        let now = crate::time::now_ms();
+        TICKS.fetch_max(now, Ordering::Relaxed).max(now)
+    } else {
+        // No calibrated TSC: fall back to counting interrupts.
+        TICKS.fetch_add(1, Ordering::Relaxed) + 1
+    };
 
     crate::scheduler::scheduler_tick(tick);
     crate::debugger::profiler_tick(tick);
@@ -956,8 +991,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(
 
     if recently_in_user_mode
         && USER_PROCESS_ACTIVE.load(Ordering::Relaxed)
-        && tick % 16 == 0
+        && tick.wrapping_sub(LAST_ISR_PAINT_TICK.load(Ordering::Relaxed)) >= 16
     {
+        LAST_ISR_PAINT_TICK.store(tick, Ordering::Relaxed);
         let phase = crate::desktop::DesktopPhase::from_u8(
             crate::desktop::DESKTOP_PHASE.load(Ordering::Relaxed)
         );

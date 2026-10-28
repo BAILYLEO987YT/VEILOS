@@ -8,9 +8,10 @@
 // timeout lasted anywhere from microseconds to seconds depending on the CPU
 // and accelerator.
 //
-// The PIT channel-0 interrupt (`interrupts::TICKS`, 1 kHz) is still the
-// scheduler / SleepFuture clock. Channel 2 is used here so that tick is
-// never disturbed.
+// The PIT channel-0 interrupt (1 kHz) still drives the scheduler and
+// SleepFuture wakeups, but the time it publishes (`interrupts::TICKS`) is
+// read from the TSC, so lost interrupts don't slow the clock. Channel 2 is
+// used here so channel 0 is never disturbed.
 //
 // `calibrate` is shared with `smp`, which measures the LAPIC timer the same
 // way.
@@ -135,6 +136,11 @@ fn us_to_tsc(us: u64) -> u64 {
 pub fn now_us() -> u64 {
     let elapsed = rdtsc().wrapping_sub(TSC_BOOT.load(Ordering::Relaxed));
     (elapsed as u128 * 1_000_000 / tsc_hz() as u128) as u64
+}
+
+/// Milliseconds since `init`.
+pub fn now_ms() -> u64 {
+    now_us() / 1_000
 }
 
 /// Nanoseconds since `init`.
