@@ -739,6 +739,8 @@ pub struct ApWorkItem {
     pub stack_top: u64,
     pub teb_base:  u64,
     pub pid:       u32,
+    /// The process's page tables (address_space).
+    pub cr3:       u64,
 }
 
 pub static AP_WORK_QUEUE: spin::Mutex<alloc::vec::Vec<ApWorkItem>> = spin::Mutex::new(alloc::vec::Vec::new());
@@ -746,7 +748,8 @@ pub static AP_WORK_QUEUE: spin::Mutex<alloc::vec::Vec<ApWorkItem>> = spin::Mutex
 pub fn park_and_wait_for_work() -> ! {
     loop {
         let work = AP_WORK_QUEUE.lock().pop();
-        if let Some(ApWorkItem { entry, stack_top, teb_base, pid }) = work {
+        if let Some(ApWorkItem { entry, stack_top, teb_base, pid, cr3 }) = work {
+            crate::address_space::activate(cr3);
             unsafe { crate::loader::launch_into_usermode(entry, stack_top, teb_base); }
             // return_from_usermode() longjmps here with IF=0 — re-enable.
             unsafe { core::arch::asm!("sti"); }
@@ -754,11 +757,14 @@ pub fn park_and_wait_for_work() -> ! {
             // Process exited (ExitProcess syscall or a fault handler called
             // return_from_usermode()).  Run the SAME teardown the BSP path
             // uses instead of just clearing the flag.
-            if let Some(process) = crate::process::PROCESSOR.lock().find(pid) {
+            // (Bound first so PROCESSOR isn't held across on_process_exit.)
+            let process = crate::process::PROCESSOR.lock().find(pid);
+            if let Some(process) = process {
                 crate::loader::on_process_exit(&process);
             } else {
                 // Process already reaped from under us — still clear the flag.
                 crate::interrupts::USER_PROCESS_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+                crate::address_space::activate(0);
             }
             crate::serial_println!("[SMP] AP process (pid {}) completed, parking.", pid);
         }

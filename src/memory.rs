@@ -37,6 +37,7 @@ pub unsafe fn get_mapper() -> OffsetPageTable<'static> {
 /// Initialize a new OffsetPageTable.
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     set_phys_mem_offset(physical_memory_offset);
+    crate::address_space::init();
     let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
 }
@@ -78,6 +79,18 @@ pub fn map_page_checked(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), &'static str> {
     use x86_64::structures::paging::mapper::MapToError;
+
+    // A user page in a slot shared with the kernel would appear in the kernel
+    // and in every process (see address_space).
+    if flags.contains(x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE)
+        && crate::address_space::is_kernel_slot(page.start_address().as_u64())
+    {
+        crate::serial_println!(
+            "[MEM] refusing user mapping at {:#X}: shared kernel slot",
+            page.start_address().as_u64()
+        );
+        return Err("user mapping in a kernel-shared slot");
+    }
 
     let res = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
     match res {

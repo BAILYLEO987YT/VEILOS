@@ -42,17 +42,20 @@ pub struct NtEnv {
 /// Held from the start of `load_and_spawn_pe` until `on_process_exit` has
 /// released the process's memory.
 ///
-/// One Windows process at a time: every process is mapped into the one
-/// shared address space, and EXEs usually share a preferred base
-/// (0x140000000), so loading a second one remaps the first one's pages out
-/// from under it. Before kernel threads this couldn't happen on a single CPU
-/// (the executor was frozen while a process ran); on SMP it already could.
-/// Lifted once processes get their own page tables.
+/// One Windows process at a time. Each process now has its own page tables
+/// (address_space), but the syscall layer still dispatches to a single
+/// "active" process (`ProcessManager::get_active`), and the user long-jump
+/// context is per CPU, so a second concurrent process would receive the first
+/// one's syscalls. Lifting this belongs with the Win32/EXE work.
 static USER_PROCESS_SLOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Load a PE into a fresh address space and queue it to run.
+///
+/// The whole load runs with the new process's page tables active
+/// (`address_space::with`), so the loader's mappings and its writes to user
+/// addresses land in that process alone, and `Process::new` records its CR3.
 pub fn load_and_spawn_pe(
     path: &str,
-    mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<Arc<Process>, &'static str> {
     use core::sync::atomic::Ordering;
@@ -60,22 +63,30 @@ pub fn load_and_spawn_pe(
         crate::serial_println!("[LOADER] Refusing to load {}: another Windows process is still running", path);
         return Err("Another Windows program is still running (one at a time for now)");
     }
+    let Some(cr3) = crate::address_space::create() else {
+        USER_PROCESS_SLOT.store(false, Ordering::Release);
+        return Err("Out of memory for page tables");
+    };
 
-    let mut scratch: Vec<u64> = Vec::new();
-    let result = load_and_spawn_pe_inner(path, mapper, frame_allocator, &mut scratch);
+    let result = crate::address_space::with(cr3, || {
+        let mut mapper = unsafe { memory::get_mapper() }; // the new process's tables
+        let mut scratch: Vec<u64> = Vec::new();
+        let result = load_and_spawn_pe_inner(path, &mut mapper, frame_allocator, &mut scratch);
+        if result.is_err() && !scratch.is_empty() {
+            crate::serial_println!(
+                "[LOADER] Load failed — rolling back {} mapped pages", scratch.len()
+            );
+            for &addr in scratch.iter() {
+                let page = Page::containing_address(VirtAddr::new(addr));
+                let _ = memory::unmap_and_free_page(page, &mut mapper);
+            }
+        }
+        result
+    });
 
     if result.is_err() {
+        crate::address_space::destroy(cr3);
         USER_PROCESS_SLOT.store(false, Ordering::Release);
-    }
-    if result.is_err() && !scratch.is_empty() {
-        crate::serial_println!(
-            "[LOADER] Load failed — rolling back {} mapped pages", scratch.len()
-        );
-        let mut m = unsafe { memory::get_mapper() };
-        for &addr in scratch.iter() {
-            let page = Page::containing_address(VirtAddr::new(addr));
-            let _ = memory::unmap_and_free_page(page, &mut m);
-        }
     }
     result
 }
@@ -696,6 +707,7 @@ async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
             stack_top: process.stack_top,
             teb_base,
             pid:       process.pid,
+            cr3:       process.cr3,
         });
         return;
     }
@@ -706,7 +718,8 @@ async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
     // launch_into_usermode right here, which froze the executor until the
     // process exited and left the timer ISR painting the desktop.
     let pid = process.pid;
-    crate::kthread::spawn("user-process", move || {
+    let cr3 = process.cr3;
+    crate::kthread::spawn_in("user-process", cr3, move || {
         unsafe { crate::loader::launch_into_usermode(process.entry_point, process.stack_top, teb_base); }
 
         // ── Post-exit ────────────────────────────────────────────────────
@@ -795,6 +808,12 @@ pub fn on_process_exit(process: &Arc<Process>) {
     //    relaunching the same EXE no longer has to wait up to a second for
     //    the reaper, and no longer collides with its own stale mapping.
     release_process_memory(process);
+
+    // 7. Drop the page tables. release_process_memory needed them active; now
+    //    move this CPU (and this thread's record) back to the kernel's tables.
+    crate::kthread::set_current_cr3(0);
+    crate::address_space::activate(0);
+    crate::address_space::destroy(process.cr3);
     USER_PROCESS_SLOT.store(false, core::sync::atomic::Ordering::Release);
 
     // Reset LAST_USER_MODE_TICK so the timer ISR's recently_in_user_mode

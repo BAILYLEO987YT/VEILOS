@@ -681,9 +681,8 @@ pub fn open_file_absolute(path: &str, name: &str) {
         FREQUENT_FILES.lock().record(path);
         if name.ends_with(".exe") || name.ends_with(".EXE") {
             // It's an executable, so attempt to load and spawn it.
-            let mut mapper = unsafe { crate::memory::get_mapper() };
             let mut frame_allocator = crate::memory::GlobalFrameAllocator;
-            match crate::loader::load_and_spawn_pe(path, &mut mapper, &mut frame_allocator) {
+            match crate::loader::load_and_spawn_pe(path, &mut frame_allocator) {
                 Ok(_) => {
                     notify(NotifCategory::Success, "LAUNCHED", name);
                     // Open a terminal to act as the "console window" for the executable

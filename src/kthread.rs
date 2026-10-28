@@ -55,6 +55,8 @@ struct Thread {
     /// None for a CPU's boot thread, which runs on the stack it booted on.
     stack: Option<Box<[u8]>>,
     entry: Option<Box<dyn FnOnce() + Send>>,
+    /// Page tables this thread runs on (address_space); 0 = the kernel's.
+    cr3: u64,
 }
 
 struct CpuThreads {
@@ -80,6 +82,7 @@ impl CpuThreads {
                 saved: SavedState { rsp: 0, _pad: 0, fx: [0; 512] },
                 stack: None,
                 entry: None,
+                cr3: 0,
             }));
             self.current = 0;
         }
@@ -155,6 +158,9 @@ unsafe fn reschedule(cpu: usize, becomes: State) -> bool {
         ct.threads[next].state = State::Running;
         ct.current = next;
         ct.slice_start = now_ms();
+        // Kernel memory (including every thread's stack) is mapped in every
+        // address space, so switching tables before the stack is safe.
+        crate::address_space::activate(ct.threads[next].cr3);
         (
             &mut ct.threads[cur].saved as *mut SavedState,
             &ct.threads[next].saved as *const SavedState,
@@ -164,9 +170,15 @@ unsafe fn reschedule(cpu: usize, becomes: State) -> bool {
     true
 }
 
-/// Start a kernel thread on the current CPU. It first runs the next time this
-/// CPU switches threads.
+/// Start a kernel thread on the current CPU, on the kernel's page tables. It
+/// first runs the next time this CPU switches threads.
 pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> u64 {
+    spawn_in(name, 0, f)
+}
+
+/// Like `spawn`, but the thread runs on the page tables at `cr3` (a process's
+/// address space; 0 = the kernel's).
+pub fn spawn_in(name: &'static str, cr3: u64, f: impl FnOnce() + Send + 'static) -> u64 {
     let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
     let top = (stack.as_mut_ptr() as u64 + STACK_SIZE as u64) & !0xF;
 
@@ -186,6 +198,7 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> u64 {
         saved: SavedState { rsp, _pad: 0, fx: [0; 512] },
         stack: Some(stack),
         entry: Some(Box::new(f)),
+        cr3,
     });
     // Start from this CPU's current FPU/SSE control state (MXCSR, x87 CW).
     unsafe {
@@ -236,6 +249,18 @@ pub fn yield_if_slice_used(slice_ms: u64) {
     if due {
         yield_now();
     }
+}
+
+/// Record that the running thread now uses the page tables at `cr3` (0 = the
+/// kernel's). The caller loads CR3 itself.
+pub fn set_current_cr3(cr3: u64) {
+    let cpu = crate::smp::cpu_index();
+    without_interrupts(|| {
+        let mut ct = CPUS[cpu].lock();
+        ct.ensure_boot_thread();
+        let cur = ct.current;
+        ct.threads[cur].cr3 = cr3;
+    });
 }
 
 /// True if another thread on this CPU is waiting to run.

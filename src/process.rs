@@ -70,6 +70,8 @@ pub struct Process {
 
 impl Process {
     pub fn new(pid: u32, name: &'static str, subsystem: Box<dyn Subsystem>) -> Self {
+        // The loader builds every process with its new address space active
+        // (address_space::with), so the active CR3 is the process's own.
         use x86_64::registers::control::Cr3;
         let (l4_frame, _) = Cr3::read();
 
@@ -210,25 +212,10 @@ impl ProcessManager {
             // Close NT handles so the object manager can drop refcounts.
             if let Some(mut h) = p.handles.try_lock() { h.close_all(); }
 
-            // Unmap AND free.  The old code called unmap_page(), which threw
-            // the physical frame away — every launch permanently consumed RAM
-            // until the bump allocator ran dry.
-            let pages: alloc::vec::Vec<u64> = {
-                match p.mapped_pages.try_lock() {
-                    Some(mut g) => core::mem::take(&mut *g),
-                    None        => alloc::vec::Vec::new(),
-                }
-            };
-            if !pages.is_empty() {
-                unsafe {
-                    let mut mapper = crate::memory::get_mapper();
-                    for addr in pages {
-                        let va = x86_64::VirtAddr::new(addr);
-                        let page = x86_64::structures::paging::Page::containing_address(va);
-                        let _ = crate::memory::unmap_and_free_page(page, &mut mapper);
-                    }
-                }
-            }
+            // Pages and page tables are released by loader::on_process_exit,
+            // which runs on the process's own CPU with its CR3 still active.
+            // This reaper runs on the kernel's page tables, where the
+            // process's pages were never mapped.
         }
         self.processes.retain(|p| p.is_alive());
         if let Some(pid) = self.current_pid {

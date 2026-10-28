@@ -56,6 +56,7 @@ pub mod smp;
 pub mod time;
 pub mod ioapic;
 pub mod kthread;
+pub mod address_space;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;
@@ -349,6 +350,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Phase 18: the desktop starts at the login screen.
     // paint_desktop() will render the correct phase on the first vsync tick.
     
+    crate::address_space::log_kernel_layout();
+
     let mut executor = task::executor::Executor::new();
     
     // Spawn core kernel tasks

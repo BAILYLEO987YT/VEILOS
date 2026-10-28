@@ -171,7 +171,10 @@ pub struct VadSpace {
     next_alloc: u64,
 }
 
-const USER_SPACE_START: u64 = 0x0000_0010_0000; // 1 MiB — skip NULL trap region
+// Starts at 4 GiB: the low 4 GiB holds the kernel image (GiB 0) and
+// identity-mapped MMIO (GiB 3), which every address space shares (see
+// address_space). KUSER_SHARED_DATA (0x7FFE0000) is mapped by the loader.
+const USER_SPACE_START: u64 = 0x0001_0000_0000;
 const USER_SPACE_END:   u64 = 0x0000_7FFF_FFFF_F000; // Top of user address space
 
 impl VadSpace {
