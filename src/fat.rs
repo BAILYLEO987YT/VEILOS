@@ -608,16 +608,39 @@ impl FileSystem for FatFileSystem {
         }
         let size: u32 = data.len().try_into().map_err(|_| VfsError::WriteError)?; // FAT max 4 GiB - 1
 
-        // Write the data to new clusters first, so a failure leaves the old file intact.
+        // Overwrite in place: the file keeps its first cluster and its chain
+        // grows or shrinks. Writing to fresh clusters and repointing the entry
+        // would survive a failed write better, but QEMU's vvfat (the default
+        // `fat:rw:` disk) tracks host files by first cluster and reads a
+        // changed first cluster as a delete: the host file disappeared.
         let cb = self.cluster_bytes();
-        let chain = self.alloc_chain(dev, &mut st, data.len().div_ceil(cb))?;
+        let need = data.len().div_ceil(cb);
+        let old = match &existing {
+            Some(it) if it.cluster != 0 => self.chain(dev, it.cluster)?,
+            _ => Vec::new(),
+        };
+        let fresh = old.is_empty();
+        let chain: Vec<u32> = if need == 0 {
+            Vec::new()
+        } else if fresh {
+            self.alloc_chain(dev, &mut st, need)?
+        } else if need > old.len() {
+            let extra = self.alloc_chain(dev, &mut st, need - old.len())?;
+            self.fat_set(dev, *old.last().unwrap(), extra[0])?;
+            old.iter().copied().chain(extra).collect()
+        } else {
+            old[..need].to_vec()
+        };
+
         let mut buf = vec![0u8; cb];
         for (k, &c) in chain.iter().enumerate() {
             let part = &data[k * cb..data.len().min((k + 1) * cb)];
             buf[..part.len()].copy_from_slice(part);
             buf[part.len()..].fill(0);
             if !dev.write_sectors(self.cluster_lba(c), self.sectors_per_cluster, buf.as_ptr() as u64) {
-                let _ = self.free_chain(dev, chain[0]);
+                if fresh {
+                    let _ = self.free_chain(dev, chain[0]);
+                }
                 return Err(VfsError::WriteError);
             }
         }
@@ -635,8 +658,12 @@ impl FileSystem for FatFileSystem {
                     e[24..26].copy_from_slice(&date.to_le_bytes());
                     e[18..20].copy_from_slice(&date.to_le_bytes());
                 })?;
-                if item.cluster != 0 {
-                    self.free_chain(dev, item.cluster)?;
+                // Release the clusters the shorter file no longer uses.
+                if need == 0 && !old.is_empty() {
+                    self.free_chain(dev, old[0])?;
+                } else if need > 0 && need < old.len() {
+                    self.fat_set(dev, old[need - 1], self.eoc())?;
+                    self.free_chain(dev, old[need])?;
                 }
                 Ok(())
             }
