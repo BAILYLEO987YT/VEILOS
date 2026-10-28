@@ -1,6 +1,5 @@
 use x86_64::instructions::port::Port;
 use crate::println;
-use alloc::vec::Vec;
 use crate::pci::PciDevice;
 
 // -----| Legacy IDE Ports |-----
@@ -18,7 +17,7 @@ const STATUS_BSY: u8 = 0x80; // Busy
 const STATUS_DRDY: u8 = 0x40; // Drive Ready
 const STATUS_ERR: u8 = 0x01; // Error
 
-pub fn init(devices: &Vec<PciDevice>) {
+pub fn init(devices: &[PciDevice]) {
     println!("\nSearching for Legacy IDE/ATA Controllers...");
 
     let mut found = false;

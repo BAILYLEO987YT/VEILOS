@@ -538,14 +538,24 @@ pub static GPU_SCHEDULER: Mutex<GpuScheduler>        = Mutex::new(GpuScheduler::
 
 /// Discover GPUs from the PCI device tree and register them.
 pub fn init() {
-    let devices = crate::pci::scan_buses();
     let mut gpus = GPU_DEVICES.lock();
 
-    for dev in &devices {
-        if dev.class != 0x03 { continue; } // 0x03 = Display Controller
-
-        let bar0 = crate::pci::read_bar(dev.bus, dev.device, dev.function, 0) & !0xF;
-        let bar1 = crate::pci::read_bar(dev.bus, dev.device, dev.function, 1) & !0xF;
+    for dev in &crate::pci::find_class(0x03, None) { // 0x03 = Display Controller
+        // Pick apertures from the sized BARs instead of assuming fixed slots:
+        //   • VRAM aperture = the largest memory BAR (on Bochs/QEMU that is the
+        //     BAR0 linear framebuffer; on discrete cards the prefetchable VRAM BAR).
+        //   • Register block = the smallest non-prefetchable memory BAR other
+        //     than the aperture (0 if the device has none, e.g. stdvga).
+        let mem_bars: Vec<(usize, crate::pci::Bar)> = dev.bars.iter().copied()
+            .enumerate()
+            .filter(|(_, b)| b.is_mem())
+            .collect();
+        let Some(&(vram_idx, vram_bar)) = mem_bars.iter().max_by_key(|(_, b)| b.size) else { continue };
+        let regs_bar = mem_bars.iter()
+            .filter(|(i, b)| *i != vram_idx && !b.prefetchable)
+            .min_by_key(|(_, b)| b.size)
+            .map(|&(_, b)| b)
+            .unwrap_or(crate::pci::Bar::EMPTY);
 
         let vendor = match dev.vendor_id {
             0x8086 => GpuVendor::Intel,
@@ -555,20 +565,20 @@ pub fn init() {
             _      => GpuVendor::Unknown,
         };
 
-        if bar0 == 0 { continue; }
-
-        // Assume 256 MiB VRAM for now; probe VRAM size via BAR sizing in future.
-        let vram_size = 256 * 1024 * 1024;
+        // Note: this is the size of the CPU-visible window, which on discrete
+        // cards without resizable BAR can be smaller than the real VRAM.
+        let vram_size = vram_bar.size as usize;
+        dev.enable_decode();
 
         let gpu = Arc::new(GpuDevice::new(
             vendor, dev.device_id as u32,
-            bar0 as u64, 0x1000,        // BAR0: 4 KiB register block
-            bar1 as u64, vram_size,     // BAR1: VRAM aperture
+            regs_bar.base, regs_bar.size as usize,
+            vram_bar.base, vram_size,
             crate::ui::SCREEN_W as u32, crate::ui::SCREEN_H as u32, 32,
         ));
 
-        println!("[GPU] Registered {:?} device {:#06x} BAR0={:#X} VRAM_base={:#X} ({} MiB)",
-            vendor, dev.device_id, bar0, bar1, vram_size / (1024 * 1024));
+        println!("[GPU] Registered {:?} device {:#06x} regs={:#X} VRAM_base={:#X} ({} MiB)",
+            vendor, dev.device_id, regs_bar.base, vram_bar.base, vram_size / (1024 * 1024));
         gpus.push(gpu);
     }
 

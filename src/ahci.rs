@@ -1,6 +1,5 @@
-use crate::pci::{self, PciDevice};
+use crate::pci::PciDevice;
 use crate::println;
-use alloc::vec::Vec;
 use volatile::Volatile;
 use x86_64::{
     structures::paging::{
@@ -10,7 +9,7 @@ use x86_64::{
 };
 
 pub fn init(
-    devices: &Vec<PciDevice>, 
+    devices: &[PciDevice],
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
@@ -21,12 +20,22 @@ pub fn init(
     for dev in devices.iter() {
         if dev.class == 0x01 && dev.subclass == 0x06 {
             if dev.prog_if == 0x01 {
+                // ABAR is always BAR5 and always memory-mapped.
+                let base_address = match dev.bar(5).mem_base() {
+                    Some(b) => b,
+                    None => {
+                        println!("  -> AHCI controller at {}:{}:{} has no ABAR — skipping.",
+                            dev.bus, dev.device, dev.function);
+                        continue;
+                    }
+                };
                 found = true;
-                
-                let abar = pci::read_bar(dev.bus, dev.device, dev.function, 5);
-                let base_address = abar & 0xFFFF_FFF0;
 
-                let phys_addr = PhysAddr::new(base_address as u64);
+                // The HBA DMAs command lists, FISes and data: it needs memory
+                // decode and bus mastering, which firmware may not have set.
+                dev.enable_for_driver();
+
+                let phys_addr = PhysAddr::new(base_address);
                 let virt_addr = VirtAddr::new(base_address as u64);
 
                 // Map enough pages to cover the entire HbaMemory struct.

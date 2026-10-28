@@ -881,9 +881,17 @@ pub fn init(hardware_tree: &[crate::pci::PciDevice]) {
 
     let device = match nic {
         Some(dev) => {
-            let bar0 = crate::pci::read_bar(dev.bus, dev.device, dev.function, 0);
-            // BAR0 bit 0 = 1 means I/O space; strip the low bits to get the base.
-            let io_base = (bar0 & !0x3) as u16;
+            // Legacy virtio-net exposes its registers through an I/O BAR0.
+            let io_base = match dev.bar(0).io_port() {
+                Some(p) => p,
+                None => {
+                    println!("[NET] VirtIO-net BAR0 is not an I/O BAR — networking unavailable.");
+                    crate::serial_println!("[NET] VirtIO-net BAR0 is not an I/O BAR: {:?}", dev.bar(0));
+                    return;
+                }
+            };
+            // The virtqueues are DMA'd by the device: bus mastering is required.
+            dev.enable_for_driver();
             println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
             crate::serial_println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
             VirtioNet::new(io_base)

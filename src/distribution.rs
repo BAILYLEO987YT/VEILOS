@@ -113,7 +113,7 @@ impl Installer {
 
             let ok = match stage {
                 InstallerStage::HardwareDetect => {
-                    let devs = crate::pci::scan_buses();
+                    let devs = crate::pci::devices();
                     self.log(&alloc::format!("  Found {} PCI device(s)", devs.len()));
                     // Check AHCI storage is present.
                     let has_storage = devs.iter().any(|d| d.class == 0x01);

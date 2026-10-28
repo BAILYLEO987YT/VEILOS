@@ -255,8 +255,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         vga_buffer::VgaColour::Black
     );
     
-    // Discover the entire hardware tree attached to the motherboard!
-    let hardware_tree = pci::scan_buses();
+    // Enumerate the bus once and populate the device registry. Every driver
+    // queries the registry from here on; nothing may rescan the bus.
+    pci::init();
+    let hardware_tree = pci::devices();
 
     // Pass the hardware tree to the AHCI module to initialize storage
     ahci::init(&hardware_tree, &mut mapper, &mut frame_allocator, phys_mem_offset);

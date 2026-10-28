@@ -74,14 +74,16 @@ pub fn probe_gpu() {
     
     println!("[GRAPHICS] Hardware Resolution Set: 1024x768x32");
 
-    // Scan PCI for the Buffer address
-    let devices = pci::scan_buses();
-    for dev in devices {
-        if dev.class == 0x03 { // Display Controller
-            let bar0 = pci::read_bar(dev.bus, dev.device, dev.function, 0);
-            let phys_addr = bar0 & !0xF; // Mask out flags
-            
+    // Look up the display controller's linear framebuffer (BAR0 on BGA).
+    for dev in pci::find_class(0x03, None) {
+        {
+            let phys_addr = match dev.bar(0).mem_base() {
+                Some(b) => b,
+                None => continue,
+            };
+
             if phys_addr != 0 {
+                dev.enable_decode();
                 println!("[GRAPHICS] Found GPU at PCI {:02X}:{:02X}. BAR0: {:#X}", dev.bus, dev.device, phys_addr);
                 
                 // CRITICAL: We MUST map the physical address to a virtual address!

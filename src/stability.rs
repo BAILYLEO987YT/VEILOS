@@ -485,13 +485,15 @@ impl DriverStressTester {
             ops: count, errors, avg_us,
         });
 
-        // ---- PCI stability: re-scan bus ----
+        // ---- PCI stability: every registered device still answers ----
+        // (A full rescan is not allowed at runtime — BAR sizing would disturb
+        // live devices — so re-read each device's identity instead.)
         let t0 = crate::interrupts::TICKS.load(Ordering::Relaxed);
-        let devices = crate::pci::scan_buses();
+        let (pci_count, pci_missing) = crate::pci::verify_present();
         let scan_ms = crate::interrupts::TICKS.load(Ordering::Relaxed).saturating_sub(t0);
         results.push(DriverStressResult {
-            driver: String::from("PCI bus scan"),
-            ops: devices.len() as u64, errors: 0, avg_us: scan_ms,
+            driver: String::from("PCI device presence"),
+            ops: pci_count as u64, errors: pci_missing as u64, avg_us: scan_ms,
         });
 
         // ---- Timer monotonicity check ----
