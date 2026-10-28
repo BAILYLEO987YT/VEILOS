@@ -79,8 +79,11 @@ import "/THEMES/DARK.VSH";
 // If WALLPAPER_PATH is unset, the desktop falls back to a flat
 // background colour taken from THEME[background].
 // Paths are UNIX-style, relative to filesystem root.
-set WALLPAPER_PATH     = "/System/wallpaper/default.jpg";
-set WALLPAPER_POSITION = "CROP";
+// CHANGED (shell runtime): the wallpaper is set in /config.vsh
+// (WALLPAPER_PATH, WALLPAPER_POSITION). Setting it here as well
+// replaced config's choice, and the old path
+// "/System/wallpaper/default.jpg" does not exist (and is not an
+// 8.3 name), so the desktop ended up with no wallpaper at all.
 // Valid positions: STRETCH (default), CENTER, TILE, CROP,
 //                  BASIC, WINDOW_FIT, WINDOW_CENTER
 

@@ -4,35 +4,12 @@ set SHELL = "/SHELL.VSH";
 // simple and user friendly like python but keeping,
 // some nice syntax such as the bracket use in rust or java
 
-// Define DARK theme
-var DARK = { 
-// var creates a variable, : is used to define the type of the variable,
-// = is used to assign a value to the variable,
-// { } is used to define the scope of the variable.
-    background: #121212,
-    foreground: #ffffff,
-    accent: #00ff00,
-    border: #00ff00,
-    border_radius: 10,
-    font_size: 14,
-    font_family: "poppins",
-};
-
-var HEX: string = "0123456789abcdef";
-// defines the hexidecimal values.
-
-var i: index = 0;
-// defines an index variable that would reset to 0 on first usage, this is different from,
-// an int type as the int type keeps its value after usage.
-
 on_event start {
     // on_event is used to define a function that is called when a specific event is triggered.
     // start is the name of the event for when os launches.
     // { } is used to define the scope of the function.
-    set THEME = DARK;
-    // set is used to set the value of a variable.
-    // THEME is the system variable we are setting.
-    // DARK is the value (the previously declared theme type variable) we are setting the variable to.
+    // The theme is set by the shell (SHELL.VSH imports /THEMES/DARK.VSH),
+    // so this file only holds system settings.
     set WALLPAPER_PATH = "/WALLPAPR.JPG"; // path variable reletive from the root directory of the file system. UNIX STILE NOT WINDOWS (NO \)
     // sets the default wallpaper.
     // wallpaper_path is the system variable for setting the wallpaper, if not set it will default to the default blank colour it is already set to.
@@ -92,17 +69,4 @@ on_event start {
     var MESH_OFFLOAD_POLICY: string = "ask";
     // To change at runtime use the VScript engine or simply edit this file
     // and restart — the value is read live from the engine on every submit.
-};
-
-on_event key_event(key="ESC", action="HOLD") {
-    // when the escape key is being held down.
-    DARK[background] = "#" + format(string, ({HEX[i]}{HEX[i]}{HEX[-i]}{HEX[-i]}{HEX[-i]}{HEX[i]}));
-    // the format function should be used to change a variable from one type to another
-    // this is how you would change a value in a theme variable.
-    i = i + 1;
-    // this is how you would increment a variable.
-    if (i == 16) {
-        i = 0;
-    };
-    // this is how you would check if a variable is equal to a value.
 };

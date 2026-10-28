@@ -308,9 +308,8 @@ impl DesktopWindowManager {
         let mut y_lines = Vec::new();
         
         let screen_w = crate::ui::SCREEN_W as i32;
-        let screen_h = crate::ui::SCREEN_H as i32;
-        let panel_h = PANEL_HEIGHT as i32;
-        
+        let (top, bottom) = work_area();
+
         x_lines.push(0);
         
         let tiles_x = self.window_tiles.0.max(1) as i32;
@@ -326,17 +325,17 @@ impl DesktopWindowManager {
         }
         x_lines.push(screen_w);
         
-        y_lines.push(panel_h);
-        
+        y_lines.push(top);
+
         let mut sum_y: u32 = self.window_tile_size_ratio_y.iter().sum();
         if sum_y == 0 { sum_y = tiles_y as u32; }
-        let mut cur_y = panel_h;
+        let mut cur_y = top;
         for i in 0..tiles_y {
             let ratio = *self.window_tile_size_ratio_y.get(i as usize).unwrap_or(&1);
-            cur_y += ((screen_h - panel_h) * ratio as i32) / sum_y as i32;
+            cur_y += ((bottom - top) * ratio as i32) / sum_y as i32;
             if i < tiles_y - 1 { y_lines.push(cur_y); }
         }
-        y_lines.push(screen_h);
+        y_lines.push(bottom);
         
         (x_lines, y_lines)
     }
@@ -493,7 +492,8 @@ impl DesktopWindowManager {
                 }
                 WindowState::Normal => {
                     w.saved_rect = w.rect;
-                    w.rect  = Rect::new(0, PANEL_HEIGHT as i32, SCREEN_W as u32, (SCREEN_H - PANEL_HEIGHT) as u32);
+                    let (top, bottom) = work_area();
+                    w.rect  = Rect::new(0, top, SCREEN_W as u32, (bottom - top) as u32);
                     w.state = WindowState::Maximized;
                 }
                 _ => {}
@@ -647,7 +647,8 @@ impl DesktopWindowManager {
             let oy = self.drag_offset_y;
             if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                 let mut nx = x - ox;
-                let mut ny = (y - oy).max(PANEL_HEIGHT as i32);
+                let top = work_area().0;
+                let mut ny = (y - oy).max(top);
                 
                 if snap_dist > 0 {
                     // Snap left edge
@@ -674,7 +675,7 @@ impl DesktopWindowManager {
                 }
                 
                 w.rect.x = nx;
-                w.rect.y = ny.max(PANEL_HEIGHT as i32);
+                w.rect.y = ny.max(top);
                 w.dirty  = true;
             }
         } else if let Some(id) = self.resizing_id {
@@ -753,7 +754,7 @@ impl DesktopWindowManager {
                 if nh < 50 { nh = 50; }
 
                 w.rect.x = nx;
-                w.rect.y = ny.max(PANEL_HEIGHT as i32);
+                w.rect.y = ny.max(work_area().0);
                 w.rect.w = nw as u32;
                 w.rect.h = nh as u32;
                 w.dirty = true;
@@ -815,6 +816,9 @@ pub struct DesktopBackground {
     pub last_tick_ms: u64,
     pub is_animated: bool,
     pub pending_wallpaper_path: Option<String>,
+    /// A request that was replaced before it was ever tried. If the newer
+    /// path fails to load, this one gets its turn instead of being lost.
+    pub fallback_wallpaper_path: Option<String>,
     pub wallpaper_position: WallpaperPosition,
 }
 
@@ -833,6 +837,7 @@ impl DesktopBackground {
             last_tick_ms: 0,
             is_animated: false,
             pending_wallpaper_path: None,
+            fallback_wallpaper_path: None,
             wallpaper_position: WallpaperPosition::Stretch,
         }
     }
@@ -854,7 +859,9 @@ impl DesktopBackground {
         if !p.starts_with('/') {
             p = alloc::format!("/{}", p);
         }
-        self.pending_wallpaper_path = Some(p);
+        if let Some(old) = self.pending_wallpaper_path.replace(p) {
+            self.fallback_wallpaper_path = Some(old);
+        }
     }
 
     pub fn set_wallpaper_position(&mut self, pos: &str) {
@@ -921,6 +928,19 @@ impl DesktopBackground {
                 }
                 Err(e) => {
                     crate::serial_println!("[DESKTOP] Failed to read wallpaper file: {:?}", e);
+                }
+            }
+            if self.wallpaper_path.as_deref() == Some(path.as_str()) {
+                self.fallback_wallpaper_path = None;
+            } else {
+                notify(
+                    NotifCategory::Warning,
+                    "Wallpaper",
+                    &alloc::format!("could not load {} (8.3 names only, JPG/PNG/GIF)", path),
+                );
+                // Keep the current wallpaper; with none, try the request this one replaced.
+                if self.wallpaper_path.is_none() {
+                    self.pending_wallpaper_path = self.fallback_wallpaper_path.take();
                 }
             }
         }
@@ -1045,8 +1065,9 @@ impl DesktopBackground {
         let icon_size = 48;
         let spacing_x = 80;
         let spacing_y = 100;
+        let (top, bottom) = work_area();
         let mut x = 20;
-        let mut y = PANEL_HEIGHT as i32 + 20;
+        let mut y = top + 20;
 
         for entry in &self.entries {
             // Draw icon background/shape
@@ -1066,8 +1087,8 @@ impl DesktopBackground {
             r.draw_text(&label, x, y + icon_size as i32 + 4, p.text_primary);
 
             y += spacing_y;
-            if y + spacing_y > crate::ui::SCREEN_H as i32 {
-                y = PANEL_HEIGHT as i32 + 20;
+            if y + spacing_y > bottom {
+                y = top + 20;
                 x += spacing_x;
             }
         }
@@ -1076,8 +1097,9 @@ impl DesktopBackground {
     pub fn hit_test(&self, mx: i32, my: i32) -> Option<String> {
         let spacing_x = 80;
         let spacing_y = 100;
+        let (top, bottom) = work_area();
         let mut x = 20;
-        let mut y = PANEL_HEIGHT as i32 + 20;
+        let mut y = top + 20;
 
         for entry in &self.entries {
             let rect = Rect::new(x, y, spacing_x as u32, spacing_y as u32);
@@ -1086,8 +1108,8 @@ impl DesktopBackground {
             }
 
             y += spacing_y;
-            if y + spacing_y > crate::ui::SCREEN_H as i32 {
-                y = PANEL_HEIGHT as i32 + 20;
+            if y + spacing_y > bottom {
+                y = top + 20;
                 x += spacing_x;
             }
         }
@@ -1101,6 +1123,18 @@ pub static DESKTOP_BG: Mutex<DesktopBackground> = Mutex::new(DesktopBackground::
 // =====================================================================
 
 pub const PANEL_HEIGHT: usize = 40;
+/// Height of the VSH shell's taskbar (`Taskbar` in SHELL.VSH), pinned to the bottom.
+pub const SHELL_TASKBAR_HEIGHT: usize = 32;
+
+/// Screen rows windows may occupy: (top, bottom). The built-in panel owns the
+/// top strip; a running VSH shell replaces it with its own bar at the bottom.
+pub fn work_area() -> (i32, i32) {
+    if crate::shell::is_active() {
+        (0, (crate::ui::SCREEN_H - SHELL_TASKBAR_HEIGHT) as i32)
+    } else {
+        (PANEL_HEIGHT as i32, crate::ui::SCREEN_H as i32)
+    }
+}
 
 pub struct TaskbarButton {
     pub window_id: u32,
@@ -2460,7 +2494,8 @@ pub fn poll_input() {
             }
 
             // Check if the click is in the panel strip first (panel is always on top).
-            let in_panel = (my as i32) < PANEL_HEIGHT as i32;
+            // A running VSH shell replaces the panel, so the strip is ordinary desktop.
+            let in_panel = !crate::shell::is_active() && (my as i32) < PANEL_HEIGHT as i32;
             if in_panel {
             if (mx as i32) < PANEL_HEIGHT as i32 {
                 let is_open = {
@@ -2741,6 +2776,8 @@ pub fn repaint_panel_only(ms: u64) {
     // Only meaningful on the desktop.
     let phase = DesktopPhase::from_u8(DESKTOP_PHASE.load(Ordering::Acquire));
     if phase != DesktopPhase::Desktop { return; }
+    // The VSH shell replaces the panel and refreshes its own clock in pump().
+    if crate::shell::is_active() { return; }
 
     // Re-tick the panel (updates the clock field) then repaint just its strip.
     let mut panel = PANEL.lock();
@@ -2817,7 +2854,8 @@ pub fn paint_desktop(ms: u64) {
             }
 
             // Panel tick + paint (writes into back buffer via Renderer).
-            {
+            // Skipped while a VSH shell is running: the shell draws its own taskbar.
+            if !crate::shell::is_active() {
                 let mut panel = PANEL.lock();
                 panel.tick(ms);
                 let wm = DESKTOP_WM.lock();

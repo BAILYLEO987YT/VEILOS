@@ -470,7 +470,7 @@ pub fn pump(ms: u64) -> bool {
 fn run_action(a: OsAction) {
     match a {
         OsAction::Launch(app) => {
-            let p = crate::desktop::PANEL_HEIGHT as i32;
+            let p = crate::desktop::work_area().0;
             match app.as_str() {
                 "files" => {
                     crate::apps::open_file_manager(100, 60, 520, 400, 0);
