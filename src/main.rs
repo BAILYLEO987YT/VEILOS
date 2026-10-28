@@ -53,6 +53,8 @@ pub mod scheduler;
 pub mod vnr;
 pub mod app_repo;
 pub mod smp;
+pub mod time;
+pub mod ioapic;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;
@@ -192,6 +194,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     crate::smp::enable_sse();
     crate::serial_println!("[INIT] SSE enabled (CR4.OSFXSR+OSXMMEXCPT, CR0.EM/TS cleared)");
 
+    // Calibrate the TSC against the PIT: the clock for delay_us and driver timeouts.
+    crate::time::init();
+
     // Set up IDT and Hardware Interrupts (PIC)
     interrupts::init_idt();
     unsafe { interrupts::PICS.lock().initialize() };
@@ -225,6 +230,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // GDT+IDT are live (APs load them immediately on wake), and before the
     // scheduler tries to dispatch work across CPUs.
     crate::smp::init(&mut mapper, &mut frame_allocator);
+
+    // Move device IRQs from the 8259 to the I/O APIC (needs the LAPIC from smp::init).
+    crate::ioapic::init(&mut mapper, &mut frame_allocator);
 
     // -----| Hardware Enumeration |-----
     vga_buffer::VGA_WRITER.lock().set_colour(

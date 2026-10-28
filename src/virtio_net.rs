@@ -184,18 +184,7 @@ impl VirtioNet {
             // 2. Reset device
             status_port.write(0);
             // Wait ≥1 ms for the device to complete its reset sequence.
-            // Use the PIT tick counter so the delay is wall-clock accurate
-            // regardless of CPU frequency, instead of a fixed iteration count
-            // that varies wildly across machines.
-            {
-                use core::sync::atomic::Ordering;
-                let start = crate::interrupts::TICKS.load(Ordering::Relaxed);
-                while crate::interrupts::TICKS.load(Ordering::Relaxed)
-                    .wrapping_sub(start) < 2
-                {
-                    core::hint::spin_loop();
-                }
-            }
+            crate::time::delay_ms(2);
 
             // 3. Set ACKNOWLEDGE status bit
             status_port.write(1);

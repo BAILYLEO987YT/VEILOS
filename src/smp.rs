@@ -18,7 +18,7 @@
 // • AP scheduling: APs currently idle-halt.  The scheduler's SchedDomain
 //   will be extended to N domains (one per CPU) in a follow-up.
 // • CPU discovery: ACPI MADT is parsed for an authoritative CPU count and
-//   the real APIC ID of each processor (see `discover_cpus_via_madt`).
+//   the real APIC ID of each processor (see `parse_madt`).
 //   CPUID leaf 0x1 EBX[23:16] is kept only as a fallback for the rare case
 //   the MADT can't be found/parsed — that field is unreliable under some
 //   hypervisors (notably it can reflect the host's topology rather than the
@@ -257,6 +257,53 @@ pub fn current_apic_id() -> u32 {
     }
 }
 
+/// LAPIC timer counts per millisecond at divide-by-16, measured on the BSP by
+/// `calibrate_lapic_timer`. Every LAPIC timer in the system runs off the same
+/// bus/crystal clock, so APs use the BSP's figure.
+static LAPIC_TICKS_PER_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Count used if calibration fails: the old hard-coded value.
+const LAPIC_TICKS_PER_MS_FALLBACK: u32 = 0x40000;
+
+/// LAPIC timer divide-configuration value for divide-by-16.
+const LAPIC_DIVIDE_16: u32 = 0x3;
+
+/// LAPIC timer counts per millisecond (divide-by-16), for programming
+/// periodic or one-shot timers.
+pub fn lapic_timer_ticks_per_ms() -> u32 {
+    match LAPIC_TICKS_PER_MS.load(Ordering::Relaxed) {
+        0 => LAPIC_TICKS_PER_MS_FALLBACK,
+        n => n,
+    }
+}
+
+/// Measure the LAPIC timer rate against PIT channel 2. The BSP's LAPIC must
+/// be mapped and enabled.
+fn calibrate_lapic_timer() {
+    let rate = unsafe {
+        lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_DIVIDE_16);
+        // Masked one-shot: count down from the top, raise nothing.
+        lapic_write(LAPIC_TIMER_LVT, (1 << 16) | crate::interrupts::AP_TIMER_VECTOR as u32);
+        lapic_write(LAPIC_TIMER_INITIAL, u32::MAX);
+        let rate = crate::time::calibrate(|| (u32::MAX - lapic_read(LAPIC_TIMER_CURRENT)) as u64);
+        lapic_write(LAPIC_TIMER_INITIAL, 0); // stop
+        rate
+    };
+    match rate.map(|hz| hz / 1_000).filter(|&per_ms| per_ms > 0 && per_ms <= u32::MAX as u64) {
+        Some(per_ms) => {
+            LAPIC_TICKS_PER_MS.store(per_ms as u32, Ordering::Relaxed);
+            crate::serial_println!(
+                "[SMP] LAPIC timer: {} ticks/ms at divide-by-16 ({} kHz bus)",
+                per_ms, per_ms * 16
+            );
+        }
+        None => crate::serial_println!(
+            "[SMP] WARN: LAPIC timer calibration failed; using {:#x} ticks/ms",
+            LAPIC_TICKS_PER_MS_FALLBACK
+        ),
+    }
+}
+
 /// Send a write to LAPIC ICR.  Waits for the Delivery Status bit to clear
 /// (i.e. the IPI has been accepted by the bus) before returning.
 unsafe fn lapic_send_ipi(apic_id: u8, delivery: u32) {
@@ -488,9 +535,30 @@ fn cpuid_logical_cpu_count() -> u32 {
 // built at VM construction time rather than something that has to be
 // virtualized per-instruction.
 
-/// One entry per enabled logical processor found in the MADT.
-struct MadtResult {
-    apic_ids: alloc::vec::Vec<u8>,
+/// An I/O APIC entry (MADT type 1).
+#[derive(Clone, Copy, Debug)]
+pub struct MadtIoApic {
+    pub id:       u8,
+    pub address:  u32,
+    pub gsi_base: u32,
+}
+
+/// An interrupt source override (MADT type 2): ISA IRQ `source` arrives on
+/// `gsi` with the given MPS INTI polarity/trigger `flags`.
+#[derive(Clone, Copy, Debug)]
+pub struct MadtOverride {
+    pub bus:    u8,
+    pub source: u8,
+    pub gsi:    u32,
+    pub flags:  u16,
+}
+
+/// What the kernel uses from the MADT.
+pub struct Madt {
+    /// APIC ID of every enabled processor.
+    pub apic_ids:  alloc::vec::Vec<u8>,
+    pub ioapics:   alloc::vec::Vec<MadtIoApic>,
+    pub overrides: alloc::vec::Vec<MadtOverride>,
 }
 
 /// Read `len` bytes from physical memory via the bootloader's physical
@@ -539,9 +607,10 @@ fn find_rsdp() -> Option<u64> {
     scan(0xE0000, 0x100000)
 }
 
-/// Parse the MADT (signature "APIC") reachable from the RSDP, returning the
-/// APIC ID of every processor entry with the Enabled flag set.
-fn discover_cpus_via_madt() -> Option<MadtResult> {
+/// Parse the MADT (signature "APIC") reachable from the RSDP: the APIC ID of
+/// every enabled processor, plus the I/O APICs and ISA interrupt overrides.
+/// Returns `None` if there is no MADT or it lists no enabled processor.
+pub fn parse_madt() -> Option<Madt> {
     let rsdp_addr = find_rsdp()?;
 
     let revision: u8 = unsafe { read_phys(rsdp_addr + 15) };
@@ -587,6 +656,8 @@ fn discover_cpus_via_madt() -> Option<MadtResult> {
     if (madt_len as usize) < 44 { return None; }
 
     let mut apic_ids = alloc::vec::Vec::new();
+    let mut ioapics = alloc::vec::Vec::new();
+    let mut overrides = alloc::vec::Vec::new();
     let mut offset: u64 = madt_addr + 44; // past header + local_apic_addr + flags
     let end: u64 = madt_addr + madt_len as u64;
 
@@ -603,6 +674,21 @@ fn discover_cpus_via_madt() -> Option<MadtResult> {
             if flags & ENABLED != 0 {
                 apic_ids.push(apic_id);
             }
+        } else if entry_type == 1 && entry_len as u64 >= 12 {
+            // I/O APIC: id[1] reserved[1] address[4] gsi_base[4]
+            ioapics.push(MadtIoApic {
+                id:       unsafe { read_phys(offset + 2) },
+                address:  unsafe { read_phys(offset + 4) },
+                gsi_base: unsafe { read_phys(offset + 8) },
+            });
+        } else if entry_type == 2 && entry_len as u64 >= 10 {
+            // Interrupt source override: bus[1] source[1] gsi[4] flags[2]
+            overrides.push(MadtOverride {
+                bus:    unsafe { read_phys(offset + 2) },
+                source: unsafe { read_phys(offset + 3) },
+                gsi:    unsafe { read_phys(offset + 4) },
+                flags:  unsafe { read_phys(offset + 8) },
+            });
         }
         // Type 9 (Local x2APIC) exists for >255 CPUs; out of scope for the
         // MAX_CPUS=8 cap this kernel currently supports.
@@ -610,7 +696,7 @@ fn discover_cpus_via_madt() -> Option<MadtResult> {
         offset += entry_len as u64;
     }
 
-    if apic_ids.is_empty() { None } else { Some(MadtResult { apic_ids }) }
+    if apic_ids.is_empty() { None } else { Some(Madt { apic_ids, ioapics, overrides }) }
 }
 
 // ── AP entry point ─────────────────────────────────────────────────────
@@ -688,8 +774,8 @@ pub extern "C" fn ap_entry(cpu_index: u32) -> ! {
         // acks the legacy PIC -- and never sends a LAPIC EOI, so an AP would get exactly one
         // tick and then never wake from `hlt` again (see interrupts::AP_TIMER_VECTOR).
         lapic_write(LAPIC_TIMER_LVT,     0x20000 | crate::interrupts::AP_TIMER_VECTOR as u32); // periodic
-        lapic_write(LAPIC_TIMER_DIVIDE,  0x3);      // divide by 16
-        lapic_write(LAPIC_TIMER_INITIAL, 0x40000);  // initial count (~1 ms at 1 GHz)
+        lapic_write(LAPIC_TIMER_DIVIDE,  LAPIC_DIVIDE_16);
+        lapic_write(LAPIC_TIMER_INITIAL, lapic_timer_ticks_per_ms()); // 1 ms period
     }
 
     // 4. Enable SYSCALL/SYSRET on this AP using the same MSR values as the BSP.
@@ -727,7 +813,7 @@ pub fn init(
     // it can reflect host topology rather than the guest's requested count,
     // which is why this previously reported "1 CPU" even when more were
     // requested on the command line.
-    let madt = discover_cpus_via_madt();
+    let madt = parse_madt();
     let (cpu_count, apic_ids): (u32, alloc::vec::Vec<u8>) = match &madt {
         Some(m) => {
             let n = (m.apic_ids.len() as u32).min(MAX_CPUS as u32);
@@ -771,6 +857,7 @@ pub fn init(
         // Spurious Interrupt Vector Register: bit 8 = APIC Software Enable.
         lapic_write(LAPIC_SVR, 0x100 | 0xFF);
     }
+    calibrate_lapic_timer();
 
     if cpu_count <= 1 {
         crate::serial_println!("[SMP] Single CPU — skipping AP startup.");
@@ -850,36 +937,32 @@ pub fn init(
             // Delivery mode 5 (INIT), Level=Assert, all others 0.
             lapic_send_ipi(ap_apic_id, 0x0000_4500);
 
-            // b) 10 ms delay — busy loop; no timer yet on BSP at this point.
-            busy_delay_ms(10);
+            // b) 10 ms delay
+            crate::time::delay_ms(10);
 
             // c) SIPI #1 — vector byte = 0x08 (address 0x8000, where the real
             //    trampoline installed above now lives).
             lapic_send_ipi(ap_apic_id, 0x0000_4608); // delivery=STARTUP, vector=0x08
 
-            // d) ~200 µs delay
-            busy_delay_ms(1);
+            // d) 200 µs delay
+            crate::time::delay_us(200);
 
             // e) SIPI #2
             lapic_send_ipi(ap_apic_id, 0x0000_4608);
         }
 
         // ── 6. Wait for AP to come online (200 ms timeout) ────────────────
-        let mut waited_ms = 0u32;
-        loop {
-            if CPU_ONLINE.load(Ordering::Acquire) & (1 << cpu_index) != 0 { break; }
-            busy_delay_ms(1);
-            waited_ms += 1;
-            if waited_ms >= 200 {
-                crate::serial_println!(
-                    "[SMP] AP index {} (APIC ID {}) did not come online within 200 ms — skipping.",
-                    cpu_index, ap_apic_id
-                );
-                // Reduce the advertised CPU count so the scheduler doesn't
-                // try to assign work to a core that never woke up.
-                CPU_COUNT.fetch_sub(1, Ordering::AcqRel);
-                break;
-            }
+        let online = crate::time::spin_until(200_000, || {
+            CPU_ONLINE.load(Ordering::Acquire) & (1 << cpu_index) != 0
+        });
+        if !online {
+            crate::serial_println!(
+                "[SMP] AP index {} (APIC ID {}) did not come online within 200 ms — skipping.",
+                cpu_index, ap_apic_id
+            );
+            // Reduce the advertised CPU count so the scheduler doesn't
+            // try to assign work to a core that never woke up.
+            CPU_COUNT.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -894,40 +977,5 @@ pub fn init(
 pub fn lapic_eoi() {
     if LAPIC_BASE.load(Ordering::Relaxed) != 0 {
         unsafe { lapic_write(LAPIC_EOI, 0); }
-    }
-}
-
-/// Busy-wait for `ms` milliseconds, timed by PIT channel 2 (1.193182 MHz).
-///
-/// This replaces a fixed-iteration `spin_loop()` (PAUSE) delay that was tuned for WHPX.
-/// Under QEMU's TCG every PAUSE costs ~160 ns (it forces a trip out of the translated-code
-/// loop), so the old "1 ms" took ~80 ms of wall time and SMP bring-up spun for seconds.
-/// The PIT is an emulated hardware timer, so this delay is the same length on every
-/// accelerator.
-///
-/// Used only during early SMP boot, before the kernel has its own timebase. Channel 2 is
-/// used (not channel 0) so the system-tick PIT programmed by `init_pit` is left untouched.
-#[inline(never)]
-fn busy_delay_ms(ms: u32) {
-    use x86_64::instructions::port::Port;
-    let mut gate: Port<u8> = Port::new(0x61); // PIT ch2 gate + speaker control
-    let mut cmd:  Port<u8> = Port::new(0x43); // PIT command
-    let mut ch2:  Port<u8> = Port::new(0x42); // PIT channel 2 data
-    for _ in 0..ms {
-        unsafe {
-            let saved = gate.read();
-            gate.write(saved & !0x03);          // gate low, speaker off
-            cmd.write(0b1011_0000);             // ch2, lobyte/hibyte, mode 0, binary
-            ch2.write((1193u16 & 0xFF) as u8);  // 1193 ticks = ~0.99989 ms
-            ch2.write((1193u16 >> 8) as u8);
-            gate.write((saved & !0x02) | 0x01); // gate high: start counting
-            // OUT2 (bit 5 of port 0x61) rises when the count reaches zero. Bounded so a
-            // machine without a working channel 2 cannot hang boot.
-            let mut polls = 0u32;
-            while gate.read() & 0x20 == 0 && polls < 2_000_000 {
-                polls += 1;
-            }
-            gate.write(saved);                  // restore original gate/speaker bits
-        }
     }
 }

@@ -15,6 +15,44 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 pub static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
+/// Acknowledge a legacy device IRQ on whichever controller delivered it: the
+/// LAPIC once `ioapic::init` has run, the 8259 before that (or if there is no
+/// I/O APIC).
+#[inline]
+fn end_of_interrupt(index: InterruptIndex) {
+    if crate::ioapic::is_active() {
+        crate::smp::lapic_eoi();
+    } else {
+        unsafe { PICS.lock().notify_end_of_interrupt(index.as_u8()); }
+    }
+}
+
+/// Mask legacy ISA IRQ `irq` (0-15) on the active interrupt controller.
+pub fn mask_irq(irq: u8) {
+    set_irq_masked(irq, true);
+}
+
+/// Unmask legacy ISA IRQ `irq` (0-15) on the active interrupt controller.
+pub fn unmask_irq(irq: u8) {
+    set_irq_masked(irq, false);
+}
+
+fn set_irq_masked(irq: u8, masked: bool) {
+    if crate::ioapic::is_active() {
+        crate::ioapic::set_isa_masked(irq, masked);
+        return;
+    }
+    // Interrupts off while PICS is held: the timer ISR takes the same lock for
+    // its EOI and would spin forever on this CPU.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let mut pics = PICS.lock();
+        let mut masks = pics.read_masks();
+        let (chip, bit) = if irq < 8 { (0, irq) } else { (1, irq - 8) };
+        if masked { masks[chip] |= 1 << bit; } else { masks[chip] &= !(1 << bit); }
+        pics.write_masks(masks[0], masks[1]);
+    });
+}
+
 // Name the hardware interrupts for easier mapping
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -96,6 +134,12 @@ lazy_static! {
             .set_handler_fn(ap_timer_interrupt_handler);
         idt[SPURIOUS_VECTOR as usize]
             .set_handler_fn(spurious_interrupt_handler);
+        // 8259 spurious IRQs (7 and 15). They can still arrive just after the
+        // PIC is masked for the I/O APIC switch.
+        idt[(PIC_1_OFFSET + 7) as usize]
+            .set_handler_fn(pic_spurious_irq7_handler);
+        idt[(PIC_2_OFFSET + 7) as usize]
+            .set_handler_fn(pic_spurious_irq15_handler);
             
         idt
     };
@@ -837,6 +881,16 @@ extern "x86-interrupt" fn ap_timer_interrupt_handler(_stack_frame: InterruptStac
 /// must NOT be acknowledged with an EOI.
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {}
 
+/// Nothing uses IRQ 7 or 15, so anything on these vectors is an 8259
+/// spurious interrupt. A spurious IRQ 7 needs no EOI.
+extern "x86-interrupt" fn pic_spurious_irq7_handler(_stack_frame: InterruptStackFrame) {}
+
+/// A spurious IRQ 15 comes through the cascade, so the master PIC still
+/// expects an EOI for IRQ 2; the slave must not get one.
+extern "x86-interrupt" fn pic_spurious_irq15_handler(_stack_frame: InterruptStackFrame) {
+    unsafe { x86_64::instructions::port::Port::<u8>::new(0x20).write(0x20); }
+}
+
 extern "x86-interrupt" fn timer_interrupt_handler(
     stack_frame: InterruptStackFrame)
 {
@@ -866,13 +920,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(
 
     // ── EOI sent FIRST — always, unconditionally ──────────────────────────────
     //
-    // The PIC will not send ANY further interrupts (timer, keyboard, mouse) on
-    // IRQ0-7 until EOI is acknowledged.  Any work below that crashes or spins
+    // The interrupt controller (8259 or LAPIC) will not deliver further
+    // timer/keyboard/mouse interrupts until EOI is acknowledged.  Any work below that crashes or spins
     // would permanently freeze all input if EOI were deferred to the end.
     // Sending it here is safe: IF is still 0 so we cannot be re-entered.
-    unsafe {
-        PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
-    }
+    end_of_interrupt(InterruptIndex::Timer);
 
     // ── Optional display repaint when a user process is running ───────────────
     //
@@ -1001,11 +1053,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     let scancode: u8 = unsafe { port.read() };
     crate::task::keyboard::add_scancode(scancode);
 
-    // Acknowledge the interrupt to the PIC immediately
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-    }
+    end_of_interrupt(InterruptIndex::Keyboard);
 }
 
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
@@ -1017,7 +1065,5 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     // async executor is permanently frozen after iretq into a user process.
     crate::task::mouse::add_byte_and_process(packet);
 
-    unsafe {
-        PICS.lock().notify_end_of_interrupt(InterruptIndex::Mouse.as_u8());
-    }
+    end_of_interrupt(InterruptIndex::Mouse);
 }

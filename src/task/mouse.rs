@@ -93,32 +93,22 @@ pub fn add_byte_and_process(byte: u8) {
 
 // -----| PS/2 low-level helpers |-----
 
+/// How long to wait for the PS/2 controller. A mouse reset (0xFF) can take
+/// several hundred ms to send its self-test result.
+const PS2_TIMEOUT_US: u64 = 500_000;
+
 /// Spins until the PS/2 controller input buffer is empty (safe to write).
 /// Returns false on timeout — caller logs and continues rather than hanging.
 fn wait_input() -> bool {
     let mut port = Port::<u8>::new(0x64);
-    let mut timeout = 0x100000;
-    unsafe {
-        while (port.read() & 0x02) != 0 && timeout > 0 {
-            core::hint::spin_loop();
-            timeout -= 1;
-        }
-    }
-    timeout > 0
+    crate::time::spin_until(PS2_TIMEOUT_US, || unsafe { port.read() } & 0x02 == 0)
 }
 
 /// Spins until the PS/2 controller output buffer has data ready to read.
 /// Returns false on timeout.
 fn wait_output() -> bool {
     let mut port = Port::<u8>::new(0x64);
-    let mut timeout = 0x100000;
-    unsafe {
-        while (port.read() & 0x01) == 0 && timeout > 0 {
-            core::hint::spin_loop();
-            timeout -= 1;
-        }
-    }
-    timeout > 0
+    crate::time::spin_until(PS2_TIMEOUT_US, || unsafe { port.read() } & 0x01 != 0)
 }
 
 /// Sends a byte to the mouse (PS/2 second port).
@@ -171,13 +161,7 @@ async fn hw_init() {
     // 0. Mask IRQ12 for the whole init. Firmware may have left it unmasked,
     //    and if the mouse ISR runs during init it reads port 0x60 itself and
     //    swallows every ACK/self-test byte this sequence is polling for.
-    //    Interrupts must be off while PICS is held: the timer ISR takes the
-    //    same lock for its EOI and would spin forever on this CPU.
-    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        let mut pics = crate::interrupts::PICS.lock();
-        let masks = pics.read_masks();
-        pics.write_masks(masks[0], masks[1] | 0x10);
-    });
+    crate::interrupts::mask_irq(12);
 
     unsafe {
         // 1. Disable both PS/2 ports for a clean slate.
@@ -278,12 +262,7 @@ async fn hw_init() {
         data_port.write(config | 0x02);
         crate::serial_println!("[MOUSE] Mouse IRQ enabled: config -> {:#04X}", config | 0x02);
     }
-    // Interrupts off while PICS is held — see step 0.
-    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        let mut pics = crate::interrupts::PICS.lock();
-        let masks = pics.read_masks();
-        pics.write_masks(masks[0], masks[1] & !0x10);
-    });
+    crate::interrupts::unmask_irq(12);
 
     crate::serial_println!("[MOUSE] PS/2 init complete. IRQ12 unmasked.");
 }

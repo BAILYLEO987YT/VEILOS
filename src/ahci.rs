@@ -361,38 +361,66 @@ impl crate::vfs::BlockDevice for AhciBlockDevice {
     }
 }
 
+/// Engine start/stop: the AHCI spec allows CR/FR up to 500 ms to clear.
+const AHCI_ENGINE_TIMEOUT_US: u64 = 500_000;
+/// BSY/DRQ must clear before a command is issued.
+const AHCI_BUSY_TIMEOUT_US: u64 = 1_000_000;
+/// One command, including a drive spin-up on real hardware.
+const AHCI_COMMAND_TIMEOUT_US: u64 = 10_000_000;
+
 impl HbaPort {
+    /// Wait for the device to clear BSY and DRQ.
+    fn wait_not_busy(&self) -> bool {
+        let ok = crate::time::spin_until(AHCI_BUSY_TIMEOUT_US, || {
+            self.task_file_data.read() & (0x80 | 0x08) == 0
+        });
+        if !ok {
+            crate::serial_println!("[AHCI] device stayed busy (tfd={:#X})", self.task_file_data.read());
+        }
+        ok
+    }
+
+    /// Wait for the command in `slot` to complete. False on a task-file error
+    /// (PxIS.TFES) or timeout. An unbounded spin here would hang the whole
+    /// kernel on a stalled DMA.
+    fn wait_for_command(&self, slot: usize, what: &str) -> bool {
+        let mut fatal = false;
+        let done = crate::time::spin_until(AHCI_COMMAND_TIMEOUT_US, || {
+            if self.command_issue.read() & (1 << slot) == 0 { return true; }
+            fatal = self.interrupt_status.read() & (1 << 30) != 0;
+            fatal
+        });
+        if fatal {
+            crate::serial_println!("[AHCI] {}: fatal error bit set", what);
+            false
+        } else if !done {
+            crate::serial_println!("[AHCI] {}: command timed out", what);
+            false
+        } else {
+            true
+        }
+    }
     pub fn stop(&mut self) -> bool {
         let mut command = self.command_and_status.read();
         command &= !(1 << 0); // Clear ST  (Start)
         command &= !(1 << 4); // Clear FRE (FIS Receive Enable)
         self.command_and_status.write(command);
         // Wait for CR (bit 15) and FR (bit 14) to clear — AHCI spec allows up to 500 ms.
-        // A bounded loop prevents a permanent hang if the controller never responds.
-        let mut timeout = 500_000u32; // ~500 ms at ~1 µs per iteration
-        loop {
-            let status = self.command_and_status.read();
-            if (status & (1 << 14)) == 0 && (status & (1 << 15)) == 0 { return true; }
-            if timeout == 0 {
-                crate::serial_println!("[AHCI] WARN: stop() timed out — CR/FR bits did not clear (status={:#010X})", status);
-                return false;
-            }
-            core::hint::spin_loop();
-            timeout -= 1;
+        let stopped = crate::time::spin_until(AHCI_ENGINE_TIMEOUT_US, || {
+            self.command_and_status.read() & ((1 << 14) | (1 << 15)) == 0
+        });
+        if !stopped {
+            crate::serial_println!("[AHCI] WARN: stop() timed out — CR/FR bits did not clear (status={:#010X})",
+                self.command_and_status.read());
         }
+        stopped
     }
 
     pub fn start(&mut self) -> bool {
         // Wait for CR (bit 15) to clear before enabling FRE/ST.
-        let mut timeout = 500_000u32;
-        loop {
-            if (self.command_and_status.read() & (1 << 15)) == 0 { break; }
-            if timeout == 0 {
-                crate::serial_println!("[AHCI] WARN: start() timed out waiting for CR to clear");
-                return false;
-            }
-            core::hint::spin_loop();
-            timeout -= 1;
+        if !crate::time::spin_until(AHCI_ENGINE_TIMEOUT_US, || self.command_and_status.read() & (1 << 15) == 0) {
+            crate::serial_println!("[AHCI] WARN: start() timed out waiting for CR to clear");
+            return false;
         }
         let mut command = self.command_and_status.read();
         command |= 1 << 4; // FRE
@@ -438,23 +466,10 @@ impl HbaPort {
         cmd_table.command_fis[1] = 0x80;
         cmd_table.command_fis[2] = 0xEC;
         
-        let mut timeout = 1000000;
-        while (self.task_file_data.read() & (0x80 | 0x08)) != 0 && timeout > 0 { timeout -= 1; }
-        if timeout == 0 { return false; }
+        if !self.wait_not_busy() { return false; }
 
         self.command_issue.write(1 << slot);
-        let mut timeout = 1_000_000u32;
-        loop {
-            if (self.command_issue.read() & (1 << slot)) == 0 { break; }
-            if (self.interrupt_status.read() & (1 << 30)) != 0 { return false; }
-            if timeout == 0 {
-                crate::serial_println!("[AHCI] identify(): command timed out");
-                return false;
-            }
-            core::hint::spin_loop();
-            timeout -= 1;
-        }
-        true
+        self.wait_for_command(slot, "identify()")
     }
 
     pub fn read_sectors(&mut self, lba: u64, count: u32, buffer_phys: u64, physical_memory_offset: VirtAddr) -> bool {
@@ -496,25 +511,14 @@ impl HbaPort {
         cmd_table.command_fis[12] = (count & 0xFF) as u8;
         cmd_table.command_fis[13] = ((count >> 8) & 0xFF) as u8;
 
-        self.command_issue.write(1 << slot);
+        if !self.wait_not_busy() { return false; }
 
-        // Poll until complete or fatal error. Matches the write path — an
-        // unbounded spin here would hang the entire kernel on a stalled DMA.
-        let mut timeout = 1_000_000u32;
-        loop {
-            if (self.command_issue.read() & (1 << slot)) == 0 { break; }
-            if (self.interrupt_status.read() & (1 << 30)) != 0 {
-                crate::serial_println!("[AHCI] read_sectors(): fatal error bit set");
-                return false;
-            }
-            if timeout == 0 {
-                crate::serial_println!("[AHCI] read_sectors(): command timed out (lba={} count={})", lba, count);
-                return false;
-            }
-            core::hint::spin_loop();
-            timeout -= 1;
+        self.command_issue.write(1 << slot);
+        let ok = self.wait_for_command(slot, "read_sectors()");
+        if !ok {
+            crate::serial_println!("[AHCI]   (lba={} count={})", lba, count);
         }
-        true
+        ok
     }
 
     /// Write `count` sectors from the physical buffer at `buffer_phys` to
@@ -565,27 +569,14 @@ impl HbaPort {
         cmd_table.command_fis[13] = ((count >> 8) & 0xFF) as u8;
 
         // Wait for BSY/DRQ to clear before issuing.
-        let mut timeout = 1_000_000u32;
-        while (self.task_file_data.read() & (0x80 | 0x08)) != 0 && timeout > 0 {
-            timeout -= 1;
-        }
-        if timeout == 0 { return false; }
+        if !self.wait_not_busy() { return false; }
 
         self.command_issue.write(1 << slot);
-
-        // Poll until complete or fatal error.
-        let mut timeout = 1_000_000u32;
-        loop {
-            if (self.command_issue.read() & (1 << slot)) == 0 { break; }
-            if (self.interrupt_status.read() & (1 << 30)) != 0 { return false; }
-            if timeout == 0 {
-                crate::serial_println!("[AHCI] read_sectors(): command timed out");
-                return false;
-            }
-            core::hint::spin_loop();
-            timeout -= 1;
+        let ok = self.wait_for_command(slot, "write_sectors()");
+        if !ok {
+            crate::serial_println!("[AHCI]   (lba={} count={})", lba, count);
         }
-        true
+        ok
     }
 }
 
