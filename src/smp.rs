@@ -190,6 +190,31 @@ pub fn enable_sse() {
     }
 }
 
+/// IA32_PAT with entry 1 changed from write-through to write-combining:
+///   PA0 WB, PA1 WC, PA2 UC-, PA3 UC, PA4 WB, PA5 WT, PA6 UC-, PA7 UC.
+/// A 4 KiB PTE with only PWT (`PageTableFlags::WRITE_THROUGH`) set therefore
+/// maps write-combining, which is what framebuffers and VRAM want: writes
+/// are batched into bursts instead of one bus transaction per pixel (UC).
+/// PCD|PWT still selects UC for MMIO registers. Nothing in the kernel wanted
+/// plain write-through, and NT's PAGE_WRITECOMBINE already set PWT alone.
+const PAT_VALUE: u64 = 0x0007_0406_0007_0106;
+
+/// Program the PAT. Per-CPU state, and every CPU must use the same value, so
+/// call it on the BSP before any WC mapping exists and on each AP at bring-up.
+pub fn init_pat() {
+    use core::arch::x86_64::__cpuid;
+    if __cpuid(1).edx & (1 << 16) == 0 {
+        crate::serial_println!("[PAT] CPU has no PAT; WRITE_THROUGH mappings stay write-through");
+        return;
+    }
+    unsafe {
+        x86_64::registers::model_specific::Msr::new(0x277).write(PAT_VALUE);
+        // SDM: flush caches and TLBs after changing memory types.
+        core::arch::asm!("wbinvd", options(nostack));
+    }
+    x86_64::instructions::tlb::flush_all();
+}
+
 /// Re-point `KERNEL_GS_BASE` at this CPU's block. Called before every ring-3
 /// launch: a long-jump out of a syscall (`return_from_usermode`) skips the
 /// exit `swapgs`, leaving the user TEB in `KERNEL_GS_BASE`.
@@ -764,6 +789,7 @@ pub extern "C" fn ap_entry(cpu_index: u32) -> ! {
     // 2b. SSE is per-CPU state: without this the AP #UDs on its first SSE
     //     instruction (the first syscall it handles, or the app itself).
     enable_sse();
+    init_pat();
 
     // 3. Enable the LAPIC and configure the timer on this core.
     unsafe {

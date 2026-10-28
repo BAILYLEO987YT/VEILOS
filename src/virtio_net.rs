@@ -122,19 +122,19 @@ pub struct VirtQueueMem {
     pub used: VirtqUsed,
 }
 
-impl VirtQueueMem {
-    pub const fn new() -> Self {
-        Self {
-            desc: [VirtqDesc { addr: 0, len: 0, flags: 0, next: 0 }; VIRTQ_SIZE],
-            avail: VirtqAvail { flags: 0, idx: 0, ring: [0; VIRTQ_SIZE], used_event: 0 },
-            _pad: [0; AVAIL_PAD],
-            used: VirtqUsed { flags: 0, idx: 0, ring: [VirtqUsedElem { id: 0, len: 0 }; VIRTQ_SIZE], avail_event: 0 },
-        }
-    }
-}
+// The device reads each queue at QueuePFN * 4096 as one physically
+// contiguous block (3 pages for N=256), so they live in DMA regions, not
+// statics: a static's pages are only virtually contiguous. Set by
+// `init_queues` and never freed.
+static mut RX_QUEUE: *mut VirtQueueMem = core::ptr::null_mut();
+static mut TX_QUEUE: *mut VirtQueueMem = core::ptr::null_mut();
 
-static mut RX_QUEUE: VirtQueueMem = VirtQueueMem::new();
-static mut TX_QUEUE: VirtQueueMem = VirtQueueMem::new();
+/// Allocate zeroed, contiguous memory for one virtqueue. Returns (CPU pointer, physical address).
+fn alloc_queue() -> Option<(*mut VirtQueueMem, u64)> {
+    let region = crate::memory::DmaRegion::new(core::mem::size_of::<VirtQueueMem>())?;
+    let (phys, ptr) = region.leak();
+    Some((ptr as *mut VirtQueueMem, phys))
+}
 
 // DMA buffers: each slot is 2048 bytes (virtio-net header + MTU frame)
 #[repr(C, align(4096))]
@@ -244,38 +244,46 @@ impl VirtioNet {
                 return;
             }
 
+            // Write physical page frame number of the queue
+            let Some((rx_ptr, rx_phys)) = alloc_queue() else {
+                crate::serial_println!("[NET] ERROR: no contiguous DMA memory for the RX queue");
+                return;
+            };
+            RX_QUEUE = rx_ptr;
+
             // Verify layout assumptions
-            let base_ptr = &raw const RX_QUEUE as usize;
-            let avail_ptr = &raw const RX_QUEUE.avail as usize;
-            let used_ptr = &raw const RX_QUEUE.used as usize;
+            let base_ptr = RX_QUEUE as usize;
+            let avail_ptr = &raw const (*RX_QUEUE).avail as usize;
+            let used_ptr = &raw const (*RX_QUEUE).used as usize;
             crate::serial_println!("[NET] RX queue layout: base=0x{:x}, avail=+0x{:x}, used=+0x{:x}",
                 base_ptr, avail_ptr - base_ptr, used_ptr - base_ptr);
-
-            // Write physical page frame number of the queue
-            let rx_phys = virt_to_phys(&raw const RX_QUEUE as u64);
             crate::serial_println!("[NET] RX queue phys addr: 0x{:x}, PFN: 0x{:x}", rx_phys, rx_phys / 4096);
             q_addr.write((rx_phys / 4096) as u32);
 
             // Populate RX descriptors: each points to a DMA buffer for receiving
             for i in 0..VIRTQ_SIZE {
                 let buf_phys = virt_to_phys(&raw const BUFFERS.rx[i] as u64);
-                RX_QUEUE.desc[i].addr = buf_phys;
-                RX_QUEUE.desc[i].len = 2048;
-                RX_QUEUE.desc[i].flags = VIRTQ_DESC_F_WRITE; // Device writes to this buffer
-                RX_QUEUE.desc[i].next = 0;
+                (*RX_QUEUE).desc[i].addr = buf_phys;
+                (*RX_QUEUE).desc[i].len = 2048;
+                (*RX_QUEUE).desc[i].flags = VIRTQ_DESC_F_WRITE; // Device writes to this buffer
+                (*RX_QUEUE).desc[i].next = 0;
 
                 // Add to available ring
-                RX_QUEUE.avail.ring[i] = i as u16;
+                (*RX_QUEUE).avail.ring[i] = i as u16;
             }
             // Tell device all descriptors are available
-            core::ptr::write_volatile(&raw mut RX_QUEUE.avail.idx, VIRTQ_SIZE as u16);
+            core::ptr::write_volatile(&raw mut (*RX_QUEUE).avail.idx, VIRTQ_SIZE as u16);
 
             // ---- TX Queue (index 1) ----
             q_select.write(1);
             let tx_qsize = q_size_port.read();
             crate::serial_println!("[NET] TX queue size from device: {}", tx_qsize);
 
-            let tx_phys = virt_to_phys(&raw const TX_QUEUE as u64);
+            let Some((tx_ptr, tx_phys)) = alloc_queue() else {
+                crate::serial_println!("[NET] ERROR: no contiguous DMA memory for the TX queue");
+                return;
+            };
+            TX_QUEUE = tx_ptr;
             crate::serial_println!("[NET] TX queue phys addr: 0x{:x}, PFN: 0x{:x}", tx_phys, tx_phys / 4096);
             q_addr.write((tx_phys / 4096) as u32);
         }
@@ -292,12 +300,13 @@ impl VirtioNet {
     /// Poll the RX virtqueue for completed (received) frames.
     pub fn poll_rx(&mut self) {
         unsafe {
+            if RX_QUEUE.is_null() { return; } // init_queues failed
             // Check used ring for new entries
-            let used_idx = core::ptr::read_volatile(&raw const RX_QUEUE.used.idx);
+            let used_idx = core::ptr::read_volatile(&raw const (*RX_QUEUE).used.idx);
 
             while self.rx_last_used != used_idx {
                 let ring_idx = self.rx_last_used as usize % VIRTQ_SIZE;
-                let elem = core::ptr::read_volatile(&raw const RX_QUEUE.used.ring[ring_idx]);
+                let elem = core::ptr::read_volatile(&raw const (*RX_QUEUE).used.ring[ring_idx]);
                 let desc_idx = elem.id as usize;
                 let total_len = elem.len as usize;
 
@@ -329,13 +338,13 @@ impl VirtioNet {
                 }
 
                 // Re-add descriptor to available ring for reuse
-                let avail_idx = core::ptr::read_volatile(&raw const RX_QUEUE.avail.idx);
+                let avail_idx = core::ptr::read_volatile(&raw const (*RX_QUEUE).avail.idx);
                 core::ptr::write_volatile(
-                    &raw mut RX_QUEUE.avail.ring[avail_idx as usize % VIRTQ_SIZE],
+                    &raw mut (*RX_QUEUE).avail.ring[avail_idx as usize % VIRTQ_SIZE],
                     desc_idx as u16,
                 );
                 core::ptr::write_volatile(
-                    &raw mut RX_QUEUE.avail.idx,
+                    &raw mut (*RX_QUEUE).avail.idx,
                     avail_idx.wrapping_add(1),
                 );
 
@@ -352,6 +361,7 @@ impl VirtioNet {
         if frame.len() > MTU || frame.len() == 0 { return; }
 
         unsafe {
+            if TX_QUEUE.is_null() { return; } // init_queues failed
             let desc_idx = self.tx_avail_idx as usize % VIRTQ_SIZE;
 
             // Write virtio-net header (10 bytes of zeros) + frame into TX buffer
@@ -361,19 +371,19 @@ impl VirtioNet {
 
             // Setup descriptor
             let buf_phys = virt_to_phys(&raw const BUFFERS.tx[desc_idx] as u64);
-            TX_QUEUE.desc[desc_idx].addr = buf_phys;
-            TX_QUEUE.desc[desc_idx].len = (VIRTIO_NET_HDR_SIZE + frame.len()) as u32;
-            TX_QUEUE.desc[desc_idx].flags = 0; // Device reads from this buffer
-            TX_QUEUE.desc[desc_idx].next = 0;
+            (*TX_QUEUE).desc[desc_idx].addr = buf_phys;
+            (*TX_QUEUE).desc[desc_idx].len = (VIRTIO_NET_HDR_SIZE + frame.len()) as u32;
+            (*TX_QUEUE).desc[desc_idx].flags = 0; // Device reads from this buffer
+            (*TX_QUEUE).desc[desc_idx].next = 0;
 
             // Add to available ring
-            let avail_idx = core::ptr::read_volatile(&raw const TX_QUEUE.avail.idx);
+            let avail_idx = core::ptr::read_volatile(&raw const (*TX_QUEUE).avail.idx);
             core::ptr::write_volatile(
-                &raw mut TX_QUEUE.avail.ring[avail_idx as usize % VIRTQ_SIZE],
+                &raw mut (*TX_QUEUE).avail.ring[avail_idx as usize % VIRTQ_SIZE],
                 desc_idx as u16,
             );
             core::ptr::write_volatile(
-                &raw mut TX_QUEUE.avail.idx,
+                &raw mut (*TX_QUEUE).avail.idx,
                 avail_idx.wrapping_add(1),
             );
 
@@ -385,7 +395,7 @@ impl VirtioNet {
             // used.idx is also logged so we can see whether the device is still
             // acknowledging TX completions (host consuming the ring) or whether
             // avail.idx and used.idx have started diverging (ring backing up).
-            let tx_used_idx = core::ptr::read_volatile(&raw const TX_QUEUE.used.idx);
+            let tx_used_idx = core::ptr::read_volatile(&raw const (*TX_QUEUE).used.idx);
             crate::serial_println!(
                 "[NET] TX #{}: {} bytes, desc={}, avail.idx={}, used.idx={}",
                 self.tx_count, frame.len(), desc_idx, avail_idx.wrapping_add(1), tx_used_idx

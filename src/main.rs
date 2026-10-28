@@ -192,6 +192,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Enable SSE on the BSP (APs do the same in smp::ap_entry).
     crate::smp::enable_sse();
+    // Write-combining memory type for framebuffers (same PAT on every CPU).
+    crate::smp::init_pat();
     crate::serial_println!("[INIT] SSE enabled (CR4.OSFXSR+OSXMMEXCPT, CR0.EM/TS cleared)");
 
     // Calibrate the TSC against the PIT: the clock for delay_us and driver timeouts.
@@ -351,6 +353,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Spawn core kernel tasks
     executor.spawn(task::Task::new(task::mouse::mouse_tick()));
     executor.spawn(task::Task::new(gui_refresh_task()));
+    executor.spawn(task::Task::new(crate::scheduler::reaper_task()));
     
     // (All non-blocking system apps are initialized in apps::init())
     

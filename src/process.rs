@@ -436,9 +436,8 @@ impl ThreadManager {
         self.threads.retain(|t| {
             let dead = matches!(t.state, ThreadState::Finished | ThreadState::Failed);
             if dead && t.subsystem == ThreadSubsystem::Win32 {
-                // try_lock: reap_finished() is driven from the timer ISR, and
-                // spinning on WIN32_USER there with interrupts off is a hard
-                // hang if a syscall handler holds it.
+                // try_lock: a syscall handler on another CPU may hold
+                // WIN32_USER; skip the cleanup rather than stall the reaper.
                 if let Some(mut w) = crate::win32_user::WIN32_USER.try_lock() {
                     w.cleanup_thread(t.thread_id);
                 }

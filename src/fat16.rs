@@ -17,7 +17,6 @@ use crate::ahci::HbaPort;
 use crate::println;
 use crate::vfs::{BlockDevice, FileSystem, DirEntry, FileType, VfsError};
 use x86_64::VirtAddr;
-use x86_64::structures::paging::{FrameAllocator, Size4KiB};
 use alloc::vec::Vec;
 use alloc::string::String;
 
@@ -423,12 +422,11 @@ fn classify_fat(bpb: &Fat16BPB) -> FatVariant {
 /// and mounts to the VFS root if the volume passes validation.
 pub fn probe_fat16(
     port: &mut HbaPort,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
     partition_lba: u64,
 ) {
-    let frame       = frame_allocator.allocate_frame().expect("No frame for FAT16 probe");
-    let buffer_phys = frame.start_address().as_u64();
+    // Sector buffer the HBA DMAs into: below 4 GiB, kept for the mount's lifetime.
+    let (buffer_phys, _) = crate::memory::DmaRegion::new(4096).expect("No DMA memory for FAT16 probe").leak();
     let buffer_virt = physical_memory_offset.as_u64() + buffer_phys;
 
     if !port.read_sectors(partition_lba, 1, buffer_phys, physical_memory_offset) {

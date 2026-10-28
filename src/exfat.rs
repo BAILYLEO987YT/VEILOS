@@ -17,7 +17,6 @@ use crate::ahci::HbaPort;
 use crate::println;
 use crate::vfs::{BlockDevice, FileSystem, DirEntry, FileType, VfsError};
 use x86_64::VirtAddr;
-use x86_64::structures::paging::{FrameAllocator, Size4KiB};
 use alloc::vec::Vec;
 use alloc::string::String;
 
@@ -362,12 +361,11 @@ impl FileSystem for ExFatFileSystem {
 /// Checks the "EXFAT   " OEM ID at bytes 3-10 of the boot sector.
 pub fn probe_exfat(
     port: &mut HbaPort,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
     partition_lba: u64,
 ) {
-    let frame       = frame_allocator.allocate_frame().expect("No frame for exFAT probe");
-    let buffer_phys = frame.start_address().as_u64();
+    // Sector buffer the HBA DMAs into: below 4 GiB, kept for the mount's lifetime.
+    let (buffer_phys, _) = crate::memory::DmaRegion::new(4096).expect("No DMA memory for exFAT probe").leak();
     let buffer_virt = physical_memory_offset.as_u64() + buffer_phys;
 
     if !port.read_sectors(partition_lba, 1, buffer_phys, physical_memory_offset) {

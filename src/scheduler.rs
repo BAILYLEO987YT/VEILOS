@@ -790,15 +790,20 @@ pub fn scheduler_tick(current_tick: u64) {
     if let Some(mut sched) = SCHEDULER.try_lock() {
         sched.tick(current_tick);
     }
-    // Reap dead processes once per second — cheap try_lock, no spinning.
-    if current_tick % 1000 == 0 {
-        if let Some(mut pm) = crate::process::PROCESSOR.try_lock() {
-            pm.reap_zombies();
-        }
-        // Also reap finished worker threads.
-        if let Some(mut tm) = crate::process::THREAD_MANAGER.try_lock() {
-            tm.reap_finished();
-        }
+}
+
+/// Reap dead processes and finished threads once a second.
+///
+/// This used to run inside the timer ISR, where tearing down a process
+/// (unmapping pages, freeing frames, heap frees, WIN32_USER cleanup) ran with
+/// interrupts off on top of whatever kernel code the tick interrupted. As an
+/// executor task it runs in normal kernel context. It doesn't run while a
+/// user process owns the BSP; dead processes simply wait for the next pass.
+pub async fn reaper_task() {
+    loop {
+        crate::interrupts::SleepFuture::new(1000).await;
+        crate::process::PROCESSOR.lock().reap_zombies();
+        crate::process::THREAD_MANAGER.lock().reap_finished();
     }
 }
 

@@ -19,7 +19,6 @@ use crate::vfs::{BlockDevice, FileSystem, DirEntry, FileType, VfsError};
 use crate::ahci::HbaPort;
 use crate::println;
 use x86_64::VirtAddr;
-use x86_64::structures::paging::{FrameAllocator, Size4KiB};
 
 // -----| Constants |-----
 
@@ -815,12 +814,11 @@ impl FileSystem for NtfsFileSystem {
 /// the VFS root ("/").  Silently returns if the volume is not NTFS.
 pub fn probe_ntfs(
     port:                    &mut HbaPort,
-    frame_allocator:         &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset:  VirtAddr,
     partition_lba:           u64,
 ) {
-    let frame      = frame_allocator.allocate_frame().expect("No frame for NTFS probe");
-    let buf_phys   = frame.start_address().as_u64();
+    // Sector buffer the HBA DMAs into: below 4 GiB, kept for the mount's lifetime.
+    let (buf_phys, _) = crate::memory::DmaRegion::new(4096).expect("No DMA memory for NTFS probe").leak();
     let buf_virt   = physical_memory_offset.as_u64() + buf_phys;
 
     if !port.read_sectors(partition_lba, 1, buf_phys, physical_memory_offset) {

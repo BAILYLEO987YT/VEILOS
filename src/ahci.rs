@@ -70,7 +70,7 @@ pub fn init(
                 println!("  -> ABAR cleanly mapped to Virtual Address: {:#010X}", virt_addr.as_u64());
 
                 let hba_mem = unsafe { &mut *(virt_addr.as_mut_ptr::<HbaMemory>()) };
-                reinit_ports(hba_mem, frame_allocator, physical_memory_offset);
+                reinit_ports(hba_mem, physical_memory_offset);
             }
         }
     }
@@ -82,7 +82,6 @@ pub fn init(
 
 fn reinit_ports(
     hba_mem: &mut HbaMemory, 
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
 ) {
     let ports_implemented = hba_mem.ports_implemented.read();
@@ -94,7 +93,7 @@ fn reinit_ports(
             let ipm = (status >> 8) & 0x0F;
 
             if det == 0x03 && ipm == 0x01 {
-                setup_port(port, i, frame_allocator, physical_memory_offset);
+                setup_port(port, i, physical_memory_offset);
             }
         }
     }
@@ -103,7 +102,6 @@ fn reinit_ports(
 fn setup_port(
     port: &mut HbaPort, 
     port_num: usize, 
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     physical_memory_offset: VirtAddr,
 ) {
     if !port.stop() {
@@ -111,13 +109,20 @@ fn setup_port(
         return;
     }
 
-    let cl_frame = frame_allocator.allocate_frame().expect("No frames for Command List");
-    let fis_frame = frame_allocator.allocate_frame().expect("No frames for FIS");
-    let ct_frame = frame_allocator.allocate_frame().expect("No frames for Command Table");
-
-    let cl_base = cl_frame.start_address().as_u64();
-    let fis_base = fis_frame.start_address().as_u64();
-    let ct_base = ct_frame.start_address().as_u64();
+    // One contiguous DMA block per port, below 4 GiB:
+    //   page 0       command list (32 headers x 32 B = 1 KiB, 1 KiB aligned)
+    //                + received-FIS area at +0x400 (256 B, 256 B aligned)
+    //   pages 1-2    32 command tables x 256 B = 8 KiB
+    // The tables used to get a single 4 KiB frame, so slots 16-31 pointed
+    // into whatever frame happened to follow it.
+    let Some(dma) = crate::memory::DmaRegion::new(3 * 4096) else {
+        crate::serial_println!("[AHCI] Port {}: no contiguous DMA memory — skipping port setup.", port_num);
+        return;
+    };
+    let (dma_phys, _) = dma.leak(); // the port uses it for the kernel's lifetime
+    let cl_base  = dma_phys;
+    let fis_base = dma_phys + 0x400;
+    let ct_base  = dma_phys + 4096;
 
     port.command_list_base.write(cl_base as u32);
     port.command_list_base_upper.write((cl_base >> 32) as u32);
@@ -142,9 +147,12 @@ fn setup_port(
 
     println!("  -> Port {}: Initialized and Running.", port_num);
     
-    let identify_buffer = frame_allocator.allocate_frame().expect("No frame for identify");
-    let buffer_phys = identify_buffer.start_address().as_u64();
-    let buffer_virt = physical_memory_offset.as_u64() + buffer_phys;
+    let Some(identify_buffer) = crate::memory::DmaRegion::new(512) else {
+        crate::serial_println!("[AHCI] Port {}: no DMA memory for IDENTIFY.", port_num);
+        return;
+    };
+    let buffer_phys = identify_buffer.phys();
+    let buffer_virt = identify_buffer.as_mut_ptr::<u8>() as u64;
     
     if port.identify(buffer_phys, physical_memory_offset) {
         let raw_data = unsafe { core::slice::from_raw_parts(buffer_virt as *const u16, 256) };
@@ -160,12 +168,14 @@ fn setup_port(
         println!("     - Model: {}", model_str.trim());
 
         // Read Sector 0 to check for MBR vs VBR
-        let frame = frame_allocator.allocate_frame().unwrap();
-        let phys = frame.start_address().as_u64();
+        let Some(sector0) = crate::memory::DmaRegion::new(512) else {
+            crate::serial_println!("[AHCI] Port {}: no DMA memory for sector 0.", port_num);
+            return;
+        };
         let mut partition_lba = 0;
 
-        if port.read_sectors(0, 1, phys, physical_memory_offset) {
-            let bytes = unsafe { core::slice::from_raw_parts((physical_memory_offset.as_u64() + phys) as *const u8, 512) };
+        if port.read_sectors(0, 1, sector0.phys(), physical_memory_offset) {
+            let bytes = unsafe { core::slice::from_raw_parts(sector0.as_mut_ptr::<u8>() as *const u8, 512) };
             
             let is_vbr = (bytes[0] == 0xEB && bytes[2] == 0x90) || bytes[0] == 0xE9;
             let boot_sig = (bytes[511] as u16) << 8 | (bytes[510] as u16);
@@ -189,15 +199,15 @@ fn setup_port(
         // Probe filesystems — stop at the first successful mount so two
         // drivers never claim the same block device simultaneously.
         // Order: NTFS → exFAT → FAT32 → FAT16 (most-to-least common).
-        crate::ntfs::probe_ntfs(port, frame_allocator, physical_memory_offset, partition_lba);
+        crate::ntfs::probe_ntfs(port, physical_memory_offset, partition_lba);
         if crate::vfs::VFS.lock().mounts.is_empty() {
-            crate::exfat::probe_exfat(port, frame_allocator, physical_memory_offset, partition_lba);
+            crate::exfat::probe_exfat(port, physical_memory_offset, partition_lba);
         }
         if crate::vfs::VFS.lock().mounts.is_empty() {
-            crate::fat32::probe_fat32(port, frame_allocator, physical_memory_offset, partition_lba);
+            crate::fat32::probe_fat32(port, physical_memory_offset, partition_lba);
         }
         if crate::vfs::VFS.lock().mounts.is_empty() {
-            crate::fat16::probe_fat16(port, frame_allocator, physical_memory_offset, partition_lba);
+            crate::fat16::probe_fat16(port, physical_memory_offset, partition_lba);
         }
 
         if crate::vfs::VFS.lock().mounts.is_empty() {

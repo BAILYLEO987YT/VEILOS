@@ -4,20 +4,32 @@ use x86_64::{
     VirtAddr,
 };
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
-static PHYS_MEM_OFFSET: Mutex<Option<VirtAddr>> = Mutex::new(None);
+
+/// Virtual base of the bootloader's physical-memory mapping. Set once in
+/// `init`; an atomic rather than a lock so ISRs can read it freely.
+/// `u64::MAX` = not set yet.
+static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub fn set_phys_mem_offset(offset: VirtAddr) {
-    *PHYS_MEM_OFFSET.lock() = Some(offset);
+    PHYS_MEM_OFFSET.store(offset.as_u64(), Ordering::Release);
+}
+
+fn phys_mem_offset() -> Option<VirtAddr> {
+    match PHYS_MEM_OFFSET.load(Ordering::Acquire) {
+        u64::MAX => None,
+        o => Some(VirtAddr::new(o)),
+    }
 }
 
 pub fn get_phys_mem_offset() -> VirtAddr {
-    PHYS_MEM_OFFSET.lock().expect("PHYS_MEM_OFFSET not set")
+    phys_mem_offset().expect("PHYS_MEM_OFFSET not set")
 }
 
 /// Returns a mapper for the active level 4 table.
 pub unsafe fn get_mapper() -> OffsetPageTable<'static> {
-    let offset = PHYS_MEM_OFFSET.lock().expect("PHYS_MEM_OFFSET not set");
+    let offset = get_phys_mem_offset();
     let level_4_table = unsafe { active_level_4_table(offset) };
     unsafe { OffsetPageTable::new(level_4_table, offset) }
 }
@@ -53,8 +65,11 @@ pub fn map_page(
 ///
 /// If the page is already mapped we do NOT panic.  Instead:
 ///   • same frame  → just refresh the flags (idempotent remap).
-///   • other frame → unmap the old one, release its frame to the free list,
-///                   and map the requested frame in its place.
+///   • other frame → unmap the old one and map the requested frame in its
+///                   place. The old frame is NOT freed: this function can't
+///                   know who owns it (MMIO, a kernel page, another process),
+///                   and freeing it would hand that memory out again as RAM.
+///                   Its owner is responsible for it.
 pub fn map_page_checked(
     page: x86_64::structures::paging::Page<Size4KiB>,
     frame: PhysFrame<Size4KiB>,
@@ -74,10 +89,13 @@ pub fn map_page_checked(
                 }
                 Ok(())
             } else {
-                // Reclaim the stale frame, then retry once.
                 if let Ok((old, flush)) = mapper.unmap(page) {
                     flush.flush();
-                    deallocate_frame(old);
+                    crate::serial_println!(
+                        "[MEM] WARN: {:#X} was mapped to frame {:#X}; replacing with {:#X} (old frame not freed)",
+                        page.start_address().as_u64(), old.start_address().as_u64(),
+                        frame.start_address().as_u64()
+                    );
                 }
                 let retry = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
                 match retry {
@@ -127,7 +145,7 @@ pub fn unmap_and_free_page(
 /// True if `page` currently has a present mapping in the active tables.
 pub fn is_mapped(addr: u64) -> bool {
     use x86_64::structures::paging::Translate;
-    let offset = match *PHYS_MEM_OFFSET.lock() { Some(o) => o, None => return false };
+    let offset = match phys_mem_offset() { Some(o) => o, None => return false };
     let l4 = unsafe { active_level_4_table(offset) };
     let mapper = unsafe { OffsetPageTable::new(l4, offset) };
     mapper.translate_addr(VirtAddr::new(addr)).is_some()
@@ -147,7 +165,7 @@ pub fn user_ptr_ok(ptr: u64, len: usize) -> bool {
     // Reject non-canonical / kernel-half addresses outright.
     if end >= 0xFFFF_8000_0000_0000 { return false; }
 
-    let offset = match *PHYS_MEM_OFFSET.lock() { Some(o) => o, None => return false };
+    let offset = match phys_mem_offset() { Some(o) => o, None => return false };
 
     let mut addr = ptr & !0xFFF;
     while addr < end {
@@ -210,165 +228,254 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     unsafe { &mut *page_table_ptr }
 }
 
-static FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+// -----| physical frame allocator |-----
+//
+// One bit per 4 KiB frame (1 = free), covering every frame up to the end of
+// the highest usable region. The bitmap lives in usable RAM, reserved at init
+// and reached through the physical-memory mapping, so the allocator never
+// touches the heap. It replaced a bump allocator plus a heap-backed free list,
+// which could not hand out contiguous runs, needed the heap to free a frame,
+// and accepted any address as "freed RAM".
+//
+// The lock is only ever taken with interrupts off, so a frame freed from an
+// interrupt handler can't deadlock against the code it interrupted.
 
-pub fn init_frame_allocator(memory_map: &'static MemoryMap) {
-    let allocator = unsafe { BootInfoFrameAllocator::init(memory_map) };
-    *FRAME_ALLOCATOR.lock() = Some(allocator);
+/// Frames below 1 MiB are never handed out: the AP trampoline (0x8000) and
+/// firmware structures live there.
+const LOW_MEMORY_END: u64 = 0x10_0000;
+
+/// Usable RAM ranges from the memory map. `deallocate_frame` refuses anything
+/// outside them, so MMIO or a kernel image page can never become "free RAM".
+const MAX_USABLE_RANGES: usize = 64;
+
+struct FrameBitmap {
+    words:  &'static mut [u64],
+    frames: usize,
+    free:   usize,
+    /// Word index where single-frame searches start.
+    hint:   usize,
+    usable: [(u64, u64); MAX_USABLE_RANGES], // [start, end) physical
+    usable_count: usize,
 }
 
-/// Reclaimed physical frames, newest first.
-///
-/// `BootInfoFrameAllocator` is a pure bump allocator — it can never hand a
-/// frame back.  Process teardown pushes freed frames here and `allocate_frame`
-/// drains this list before advancing the bump pointer, so launching and closing
-/// the same EXE repeatedly no longer leaks physical RAM.
-///
-/// `Vec::new()` is const, so this is safe to declare before the heap exists;
-/// nothing pushes to it until well after `init_heap()`.
-static FREE_FRAMES: Mutex<alloc::vec::Vec<u64>> = Mutex::new(alloc::vec::Vec::new());
+static FRAMES: Mutex<Option<FrameBitmap>> = Mutex::new(None);
 
-/// Number of frames currently sitting on the free list (diagnostics).
-pub fn free_frame_count() -> usize {
-    FREE_FRAMES.lock().len()
-}
+impl FrameBitmap {
+    #[inline]
+    fn is_free(&self, frame: usize) -> bool {
+        self.words[frame / 64] & (1 << (frame % 64)) != 0
+    }
 
-pub fn allocate_frame() -> Option<PhysFrame> {
-    // 1. Reuse a reclaimed frame if one is available.
-    if let Some(addr) = FREE_FRAMES.lock().pop() {
-        let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(addr));
-        // Scrub before handing out — prevents information leaking from a dead
-        // process into the next one.
-        if let Some(offset) = *PHYS_MEM_OFFSET.lock() {
-            unsafe {
-                core::ptr::write_bytes((offset + addr).as_mut_ptr::<u8>(), 0, 4096);
+    #[inline]
+    fn set_free(&mut self, frame: usize, free: bool) {
+        let bit = 1u64 << (frame % 64);
+        if free { self.words[frame / 64] |= bit; } else { self.words[frame / 64] &= !bit; }
+    }
+
+    fn is_usable_ram(&self, phys: u64) -> bool {
+        phys >= LOW_MEMORY_END
+            && self.usable[..self.usable_count].iter().any(|&(s, e)| phys >= s && phys + 4096 <= e)
+    }
+
+    fn alloc_one(&mut self) -> Option<usize> {
+        let n = self.words.len();
+        for k in 0..n {
+            let w = (self.hint + k) % n;
+            if self.words[w] != 0 {
+                let frame = w * 64 + self.words[w].trailing_zeros() as usize;
+                self.set_free(frame, false);
+                self.free -= 1;
+                self.hint = w;
+                return Some(frame);
             }
         }
-        return Some(frame);
+        None
     }
-    // 2. Otherwise advance the bump allocator.
-    FRAME_ALLOCATOR.lock().as_mut().and_then(|a| a.allocate_frame())
+
+    /// First run of `count` free frames that starts on an `align`-frame
+    /// boundary and ends below `limit` (exclusive physical address).
+    fn alloc_run(&mut self, count: usize, align: usize, limit: u64) -> Option<usize> {
+        let max_frame = ((limit / 4096) as usize).min(self.frames);
+        let mut start = 0;
+        while start + count <= max_frame {
+            if start % align != 0 {
+                start = (start / align + 1) * align;
+                continue;
+            }
+            match (start..start + count).find(|&f| !self.is_free(f)) {
+                Some(used) => start = used + 1,
+                None => {
+                    for f in start..start + count { self.set_free(f, false); }
+                    self.free -= count;
+                    return Some(start);
+                }
+            }
+        }
+        None
+    }
 }
 
-/// Return a frame to the free list.
-///
-/// Safe to call from teardown paths; uses `try_lock` semantics indirectly via
-/// the spin mutex, and silently drops the frame if the heap push would fail.
+/// Build the frame bitmap from the bootloader memory map. Call once, after
+/// `init` (the bitmap is reached through the physical-memory mapping) and
+/// before anything allocates a frame.
+pub fn init_frame_allocator(memory_map: &'static MemoryMap) {
+    use bootloader::bootinfo::MemoryRegionType;
+    let offset = get_phys_mem_offset();
+
+    // Page-aligned usable ranges.
+    let mut usable = [(0u64, 0u64); MAX_USABLE_RANGES];
+    let mut usable_count = 0;
+    for r in memory_map.iter().filter(|r| r.region_type == MemoryRegionType::Usable) {
+        let start = (r.range.start_addr() + 4095) & !4095;
+        let end = r.range.end_addr() & !4095;
+        if end <= start { continue; }
+        if usable_count == MAX_USABLE_RANGES {
+            crate::serial_println!("[MEM] WARN: more than {} usable regions; ignoring {:#X}..{:#X}",
+                MAX_USABLE_RANGES, start, end);
+            continue;
+        }
+        usable[usable_count] = (start, end);
+        usable_count += 1;
+    }
+    let max_phys = usable[..usable_count].iter().map(|&(_, e)| e).max().unwrap_or(0);
+    let frames = (max_phys / 4096) as usize;
+    let words_len = (frames + 63) / 64;
+    let bitmap_bytes = ((words_len * 8 + 4095) & !4095) as u64;
+
+    // Put the bitmap in the first usable range above 1 MiB that fits it.
+    let bitmap_phys = usable[..usable_count].iter()
+        .map(|&(s, e)| (s.max(LOW_MEMORY_END), e))
+        .find(|&(s, e)| e > s && e - s >= bitmap_bytes)
+        .map(|(s, _)| s)
+        .expect("[MEM] no usable region can hold the frame bitmap");
+
+    let words = unsafe {
+        core::slice::from_raw_parts_mut((offset + bitmap_phys).as_mut_ptr::<u64>(), words_len)
+    };
+    words.fill(0);
+
+    let mut bitmap = FrameBitmap { words, frames, free: 0, hint: 0, usable, usable_count };
+    for &(s, e) in &usable[..usable_count] {
+        for phys in (s.max(LOW_MEMORY_END)..e).step_by(4096) {
+            if phys >= bitmap_phys && phys < bitmap_phys + bitmap_bytes { continue; }
+            bitmap.set_free((phys / 4096) as usize, true);
+            bitmap.free += 1;
+        }
+    }
+    bitmap.hint = (LOW_MEMORY_END / 4096 / 64) as usize;
+
+    crate::serial_println!(
+        "[MEM] Frame bitmap: {} frames tracked, {} free ({} MiB), bitmap {} KiB at {:#X}",
+        frames, bitmap.free, bitmap.free / 256, bitmap_bytes / 1024, bitmap_phys
+    );
+    x86_64::instructions::interrupts::without_interrupts(|| *FRAMES.lock() = Some(bitmap));
+}
+
+fn with_frames<R>(f: impl FnOnce(&mut FrameBitmap) -> R) -> Option<R> {
+    x86_64::instructions::interrupts::without_interrupts(|| FRAMES.lock().as_mut().map(f))
+}
+
+/// Number of free frames (diagnostics).
+pub fn free_frame_count() -> usize {
+    with_frames(|b| b.free).unwrap_or(0)
+}
+
+/// Allocate one 4 KiB frame. Frames freed through `deallocate_frame` come
+/// back zeroed; never-used frames hold whatever was there at boot.
+pub fn allocate_frame() -> Option<PhysFrame> {
+    with_frames(|b| b.alloc_one()).flatten()
+        .map(|f| PhysFrame::containing_address(x86_64::PhysAddr::new(f as u64 * 4096)))
+}
+
+/// Return a frame to the allocator. It is zeroed first, so one process's data
+/// never reaches the next owner. Frames that aren't usable RAM (MMIO, the
+/// kernel image, low memory) and double frees are refused and logged.
 pub fn deallocate_frame(frame: PhysFrame<Size4KiB>) {
     let addr = frame.start_address().as_u64();
-    if addr == 0 { return; }
-    let mut list = FREE_FRAMES.lock();
-    // Guard against double-free, which would hand the same frame to two
-    // processes and corrupt both.
-    if list.iter().any(|&a| a == addr) {
-        crate::serial_println!("[MEM] double free of frame {:#X} ignored", addr);
-        return;
-    }
-    list.push(addr);
-}
-
-/// A FrameAllocator that returns usable frames from the bootloader's memory map.
-///
-/// Performance design
-/// ------------------
-/// The naive approach calls `usable_frames().nth(self.next)` on every allocation,
-/// re-iterating from index 0 each time — O(N²) total for N allocations.
-///
-/// A previous partial fix stored `next_phys` but still used `flat_map().find()`
-/// to advance, which is O(N) per step — still O(N²) overall.
-///
-/// This implementation is truly O(1) amortised per allocation:
-///   • We cache which memory-map *region* we are currently allocating from
-///     (`region_idx`) and our byte offset within that region (`next_phys`).
-///   • On each allocation we add 4096 to `next_phys`. If the result is still
-///     inside the current usable region, we are done — zero iteration.
-///   • Only when we exhaust a region do we advance `region_idx` by scanning
-///     forward, which costs O(R) where R is the number of memory-map regions
-///     (typically 5–15 on real hardware).  This happens at most R times total
-///     across the entire lifetime of the allocator.
-pub struct BootInfoFrameAllocator {
-    memory_map: &'static bootloader::bootinfo::MemoryMap,
-    /// How many frames have been handed out (for debugging / accounting).
-    allocated: usize,
-    /// Physical address of the *next* frame to hand out.
-    /// `u64::MAX` signals exhausted.
-    next_phys: u64,
-    /// The *end* address (exclusive) of the usable region `next_phys` lives in.
-    /// When `next_phys >= region_end` we must hop to the next region.
-    region_end: u64,
-}
-
-impl BootInfoFrameAllocator {
-    pub unsafe fn init(memory_map: &'static bootloader::bootinfo::MemoryMap) -> Self {
-        let mut alloc = BootInfoFrameAllocator {
-            memory_map,
-            allocated: 0,
-            next_phys: u64::MAX,
-            region_end: 0,
-        };
-        // Locate the very first usable region.
-        alloc.advance_to_next_region(0);
-        alloc
-    }
-
-    /// Scan forward from `after_phys` to find the next usable region.
-    /// Sets `next_phys` and `region_end` accordingly.
-    /// O(R) — only called when the current region is exhausted.
-    fn advance_to_next_region(&mut self, after_phys: u64) {
-        use bootloader::bootinfo::MemoryRegionType;
-        let next_region = self.memory_map
-            .iter()
-            .filter(|r| r.region_type == MemoryRegionType::Usable)
-            .filter(|r| r.range.end_addr() > after_phys)
-            .min_by_key(|r| r.range.start_addr());
-
-        if let Some(region) = next_region {
-            let mut start = region.range.start_addr();
-            if start < after_phys {
-                start = after_phys;
-            }
-            // Align start up to the next 4 KiB boundary.
-            let aligned_start = (start + 4095) & !4095;
-            
-            // If aligning pushed us past the end of this region, we must recurse to the next region.
-            if aligned_start >= region.range.end_addr() {
-                self.advance_to_next_region(region.range.end_addr());
-            } else {
-                self.next_phys = aligned_start;
-                self.region_end = region.range.end_addr();
-            }
-        } else {
-            self.next_phys  = u64::MAX; // exhausted
-            self.region_end = 0;
+    let checked = with_frames(|b| {
+        if !b.is_usable_ram(addr) { return Err("not usable RAM"); }
+        if b.is_free((addr / 4096) as usize) { return Err("double free"); }
+        Ok(())
+    });
+    match checked {
+        Some(Ok(())) => {}
+        Some(Err(why)) => {
+            crate::serial_println!("[MEM] deallocate_frame({:#X}) refused: {}", addr, why);
+            return;
         }
+        None => return,
     }
+    // Zero outside the lock; the frame is still marked used, so it can't be
+    // handed out meanwhile.
+    if let Some(offset) = phys_mem_offset() {
+        unsafe { core::ptr::write_bytes((offset + addr).as_mut_ptr::<u8>(), 0, 4096); }
+    }
+    with_frames(|b| {
+        b.set_free((addr / 4096) as usize, true);
+        b.free += 1;
+    });
+}
 
-    pub fn allocate_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame> {
-        use x86_64::PhysAddr;
-        use x86_64::structures::paging::PhysFrame;
+/// Allocate `count` physically contiguous frames, the first aligned to
+/// `align_frames` frames, all below `limit`. For device DMA; prefer `DmaRegion`.
+pub fn allocate_contiguous(count: usize, align_frames: usize, limit: u64) -> Option<PhysFrame> {
+    if count == 0 { return None; }
+    with_frames(|b| b.alloc_run(count, align_frames.max(1), limit)).flatten()
+        .map(|f| PhysFrame::containing_address(x86_64::PhysAddr::new(f as u64 * 4096)))
+}
 
-        if self.next_phys == u64::MAX { return None; }
-
-        let frame = PhysFrame::containing_address(PhysAddr::new(self.next_phys));
-        self.allocated += 1;
-
-        // O(1): advance within the current region.
-        // NOTE: the test is `candidate + 4096 <= region_end`, not
-        // `candidate < region_end` — the latter could hand out a frame whose
-        // last bytes lie past the end of the usable region.
-        let candidate = self.next_phys + 4096;
-        if candidate + 4096 <= self.region_end {
-            self.next_phys = candidate;
-        } else {
-            // O(R): hop to the next usable region (at most R times total).
-            self.advance_to_next_region(self.next_phys + 1);
-        }
-
-        Some(frame)
+/// Free `count` frames starting at `start`.
+pub fn deallocate_contiguous(start: PhysFrame<Size4KiB>, count: usize) {
+    for i in 0..count as u64 {
+        deallocate_frame(start + i);
     }
 }
 
-// Implement the trait for the global Mutex wrapper
+/// Highest address a `DmaRegion` may use: 32-bit-only devices (and AHCI HBAs
+/// without S64A) can't reach above 4 GiB.
+pub const DMA_LIMIT: u64 = 0x1_0000_0000;
+
+/// Zeroed, physically contiguous memory for a device to DMA into, below
+/// `DMA_LIMIT`. The CPU reaches it through the physical-memory mapping.
+/// Freed on drop.
+pub struct DmaRegion {
+    phys:   u64,
+    frames: usize,
+}
+
+impl DmaRegion {
+    pub fn new(bytes: usize) -> Option<Self> {
+        let frames = (bytes.max(1) + 4095) / 4096;
+        let start = allocate_contiguous(frames, 1, DMA_LIMIT)?;
+        let region = Self { phys: start.start_address().as_u64(), frames };
+        unsafe { core::ptr::write_bytes(region.as_mut_ptr::<u8>(), 0, frames * 4096); }
+        Some(region)
+    }
+
+    pub fn phys(&self) -> u64 { self.phys }
+
+    pub fn len(&self) -> usize { self.frames * 4096 }
+
+    pub fn as_mut_ptr<T>(&self) -> *mut T {
+        (get_phys_mem_offset() + self.phys).as_mut_ptr::<T>()
+    }
+
+    /// Keep the memory for the rest of the kernel's life (drivers that never
+    /// unload). Returns (physical address, CPU pointer).
+    pub fn leak(self) -> (u64, *mut u8) {
+        let out = (self.phys, self.as_mut_ptr::<u8>());
+        core::mem::forget(self);
+        out
+    }
+}
+
+impl Drop for DmaRegion {
+    fn drop(&mut self) {
+        deallocate_contiguous(PhysFrame::containing_address(x86_64::PhysAddr::new(self.phys)), self.frames);
+    }
+}
+
+// Implement the trait for the global allocator
 pub struct GlobalFrameAllocator;
 
 unsafe impl FrameAllocator<Size4KiB> for GlobalFrameAllocator {

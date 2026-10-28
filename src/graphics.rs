@@ -135,9 +135,10 @@ pub fn map_direct_hw(
             x86_64::PhysAddr::new(phys_addr + i * 4096),
         );
 
+        // PWT alone selects PAT entry 1 = write-combining (smp::init_pat).
+        // This was UC (PCD|PWT): every pixel store was its own bus write.
         let flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_CACHE
             | PageTableFlags::WRITE_THROUGH;
 
         unsafe {

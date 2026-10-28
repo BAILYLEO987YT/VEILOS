@@ -1,4 +1,6 @@
+use core::alloc::{GlobalAlloc, Layout};
 use linked_list_allocator::LockedHeap;
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::{
     structures::paging::{
         mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB,
@@ -6,8 +8,24 @@ use x86_64::{
     VirtAddr,
 };
 
+/// The kernel heap. Every alloc/free runs with interrupts off, so an
+/// interrupt handler that allocates can never spin on the heap lock held by
+/// the code it interrupted (a guaranteed deadlock on that CPU). Other CPUs
+/// still contend normally.
+struct IrqSafeHeap(LockedHeap);
+
+unsafe impl GlobalAlloc for IrqSafeHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        without_interrupts(|| unsafe { self.0.alloc(layout) })
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        without_interrupts(|| unsafe { self.0.dealloc(ptr, layout) })
+    }
+}
+
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: IrqSafeHeap = IrqSafeHeap(LockedHeap::empty());
 
 // We pick an arbitrary unused virtual address for our heap to start at.
 pub const HEAP_START: usize = 0x4444_4444_0000;
@@ -42,17 +60,17 @@ pub fn init_heap(
 
     // Now that the virtual memory is securely mapped to physical RAM, initialize the Allocator!
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+        without_interrupts(|| ALLOCATOR.0.lock().init(HEAP_START as *mut u8, HEAP_SIZE));
     }
 
     Ok(())
 }
 
-/// (bytes in use, heap size). Interrupts are off while the allocator lock is
-/// held, so an interrupt handler that allocates can never spin on it.
+/// (bytes in use, heap size). Like every heap access, runs with interrupts
+/// off (see `IrqSafeHeap`).
 pub fn heap_usage() -> (usize, usize) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let heap = ALLOCATOR.lock();
+    without_interrupts(|| {
+        let heap = ALLOCATOR.0.lock();
         (heap.used(), heap.size())
     })
 }

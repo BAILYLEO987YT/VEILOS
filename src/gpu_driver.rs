@@ -405,10 +405,12 @@ impl GpuDevice {
                 use x86_64::{VirtAddr, PhysAddr, structures::paging::{Page, PhysFrame, PageTableFlags, Size4KiB, Mapper}};
                 let mut mapper = unsafe { crate::memory::get_mapper() };
                 let num_pages  = (map_size + 4095) / 4096;
+                // Write-combining (PWT -> PAT entry 1, see smp::init_pat): VRAM is
+                // a prefetchable BAR, and UC made every store its own bus write.
                 let flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::NO_CACHE;
+                    | PageTableFlags::WRITE_THROUGH;
 
                 for i in 0..num_pages {
                     let page  = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_base + i as u64 * 4096));

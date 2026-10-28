@@ -626,7 +626,8 @@ pub fn nt_protect_to_page_flags(protect: u32) -> PageTableFlags {
         flags |= PageTableFlags::NO_CACHE;
     }
 
-    // PAGE_WRITECOMBINE maps to write-through in x86_64 paging
+    // PAGE_WRITECOMBINE: PWT alone selects PAT entry 1, which smp::init_pat
+    // programs as write-combining.
     if protect & PAGE_WRITECOMBINE != 0 {
         flags |= PageTableFlags::WRITE_THROUGH;
     }
