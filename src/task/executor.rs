@@ -3,6 +3,10 @@ use alloc::{collections::BTreeMap, sync::Arc, task::Wake};
 use core::task::{Context, Poll, Waker};
 use crossbeam_queue::ArrayQueue;
 
+/// How long the executor keeps the CPU, while it has work, before letting a
+/// waiting user thread on the same CPU run.
+const EXECUTOR_SLICE_MS: u64 = 10;
+
 /// A preemptive, event-driven task scheduler. 
 /// Instead of busy-polling tasks (100% CPU usage), this Executor puts the CPU 
 /// to sleep (`hlt`) until a hardware interrupt sends a "Wake" signal to a specific task.
@@ -34,6 +38,9 @@ impl Executor {
     pub fn run(&mut self) -> ! {
         loop {
             self.run_ready_tasks();
+            // Between task polls this thread holds no locks: a safe point to
+            // let a user thread on this CPU run if we've had the CPU a while.
+            crate::kthread::yield_if_slice_used(EXECUTOR_SLICE_MS);
             self.sleep_if_idle();
         }
     }
@@ -85,7 +92,12 @@ impl Executor {
         // If we didn't disable interrupts first, an interrupt could sneak in right
         // after `is_empty()`, wake a task, and then we'd halt indefinitely!
         interrupts::disable();
-        if self.task_queue.is_empty() {
+        if self.task_queue.is_empty() && crate::kthread::others_ready() {
+            // Nothing to poll but another thread (a user process) can run:
+            // hand it the CPU instead of halting.
+            interrupts::enable();
+            crate::kthread::yield_now();
+        } else if self.task_queue.is_empty() {
             let t0 = unsafe { core::arch::x86_64::_rdtsc() };
             interrupts::enable_and_hlt();
             crate::shell::note_idle(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));

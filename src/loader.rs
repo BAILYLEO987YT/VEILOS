@@ -39,14 +39,34 @@ pub struct NtEnv {
 /// Previously every `?` after the first `map_page` leaked the pages mapped so
 /// far and left the image half-resident, which guaranteed a collision (and,
 /// before the map_page fix, a kernel panic) on the next attempt.
+/// Held from the start of `load_and_spawn_pe` until `on_process_exit` has
+/// released the process's memory.
+///
+/// One Windows process at a time: every process is mapped into the one
+/// shared address space, and EXEs usually share a preferred base
+/// (0x140000000), so loading a second one remaps the first one's pages out
+/// from under it. Before kernel threads this couldn't happen on a single CPU
+/// (the executor was frozen while a process ran); on SMP it already could.
+/// Lifted once processes get their own page tables.
+static USER_PROCESS_SLOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn load_and_spawn_pe(
     path: &str,
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<Arc<Process>, &'static str> {
+    use core::sync::atomic::Ordering;
+    if USER_PROCESS_SLOT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        crate::serial_println!("[LOADER] Refusing to load {}: another Windows process is still running", path);
+        return Err("Another Windows program is still running (one at a time for now)");
+    }
+
     let mut scratch: Vec<u64> = Vec::new();
     let result = load_and_spawn_pe_inner(path, mapper, frame_allocator, &mut scratch);
 
+    if result.is_err() {
+        USER_PROCESS_SLOT.store(false, Ordering::Release);
+    }
     if result.is_err() && !scratch.is_empty() {
         crate::serial_println!(
             "[LOADER] Load failed — rolling back {} mapped pages", scratch.len()
@@ -680,26 +700,30 @@ async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
         return;
     }
 
-    unsafe { crate::loader::launch_into_usermode(process.entry_point, process.stack_top, teb_base); }
+    // Single CPU: run the process on its own kernel thread. This task returns
+    // at once, so the executor (GUI, input, network) keeps running; the timer
+    // switches between the two (see kthread). It used to call
+    // launch_into_usermode right here, which froze the executor until the
+    // process exited and left the timer ISR painting the desktop.
+    let pid = process.pid;
+    crate::kthread::spawn("user-process", move || {
+        unsafe { crate::loader::launch_into_usermode(process.entry_point, process.stack_top, teb_base); }
 
-    // ── Post-exit ────────────────────────────────────────────────────────
-    //
-    // return_from_usermode() longjmps here from either:
-    //   • ExitProcess syscall handler  (SYSCALL clears IF via SFMASK)
-    //   • Page fault / GPF handler     (exception entry clears IF)
-    //
-    // In BOTH cases the CPU's interrupt flag is still 0 because we bypassed
-    // the normal iretq that would restore RFLAGS.  Without this STI,
-    // timer/keyboard/mouse interrupts are permanently dead and the entire OS
-    // appears frozen.
-    unsafe { core::arch::asm!("sti"); }
+        // ── Post-exit ────────────────────────────────────────────────────
+        //
+        // return_from_usermode() longjmps here from either:
+        //   • ExitProcess syscall handler  (SYSCALL clears IF via SFMASK)
+        //   • Page fault / GPF handler     (exception entry clears IF)
+        //
+        // In BOTH cases the CPU's interrupt flag is still 0 because we
+        // bypassed the normal iretq that would restore RFLAGS.
+        unsafe { core::arch::asm!("sti"); }
 
-    on_process_exit(&process);
+        on_process_exit(&process);
 
-    crate::serial_println!(
-        "[SCHED] Process {} completed execution on BSP.  Interrupts re-enabled.",
-        process.pid
-    );
+        crate::serial_println!("[SCHED] Process {} completed execution on BSP.", process.pid);
+    });
+    crate::serial_println!("[SCHED] Pid={} runs on a kernel thread (BSP)", pid);
 }
 
 /// Everything that must happen once a user process stops running, regardless
@@ -771,6 +795,7 @@ pub fn on_process_exit(process: &Arc<Process>) {
     //    relaunching the same EXE no longer has to wait up to a second for
     //    the reaper, and no longer collides with its own stale mapping.
     release_process_memory(process);
+    USER_PROCESS_SLOT.store(false, core::sync::atomic::Ordering::Release);
 
     // Reset LAST_USER_MODE_TICK so the timer ISR's recently_in_user_mode
     // grace period ends immediately, preventing the ISR from painting

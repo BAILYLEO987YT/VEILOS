@@ -55,6 +55,7 @@ pub mod app_repo;
 pub mod smp;
 pub mod time;
 pub mod ioapic;
+pub mod kthread;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;

@@ -784,8 +784,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// registering). Consumers may see it advance by more than 1 between reads.
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// TICKS value of the last ISR-driven desktop repaint (see the timer ISR).
-static LAST_ISR_PAINT_TICK: AtomicU64 = AtomicU64::new(0);
+
 
 /// Set to true by the loader when a user process is launched via iretq.
 /// The timer ISR uses this to decide whether to drive the display pipeline.
@@ -961,119 +960,22 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     // Sending it here is safe: IF is still 0 so we cannot be re-entered.
     end_of_interrupt(InterruptIndex::Timer);
 
-    // ── Optional display repaint when a user process is running ───────────────
+    // ── Preemption ────────────────────────────────────────────────────────────
     //
-    // After iretq launches a user process the async executor is permanently
-    // frozen — gui_refresh_task never runs again.  We drive the display from
-    // the timer ISR instead at ~60 fps (every 16 ticks at 1 kHz).
+    // This ISR used to paint the whole desktop (~60 fps) while a user process
+    // ran, because the process ran inside an executor poll and froze
+    // gui_refresh_task. Processes now run on their own kernel thread, so the
+    // executor keeps painting and the ISR only decides whether to switch.
     //
-    // Safety guarantees:
-    //   SYSCALL clears IF (SFMASK), so this ISR can ONLY fire while the CPU is
-    //   in user mode between syscalls.  No kernel spinlock can be held by any
-    //   syscall handler at this point.
-    //   We use try_lock everywhere so we skip frames rather than spinning if a
-    //   lock is unexpectedly taken.  EOI was already sent so a slow paint
-    //   cannot freeze input.
+    // Only a thread interrupted in ring 3 is preempted: ring-3 code holds no
+    // kernel locks, and syscalls run with IF=0 so this can't fire inside one.
+    // Kernel threads switch cooperatively (see kthread). The switch happens
+    // last, after EOI, with nothing held: the interrupted thread resumes here
+    // when it is switched back in and returns through this frame's iretq.
     let interrupted_user_mode = (stack_frame.code_segment & 0x3) == 3;
-
-    // Track the most recent tick where we observed ring-3 execution.
     if interrupted_user_mode {
         LAST_USER_MODE_TICK.store(tick, Ordering::Relaxed);
-    }
-
-    // Paint while a user process is running OR for up to 2000 ticks (~2 s)
-    // after it last ran.  This grace period keeps the display live during the
-    // window where a user-mode crash drops the CPU back to ring 0 (halting in
-    // the fault handler), meaning `interrupted_user_mode` becomes false but we
-    // still want to see the desktop repaint so the crash is visible.
-    let ticks_since_user = tick.saturating_sub(LAST_USER_MODE_TICK.load(Ordering::Relaxed));
-    let recently_in_user_mode = interrupted_user_mode || ticks_since_user < 2000;
-
-    if recently_in_user_mode
-        && USER_PROCESS_ACTIVE.load(Ordering::Relaxed)
-        && tick.wrapping_sub(LAST_ISR_PAINT_TICK.load(Ordering::Relaxed)) >= 16
-    {
-        LAST_ISR_PAINT_TICK.store(tick, Ordering::Relaxed);
-        let phase = crate::desktop::DesktopPhase::from_u8(
-            crate::desktop::DESKTOP_PHASE.load(Ordering::Relaxed)
-        );
-        if phase == crate::desktop::DesktopPhase::Desktop {
-            // ── ISR-safe frame render ──────────────────────────────────────────
-            //
-            // Every resource this block touches is acquired with try_lock so
-            // the ISR NEVER spins.  A missed frame (skipped because a lock was
-            // already held by a syscall handler) is entirely harmless — the
-            // display updates at 60 fps anyway and the very next tick will
-            // succeed.
-            //
-            // Lock order when a BackBufferGuard is NOT active:
-            //   BACK_BUFFER → FRAMEBUFFER
-            // We must not acquire them in reverse order anywhere.
-
-            // Step 1 — try to claim the back buffer.  Skip this frame on contention.
-            let bb_guard = crate::ui::BACK_BUFFER.try_lock();
-            let bb_ptr = match bb_guard {
-                Some(ref g) => match g.as_ref() {
-                    Some(bb) => bb.as_ptr() as *mut u32,
-                    None     => return, // back buffer not initialised yet
-                },
-                None => return, // held by a syscall — skip frame, not a problem
-            };
-
-            // Publish the pointer so draw_rect_atomic etc. use the fast path
-            // (no re-lock) while we hold bb_guard.
-            crate::ui::PAINTER_PTR.store(bb_ptr, Ordering::Release);
-            crate::ui::PAINTER_ACTIVE.store(true, Ordering::Release);
-
-            // Step 2 — clear background directly via the fast path.
-            crate::ui::draw_rect_atomic(
-                0, 0,
-                crate::ui::SCREEN_W, crate::ui::SCREEN_H,
-                crate::graphics::Color { r: 20, g: 20, b: 35 },
-            );
-
-            // Step 3 — full desktop paint (uses draw_rect_atomic fast path throughout).
-            crate::desktop::paint_desktop(tick);
-
-            // Step 4 — flush to hardware.  commit_back_buffer reads through
-            // PAINTER_PTR (fast path), but still needs FRAMEBUFFER.
-            // Use try_lock; if the framebuffer is momentarily busy, skip.
-            {
-                let mut fb_guard = crate::graphics::FRAMEBUFFER.try_lock();
-                if let Some(ref mut fb_opt) = fb_guard {
-                    if let Some(fb) = fb_opt.as_mut() {
-                        // Blit the back buffer directly — fast path already populated bb_ptr.
-                        let draw_w = fb.width.min(crate::ui::SCREEN_W);
-                        for py in 0..fb.height.min(crate::ui::SCREEN_H) {
-                            let row_dst = (fb.base_addr + (py * fb.stride) as u64 * 4) as *mut u32;
-                            let src = py * crate::ui::SCREEN_W;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(bb_ptr.add(src), row_dst, draw_w);
-                            }
-                        }
-                    }
-                }
-                // fb_guard drops here — FRAMEBUFFER released before cursor draw.
-            }
-
-            // Step 5 — tear down fast path BEFORE releasing bb_guard so no
-            // window exists where PAINTER_ACTIVE=true but bb_guard is dropped.
-            crate::ui::PAINTER_ACTIVE.store(false, Ordering::Release);
-            crate::ui::PAINTER_PTR.store(core::ptr::null_mut(), Ordering::Relaxed);
-            drop(bb_guard);
-
-            // Step 6 — draw cursor directly on hardware (no back-buffer involvement).
-            if let Some(state) = crate::task::mouse::MOUSE_STATE.try_lock() {
-                let mx = state.x as usize;
-                let my = state.y as usize;
-                drop(state);
-                if let Some(mut ui_wm) = crate::ui::WINDOW_MANAGER.try_lock() {
-                    ui_wm.cursor_x = mx;
-                    ui_wm.cursor_y = my;
-                    ui_wm.draw_cursor_hw();
-                }
-            }
-        }
+        crate::kthread::preempt_from_timer();
     }
 }
 
