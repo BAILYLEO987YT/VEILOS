@@ -542,7 +542,8 @@ pub static GPU_SCHEDULER: Mutex<GpuScheduler>        = Mutex::new(GpuScheduler::
 pub fn init() {
     let mut gpus = GPU_DEVICES.lock();
 
-    for dev in &crate::pci::find_class(0x03, None) { // 0x03 = Display Controller
+    // Display controllers a HAL driver is running.
+    for dev in crate::hal::bound(crate::hal::DeviceClass::Display).iter().map(|d| &d.pci) {
         // Pick apertures from the sized BARs instead of assuming fixed slots:
         //   • VRAM aperture = the largest memory BAR (on Bochs/QEMU that is the
         //     BAR0 linear framebuffer; on discrete cards the prefetchable VRAM BAR).

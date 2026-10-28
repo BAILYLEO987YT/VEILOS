@@ -504,7 +504,7 @@ impl NodeMesh {
     }
 
     /// Update the node ID with the actual MAC-derived ID. Safe to call more
-    /// than once (e.g. once eagerly from network::init(), and again as a
+    /// than once (e.g. once eagerly when the NIC binds (network::probe_virtio_net), and again as a
     /// fallback from tick()) — it's a no-op after the first successful call.
     pub fn update_mac(&mut self, mac: &[u8; 6]) {
         if self.mac_updated { return; }
@@ -677,7 +677,7 @@ impl NodeMesh {
 
     /// Periodic tick: send LAN broadcast, expire dead peers, maintain relay.
     pub fn tick(&mut self, current_tick: u64) {
-        // Fallback MAC update — normally network::init() has already set
+        // Fallback MAC update — normally the NIC probe (network::probe_virtio_net) has already set
         // this deterministically before the mesh ever sends a packet, so
         // this is a no-op. Kept as a safety net in case init() ran before
         // the NIC was probed for any reason.

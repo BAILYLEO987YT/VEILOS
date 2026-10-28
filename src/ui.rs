@@ -2,7 +2,7 @@ pub use crate::graphics::{FRAMEBUFFER, Color};
 use spin::Mutex;
 
 // -----| screen dimensions |-----
-// These match the resolution set in graphics::probe_gpu().
+// These match the resolution set by the display driver (graphics::probe_display).
 // Update both here and there if you change the resolution.
 pub const SCREEN_W: usize = 1024;
 pub const SCREEN_H: usize = 768;

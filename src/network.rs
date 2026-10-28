@@ -871,38 +871,32 @@ lazy_static! {
     pub static ref NETWORK: Mutex<Option<NetworkStack>> = Mutex::new(None);
 }
 
-/// Called from main.rs after PCI scan. Looks for a VirtIO-net NIC,
-/// initialises the driver, builds the smoltcp stack, starts DHCP.
-pub fn init(hardware_tree: &[crate::pci::PciDevice]) {
-    // Find a VirtIO-net device in the PCI tree.
-    let nic = hardware_tree.iter().find(|d| {
-        d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_NET_DEV
-    });
+/// Legacy virtio-net NICs. Bound by `hal::bind`.
+pub const VIRTIO_NET_DRIVER: crate::hal::Driver = crate::hal::Driver {
+    name: "virtio-net",
+    class: crate::hal::DeviceClass::Network,
+    matches: is_virtio_net,
+    probe: probe_virtio_net,
+};
 
-    let device = match nic {
-        Some(dev) => {
-            // Legacy virtio-net exposes its registers through an I/O BAR0.
-            let io_base = match dev.bar(0).io_port() {
-                Some(p) => p,
-                None => {
-                    println!("[NET] VirtIO-net BAR0 is not an I/O BAR — networking unavailable.");
-                    crate::serial_println!("[NET] VirtIO-net BAR0 is not an I/O BAR: {:?}", dev.bar(0));
-                    return;
-                }
-            };
-            // The virtqueues are DMA'd by the device: bus mastering is required.
-            dev.enable_for_driver();
-            println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
-            crate::serial_println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
-            VirtioNet::new(io_base)
-        }
-        None => {
-            println!("[NET] No VirtIO-net NIC found — networking unavailable.");
-            crate::serial_println!("[NET] No VirtIO-net NIC found — networking unavailable.");
-            println!("[NET] Add -device virtio-net-pci,netdev=net0 to QEMU args.");
-            return;
-        }
-    };
+fn is_virtio_net(d: &crate::pci::PciDevice) -> bool {
+    d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_NET_DEV
+}
+
+/// Initialise the NIC, build the smoltcp stack on it and start DHCP.
+fn probe_virtio_net(dev: &crate::pci::PciDevice) -> Result<(), alloc::string::String> {
+    use alloc::string::String;
+    // One stack, one NIC for now; more NICs are the logical-NIC work (HAL_DESIGN.md 7E).
+    if NETWORK.lock().is_some() {
+        return Err(String::from("only one NIC is used for now"));
+    }
+    // Legacy virtio-net exposes its registers through an I/O BAR0.
+    let io_base = dev.bar(0).io_port().ok_or_else(|| String::from("BAR0 is not an I/O BAR"))?;
+    // The virtqueues are DMA'd by the device: bus mastering is required.
+    dev.enable_for_driver();
+    println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
+    crate::serial_println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
+    let device = VirtioNet::new(io_base);
 
     let mut stack = NetworkStack::new(device);
 
@@ -924,6 +918,7 @@ pub fn init(hardware_tree: &[crate::pci::PciDevice]) {
     crate::serial_println!("[NET] Network stack online. Awaiting DHCP...");
     println!("[NET]   IPv4 + IPv6, TCP, UDP, ICMP via smoltcp 0.13");
     println!("[NET]   DHCP client, DNS resolver, NTP client, Firewall");
+    Ok(())
 }
 
 /// Drive the network stack forward. Call this from a background async task

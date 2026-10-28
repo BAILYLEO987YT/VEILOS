@@ -57,6 +57,7 @@ pub mod ioapic;
 pub mod kthread;
 pub mod address_space;
 pub mod block;
+pub mod hal;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;
@@ -252,15 +253,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Enumerate the bus once and populate the device registry. Every driver
     // queries the registry from here on; nothing may rescan the bus.
     pci::init();
-    let hardware_tree = pci::devices();
+    crate::hal::init();
 
-    // Pass the hardware tree to the AHCI module to initialize storage
-    ahci::init(&hardware_tree, &mut mapper, &mut frame_allocator, phys_mem_offset);
+    // Storage first: the filesystems are needed by most of the rest of boot.
+    crate::hal::bind(crate::hal::DeviceClass::Storage);
     crate::vfs::ensure_standard_dirs();
 
-    // Phase 13: initialise the network stack (VirtIO-net + smoltcp).
-    // Must come after PCI scan so hardware_tree is populated.
-    crate::network::init(&hardware_tree);
+    // Phase 13: the network stack (VirtIO-net + smoltcp) starts when its NIC binds.
+    crate::hal::bind(crate::hal::DeviceClass::Network);
 
     // Phase 15: initialise the hypervisor (VT-x VMX + EPT).
     // Detects CPU support and gracefully does nothing if unavailable.
@@ -291,7 +291,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // -----| multitasking setup |-----
 
-    crate::graphics::probe_gpu();
+    crate::hal::bind(crate::hal::DeviceClass::Display);
+    if crate::graphics::FRAMEBUFFER.lock().is_none() {
+        println!("[GRAPHICS] No supported display adapter. Falling back to VGA Text Mode.");
+    }
 
     serial_println!("[BOOT] >> dll::init ...");
     crate::dll::init();

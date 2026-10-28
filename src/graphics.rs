@@ -62,57 +62,65 @@ fn bga_write(index: u16, data: u16) {
     }
 }
 
-pub fn probe_gpu() {
+/// Bochs/QEMU display adapters (stdvga, bochs-display): a linear framebuffer
+/// in BAR0, mode set through the BGA ports. Bound by `hal::bind`.
+///
+/// Matching on the Bochs vendor ID matters: on Intel/AMD/NVIDIA cards BAR0 is
+/// the register block, and the old "first display device's BAR0" logic would
+/// have written pixels into device registers.
+pub const LFB_DISPLAY_DRIVER: crate::hal::Driver = crate::hal::Driver {
+    name: "bochs-lfb",
+    class: crate::hal::DeviceClass::Display,
+    matches: is_bochs_display,
+    probe: probe_display,
+};
+
+fn is_bochs_display(dev: &pci::PciDevice) -> bool {
+    dev.vendor_id == 0x1234 && dev.bar(0).mem_base().is_some_and(|b| b != 0)
+}
+
+fn probe_display(dev: &pci::PciDevice) -> Result<(), alloc::string::String> {
+    // The desktop drives one scanout for now; more displays are HAL step 7D.
+    if FRAMEBUFFER.lock().is_some() {
+        return Err(alloc::string::String::from("second display not driven yet"));
+    }
     println!("[GRAPHICS] Probing for Bochs/QEMU GPU (BGA)...");
-    
+
     // Set resolution explicitly: 1024x768x32
     bga_write(4, 0x00); // VBE_DISPI_INDEX_ENABLE -> Disable
     bga_write(1, 1024); // VBE_DISPI_INDEX_XRES
     bga_write(2, 768);  // VBE_DISPI_INDEX_YRES
     bga_write(3, 32);   // VBE_DISPI_INDEX_BPP
     bga_write(4, 0x01 | 0x40); // VBE_DISPI_INDEX_ENABLE -> (Enabled | LFB)
-    
+
     println!("[GRAPHICS] Hardware Resolution Set: 1024x768x32");
 
-    // Look up the display controller's linear framebuffer (BAR0 on BGA).
-    for dev in pci::find_class(0x03, None) {
-        {
-            let phys_addr = match dev.bar(0).mem_base() {
-                Some(b) => b,
-                None => continue,
-            };
+    // The display controller's linear framebuffer (BAR0 on BGA).
+    let phys_addr = dev.bar(0).mem_base().unwrap_or(0);
+    dev.enable_decode();
+    println!("[GRAPHICS] Found GPU at PCI {:02X}:{:02X}. BAR0: {:#X}", dev.bus, dev.device, phys_addr);
 
-            if phys_addr != 0 {
-                dev.enable_decode();
-                println!("[GRAPHICS] Found GPU at PCI {:02X}:{:02X}. BAR0: {:#X}", dev.bus, dev.device, phys_addr);
-                
-                // CRITICAL: We MUST map the physical address to a virtual address!
-                // We'll use identity mapping for the hardware for simplicity.
-                let mut mapper = unsafe { crate::memory::get_mapper() };
-                let mut frame_allocator = crate::memory::GlobalFrameAllocator;
-                
-                let fb_size = crate::ui::SCREEN_W * crate::ui::SCREEN_H * 4;
-                if let Err(e) = map_direct_hw(phys_addr as u64, fb_size as u64, phys_addr as u64, &mut mapper, &mut frame_allocator) {
-                    println!("[GRAPHICS] ERROR: Failed to map framebuffer: {}", e);
-                    return;
-                }
-                
-                let fb = Framebuffer {
-                    base_addr: phys_addr as u64,
-                    width:  crate::ui::SCREEN_W,
-                    height: crate::ui::SCREEN_H,
-                    stride: crate::ui::SCREEN_W,
-                };
-                
-                fb.clear(Color { r: 20, g: 20, b: 35 });
-                *FRAMEBUFFER.lock() = Some(fb);
-                println!("[GRAPHICS] Manually mapped framebuffer at {:#X}", phys_addr);
-                return;
-            }
-        }
+    // Identity-map the framebuffer (write-combining, see map_direct_hw).
+    let mut mapper = unsafe { crate::memory::get_mapper() };
+    let mut frame_allocator = crate::memory::GlobalFrameAllocator;
+
+    let fb_size = crate::ui::SCREEN_W * crate::ui::SCREEN_H * 4;
+    if let Err(e) = map_direct_hw(phys_addr as u64, fb_size as u64, phys_addr as u64, &mut mapper, &mut frame_allocator) {
+        println!("[GRAPHICS] ERROR: Failed to map framebuffer: {}", e);
+        return Err(alloc::format!("framebuffer mapping failed: {}", e));
     }
-    
-    println!("[GRAPHICS] No PCI GPU found. Falling back to VGA Text Mode.");
+
+    let fb = Framebuffer {
+        base_addr: phys_addr as u64,
+        width:  crate::ui::SCREEN_W,
+        height: crate::ui::SCREEN_H,
+        stride: crate::ui::SCREEN_W,
+    };
+
+    fb.clear(Color { r: 20, g: 20, b: 35 });
+    *FRAMEBUFFER.lock() = Some(fb);
+    println!("[GRAPHICS] Manually mapped framebuffer at {:#X}", phys_addr);
+    Ok(())
 }
 
 // -----| hardware security (DirectHW) |-----

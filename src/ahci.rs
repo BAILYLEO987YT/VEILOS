@@ -3,81 +3,68 @@ use crate::println;
 use volatile::Volatile;
 use x86_64::{
     structures::paging::{
-        FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB,
+        Mapper, Page, PageTableFlags, PhysFrame, Size4KiB,
     },
     PhysAddr, VirtAddr,
 };
 
-pub fn init(
-    devices: &[PciDevice],
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    physical_memory_offset: VirtAddr,
-) {
-    println!("\nInitializing AHCI/SATA Controller...");
-    
-    let mut found = false;
-    for dev in devices.iter() {
-        if dev.class == 0x01 && dev.subclass == 0x06 {
-            if dev.prog_if == 0x01 {
-                // ABAR is always BAR5 and always memory-mapped.
-                let base_address = match dev.bar(5).mem_base() {
-                    Some(b) => b,
-                    None => {
-                        println!("  -> AHCI controller at {}:{}:{} has no ABAR — skipping.",
-                            dev.bus, dev.device, dev.function);
-                        continue;
-                    }
-                };
-                found = true;
+/// AHCI SATA controllers (class 01:06, prog-if 01). Bound by `hal::bind`.
+pub const DRIVER: crate::hal::Driver = crate::hal::Driver {
+    name: "ahci",
+    class: crate::hal::DeviceClass::Storage,
+    matches: is_ahci,
+    probe,
+};
 
-                // The HBA DMAs command lists, FISes and data: it needs memory
-                // decode and bus mastering, which firmware may not have set.
-                dev.enable_for_driver();
+fn is_ahci(dev: &PciDevice) -> bool {
+    dev.class == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01
+}
 
-                let phys_addr = PhysAddr::new(base_address);
-                let virt_addr = VirtAddr::new(base_address as u64);
+/// Map the controller's registers, start every connected port, and hand
+/// each disk to the block layer.
+fn probe(dev: &PciDevice) -> Result<(), alloc::string::String> {
+    println!("
+Initializing AHCI controller at {}:{}:{}...", dev.bus, dev.device, dev.function);
+    // ABAR is always BAR5 and always memory-mapped.
+    let base_address = dev.bar(5).mem_base().ok_or_else(|| alloc::string::String::from("no ABAR (BAR5)"))?;
 
-                // Map enough pages to cover the entire HbaMemory struct.
-                // One page (4 KiB) is not enough on controllers with many ports
-                // implemented — HbaMemory can be up to ~8 KiB with 32 ports.
-                // Round up: ceil(sizeof(HbaMemory) / 4096).
-                const HBA_SIZE: u64 = core::mem::size_of::<HbaMemory>() as u64;
-                const PAGE_SIZE: u64 = 4096;
-                let pages_needed = (HBA_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    // The HBA DMAs command lists, FISes and data: it needs memory
+    // decode and bus mastering, which firmware may not have set.
+    dev.enable_for_driver();
 
-                let flags = PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::NO_CACHE;
+    let phys_addr = PhysAddr::new(base_address);
+    let virt_addr = VirtAddr::new(base_address as u64);
 
-                for i in 0..pages_needed {
-                    let phys_page = PhysAddr::new(phys_addr.as_u64() + i * PAGE_SIZE);
-                    let virt_page = VirtAddr::new(virt_addr.as_u64() + i * PAGE_SIZE);
-                    let frame = PhysFrame::<Size4KiB>::containing_address(phys_page);
-                    let page  = Page::<Size4KiB>::containing_address(virt_page);
-                    unsafe {
-                        match mapper.map_to(page, frame, flags, frame_allocator) {
-                            Ok(tlb) => tlb.flush(),
-                            Err(_)  => {} // already mapped (page 0 may overlap another mapping)
-                        }
-                    }
-                }
-                
-                println!(
-                    "  -> AHCI Controller discovered at {}:{}:{}",
-                    dev.bus, dev.device, dev.function
-                );
-                println!("  -> ABAR cleanly mapped to Virtual Address: {:#010X}", virt_addr.as_u64());
+    // Map enough pages to cover the entire HbaMemory struct.
+    // One page (4 KiB) is not enough on controllers with many ports
+    // implemented — HbaMemory can be up to ~8 KiB with 32 ports.
+    const HBA_SIZE: u64 = core::mem::size_of::<HbaMemory>() as u64;
+    const PAGE_SIZE: u64 = 4096;
+    let pages_needed = (HBA_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
 
-                let hba_mem = unsafe { &mut *(virt_addr.as_mut_ptr::<HbaMemory>()) };
-                reinit_ports(hba_mem, physical_memory_offset);
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_CACHE;
+
+    let mut mapper = unsafe { crate::memory::get_mapper() };
+    let mut frame_allocator = crate::memory::GlobalFrameAllocator;
+    for i in 0..pages_needed {
+        let phys_page = PhysAddr::new(phys_addr.as_u64() + i * PAGE_SIZE);
+        let virt_page = VirtAddr::new(virt_addr.as_u64() + i * PAGE_SIZE);
+        let frame = PhysFrame::<Size4KiB>::containing_address(phys_page);
+        let page  = Page::<Size4KiB>::containing_address(virt_page);
+        unsafe {
+            match mapper.map_to(page, frame, flags, &mut frame_allocator) {
+                Ok(tlb) => tlb.flush(),
+                Err(_)  => {} // already mapped (page 0 may overlap another mapping)
             }
         }
     }
-    
-    if !found {
-        println!("  -> No AHCI Storage Controllers found on the PCI Bus.");
-    }
+    println!("  -> ABAR mapped at {:#010X}", virt_addr.as_u64());
+
+    let hba_mem = unsafe { &mut *(virt_addr.as_mut_ptr::<HbaMemory>()) };
+    reinit_ports(hba_mem, crate::memory::get_phys_mem_offset());
+    Ok(())
 }
 
 fn reinit_ports(
