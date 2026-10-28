@@ -80,5 +80,5 @@ run-args = [
     "-device", "ahci,id=ahci",
     "-device", "ide-hd,drive=disk,bus=ahci.0",
     "-netdev", "socket,id=net0,udp=127.0.0.1:1235,localaddr=127.0.0.1:1234",
-    "-device", "e1000,netdev=net0"
+    "-device", "virtio-net-pci,netdev=net0"
 ]

@@ -835,7 +835,9 @@ static EXEC_CTX_VALID: [core::sync::atomic::AtomicBool; MAX_EXEC_CPUS] =
 
 #[inline]
 pub fn current_exec_cpu() -> usize {
-    (crate::smp::current_apic_id() as usize) % MAX_EXEC_CPUS
+    // Dense CPU index, not the raw APIC ID: APIC IDs can be sparse or
+    // exceed MAX_EXEC_CPUS on real hardware, and `id % 8` made CPUs collide.
+    crate::smp::cpu_index().min(MAX_EXEC_CPUS - 1)
 }
 
 #[inline]
@@ -1035,6 +1037,11 @@ pub unsafe fn launch_into_usermode(entry: u64, stack_top: u64, teb_base: u64) {
     // Arm the long-jump slot *before* entering ring 3 — the very first
     // instruction of the entry point can fault.
     EXEC_CTX_VALID[cpu_id].store(true, core::sync::atomic::Ordering::Release);
+
+    // syscall_entry swapgs's into the per-CPU block. If the previous process
+    // left via a long-jump out of a syscall, the exit swapgs never ran and
+    // KERNEL_GS_BASE still holds that process's TEB — fix it before ring 3.
+    crate::smp::reset_kernel_gs_base();
 
     crate::serial_println!(
         "[LOADER] iretq   entry={:#X}  rsp={:#X}  CS={:#X}  DS={:#X}  gs.base={:#X}",

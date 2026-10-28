@@ -62,59 +62,152 @@ pub static LAPIC_BASE: AtomicU32 = AtomicU32::new(0);
 /// Bitmask: bit N is set when CPU N has completed its AP startup sequence.
 pub static CPU_ONLINE: AtomicU32 = AtomicU32::new(1); // BSP (core 0) always online
 
-// ── Per-CPU syscall stacks ─────────────────────────────────────────────
+// ── Per-CPU data ───────────────────────────────────────────────────────
 //
-// Each logical CPU gets an independent 64 KiB kernel stack for syscall
-// handling.  The BSP uses STACK[0]; AP n uses STACK[n].
-// This eliminates the shared-stack crash risk identified in the audit.
+// Each logical CPU owns one `PerCpu` block. `KERNEL_GS_BASE` points at it,
+// so `syscall_entry` reaches it with `swapgs` + `gs:[offset]` without
+// touching any general-purpose register or the (untrusted) user stack.
 //
-// The stacks are a static array so they are baked into the kernel image
-// and have known, fixed addresses — critical for the `syscall_entry` asm
-// which must compute `RSP = STACK[cpu_id].top` without dynamic allocation
-// (at syscall time, the allocator lock may be held).
+// Other kernel code must NOT use `gs:` to find its CPU: an interrupt that
+// arrives in ring 3 does not `swapgs`, so GS still holds the user's TEB
+// there. Use `cpu_index()` (LAPIC-ID lookup) instead.
+//
+// Each CPU also gets a dedicated 64 KiB syscall stack. It is used ONLY for
+// syscalls — never as a boot or idle stack (APs get separate boot stacks
+// in `init`). Sharing the two used to let the first syscall on an AP
+// overwrite the frames `return_from_usermode()` later jumps back into.
 
 pub const SYSCALL_STACK_SIZE: usize = 4096 * 16;   // 64 KiB per CPU
 pub const MAX_CPUS:           usize = 8;            // supports up to 8-way SMP
 
+/// Size of each AP's boot/idle stack (heap-allocated in `init`).
+const AP_BOOT_STACK_SIZE: usize = 4096 * 16;
+
+/// Byte offsets into `PerCpu`, used by the naked `syscall_entry` asm.
+pub const PERCPU_KERNEL_RSP: usize = 0;
+pub const PERCPU_USER_RSP:   usize = 8;
+
+#[repr(C, align(64))]
+pub struct PerCpu {
+    /// Top of this CPU's syscall stack. Offset 0 (`PERCPU_KERNEL_RSP`).
+    pub kernel_rsp: u64,
+    /// User RSP saved by `syscall_entry` for the syscall in progress.
+    /// Offset 8 (`PERCPU_USER_RSP`).
+    pub user_rsp: u64,
+    pub cpu_index: u64,
+    pub apic_id: u64,
+}
+
 #[repr(C, align(16))]
-pub struct PerCpuStack(pub [u8; SYSCALL_STACK_SIZE]);
+struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
 
-/// The per-CPU syscall stacks.  Exported so `interrupts.rs` can reference
-/// the array in the naked ASM (replacing the old single `SYSCALL_KERNEL_STACK`).
-#[unsafe(no_mangle)]
-pub static PERCPU_SYSCALL_STACKS: [PerCpuStack; MAX_CPUS] =
-    [const { PerCpuStack([0u8; SYSCALL_STACK_SIZE]) }; MAX_CPUS];
+// Both tables are written through raw pointers (by `init_percpu`, and by
+// the CPU itself when it uses a stack), so they need interior mutability.
+// A plain immutable `static` written this way is UB and may even be placed
+// in read-only memory.
+struct PerCpuTable(core::cell::UnsafeCell<[PerCpu; MAX_CPUS]>);
+unsafe impl Sync for PerCpuTable {}
+struct StackTable(core::cell::UnsafeCell<[SyscallStack; MAX_CPUS]>);
+unsafe impl Sync for StackTable {}
 
-/// Write a 64-bit value to `KERNEL_GS_BASE` MSR (0xC000_0102).
-///
-/// We use this MSR as the per-CPU syscall stack pointer storage because:
-///   • it is readable from a naked asm stub with a single `rdmsr`
-///   • it is architecturally per-CPU (swapped by `swapgs`)
-///   • it costs zero memory-mapping complexity
-///
-/// Called once during init for each CPU.
-pub fn set_cpu_syscall_stack(cpu_index: usize) {
-    let stack_top = syscall_stack_top(cpu_index.min(MAX_CPUS - 1)) as u64;
+static PERCPU: PerCpuTable = PerCpuTable(core::cell::UnsafeCell::new(
+    [const { PerCpu { kernel_rsp: 0, user_rsp: 0, cpu_index: 0, apic_id: 0 } }; MAX_CPUS]
+));
+static SYSCALL_STACKS: StackTable = StackTable(core::cell::UnsafeCell::new(
+    [const { SyscallStack([0u8; SYSCALL_STACK_SIZE]) }; MAX_CPUS]
+));
+
+/// APIC ID → CPU index. 0xFF = unknown. APIC IDs are not dense on real
+/// hardware (e.g. 0, 2, 4, ... or > MAX_CPUS), so they can't index tables
+/// directly.
+static APIC_TO_CPU: [core::sync::atomic::AtomicU8; 256] =
+    [const { core::sync::atomic::AtomicU8::new(0xFF) }; 256];
+
+fn percpu_ptr(cpu_index: usize) -> *mut PerCpu {
+    unsafe { (*PERCPU.0.get()).as_mut_ptr().add(cpu_index) }
+}
+
+/// Top (high address) of `cpu_index`'s syscall stack.
+fn syscall_stack_top(cpu_index: usize) -> u64 {
+    let base = unsafe { (*SYSCALL_STACKS.0.get())[cpu_index].0.as_ptr() } as u64;
+    base + SYSCALL_STACK_SIZE as u64
+}
+
+fn write_kernel_gs_base(value: u64) {
     unsafe {
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC0000102u32,  // MSR_KERNEL_GS_BASE
-            in("eax") (stack_top & 0xFFFF_FFFF) as u32,
-            in("edx") (stack_top >> 32) as u32,
+            in("eax") (value & 0xFFFF_FFFF) as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags),
         );
     }
+}
+
+/// Set up the calling CPU's `PerCpu` block and point `KERNEL_GS_BASE` at it.
+/// Must run on the CPU being initialised (called from `gdt::init`/`init_ap`).
+pub fn init_percpu(cpu_index: usize) {
+    assert!(cpu_index < MAX_CPUS, "CPU index out of range");
+    let apic_id = current_apic_id();
+    let p = percpu_ptr(cpu_index);
+    unsafe {
+        (*p).kernel_rsp = syscall_stack_top(cpu_index);
+        (*p).user_rsp   = 0;
+        (*p).cpu_index  = cpu_index as u64;
+        (*p).apic_id    = apic_id as u64;
+    }
+    APIC_TO_CPU[(apic_id & 0xFF) as usize].store(cpu_index as u8, Ordering::Release);
+    write_kernel_gs_base(p as u64);
     crate::serial_println!(
-        "[SMP] CPU {} syscall stack top set to {:#018x}",
-        cpu_index, stack_top
+        "[SMP] CPU {} (APIC ID {}) per-CPU block at {:#x}, syscall stack top {:#x}",
+        cpu_index, apic_id, p as u64, syscall_stack_top(cpu_index)
     );
 }
 
-/// Return a pointer to the **top** (high address) of the syscall stack for
-/// the given CPU index.  "Top" because x86 stacks grow downward.
-#[inline(always)]
-pub fn syscall_stack_top(cpu_index: usize) -> *const u8 {
-    let base = PERCPU_SYSCALL_STACKS[cpu_index].0.as_ptr();
-    unsafe { base.add(SYSCALL_STACK_SIZE) }
+/// Enable SSE/SSE2 on the calling CPU. CR4/CR0 are per-CPU registers, so
+/// every CPU must run this — an AP without it raises #UD on the first SSE
+/// instruction (e.g. the XMM save in `syscall_entry`, or MSVC code zeroing a
+/// struct with XORPS).
+///   • CR4.OSFXSR (bit 9): allow SSE + FXSAVE/FXRSTOR.
+///   • CR4.OSXMMEXCPT (bit 10): deliver SIMD FP faults as #XM.
+///   • CR0.EM (bit 2) clear: no x87 emulation; CR0.TS (bit 3) clear: no #NM.
+pub fn enable_sse() {
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            "or  rax, {cr4_bits}",
+            "mov cr4, rax",
+            "mov rax, cr0",
+            "and rax, {cr0_mask}",
+            "mov cr0, rax",
+            cr4_bits = const (1u64 << 9) | (1u64 << 10),
+            cr0_mask = const !((1u64 << 2) | (1u64 << 3)),
+            out("rax") _,
+            options(nostack),
+        );
+        core::arch::asm!("fninit", options(nostack, nomem));
+    }
+}
+
+/// Re-point `KERNEL_GS_BASE` at this CPU's block. Called before every ring-3
+/// launch: a long-jump out of a syscall (`return_from_usermode`) skips the
+/// exit `swapgs`, leaving the user TEB in `KERNEL_GS_BASE`.
+pub fn reset_kernel_gs_base() {
+    write_kernel_gs_base(percpu_ptr(cpu_index()) as u64);
+}
+
+/// Index (0..MAX_CPUS) of the CPU executing this code. Safe from any context,
+/// including interrupt handlers that interrupted ring 3.
+#[inline]
+pub fn cpu_index() -> usize {
+    let idx = APIC_TO_CPU[(current_apic_id() & 0xFF) as usize].load(Ordering::Relaxed);
+    if idx == 0xFF { 0 } else { idx as usize }
+}
+
+/// User RSP of the syscall currently executing on this CPU.
+pub fn current_syscall_user_rsp() -> u64 {
+    unsafe { (*percpu_ptr(cpu_index())).user_rsp }
 }
 
 // ── LAPIC access ──────────────────────────────────────────────────────
@@ -576,11 +669,15 @@ pub fn park_and_wait_for_work() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry(cpu_index: u32) -> ! {
     // 1. Load this AP's own GDT + TSS (unique stacks per CPU).
-    //    init_ap() also calls set_cpu_syscall_stack(cpu_index) internally.
+    //    init_ap() also calls init_percpu(cpu_index) internally.
     crate::gdt::init_ap(cpu_index as usize);
 
     // 2. Load the shared IDT (already built on the BSP).
     crate::interrupts::init_idt_ap();
+
+    // 2b. SSE is per-CPU state: without this the AP #UDs on its first SSE
+    //     instruction (the first syscall it handles, or the app itself).
+    enable_sse();
 
     // 3. Enable the LAPIC and configure the timer on this core.
     unsafe {
@@ -735,11 +832,17 @@ pub fn init(
 
         crate::serial_println!("[SMP] Starting AP index {} (APIC ID {})", cpu_index, ap_apic_id);
 
-        // Give this AP its own kernel stack and tell the trampoline where to
-        // jump once it reaches long mode. Written fresh for each AP — they
+        // Give this AP its own boot/idle stack and tell the trampoline where
+        // to jump once it reaches long mode. Written fresh for each AP — they
         // come up strictly one at a time (we wait for CPU_ONLINE below
         // before touching the parameter block again).
-        let stack_top = syscall_stack_top(cpu_index as usize) as u64;
+        //
+        // This must NOT be the AP's syscall stack: ap_entry and
+        // park_and_wait_for_work live on this stack for the AP's whole life,
+        // and launch_into_usermode saves its long-jump RSP here. The stack is
+        // leaked on purpose — the AP never stops using it.
+        let boot_stack: &'static mut [u8] = alloc::vec![0u8; AP_BOOT_STACK_SIZE].leak();
+        let stack_top = (boot_stack.as_ptr() as u64 + AP_BOOT_STACK_SIZE as u64) & !0xF;
         write_ap_params(cpu_index, stack_top);
 
         unsafe {

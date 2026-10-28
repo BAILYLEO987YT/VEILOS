@@ -143,7 +143,15 @@ fn init_syscall() {
 
     // SFMASK: bits set here are cleared in RFLAGS on syscall entry.
     // Clearing IF ensures interrupts are disabled until we're on the kernel stack.
-    SFMask::write(RFlags::INTERRUPT_FLAG);
+    // DF must be clear because Rust/compiler-builtins memcpy (`rep movs`) assumes
+    // it; TF/AC/NT are user-controlled flags that must not leak into ring 0.
+    SFMask::write(
+        RFlags::INTERRUPT_FLAG
+            | RFlags::DIRECTION_FLAG
+            | RFlags::TRAP_FLAG
+            | RFlags::ALIGNMENT_CHECK
+            | RFlags::NESTED_TASK,
+    );
 
     // EFER.SCE: enable the SYSCALL/SYSRET instructions.
     unsafe {
@@ -159,103 +167,54 @@ fn init_syscall() {
 ///   • disabled interrupts (via SFMASK)
 ///   • NOT switched RSP — we are still on the user stack!
 ///
-/// We must swap to a kernel stack before touching anything.
-/// For now we re-use the per-CPU IST (the double-fault stack is safe here as a
-/// temporary measure until proper per-process kernel stacks are wired up).
+/// Calling convention (our IAT thunk: `mov r10, rcx; mov rax, id; syscall`):
+///   RAX = syscall id, R10 = arg0, RDX = arg1, R8 = arg2, R9 = arg3.
+///   Arguments 4+ are on the user stack — see `syscall_stack_arg()`.
+///
+/// Stack switch: `swapgs` makes GS point at this CPU's `smp::PerCpu` block
+/// (KERNEL_GS_BASE). The user RSP is parked there and the kernel RSP loaded
+/// from it, so no register is clobbered and the user stack is never touched
+/// while in ring 0. (The previous version used R15 as scratch without saving
+/// it — R15 is non-volatile in the Windows x64 ABI, so every syscall
+/// corrupted it — and pushed R12/R13 onto the user-supplied RSP, letting a
+/// bad RSP make the kernel write anywhere.)
+///
+/// Interrupts stay disabled for the whole syscall. Re-enabling them here is
+/// not safe yet: the timer ISR paints the desktop (heap allocations) while a
+/// process runs, which would deadlock against a handler holding the heap lock.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_entry() {
-    // SAFETY: naked fn — Rust emits zero prologue/epilogue.
-    //
-    // CPU state on SYSCALL entry (x86_64 architecture guarantees):
-    //   RAX  = syscall number
-    //   RCX  = user RIP  (CPU saved it here; clobbered by SYSCALL)
-    //   R11  = user RFLAGS (CPU saved it here; clobbered by SYSCALL)
-    //   RSP  = user stack pointer  ← NOT changed by SYSCALL, still user value
-    //   R10  = arg0 (our thunk: `mov r10, rcx` before SYSCALL)
-    //   RDX  = arg1
-    //   R8   = arg2
-    //   R9   = arg3
-    //
-    // Critical: RSP must be saved BEFORE we switch to the kernel stack,
-    // and restored BEFORE sysretq — otherwise the user process resumes
-    // with RSP pointing into kernel memory, causing an immediate
-    // PROTECTION_VIOLATION on the first push/call back in ring-3.
-    //
-    // We save user RSP in R15 (callee-saved in SysV ABI — the Rust
-    // dispatcher will not clobber it).  No scratch MSR needed.
     core::arch::naked_asm!(
-        // ── save user RSP before touching anything ────────────────────────────
-        "mov r15, rsp",     // r15 = user RSP  (callee-saved — safe to use here)
+        // ── switch to this CPU's syscall stack ──────────────────────────────
+        "swapgs",
+        "mov gs:[{user_rsp}], rsp",
+        "mov rsp, gs:[{kernel_rsp}]",
 
-        // ── switch to per-CPU kernel stack via KERNEL_GS_BASE MSR ────────────
-        //
-        // rdmsr destroys RAX (syscall id) and ECX (and thus the user RIP in RCX).
-        // We stash them in R12/R13 (callee-saved, not clobbered by SYSCALL CPU
-        // mechanism). We first save the *user's* R12/R13 in the callee-saved
-        // R14 temporarily, but R14 is also callee-saved so we need a plan:
-        //
-        // Simple safe approach — use the user stack (RSP still valid here) to
-        // push/pop two values, then switch.  We can't use the kernel stack yet.
-        // Push original R12/R13 onto user stack, do rdmsr, switch stack,
-        // then immediately pop them back from the user stack before losing RSP.
-        //
-        // BUT — we already saved user RSP in R15, so we can reconstruct it.
-        // Actually the cleanest approach: just save user R12/R13 first via the
-        // user stack, then they're safe, and we restore them after switching.
-        "push r12",         // save user R12 on user stack  (we'll recover via r15)
-        "push r13",         // save user R13 on user stack
-
-        "mov r12, rax",     // r12 = syscall id  (RAX, trashed by rdmsr)
-        "mov r13, rcx",     // r13 = user RIP    (RCX, trashed by rdmsr)
-
-        "mov ecx, 0xC0000102",  // MSR_KERNEL_GS_BASE
-        "rdmsr",                // edx:eax = stack top
-        "shl rdx, 32",
-        "or  rax, rdx",
-        "mov rsp, rax",         // RSP = top of this CPU's kernel stack
-
-        // Restore RAX and RCX from scratch registers.
-        "mov rax, r12",     // RAX = syscall id  (restored)
-        "mov rcx, r13",     // RCX = user RIP    (restored)
-
-        // Recover user R12/R13 from the user stack (r15 = user RSP before the
-        // two pushes, so user R13 is at r15-8 and user R12 at r15-16).
-        "mov r13, [r15 - 8]",   // user's original R13
-        "mov r12, [r15 - 16]",  // user's original R12
-
-        // ── save ALL user-mode registers onto the kernel stack ────────────────
-        "push r15",   // user RSP  (value before our 2 pushes above)
+        // ── save user state (16 pushes = 128 bytes; RSP stays 16-aligned) ──
+        "push qword ptr gs:[{user_rsp}]", // user RSP
         "push rcx",   // user RIP
         "push r11",   // user RFLAGS
-        "push rax",   // user RAX  (syscall ID)
+        "push rax",   // syscall id (slot discarded on return)
         "push rdi",
         "push rsi",
         "push rdx",
-        "push rcx",   // user RCX again (same as RIP; user expects it back)
         "push r8",
         "push r9",
         "push r10",
-        "push r11",   // user R11 again (same as RFLAGS)
         "push rbp",
         "push rbx",
-        "push r12",   // user R12 (original value, recovered above)
-        "push r13",   // user R13 (original value, recovered above)
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
 
         // ── save XMM6–XMM15 ─────────────────────────────────────────────────
         //
-        // These are Windows x64 ABI CALLEE-SAVED registers, but the Rust
-        // dispatcher below compiles to SysV, where XMM0–15 are ALL caller-
-        // saved / volatile.  Without this save, any float/SIMD work the
-        // dispatcher or something it calls does (and MSVC-generated CRT code
-        // like memcpy/memset uses XMM heavily) silently corrupts whatever the
-        // user-mode app was keeping in XMM6–15 across the call — the kind of
-        // rare, "random" corruption that looks like the loader is broken
-        // rather than a missing register save.
-        //
-        // 16 pushes above = 128 bytes, so RSP is still 16-aligned here
-        // (kernel stack top is 16-aligned).  `sub rsp, 160` (10 * 16 bytes)
-        // preserves that alignment, which `call` below requires.
+        // Callee-saved in the Windows x64 ABI but volatile in SysV, which the
+        // Rust dispatcher uses — without this, any SIMD work in the kernel
+        // (memcpy, formatting, ...) silently corrupts the app's XMM6–15.
+        // 10 × 16 bytes keeps RSP 16-aligned for the `call` below.
         "sub rsp, 160",
         "movaps [rsp + 0*16], xmm6",
         "movaps [rsp + 1*16], xmm7",
@@ -268,16 +227,12 @@ pub unsafe extern "C" fn syscall_entry() {
         "movaps [rsp + 8*16], xmm14",
         "movaps [rsp + 9*16], xmm15",
 
-        // ── build System V arg registers for syscall_dispatch ─────────────────
-        // Windows x64 calling convention on entry:
-        //   RAX=syscall_id, R10=arg0, RDX=arg1, R8=arg2, R9=arg3
-        // System V calling convention expected by Rust:
-        //   RDI=id, RSI=a0, RDX=a1, RCX=a2, R8=a3
-        "mov rcx, r8",    // a2 ← R8  (do before R8 is overwritten)
-        "mov r8,  r9",    // a3 ← R9
-        "mov rsi, r10",   // a0 ← R10
-        "mov rdi, rax",   // id ← RAX
-        // RDX is already a1 — no move needed
+        // ── Windows-style args → System V for syscall_dispatch ──────────────
+        //   RDI=id, RSI=a0, RDX=a1 (already), RCX=a2, R8=a3
+        "mov rcx, r8",
+        "mov r8,  r9",
+        "mov rsi, r10",
+        "mov rdi, rax",
         "call {dispatch}",
         // Return value is in RAX.
 
@@ -294,34 +249,71 @@ pub unsafe extern "C" fn syscall_entry() {
         "movaps xmm15, [rsp + 9*16]",
         "add rsp, 160",
 
-        // ── restore ALL user-mode registers ───────────────────────────────────
-        // Restore in reverse push order. Skip RAX (return value stays).
-        "pop r13",    // user R13
-        "pop r12",    // user R12
-        "pop rbx",    // user RBX
-        "pop rbp",    // user RBP
-        "pop r11",    // user R11 (temporary; real RFLAGS restored below)
-        "pop r10",    // user R10
-        "pop r9",     // user R9
-        "pop r8",     // user R8
-        "pop rcx",    // user RCX (temporary; real RIP restored below)
-        "pop rdx",    // user RDX
-        "pop rsi",    // user RSI
-        "pop rdi",    // user RDI
-        "add rsp, 8", // skip saved RAX (return value is already in RAX)
-
-        // ── restore SYSRET-critical registers and return to ring-3 ────────────
+        // ── restore user registers (reverse push order) ─────────────────────
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "add rsp, 8", // syscall id slot (RAX carries the return value)
         "pop r11",    // user RFLAGS → R11 (SYSRET loads RFLAGS from R11)
-        "pop rcx",    // user RIP   → RCX (SYSRET loads RIP    from RCX)
-        "pop rsp",    // user RSP   → RSP (restores the pre-push RSP from r15)
+        "pop rcx",    // user RIP    → RCX (SYSRET loads RIP    from RCX)
+
+        // SYSRET with a non-canonical RCX raises #GP *in ring 0* on Intel,
+        // on the user's stack. A user RIP can only have bit 47 set if the
+        // syscall instruction sat at the very top of the lower half.
+        "bt rcx, 47",
+        "jc 2f",
+
+        "swapgs",
+        "pop rsp",    // user RSP
         "sysretq",
 
-        dispatch     = sym syscall_dispatch,
+        "2:",
+        "and rsp, -16",
+        "call {bad_return}",
+        "ud2",
+
+        user_rsp   = const crate::smp::PERCPU_USER_RSP,
+        kernel_rsp = const crate::smp::PERCPU_KERNEL_RSP,
+        dispatch   = sym syscall_dispatch,
+        bad_return = sym syscall_bad_return,
     );
 }
 
-// Per-CPU stacks are now in smp::PERCPU_SYSCALL_STACKS.
-// The old single SYSCALL_KERNEL_STACK is removed.
+/// Reached instead of SYSRET when the saved user RIP is non-canonical.
+/// Kills the process the same way a fault would.
+extern "C" fn syscall_bad_return() -> ! {
+    crate::serial_println!("[SYSCALL] non-canonical return RIP — terminating process");
+    if let Some(proc) = crate::process::PROCESSOR.lock().get_active() {
+        proc.terminate(-1);
+    }
+    USER_PROCESS_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+    unsafe { crate::loader::return_from_usermode() }
+}
+
+/// Read argument `index` (0-based) of the Win32 call currently being handled
+/// on this CPU, for arguments the Windows x64 ABI passes on the stack
+/// (`index >= 4`). Returns `None` for register arguments or an unreadable
+/// stack slot.
+///
+/// At the `syscall` in our IAT thunk, `[rsp]` is the app's return address,
+/// followed by the 32-byte shadow space, so arg 4 is at `rsp + 0x28`, arg 5
+/// at `rsp + 0x30`, and so on.
+pub fn syscall_stack_arg(index: usize) -> Option<u64> {
+    if index < 4 { return None; }
+    let rsp = crate::smp::current_syscall_user_rsp();
+    let addr = rsp.checked_add(0x28 + (index as u64 - 4) * 8)?;
+    if !crate::memory::user_ptr_ok(addr, 8) { return None; }
+    Some(unsafe { core::ptr::read_unaligned(addr as *const u64) })
+}
 
 /// Pure Rust syscall dispatcher — called from the naked stub above with a valid
 /// kernel stack.  Arguments follow Windows x64 ABI (rescued by thunk + asm):

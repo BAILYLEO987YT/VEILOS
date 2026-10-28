@@ -168,6 +168,17 @@ async fn hw_init() {
     let mut command_port = Port::<u8>::new(0x64);
     let mut data_port    = Port::<u8>::new(0x60);
 
+    // 0. Mask IRQ12 for the whole init. Firmware may have left it unmasked,
+    //    and if the mouse ISR runs during init it reads port 0x60 itself and
+    //    swallows every ACK/self-test byte this sequence is polling for.
+    //    Interrupts must be off while PICS is held: the timer ISR takes the
+    //    same lock for its EOI and would spin forever on this CPU.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let mut pics = crate::interrupts::PICS.lock();
+        let masks = pics.read_masks();
+        pics.write_masks(masks[0], masks[1] | 0x10);
+    });
+
     unsafe {
         // 1. Disable both PS/2 ports for a clean slate.
         crate::serial_println!("[MOUSE] Disabling PS/2 ports...");
@@ -185,14 +196,16 @@ async fn hw_init() {
     // Yield so gui_refresh_task gets a tick while we pause between steps.
     crate::interrupts::SleepFuture::new(5).await;
 
-    unsafe {
+    let config = unsafe {
         // 3. Read, patch, and write the Controller Configuration Byte.
         crate::serial_println!("[MOUSE] Reading controller config...");
         wait_input();
         command_port.write(0x20); // Request config byte
         let config_raw = mouse_read_logged("config byte");
-        // Enable IRQ1 (keyboard) + IRQ12 (mouse), clear port-disable bits.
-        let config = (config_raw | 0x03) & !0x30;
+        // Enable IRQ1 (keyboard), clear both port-disable bits. The mouse
+        // IRQ bit stays OFF until init is finished (step 9) so ACK bytes are
+        // left in the output buffer for the polling reads below.
+        let config = (config_raw | 0x01) & !0x32;
 
         wait_input();
         command_port.write(0x60); // Write config byte
@@ -204,7 +217,8 @@ async fn hw_init() {
         crate::serial_println!("[MOUSE] Enabling mouse port...");
         wait_input();
         command_port.write(0xA8);
-    }
+        config
+    };
 
     crate::interrupts::SleepFuture::new(5).await;
 
@@ -253,10 +267,23 @@ async fn hw_init() {
     // 9. Unmask IRQ12 in the PIC now that the device is fully configured.
     //    Doing this last prevents spurious interrupts during init.
     unsafe {
+        // Turn on the controller's mouse IRQ (config bit 1) first. Reuse the
+        // byte from step 3 rather than re-reading it: with the keyboard IRQ
+        // live, the keyboard ISR would consume the 0x20 response byte.
+        let mut command_port = Port::<u8>::new(0x64);
+        let mut data_port    = Port::<u8>::new(0x60);
+        wait_input();
+        command_port.write(0x60);
+        wait_input();
+        data_port.write(config | 0x02);
+        crate::serial_println!("[MOUSE] Mouse IRQ enabled: config -> {:#04X}", config | 0x02);
+    }
+    // Interrupts off while PICS is held — see step 0.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         let mut pics = crate::interrupts::PICS.lock();
         let masks = pics.read_masks();
         pics.write_masks(masks[0], masks[1] & !0x10);
-    }
+    });
 
     crate::serial_println!("[MOUSE] PS/2 init complete. IRQ12 unmasked.");
 }

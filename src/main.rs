@@ -188,26 +188,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Set up GDT and TSS for Double Fault handling
     gdt::init();
 
-    // ── Enable SSE / SSE2 for user-mode code ───────────────────────────────────────
-    // Every MSVC-compiled binary uses SSE (XORPS, MOVUPS) to zero structs.
-    // CR4.OSFXSR (bit 9) must be set or the CPU raises #UD on those instructions.
-    // CR4.OSXMMEXCPT (bit 10) lets the OS field SIMD FP faults cleanly.
-    // CR0.EM (bit 2) must be CLEAR; CR0.TS (bit 3) cleared to avoid #NM.
-    unsafe {
-        core::arch::asm!(
-            "mov rax, cr4",
-            "or  rax, {cr4_bits}",
-            "mov cr4, rax",
-            "mov rax, cr0",
-            "and rax, {cr0_mask}",
-            "mov cr0, rax",
-            cr4_bits = const (1u64 << 9) | (1u64 << 10),
-            cr0_mask = const !((1u64 << 2) | (1u64 << 3)),
-            out("rax") _,
-            options(nostack),
-        );
-        core::arch::asm!("fninit", options(nostack, nomem));
-    }
+    // Enable SSE on the BSP (APs do the same in smp::ap_entry).
+    crate::smp::enable_sse();
     crate::serial_println!("[INIT] SSE enabled (CR4.OSFXSR+OSXMMEXCPT, CR0.EM/TS cleared)");
 
     // Set up IDT and Hardware Interrupts (PIC)

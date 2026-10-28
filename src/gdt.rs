@@ -154,9 +154,8 @@ pub fn init() {
         SS::set_reg(selectors.kernel_data_selector);
         load_tss(selectors.tss_selector);
     }
-    // Point KERNEL_GS_BASE at BSP's syscall stack top so syscall_entry
-    // can find it with a single rdmsr — no LAPIC probe needed.
-    crate::smp::set_cpu_syscall_stack(0);
+    // Set up the BSP's per-CPU block (KERNEL_GS_BASE → block, for swapgs).
+    crate::smp::init_percpu(0);
 }
 
 /// Load a per-AP GDT and TSS for `cpu_index`.
@@ -208,8 +207,8 @@ pub fn init_ap(cpu_index: usize) {
         SS::set_reg(kernel_ds);
         load_tss(tss_sel);
     }
-    // Point this AP's KERNEL_GS_BASE at its own syscall stack.
-    crate::smp::set_cpu_syscall_stack(cpu_index);
+    // Set up this AP's per-CPU block (KERNEL_GS_BASE → block, for swapgs).
+    crate::smp::init_percpu(cpu_index);
 }
 
 /// Force the CPU to transition from Ring 0 (Kernel) to Ring 3 (User).

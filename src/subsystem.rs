@@ -795,8 +795,8 @@ impl Subsystem for WindowsSubsystem {
 
             // CreateWindowExA/W (0x2002)
             // After the ABI fix: arg0=dwExStyle, arg1=lpClassName, arg2=lpWindowName, arg3=dwStyle
-            // x/y/w/h are stack args (args 5–8) we can't reach via 4-arg syscall interface.
-            // We default to a sensible 800×600 centred window and read the title from arg2.
+            // x/y/w/h are stack args 4–7, read via interrupts::syscall_stack_arg().
+            // (falls back to 100,100 / 800×600 for CW_USEDEFAULT).
             0x2002 => win32_user::dispatch_win32_user_syscall(0x4001, arg0, arg1, arg2, arg3),
 
             // ShowWindow (0x2003): arg0=hwnd, arg1=nCmdShow

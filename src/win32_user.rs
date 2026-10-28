@@ -1045,13 +1045,22 @@ pub fn dispatch_win32_user_syscall(syscall_id: u64, arg0: u64, arg1: u64, arg2: 
                 class_name, title, wnd_proc
             );
 
-            // Default position and size — x/y/w/h are unreachable stack args.
-            // 800×600 is a safe visible default; a real CW_USEDEFAULT cascade
-            // would tile windows, but that requires the full WM to be wired up.
-            let x = 100i32;
-            let y = 100i32;
-            let w = 800u32;
-            let h = 600u32;
+            // X, Y, nWidth, nHeight are stack args 4–7. Each is a 32-bit int
+            // in a 64-bit slot (upper half is garbage). CW_USEDEFAULT, or an
+            // unreadable stack, falls back to 100,100 / 800×600 — a real
+            // CW_USEDEFAULT cascade needs the full WM wired up.
+            const CW_USEDEFAULT: i32 = i32::MIN; // 0x80000000
+            let stack_i32 = |i: usize| crate::interrupts::syscall_stack_arg(i).map(|v| v as u32 as i32);
+            let (x, y) = match (stack_i32(4), stack_i32(5)) {
+                (Some(x), Some(y)) if x != CW_USEDEFAULT => (x, y),
+                _ => (100, 100),
+            };
+            let (w, h) = match (stack_i32(6), stack_i32(7)) {
+                (Some(w), Some(h)) if w != CW_USEDEFAULT && w > 0 && h > 0 =>
+                    ((w as u32).min(4096), (h as u32).min(4096)),
+                _ => (800, 600),
+            };
+            crate::serial_println!("[WIN32]   rect from stack args: x={} y={} w={} h={}", x, y, w, h);
             let style    = arg3 as u32;
             let ex_style = arg0 as u32;
 
