@@ -944,7 +944,7 @@ impl VirtDisk {
                 println!("[VIRTDISK] READ {} sector(s) @ LBA {}", count, lba);
 
                 // Read the file from the VFS and slice out the requested range.
-                let vfs = crate::vfs::VFS.lock();
+                let vfs = &crate::vfs::VFS;
                 match vfs.read_file(&self.vfs_path) {
                     Ok(data) => {
                         let start = byte_offset as usize;
@@ -1054,7 +1054,7 @@ impl VirtDevice for VirtDisk {
                         println!("[VIRTDISK] WRITE flush: {} bytes @ LBA {}", data.len(), lba);
                         // Best-effort: read the full file, splice in the new
                         // sectors, and write it back.
-                        let vfs = crate::vfs::VFS.lock();
+                        let vfs = &crate::vfs::VFS;
                         let mut file_data = vfs.read_file(&self.vfs_path).unwrap_or_default();
                         let start = (lba * 512) as usize;
                         if file_data.len() < start + data.len() {

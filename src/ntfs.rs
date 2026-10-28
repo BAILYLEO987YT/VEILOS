@@ -16,9 +16,6 @@
 use alloc::vec::Vec;
 use alloc::string::String;
 use crate::vfs::{BlockDevice, FileSystem, DirEntry, FileType, VfsError};
-use crate::ahci::HbaPort;
-use crate::println;
-use x86_64::VirtAddr;
 
 // -----| Constants |-----
 
@@ -807,82 +804,32 @@ impl FileSystem for NtfsFileSystem {
 // -----| Detection and mounting |-----
 // =====================================================================
 
-/// Probe for an NTFS volume on AHCI port `port`.
-///
-/// Reads the first sector, checks the NTFS OEM ID, then parses the boot
-/// sector to derive the filesystem parameters and mounts the volume to
-/// the VFS root ("/").  Silently returns if the volume is not NTFS.
-pub fn probe_ntfs(
-    port:                    &mut HbaPort,
-    physical_memory_offset:  VirtAddr,
-    partition_lba:           u64,
-) {
-    // Sector buffer the HBA DMAs into: below 4 GiB, kept for the mount's lifetime.
-    let (buf_phys, _) = crate::memory::DmaRegion::new(4096).expect("No DMA memory for NTFS probe").leak();
-    let buf_virt   = physical_memory_offset.as_u64() + buf_phys;
-
-    if !port.read_sectors(partition_lba, 1, buf_phys, physical_memory_offset) {
-        return;
-    }
-
-    let raw = unsafe { core::slice::from_raw_parts(buf_virt as *const u8, 512) };
+/// Recognise an NTFS volume on `device`. `block::mount_disk` mounts it.
+pub fn detect(device: &dyn BlockDevice) -> Option<alloc::boxed::Box<dyn FileSystem>> {
+    const _: () = assert!(core::mem::size_of::<NtfsBootSector>() <= 512);
+    let raw = crate::block::read_boot_sector(device)?;
 
     // Must have the NTFS OEM ID at offset 3
-    if &raw[3..11] != NTFS_OEM_ID {
-        return;
-    }
+    if &raw[3..11] != NTFS_OEM_ID { return None; }
 
-    let bpb = unsafe { &*(buf_virt as *const NtfsBootSector) };
-
-    let bytes_per_sector    = bpb.bytes_per_sector    as u32;
-    let sectors_per_cluster = bpb.sectors_per_cluster as u32;
+    let bpb = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const NtfsBootSector) };
+    let bytes_per_sector    = { bpb.bytes_per_sector } as u32;
+    let sectors_per_cluster = { bpb.sectors_per_cluster } as u32;
     let bytes_per_cluster   = bytes_per_sector * sectors_per_cluster;
 
     // If clusters_per_mft_rec < 0, record size = 2^(-clusters_per_mft_rec).
     // Otherwise, record size = clusters_per_mft_rec * bytes_per_cluster.
-    let mft_record_size = if bpb.clusters_per_mft_rec < 0 {
-        1u32 << (-(bpb.clusters_per_mft_rec as i32) as u32)
+    let per_rec = { bpb.clusters_per_mft_rec };
+    let mft_record_size = if per_rec < 0 {
+        1u32 << (-(per_rec as i32) as u32)
     } else {
-        bpb.clusters_per_mft_rec as u32 * bytes_per_cluster
+        per_rec as u32 * bytes_per_cluster
     };
-
-    println!("\n  -> NTFS File System Detected!");
-    println!("     - Bytes/Sector: {}", bytes_per_sector);
-    println!("     - Sectors/Cluster: {}", sectors_per_cluster);
-    let mft_lcn = bpb.mft_lcn;
-    println!("     - MFT LCN: {}", mft_lcn);
-    println!("     - MFT Record Size: {} bytes", mft_record_size);
-
-    let fs = NtfsFileSystem {
+    Some(alloc::boxed::Box::new(NtfsFileSystem {
         bytes_per_sector,
         sectors_per_cluster,
         bytes_per_cluster,
-        mft_lcn: bpb.mft_lcn,
+        mft_lcn: { bpb.mft_lcn },
         mft_record_size,
-    };
-
-    let device = crate::ahci::AhciBlockDevice {
-        port: port as *mut HbaPort,
-        physical_memory_offset,
-        bounce_buffer_phys: buf_phys,
-        partition_lba,
-    };
-
-    use alloc::boxed::Box;
-    let mut vfs = crate::vfs::VFS.lock();
-    vfs.mount(
-        alloc::string::String::from("/"),
-        Box::new(fs),
-        Box::new(device),
-    );
-
-    println!("     - Mounted NTFS to root (/)");
-
-    // Quick sanity check: try to list the root directory.
-    if let Ok(entries) = vfs.list_dir("/") {
-        println!("     - Root entries: {}", entries.len());
-        for e in entries.iter().take(5) {
-            println!("       {:?}  {}", e.file_type, e.name);
-        }
-    }
+    }))
 }

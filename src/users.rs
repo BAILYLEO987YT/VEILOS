@@ -335,7 +335,7 @@ impl UserDatabase {
     /// Load users from /etc/users.vdb.  If the file is missing, seed a
     /// default root account with no password so first boot works.
     pub fn load(&mut self) {
-        let vfs = crate::vfs::VFS.lock();
+        let vfs = &crate::vfs::VFS;
         match vfs.read_file(USERS_VDB_PATH) {
             Ok(bytes) => {
                 let text = core::str::from_utf8(&bytes).unwrap_or("");
@@ -360,7 +360,7 @@ impl UserDatabase {
 
     /// Persist the database back to /etc/users.vdb.
     pub fn save(&self) {
-        let vfs = crate::vfs::VFS.lock();
+        let vfs = &crate::vfs::VFS;
         let _ = self.save_unlocked(&vfs);
     }
 
@@ -478,7 +478,7 @@ impl Session {
         println!("[SESSION] Logged in as '{}'", username);
 
         // Save last-user preference.
-        let _ = crate::vfs::VFS.lock().write_file(LAST_USER_PATH, username.as_bytes());
+        let _ = crate::vfs::VFS.write_file(LAST_USER_PATH, username.as_bytes());
 
         // Apply capability profile for this user.
         let caps = USER_DB.lock().capability_set_for(username);
@@ -488,7 +488,7 @@ impl Session {
 
         // Create home directory if it doesn't exist.
         let home = alloc::format!("/home/{}/.keep", username);
-        let _ = crate::vfs::VFS.lock().write_file(&home, b"");
+        let _ = crate::vfs::VFS.write_file(&home, b"");
     }
 
     pub fn logout(&mut self) {

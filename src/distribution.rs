@@ -187,7 +187,7 @@ impl Installer {
                         "/etc/settings.vdb",
                     ];
 
-                    let vfs = crate::vfs::VFS.lock();
+                    let vfs = &crate::vfs::VFS;
                     for path in &check_paths {
                         match vfs.read_file(path) {
                             Ok(data) => {
@@ -370,7 +370,7 @@ impl UpdateSystem {
 
         // ---- Step 1: local VFS manifest --------------------------------
         let manifest_bytes = {
-            let vfs = crate::vfs::VFS.lock();
+            let vfs = &crate::vfs::VFS;
             vfs.read_file("/etc/update_manifest.vdb").ok()
         };
 
@@ -563,7 +563,7 @@ impl UpdateSystem {
             manifest.version.minor,
             manifest.version.patch);
         {
-            let vfs = crate::vfs::VFS.lock();
+            let vfs = &crate::vfs::VFS;
             let _ = vfs.write_file("/etc/version", version_str.as_bytes());
         }
 

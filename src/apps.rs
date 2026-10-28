@@ -158,7 +158,7 @@ impl TextEditorState {
 
         let save_rect = Rect::new(cx + cw as i32 - 70, cy + 4, 60, 20);
         if save_rect.contains(x, y) {
-            match crate::vfs::VFS.lock().write_file(&self.path, self.content.as_bytes()) {
+            match crate::vfs::VFS.write_file(&self.path, self.content.as_bytes()) {
                 Ok(_) => { notify(NotifCategory::Success, "SAVED", &self.path); },
                 Err(_) => { notify(NotifCategory::Warning, "ERROR", "Could not save file"); },
             }
@@ -456,7 +456,7 @@ impl FileManagerState {
         if self.cwd != "/" {
             self.entries.push(FileEntry { name: String::from(".."), size: 0, is_dir: true });
         }
-        match VFS.lock().list_dir(&self.cwd) {
+        match VFS.list_dir(&self.cwd) {
             Ok(list) => {
                 for e in list {
                     self.entries.push(FileEntry {
@@ -708,7 +708,7 @@ pub fn open_file_absolute(path: &str, name: &str) {
         }
 
         // Read the file contents.
-        let data = match crate::vfs::VFS.lock().read_file(path) {
+        let data = match crate::vfs::VFS.read_file(path) {
             Ok(bytes) => bytes,
             Err(_) => {
                 notify(
@@ -1758,7 +1758,7 @@ pub fn init() {
 /// Load and execute /config.vsh, then fire the 'start' event.
 /// Called exactly once from gui_refresh_task() after the VFS is mounted.
 pub fn load_config_vsh() {
-    let config_bytes = crate::vfs::VFS.lock().read_file("/config.vsh");
+    let config_bytes = crate::vfs::VFS.read_file("/config.vsh");
     match config_bytes {
         Ok(bytes) => {
             match core::str::from_utf8(&bytes) {

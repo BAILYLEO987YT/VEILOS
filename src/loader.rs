@@ -100,7 +100,7 @@ fn load_and_spawn_pe_inner(
     crate::serial_println!("\n[LOADER] >>> LOADING WINDOWS EXECUTABLE: {}", path);
 
     // 1. Read binary data from VFS
-    let data = match VFS.lock().read_file(path) {
+    let data = match VFS.read_file(path) {
         Ok(d) => d,
         Err(_) => return Err("Failed to read PE file from VFS"),
     };
@@ -1273,7 +1273,7 @@ fn resolve_imports(
         // 1. Load the DLL binary
         // We look in /SYSTEM/ for the DLL.
         let dll_path = alloc::format!("/SYSTEM/{}", dll_info.name);
-        let dll_data_opt = VFS.lock().read_file(&dll_path);
+        let dll_data_opt = VFS.read_file(&dll_path);
         
         if let Ok(dll_data) = dll_data_opt {
             // --- REAL DLL LOADING PATH ---

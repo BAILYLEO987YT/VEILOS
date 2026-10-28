@@ -285,7 +285,7 @@ impl CertStore {
 
     /// Load all .der files from a VFS directory into the store.
     pub fn load_from_vfs(&mut self, dir: &str) {
-        let entries = match crate::vfs::VFS.lock().list_dir(dir) {
+        let entries = match crate::vfs::VFS.list_dir(dir) {
             Ok(e)  => e,
             Err(_) => {
                 println!("[TLS] No certificate directory at {} — trust-all mode.", dir);
@@ -302,7 +302,7 @@ impl CertStore {
                 alloc::format!("{}/{}", dir, entry.name)
             };
 
-            let data = match crate::vfs::VFS.lock().read_file(&path) {
+            let data = match crate::vfs::VFS.read_file(&path) {
                 Ok(d)  => d,
                 Err(_) => continue,
             };

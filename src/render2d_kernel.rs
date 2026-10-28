@@ -106,7 +106,7 @@ const MAX_FONT_BYTES: u64 = 8 * 1024 * 1024;
 /// logs one serial line per file.
 pub fn load_fonts() -> (usize, usize) {
     let entries = {
-        let vfs = crate::vfs::VFS.lock();
+        let vfs = &crate::vfs::VFS;
         vfs.list_dir(FONT_DIR)
     };
     let entries = match entries {
@@ -130,7 +130,7 @@ pub fn load_fonts() -> (usize, usize) {
         }
         let path = format!("{}/{}", FONT_DIR, e.name);
         let bytes = {
-            let vfs = crate::vfs::VFS.lock();
+            let vfs = &crate::vfs::VFS;
             vfs.read_file(&path)
         };
         let bytes = match bytes {

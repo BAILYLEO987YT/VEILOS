@@ -13,10 +13,7 @@
 //   - Sector/cluster sizes are encoded as power-of-2 shifts.
 // =====================================================================
 
-use crate::ahci::HbaPort;
-use crate::println;
 use crate::vfs::{BlockDevice, FileSystem, DirEntry, FileType, VfsError};
-use x86_64::VirtAddr;
 use alloc::vec::Vec;
 use alloc::string::String;
 
@@ -356,97 +353,27 @@ impl FileSystem for ExFatFileSystem {
 // -----| detection and mounting |-----
 // =====================================================================
 
-/// Probe for an exFAT volume on the given AHCI port.
-///
-/// Checks the "EXFAT   " OEM ID at bytes 3-10 of the boot sector.
-pub fn probe_exfat(
-    port: &mut HbaPort,
-    physical_memory_offset: VirtAddr,
-    partition_lba: u64,
-) {
-    // Sector buffer the HBA DMAs into: below 4 GiB, kept for the mount's lifetime.
-    let (buffer_phys, _) = crate::memory::DmaRegion::new(4096).expect("No DMA memory for exFAT probe").leak();
-    let buffer_virt = physical_memory_offset.as_u64() + buffer_phys;
+/// Recognise an exFAT volume on `device`. `block::mount_disk` mounts it.
+pub fn detect(device: &dyn BlockDevice) -> Option<alloc::boxed::Box<dyn FileSystem>> {
+    const _: () = assert!(core::mem::size_of::<ExFatBootSector>() <= 512);
+    let raw = crate::block::read_boot_sector(device)?;
 
-    if !port.read_sectors(partition_lba, 1, buffer_phys, physical_memory_offset) {
-        return;
-    }
+    // Check for "EXFAT   " at offset 3, and the boot signature at 0x1FE.
+    if &raw[3..11] != EXFAT_OEM_ID { return None; }
+    if u16::from_le_bytes([raw[0x1FE], raw[0x1FF]]) != 0xAA55 { return None; }
 
-    let raw = unsafe { core::slice::from_raw_parts(buffer_virt as *const u8, 512) };
-
-    // Check for "EXFAT   " at offset 3
-    if &raw[3..11] != EXFAT_OEM_ID {
-        return;
-    }
-
-    // Boot signature at 0x1FE must be 0xAA55.
-    let boot_sig = u16::from_le_bytes([raw[0x1FE], raw[0x1FF]]);
-    if boot_sig != 0xAA55 { return; }
-
-    let bpb = unsafe { &*(buffer_virt as *const ExFatBootSector) };
-
-    // Extract fields safely (packed struct).
-    let bps_shift  = { bpb.bytes_per_sector_shift };
-    let spc_shift  = { bpb.sectors_per_cluster_shift };
+    let bpb = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const ExFatBootSector) };
+    let bps_shift = { bpb.bytes_per_sector_shift };
+    let spc_shift = { bpb.sectors_per_cluster_shift };
     let bytes_per_sector    = 1u32 << bps_shift;
     let sectors_per_cluster = 1u32 << spc_shift;
-    let bytes_per_cluster   = bytes_per_sector * sectors_per_cluster;
-    let fat_offset          = { bpb.fat_offset };
-    let cluster_heap_offset = { bpb.cluster_heap_offset };
-    let cluster_count       = { bpb.cluster_count };
-    let root_cluster        = { bpb.first_cluster_of_root_dir };
-
-    println!("\n  -> exFAT File System Detected!");
-    println!("     - Bytes/Sector: {}", bytes_per_sector);
-    println!("     - Sectors/Cluster: {}", sectors_per_cluster);
-    println!("     - Root Cluster: {}", root_cluster);
-
-    let fs = ExFatFileSystem {
+    Some(alloc::boxed::Box::new(ExFatFileSystem {
         bytes_per_sector,
         sectors_per_cluster,
-        bytes_per_cluster,
-        fat_offset,
-        cluster_heap_offset,
-        cluster_count,
-        root_cluster,
-    };
-
-    let device = crate::ahci::AhciBlockDevice {
-        port: port as *mut HbaPort,
-        physical_memory_offset,
-        bounce_buffer_phys: buffer_phys,
-        partition_lba,
-    };
-
-    use alloc::boxed::Box;
-    let mut vfs = crate::vfs::VFS.lock();
-
-    vfs.mount(
-        String::from("/"),
-        Box::new(fs),
-        Box::new(device),
-    );
-
-    println!("  -> Mounted exFAT to root (/)");
-
-    // Quick verify
-    if let Ok(content) = vfs.read_file("/HELLO.TXT") {
-        let s = core::str::from_utf8(&content).unwrap_or("[Binary]");
-        println!("     - /HELLO.TXT: \"{}\"", s.trim_matches(char::from(0)));
-    } else {
-        println!("     - /HELLO.TXT: not found");
-    }
-
-    match vfs.list_dir("/") {
-        Ok(entries) => {
-            println!("     - Root dir: {} entries", entries.len());
-            for e in &entries {
-                println!("       {} {}",
-                    if e.file_type == FileType::Directory { "D" } else { "F" },
-                    e.name,
-                );
-            }
-        }
-        Err(e) => println!("     - Root dir listing FAILED: {:?}", e),
-    }
+        bytes_per_cluster: bytes_per_sector * sectors_per_cluster,
+        fat_offset: { bpb.fat_offset },
+        cluster_heap_offset: { bpb.cluster_heap_offset },
+        cluster_count: { bpb.cluster_count },
+        root_cluster: { bpb.first_cluster_of_root_dir },
+    }))
 }

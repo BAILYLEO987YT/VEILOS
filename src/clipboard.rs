@@ -320,13 +320,13 @@ impl ClipboardManager {
                 _ => {}
             }
         }
-        let _ = crate::vfs::VFS.lock().write_file(&self.storage_path, &buf);
+        let _ = crate::vfs::VFS.write_file(&self.storage_path, &buf);
     }
 
     /// Load persisted entries from disk on boot.
     pub fn load_persisted(&mut self) {
         if self.storage_path.is_empty() { return; }
-        let data = match crate::vfs::VFS.lock().read_file(&self.storage_path) {
+        let data = match crate::vfs::VFS.read_file(&self.storage_path) {
             Ok(d) => d,
             Err(_) => return,
         };
@@ -507,10 +507,10 @@ fn clipboard_paste_idx(opt_idx: Option<usize>) {
                 } else {
                     format!("{}/{}", dest_dir, file_name)
                 };
-                let data = match crate::vfs::VFS.lock().read_file(src_path) {
+                let data = match crate::vfs::VFS.read_file(src_path) {
                     Ok(d) => d, Err(_) => continue,
                 };
-                let _ = crate::vfs::VFS.lock().write_file(&dest_path, &data);
+                let _ = crate::vfs::VFS.write_file(&dest_path, &data);
                 // For cut, we'd delete source but VFS has no delete_file yet.
                 let _ = is_cut;
             }

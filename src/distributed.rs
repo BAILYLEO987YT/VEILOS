@@ -1664,7 +1664,7 @@ impl DistributedFs {
         match msg_type {
             MessageType::DfsReadRequest => {
                 let path = core::str::from_utf8(payload).unwrap_or("/");
-                match crate::vfs::VFS.lock().read_file(path) {
+                match crate::vfs::VFS.read_file(path) {
                     Ok(data) => {
                         let mut resp = vec![0u8; 4];
                         resp.extend_from_slice(&data);
@@ -1683,7 +1683,7 @@ impl DistributedFs {
                 }
                 let path = core::str::from_utf8(&payload[2..2+path_len]).unwrap_or("/");
                 let data = &payload[2+path_len..];
-                match crate::vfs::VFS.lock().write_file(path, data) {
+                match crate::vfs::VFS.write_file(path, data) {
                     Ok(_)  => encode_message(MessageType::DfsWriteResponse, &[0,0,0,0]),
                     Err(_) => encode_message(MessageType::DfsWriteResponse, &[1,0,0,0]),
                 }
@@ -1989,7 +1989,7 @@ fn handle_task_capsule(payload: &[u8]) -> crate::task_capsule::TaskResult {
                         "/tmp/job_{:#x}/{}",
                         capsule.job_id, filename
                     );
-                    let _ = crate::vfs::VFS.lock().write_file(&local_path, &data);
+                    let _ = crate::vfs::VFS.write_file(&local_path, &data);
                     crate::serial_println!(
                         "[DIST/CAPSULE] Fetched asset {} -> {}",
                         asset_path, local_path
@@ -2479,7 +2479,7 @@ impl CloudVmManager {
 
         // Write image to the local VFS so the hypervisor can boot from it.
         let local_path = alloc::format!("/{}", image_name);
-        crate::vfs::VFS.lock()
+        crate::vfs::VFS
             .write_file(&local_path, &image_data)
             .map_err(|_| CloudVmError::StorageError)?;
 

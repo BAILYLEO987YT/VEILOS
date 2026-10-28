@@ -167,51 +167,15 @@ fn setup_port(
         let model_str = core::str::from_utf8(&model).unwrap_or("Unknown Model");
         println!("     - Model: {}", model_str.trim());
 
-        // Read Sector 0 to check for MBR vs VBR
-        let Some(sector0) = crate::memory::DmaRegion::new(512) else {
-            crate::serial_println!("[AHCI] Port {}: no DMA memory for sector 0.", port_num);
-            return;
-        };
-        let mut partition_lba = 0;
-
-        if port.read_sectors(0, 1, sector0.phys(), physical_memory_offset) {
-            let bytes = unsafe { core::slice::from_raw_parts(sector0.as_mut_ptr::<u8>() as *const u8, 512) };
-            
-            let is_vbr = (bytes[0] == 0xEB && bytes[2] == 0x90) || bytes[0] == 0xE9;
-            let boot_sig = (bytes[511] as u16) << 8 | (bytes[510] as u16);
-            
-            if !is_vbr && boot_sig == 0xAA55 {
-                // Parse partition table
-                let p1_type = bytes[450];
-                if p1_type != 0x00 { // Valid partition
-                    let lba = (bytes[454] as u32) 
-                        | ((bytes[455] as u32) << 8)
-                        | ((bytes[456] as u32) << 16)
-                        | ((bytes[457] as u32) << 24);
-                    partition_lba = lba as u64;
-                    crate::println!("     - Found MBR Partition: LBA {}", partition_lba);
-                }
-            } else if is_vbr {
-                crate::println!("     - Found VBR (Superfloppy format)");
-            }
-        }
-
-        // Probe filesystems — stop at the first successful mount so two
-        // drivers never claim the same block device simultaneously.
-        // Order: NTFS → exFAT → FAT32 → FAT16 (most-to-least common).
-        crate::ntfs::probe_ntfs(port, physical_memory_offset, partition_lba);
-        if crate::vfs::VFS.lock().mounts.is_empty() {
-            crate::exfat::probe_exfat(port, physical_memory_offset, partition_lba);
-        }
-        if crate::vfs::VFS.lock().mounts.is_empty() {
-            crate::fat32::probe_fat32(port, physical_memory_offset, partition_lba);
-        }
-        if crate::vfs::VFS.lock().mounts.is_empty() {
-            crate::fat16::probe_fat16(port, physical_memory_offset, partition_lba);
-        }
-
-        if crate::vfs::VFS.lock().mounts.is_empty() {
-            crate::println!("[WARN] NO FILESYSTEM MOUNTED ON AHCI DISK!");
+        // Hand the port to the block layer: one shared, locked device per
+        // disk. It reads the partition table and mounts every filesystem it
+        // recognises (block::mount_disk). This used to read only MBR entry 1
+        // and stop probing once anything was mounted, so a second partition
+        // or disk was never seen.
+        let port_static: &'static mut HbaPort = unsafe { &mut *(port as *mut HbaPort) };
+        match crate::block::Disk::new(port_static, port_num, sectors) {
+            Some(disk) => crate::block::mount_disk(disk),
+            None => crate::serial_println!("[AHCI] Port {}: no DMA memory for the disk buffer.", port_num),
         }
     }
 }
@@ -266,109 +230,6 @@ pub struct HbaPort {
     pub fis_switch_control: Volatile<u32>,
     pub reserved1: [Volatile<u32>; 11],
     pub vendor: [Volatile<u32>; 4],
-}
-
-pub struct AhciBlockDevice {
-    pub port: *mut HbaPort,
-    pub physical_memory_offset: VirtAddr,
-    pub bounce_buffer_phys: u64,
-    pub partition_lba: u64,
-}
-
-unsafe impl Send for AhciBlockDevice {}
-unsafe impl Sync for AhciBlockDevice {}
-
-impl crate::vfs::BlockDevice for AhciBlockDevice {
-    /// Read `count` sectors starting at `lba` into the buffer at virtual
-    /// address `buffer_virt`.
-    ///
-    /// The callers (FAT32, NTFS, etc.) pass heap / stack virtual addresses
-    /// as the destination buffer.  AHCI DMA, however, requires *physical*
-    /// addresses.  We solve this with a bounce buffer: allocate a physical
-    /// frame, let the DMA engine write into it, then memcpy the data to the
-    /// caller's virtual buffer.  One frame (4 KiB) holds 8 sectors, so we
-    /// loop in 8-sector chunks when `count` is larger.
-    fn read_sectors(&self, lba: u64, count: u32, buffer_virt: u64) -> bool {
-        let port_mut = unsafe { &mut *self.port };
-
-        // Maximum sectors per bounce iteration (4 KiB frame = 8 × 512).
-        const SECTORS_PER_FRAME: u32 = 8;
-
-        let mut remaining = count;
-        let mut cur_lba   = lba;
-        let mut dst       = buffer_virt;
-
-        while remaining > 0 {
-            let chunk = remaining.min(SECTORS_PER_FRAME);
-            let bytes = (chunk as usize) * 512;
-
-            // Reuse the pre-allocated bounce frame.
-            let phys = self.bounce_buffer_phys;
-
-            // DMA into the physical frame.
-            if !port_mut.read_sectors(cur_lba + self.partition_lba, chunk, phys, self.physical_memory_offset) {
-                return false;
-            }
-
-            // Copy from the physical frame (accessed via the direct map) to
-            // the caller's virtual buffer.
-            let src_virt = self.physical_memory_offset.as_u64() + phys;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src_virt as *const u8,
-                    dst as *mut u8,
-                    bytes,
-                );
-            }
-
-            cur_lba   += chunk as u64;
-            dst       += bytes as u64;
-            remaining -= chunk;
-        }
-
-        true
-    }
-
-    fn write_sectors(&self, lba: u64, count: u32, buffer_virt: u64) -> bool {
-        let port_mut = unsafe { &mut *self.port };
-
-        // Maximum sectors per bounce iteration — one 4 KiB frame = 8 × 512-byte sectors.
-        const SECTORS_PER_FRAME: u32 = 8;
-
-        let mut remaining = count;
-        let mut cur_lba   = lba;
-        let mut src       = buffer_virt;
-
-        while remaining > 0 {
-            let chunk = remaining.min(SECTORS_PER_FRAME);
-            let bytes = (chunk as usize) * 512;
-
-            // Reuse the pre-allocated bounce frame.
-            let phys     = self.bounce_buffer_phys;
-            let dst_virt = self.physical_memory_offset.as_u64() + phys;
-
-            // Copy caller's virtual buffer into the physically-mapped bounce frame
-            // so the DMA engine can read from a known physical address.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src as *const u8,
-                    dst_virt as *mut u8,
-                    bytes,
-                );
-            }
-
-            // Issue the DMA write from the bounce frame.
-            if !port_mut.write_sectors(cur_lba + self.partition_lba, chunk, phys, self.physical_memory_offset) {
-                return false;
-            }
-
-            cur_lba   += chunk as u64;
-            src       += bytes as u64;
-            remaining -= chunk;
-        }
-
-        true
-    }
 }
 
 /// Engine start/stop: the AHCI spec allows CR/FR up to 500 ms to clear.

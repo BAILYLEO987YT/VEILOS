@@ -161,16 +161,12 @@ impl Host for KernelHost {
 
     /// `import "/path.vsh"`.
     ///
-    /// Uses try_lock: the engine lock is held while a script runs, and other
-    /// code (the terminal's VSH command) takes the VFS lock first and the
-    /// engine lock second. Blocking here could deadlock, so a busy VFS is
-    /// reported and the load can simply be retried.
+    /// The VFS mount-table lock is only held while resolving a path (never
+    /// across I/O or while the caller holds other locks), so this can't
+    /// deadlock against the engine lock the way the old long-held VFS lock
+    /// could.
     fn read_file(&mut self, path: &str) -> Result<String, String> {
-        let vfs = match crate::vfs::VFS.try_lock() {
-            Some(g) => g,
-            None => return Err(String::from("filesystem busy, try again")),
-        };
-        let bytes = match vfs.read_file(path) {
+        let bytes = match crate::vfs::VFS.read_file(path) {
             Ok(b) => b,
             Err(_) => return Err(format!("cannot read '{}'", path)),
         };

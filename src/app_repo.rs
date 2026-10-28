@@ -258,13 +258,10 @@ impl AppRepository {
     }
 
     fn scan_dir_recursive(&mut self, dir: &str) {
-        let vfs = crate::vfs::VFS.lock();
-        let entries = match vfs.list_dir(dir) {
+        let entries = match crate::vfs::VFS.list_dir(dir) {
             Ok(e)  => e,
             Err(_) => return,
         };
-        // Drop the VFS lock before recursing to avoid deadlock.
-        drop(vfs);
 
         for entry in entries {
             if entry.name.starts_with('.') { continue; }
@@ -294,7 +291,7 @@ impl AppRepository {
     /// Load a .vpkg from the VFS at `path`, verify it, and install it
     /// into PACKAGE_REGISTRY.
     pub fn install_from_path(&self, path: &str) -> Result<(), RepoError> {
-        let data = crate::vfs::VFS.lock().read_file(path)
+        let data = crate::vfs::VFS.read_file(path)
             .map_err(|_| RepoError::IoError)?;
 
         let archive = VpkgArchive::parse(&data)?;
@@ -364,7 +361,7 @@ impl AppRepository {
         patch_data:   &[u8],
         new_version_str: &str,
     ) -> Result<(), RepoError> {
-        let base = crate::vfs::VFS.lock().read_file(base_path)
+        let base = crate::vfs::VFS.read_file(base_path)
             .map_err(|_| RepoError::IoError)?;
 
         let patch   = DeltaPatch::deserialise(patch_data)?;
@@ -373,7 +370,7 @@ impl AppRepository {
         println!("[REPO] Delta: {} hunks, {} bytes changed → {}",
             patch.hunk_count(), patch.total_changed_bytes(), package_name);
 
-        crate::vfs::VFS.lock().write_file(base_path, &patched)
+        crate::vfs::VFS.write_file(base_path, &patched)
             .map_err(|_| RepoError::IoError)?;
 
         // Update the version string in the registry.
@@ -404,7 +401,7 @@ impl AppRepository {
     ) -> Result<(), RepoError> {
         // Step 1: read the package from the VFS.
         let pkg_bytes = {
-            let vfs = crate::vfs::VFS.lock();
+            let vfs = &crate::vfs::VFS;
             vfs.read_file(package_path).map_err(|_| RepoError::IoError)?
         };
 
@@ -416,7 +413,7 @@ impl AppRepository {
         let filename = package_path.split('/').last().unwrap_or("package.vpkg");
         let outbox_path = alloc::format!("/var/repo/outbox/{}", filename);
         {
-            let vfs = crate::vfs::VFS.lock();
+            let vfs = &crate::vfs::VFS;
             vfs.write_file(&outbox_path, &pkg_bytes).map_err(|_| RepoError::IoError)?;
         }
         println!("[REPO]   Written to outbox: {}", outbox_path);

@@ -13,10 +13,7 @@
 //       < 65525  → FAT16
 // =====================================================================
 
-use crate::ahci::HbaPort;
-use crate::println;
 use crate::vfs::{BlockDevice, FileSystem, DirEntry, FileType, VfsError};
-use x86_64::VirtAddr;
 use alloc::vec::Vec;
 use alloc::string::String;
 
@@ -416,30 +413,15 @@ fn classify_fat(bpb: &Fat16BPB) -> FatVariant {
     }
 }
 
-/// Probe for a FAT12 or FAT16 volume on the given AHCI port.
-///
-/// Checks the extended boot signature at byte 38 (the FAT12/16 location)
-/// and mounts to the VFS root if the volume passes validation.
-pub fn probe_fat16(
-    port: &mut HbaPort,
-    physical_memory_offset: VirtAddr,
-    partition_lba: u64,
-) {
-    // Sector buffer the HBA DMAs into: below 4 GiB, kept for the mount's lifetime.
-    let (buffer_phys, _) = crate::memory::DmaRegion::new(4096).expect("No DMA memory for FAT16 probe").leak();
-    let buffer_virt = physical_memory_offset.as_u64() + buffer_phys;
-
-    if !port.read_sectors(partition_lba, 1, buffer_phys, physical_memory_offset) {
-        return;
-    }
-
-    let raw = unsafe { core::slice::from_raw_parts(buffer_virt as *const u8, 512) };
+/// Recognise a FAT12 or FAT16 volume on `device`. `block::mount_disk` mounts it.
+pub fn detect(device: &dyn BlockDevice) -> Option<(alloc::boxed::Box<dyn FileSystem>, &'static str)> {
+    const _: () = assert!(core::mem::size_of::<Fat16BPB>() <= 512);
+    let raw = crate::block::read_boot_sector(device)?;
 
     // Boot signature at 0x1FE must be 0xAA55.
-    let boot_sig = u16::from_le_bytes([raw[0x1FE], raw[0x1FF]]);
-    if boot_sig != 0xAA55 { return; }
+    if u16::from_le_bytes([raw[0x1FE], raw[0x1FF]]) != 0xAA55 { return None; }
 
-    // We can't strictly rely on the extended boot signature (0x28 or 0x29) 
+    // We can't strictly rely on the extended boot signature (0x28 or 0x29)
     // at byte 38, because older DOS versions and QEMU's `vvfat` do not set it.
     // Instead we do a structural check on the BPB itself.
     let bps = u16::from_le_bytes([raw[11], raw[12]]);
@@ -447,63 +429,16 @@ pub fn probe_fat16(
     let reserved = u16::from_le_bytes([raw[14], raw[15]]);
     let fat_count = raw[16];
     let root_count = u16::from_le_bytes([raw[17], raw[18]]);
+    if bps == 0 || spc == 0 || reserved == 0 || fat_count == 0 { return None; }
+    if root_count == 0 { return None; } // FAT32 has root_count = 0.
+    // FAT32 also has sectors_per_fat_16 == 0.
+    if u16::from_le_bytes([raw[22], raw[23]]) == 0 { return None; }
 
-    // Validate sane FAT values
-    if bps == 0 || spc == 0 || reserved == 0 || fat_count == 0 { return; }
-    if root_count == 0 { return; } // FAT32 has root_count = 0, so this safely skips FAT32.
-
-    // Make sure this is NOT a FAT32 volume (FAT32 also has 0xAA55 but
-    // its ext sig is at byte 66, and sectors_per_fat_16 == 0).
-    let spf16 = u16::from_le_bytes([raw[22], raw[23]]);
-    if spf16 == 0 { return; } // Likely FAT32 — leave for fat32.rs.
-
-    let bpb = unsafe { &*(buffer_virt as *const Fat16BPB) };
-    let variant = classify_fat(bpb);
-
-    println!("  -> {:?} File System Detected!", variant);
-
-    let fs = Fat16FileSystem { bpb: *bpb, variant };
-    let device = crate::ahci::AhciBlockDevice {
-        port: port as *mut HbaPort,
-        physical_memory_offset,
-        bounce_buffer_phys: buffer_phys,
-        partition_lba,
-    };
-
-    use alloc::boxed::Box;
-    let mut vfs = crate::vfs::VFS.lock();
-
-    vfs.mount(
-        String::from("/"),
-        Box::new(fs),
-        Box::new(device),
-    );
-
-    let variant_str = match variant {
+    let bpb = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const Fat16BPB) };
+    let variant = classify_fat(&bpb);
+    let name = match variant {
         FatVariant::Fat12 => "FAT12",
         FatVariant::Fat16 => "FAT16",
     };
-    println!("  -> Mounted {} to root (/)", variant_str);
-
-    // Quick verify — file read
-    if let Ok(content) = vfs.read_file("/HELLO.TXT") {
-        let s = core::str::from_utf8(&content).unwrap_or("[Binary]");
-        println!("     - /HELLO.TXT: \"{}\"", s.trim_matches(char::from(0)));
-    } else {
-        println!("     - /HELLO.TXT: not found");
-    }
-
-    // Quick verify — root listing
-    match vfs.list_dir("/") {
-        Ok(entries) => {
-            println!("     - Root dir: {} entries", entries.len());
-            for e in &entries {
-                println!("       {} {}",
-                    if e.file_type == FileType::Directory { "D" } else { "F" },
-                    e.name,
-                );
-            }
-        }
-        Err(e) => println!("     - Root dir listing FAILED: {:?}", e),
-    }
+    Some((alloc::boxed::Box::new(Fat16FileSystem { bpb, variant }), name))
 }

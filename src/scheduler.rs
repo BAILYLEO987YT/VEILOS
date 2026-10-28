@@ -430,7 +430,7 @@ impl ProfileStore {
     /// Try to load profiles from the VFS. Returns an empty store on
     /// first boot or if the file is corrupt — both are safe.
     fn load_from_vfs() -> Self {
-        match crate::vfs::VFS.lock().read_file(PROFILES_PATH) {
+        match crate::vfs::VFS.read_file(PROFILES_PATH) {
             Ok(bytes) => {
                 let profiles = Self::deserialise(&bytes);
                 let count    = profiles.len();
@@ -449,7 +449,7 @@ impl ProfileStore {
     pub fn save_to_vfs(&mut self) {
         if !self.dirty { return; }
         let bytes = Self::serialise(&self.profiles);
-        match crate::vfs::VFS.lock().write_file(PROFILES_PATH, &bytes) {
+        match crate::vfs::VFS.write_file(PROFILES_PATH, &bytes) {
             Ok(_) => {
                 self.dirty = false;
                 crate::println!(

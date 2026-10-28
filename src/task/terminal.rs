@@ -63,7 +63,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "LS" => {
             let raw_path = if parts.len() > 1 { parts[1] } else { "/" };
             let path = normalize_path(raw_path);
-            let vfs = VFS.lock();
+            let vfs = &VFS;
             match vfs.list_dir(&path) {
                 Ok(entries) => {
                     history.push(alloc::format!("  {}", path));
@@ -82,7 +82,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "CAT" => {
             if parts.len() < 2 { history.push(String::from("USAGE: CAT [FILE]")); return; }
             let path = normalize_path(parts[1]);
-            match VFS.lock().read_file(&path) {
+            match VFS.read_file(&path) {
                 Ok(bytes) => {
                     match core::str::from_utf8(&bytes) {
                         Ok(s) => {
@@ -114,7 +114,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             if parts.len() < 2 { history.push(String::from("USAGE: HEAD [FILE] [LINES]")); return; }
             let path = normalize_path(parts[1]);
             let max_lines = parts.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
-            match VFS.lock().read_file(&path) {
+            match VFS.read_file(&path) {
                 Ok(bytes) => {
                     let s = core::str::from_utf8(&bytes).unwrap_or("<binary>");
                     for line in s.lines().take(max_lines) {
@@ -133,7 +133,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // We write a zero-byte sentinel; the filesystem driver treats any
             // entry without a DATA attribute as a directory when listed.
             let dir_marker_path = alloc::format!("{}/.veilos_dir", path);
-            match VFS.lock().write_file(&dir_marker_path, b"") {
+            match VFS.write_file(&dir_marker_path, b"") {
                 Ok(_)  => history.push(alloc::format!("mkdir: created directory '{}'", path)),
                 Err(_) => {
                     // Fall back: write_file may not support directory creation yet
@@ -149,7 +149,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // Full unlink support requires a filesystem-level delete API; until
             // that is implemented we zero-truncate so subsequent reads return
             // empty data and the space can be reclaimed on the next fsck pass.
-            match VFS.lock().write_file(&path, b"") {
+            match VFS.write_file(&path, b"") {
                 Ok(_)  => history.push(alloc::format!("rm: removed '{}'", path)),
                 Err(crate::vfs::VfsError::FileNotFound) =>
                     history.push(alloc::format!("rm: cannot remove '{}': no such file", path)),
@@ -458,7 +458,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 }
             } else {
                 let path = normalize_path(parts[1]);
-                match VFS.lock().read_file(&path) {
+                match VFS.read_file(&path) {
                     Ok(bytes) => {
                         let script = core::str::from_utf8(&bytes).unwrap_or("");
                         let mut eng = crate::vscript::GLOBAL_ENGINE.lock();
@@ -780,7 +780,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 Ok(data) => {
                     if parts.len() > 3 {
                         let local_path = normalize_path(parts[3]);
-                        match VFS.lock().write_file(&local_path, &data) {
+                        match VFS.write_file(&local_path, &data) {
                             Ok(()) => history.push(alloc::format!("  Wrote {} bytes to {}", data.len(), local_path)),
                             Err(e) => history.push(alloc::format!("ERROR writing local file: {:?}", e)),
                         }
@@ -807,7 +807,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 Some(id) => id,
                 None => { history.push(String::from("ERROR: Unknown node (expected a hex ID or peerN alias, see PEERS)")); return; }
             };
-            let data = match VFS.lock().read_file(&local_path) {
+            let data = match VFS.read_file(&local_path) {
                 Ok(d) => d,
                 Err(e) => { history.push(alloc::format!("ERROR reading local file: {:?}", e)); return; }
             };

@@ -1,7 +1,4 @@
-use crate::ahci::HbaPort;
-use crate::println;
 use crate::vfs::{BlockDevice, FileSystem, DirEntry, FileType, VfsError};
-use x86_64::VirtAddr;
 use alloc::vec::Vec;
 use alloc::string::String;
 
@@ -595,79 +592,20 @@ impl FileSystem for Fat32FileSystem {
 
 // -----| bootstrapping |-----
 
-pub fn probe_fat32(
-    port: &mut HbaPort, 
-    physical_memory_offset: VirtAddr,
-    partition_lba: u64,
-) {
-    println!("\nProbing for FAT File System on Port 0...");
-
-    // Sector buffer the HBA DMAs into: below 4 GiB, kept for the mount's lifetime.
-    let (buffer_phys, _) = crate::memory::DmaRegion::new(4096).expect("No DMA memory for FAT probe").leak();
-    let buffer_virt = physical_memory_offset.as_u64() + buffer_phys;
-
-    if port.read_sectors(partition_lba, 1, buffer_phys, physical_memory_offset) {
-        let bpb = unsafe { &*(buffer_virt as *const Fat32BPB) };
-
-        if bpb.boot_signature == 0xAA55 {
-            let raw_bytes = unsafe { core::slice::from_raw_parts(buffer_virt as *const u8, 512) };
-
-            // FAT32 structurally requires the 16-bit FAT size to be 0
-            // AND the root entry count to be 0.
-            let root_count = unsafe { core::ptr::read_unaligned(raw_bytes.as_ptr().add(17) as *const u16) };
-            let spf16 = unsafe { core::ptr::read_unaligned(raw_bytes.as_ptr().add(22) as *const u16) };
-            
-            if root_count != 0 || spf16 != 0 || bpb.sectors_per_fat_32 == 0 {
-                return; // Not a FAT32 volume
-            }
-
-            println!("  -> FAT32 File System Detected!");
-            
-            let fs = Fat32FileSystem { bpb: *bpb };
-            let device = crate::ahci::AhciBlockDevice {
-                port: port as *mut HbaPort,
-                physical_memory_offset,
-                bounce_buffer_phys: buffer_phys,
-                partition_lba,
-            };
-
-            // Mount to VFS!
-            use alloc::boxed::Box;
-            let mut vfs = crate::vfs::VFS.lock();
-            
-            vfs.mount(
-                alloc::string::String::from("/"), 
-                Box::new(fs), 
-                Box::new(device)
-            );
-            
-            println!("  -> Mounted FAT32 to root (/)");
-
-            // Quick Verify
-            if let Ok(content) = vfs.read_file("/HELLO.TXT") {
-                let content_str = core::str::from_utf8(&content).unwrap_or("[Binary]");
-                println!("     - /HELLO.TXT: \"{}\"", content_str.trim_matches(char::from(0)));
-            } else {
-                println!("     - /HELLO.TXT: not found (list_dir may still work)");
-            }
-
-            // Quick verify directory listing
-            match vfs.list_dir("/") {
-                Ok(entries) => {
-                    println!("     - Root dir: {} entries", entries.len());
-                    for e in &entries {
-                        println!("       {} {}", 
-                            if e.file_type == crate::vfs::FileType::Directory { "D" } else { "F" },
-                            e.name
-                        );
-                    }
-                }
-                Err(e) => println!("     - Root dir listing FAILED: {:?}", e),
-            }
-        } else {
-            println!("  -> No valid boot signature (0xAA55) found.");
-        }
-    } else {
-        println!("  -> Failed to read sector 0.");
+/// Recognise a FAT32 volume on `device`. `block::mount_disk` mounts it.
+pub fn detect(device: &dyn BlockDevice) -> Option<alloc::boxed::Box<dyn FileSystem>> {
+    const _: () = assert!(core::mem::size_of::<Fat32BPB>() <= 512);
+    let raw = crate::block::read_boot_sector(device)?;
+    let bpb = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const Fat32BPB) };
+    if u16::from_le_bytes([raw[510], raw[511]]) != 0xAA55 {
+        return None;
     }
+    // FAT32 structurally requires the 16-bit FAT size to be 0
+    // AND the root entry count to be 0.
+    let root_count = u16::from_le_bytes([raw[17], raw[18]]);
+    let spf16 = u16::from_le_bytes([raw[22], raw[23]]);
+    if root_count != 0 || spf16 != 0 || { bpb.sectors_per_fat_32 } == 0 {
+        return None;
+    }
+    Some(alloc::boxed::Box::new(Fat32FileSystem { bpb }))
 }

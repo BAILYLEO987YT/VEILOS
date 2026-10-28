@@ -880,7 +880,7 @@ impl DesktopBackground {
         // Deferred wallpaper loading (prevents hang during boot phase)
         if let Some(path) = self.pending_wallpaper_path.take() {
             crate::serial_println!("[DESKTOP] Attempting to load wallpaper from: {}", path);
-            match crate::vfs::VFS.lock().read_file(&path) {
+            match crate::vfs::VFS.read_file(&path) {
                 Ok(data) => {
                     crate::serial_println!("[DESKTOP] Successfully read wallpaper file, {} bytes.", data.len());
                     let upper = path.to_uppercase();
@@ -962,7 +962,7 @@ impl DesktopBackground {
         if ms - self.last_refresh < 2000 { return; } // refresh file list every 2 seconds
         self.last_refresh = ms;
         
-        let vfs = crate::vfs::VFS.lock();
+        let vfs = &crate::vfs::VFS;
         self.entries.clear();
         let target_dir = self.get_desktop_dir();
         
@@ -1868,7 +1868,7 @@ impl LoginScreen {
 
     /// Load the last-used username hint from the VFS.
     pub fn load_last_user(&mut self) {
-        let vfs = crate::vfs::VFS.lock();
+        let vfs = &crate::vfs::VFS;
         if let Ok(bytes) = vfs.read_file(crate::users::LAST_USER_PATH) {
             if let Ok(s) = core::str::from_utf8(&bytes) {
                 let s = s.trim();
@@ -2429,14 +2429,14 @@ pub fn poll_input() {
                         ContextAction::CopyToDesktop(src) => {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
-                            if let Ok(data) = crate::vfs::VFS.lock().read_file(&src) {
-                                let _ = crate::vfs::VFS.lock().write_file(&dest, &data);
+                            if let Ok(data) = crate::vfs::VFS.read_file(&src) {
+                                let _ = crate::vfs::VFS.write_file(&dest, &data);
                             }
                         }
                         ContextAction::MoveToDesktop(src) => {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
-                            let vfs = crate::vfs::VFS.lock();
+                            let vfs = &crate::vfs::VFS;
                             if let Ok(data) = vfs.read_file(&src) {
                                 if vfs.write_file(&dest, &data).is_ok() {
                                     let _ = vfs.delete_file(&src);
@@ -2651,7 +2651,7 @@ pub fn handle_drop(source_path: alloc::string::String, x: i32, y: i32) {
             };
             
             if target_path != source_path {
-                let vfs = crate::vfs::VFS.lock();
+                let vfs = &crate::vfs::VFS;
                 if let Ok(data) = vfs.read_file(&source_path) {
                     if vfs.write_file(&target_path, &data).is_ok() {
                         notify(NotifCategory::Success, "COPIED", &target_path);

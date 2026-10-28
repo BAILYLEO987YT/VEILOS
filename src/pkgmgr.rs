@@ -653,7 +653,7 @@ impl BuildScript {
                 // ----------------------------------------------------------
                 BuildStep::Sign { target } => {
                     println!("[BUILD]   sign {}", target);
-                    let vfs = crate::vfs::VFS.lock();
+                    let vfs = &crate::vfs::VFS;
                     let target_bytes = match vfs.read_file(target) {
                         Ok(b)  => b,
                         Err(_) => {
@@ -685,7 +685,7 @@ impl BuildScript {
                 BuildStep::Run { program, args } => {
                     println!("[BUILD]   run {} {}", program, args.join(" "));
                     // Verify the program exists on the VFS.
-                    let vfs = crate::vfs::VFS.lock();
+                    let vfs = &crate::vfs::VFS;
                     match vfs.read_file(program) {
                         Ok(bin) => {
                             println!("[BUILD]     program '{}' found ({} bytes), spawning…", program, bin.len());

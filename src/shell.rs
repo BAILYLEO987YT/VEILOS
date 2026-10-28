@@ -80,7 +80,7 @@ pub fn is_active() -> bool {
 
 fn read_text(path: &str) -> Result<String, String> {
     let bytes = {
-        let vfs = crate::vfs::VFS.lock();
+        let vfs = &crate::vfs::VFS;
         vfs.read_file(path)
     };
     let bytes = bytes.map_err(|_| format!("cannot read {} (8.3 names only: e.g. /SHELL.VSH)", path))?;

@@ -67,7 +67,7 @@ impl CheckpointManager {
     pub fn write_checkpoint(job_id: u64, step: u32, payload: &[u8]) {
         let path = Self::local_path(job_id, step);
         let data = Self::serialise(job_id, step, payload);
-        match crate::vfs::VFS.lock().write_file(&path, &data) {
+        match crate::vfs::VFS.write_file(&path, &data) {
             Ok(_) => {
                 crate::serial_println!(
                     "[CKPT] Wrote checkpoint job={:#x} step={} path={}",
@@ -92,7 +92,7 @@ impl CheckpointManager {
     /// Returns the opaque payload bytes on success.
     pub fn read_checkpoint_local(job_id: u64, step: u32) -> Option<Vec<u8>> {
         let path = Self::local_path(job_id, step);
-        let raw = crate::vfs::VFS.lock().read_file(&path).ok()?;
+        let raw = crate::vfs::VFS.read_file(&path).ok()?;
         Self::deserialise(&raw).map(|(_, _, payload)| payload)
     }
 
@@ -127,7 +127,7 @@ impl CheckpointManager {
     /// This is called by the OffloadBroker's retry path to determine
     /// where a re-submitted job should resume.
     pub fn find_latest_checkpoint_local(job_id: u64) -> Option<u32> {
-        let entries = match crate::vfs::VFS.lock().list_dir("/tmp") {
+        let entries = match crate::vfs::VFS.list_dir("/tmp") {
             Ok(e) => e,
             Err(_) => return None,
         };
@@ -162,7 +162,7 @@ impl CheckpointManager {
     /// Called by the OffloadBroker when a job completes successfully so
     /// checkpoint files don't accumulate indefinitely.
     pub fn purge_checkpoints(job_id: u64) {
-        let entries = match crate::vfs::VFS.lock().list_dir("/tmp") {
+        let entries = match crate::vfs::VFS.list_dir("/tmp") {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -174,7 +174,7 @@ impl CheckpointManager {
         for entry in &entries {
             if entry.name.starts_with(&*prefix) && entry.name.ends_with(suffix) {
                 let path = format!("/tmp/{}", entry.name);
-                if crate::vfs::VFS.lock().delete_file(&path).is_ok() {
+                if crate::vfs::VFS.delete_file(&path).is_ok() {
                     deleted += 1;
                 }
             }
@@ -229,7 +229,7 @@ impl CheckpointManager {
     /// Returns a Vec of human-readable summary strings for the CHECKPOINT LIST
     /// terminal command.
     pub fn list_all() -> Vec<String> {
-        let entries = match crate::vfs::VFS.lock().list_dir("/tmp") {
+        let entries = match crate::vfs::VFS.list_dir("/tmp") {
             Ok(e) => e,
             Err(_) => return alloc::vec![String::from("(cannot read /tmp)")],
         };
@@ -238,7 +238,7 @@ impl CheckpointManager {
         for entry in &entries {
             if !entry.name.ends_with(".ckpt") { continue; }
             let path = format!("/tmp/{}", entry.name);
-            let summary = match crate::vfs::VFS.lock().read_file(&path) {
+            let summary = match crate::vfs::VFS.read_file(&path) {
                 Ok(raw) => match Self::deserialise(&raw) {
                     Some((job_id, step, payload)) => {
                         format!(

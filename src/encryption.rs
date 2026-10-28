@@ -426,7 +426,7 @@ pub fn cen_persist_key(handle: KeyHandle) -> Result<(), CenError> {
 
     let path = entry.feature.ledger_path();
     
-    let vfs = crate::vfs::VFS.lock();
+    let vfs = &crate::vfs::VFS;
     let mut file_content = vfs.read_file(&path).unwrap_or_else(|_| {
         let mut initial = Vec::new();
         initial.extend_from_slice(LEDGER_MAGIC);
@@ -451,7 +451,7 @@ pub fn cen_load_keys(feature: FeatureTag) -> Result<Vec<KeyHandle>, CenError> {
     }
 
     let path = feature.ledger_path();
-    let bytes: Vec<u8> = crate::vfs::VFS.lock().read_file(&path).unwrap_or_else(|_| Vec::new());
+    let bytes: Vec<u8> = crate::vfs::VFS.read_file(&path).unwrap_or_else(|_| Vec::new());
 
     if bytes.is_empty() {
         return Ok(Vec::new());
