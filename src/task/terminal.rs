@@ -128,31 +128,23 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "MKDIR" => {
             if parts.len() < 2 { history.push(String::from("USAGE: MKDIR [DIR]")); return; }
             let path = normalize_path(parts[1]);
-            // Create an empty directory marker file so the VFS can list it.
-            // FAT32 write_file creates any missing path components automatically.
-            // We write a zero-byte sentinel; the filesystem driver treats any
-            // entry without a DATA attribute as a directory when listed.
-            let dir_marker_path = alloc::format!("{}/.veilos_dir", path);
-            match VFS.write_file(&dir_marker_path, b"") {
+            match VFS.create_dir(&path) {
                 Ok(_)  => history.push(alloc::format!("mkdir: created directory '{}'", path)),
-                Err(_) => {
-                    // Fall back: write_file may not support directory creation yet
-                    // on all filesystems (e.g. NTFS read-only).  Report clearly.
-                    history.push(alloc::format!("mkdir: cannot create '{}': filesystem is read-only or unsupported", path));
-                }
+                Err(crate::vfs::VfsError::FileNotFound) =>
+                    history.push(alloc::format!("mkdir: cannot create '{}': parent directory does not exist", path)),
+                Err(_) =>
+                    history.push(alloc::format!("mkdir: cannot create '{}': filesystem is read-only or unsupported", path)),
             }
         }
         "RM" => {
             if parts.len() < 2 { history.push(String::from("USAGE: RM [FILE]")); return; }
             let path = normalize_path(parts[1]);
-            // Overwrite the file with zero bytes then write an empty tombstone.
-            // Full unlink support requires a filesystem-level delete API; until
-            // that is implemented we zero-truncate so subsequent reads return
-            // empty data and the space can be reclaimed on the next fsck pass.
-            match VFS.write_file(&path, b"") {
+            match VFS.delete_file(&path) {
                 Ok(_)  => history.push(alloc::format!("rm: removed '{}'", path)),
                 Err(crate::vfs::VfsError::FileNotFound) =>
                     history.push(alloc::format!("rm: cannot remove '{}': no such file", path)),
+                Err(crate::vfs::VfsError::IsDirectory) =>
+                    history.push(alloc::format!("rm: cannot remove '{}': directory not empty", path)),
                 Err(_) =>
                     history.push(alloc::format!("rm: cannot remove '{}': filesystem is read-only or unsupported", path)),
             }

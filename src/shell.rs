@@ -46,6 +46,12 @@ static NOW: Mutex<DateTime> = Mutex::new(DateTime { year: 2000, month: 1, day: 1
 /// NTP-corrected clock later).
 static CLOCK: Mutex<fn() -> DateTime> = Mutex::new(read_rtc);
 
+/// The current wall-clock time (RTC unless replaced by `set_clock_source`).
+pub fn wall_clock() -> DateTime {
+    let f = *CLOCK.lock();
+    f()
+}
+
 pub fn set_clock_source(f: fn() -> DateTime) {
     *CLOCK.lock() = f;
     LAST_RTC_MS.store(u64::MAX, Ordering::Relaxed);

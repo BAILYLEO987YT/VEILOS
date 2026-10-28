@@ -486,9 +486,8 @@ impl Session {
             *proc.capabilities.lock() = caps;
         }
 
-        // Create home directory if it doesn't exist.
-        let home = alloc::format!("/home/{}/.keep", username);
-        let _ = crate::vfs::VFS.write_file(&home, b"");
+        // Create the home directory if it doesn't exist.
+        let _ = crate::vfs::VFS.create_dir(&alloc::format!("/home/{}", username));
     }
 
     pub fn logout(&mut self) {

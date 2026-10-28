@@ -46,8 +46,13 @@ pub trait FileSystem: Send + Sync {
         let _ = (device, path, data);
         Err(VfsError::WriteError)
     }
-    /// Delete a file.
+    /// Delete a file (or an empty directory).
     fn delete_file(&self, device: &dyn BlockDevice, path: &str) -> Result<(), VfsError> {
+        let _ = (device, path);
+        Err(VfsError::WriteError)
+    }
+    /// Create a directory. Succeeds if it already exists; the parent must exist.
+    fn create_dir(&self, device: &dyn BlockDevice, path: &str) -> Result<(), VfsError> {
         let _ = (device, path);
         Err(VfsError::WriteError)
     }
@@ -90,18 +95,17 @@ impl VfsManager {
     ///   2. Exact match — path IS the mount point (e.g. listing the mount dir itself).
     ///   3. Prefix match — path starts with mount_point followed by '/'
     ///      so "/foo" never incorrectly matches "/foobar/file.txt".
+    /// Case-insensitive, like the FAT names underneath (the terminal
+    /// upper-cases what it's given, so `/MNT/D1P0` must reach `/mnt/d1p0`).
     fn path_under_mount(path: &str, mount_point: &str) -> bool {
         if mount_point == "/" {
             return true;
         }
-        if path == mount_point {
-            return true;
-        }
-        if path.starts_with(mount_point) {
-            let rest = &path[mount_point.len()..];
-            return rest.starts_with('/');
-        }
-        false
+        let n = mount_point.len();
+        path.len() >= n
+            && path.is_char_boundary(n)
+            && path[..n].eq_ignore_ascii_case(mount_point)
+            && (path.len() == n || path[n..].starts_with('/'))
     }
 
     /// Strip the mount-point prefix from `path`, returning the filesystem-relative path.
@@ -166,7 +170,9 @@ impl VfsManager {
         let prefix = if dir.ends_with('/') { String::from(dir) } else { alloc::format!("{}/", dir) };
         let mut names: Vec<String> = Vec::new();
         for m in self.mounts.lock().iter() {
-            if let Some(rest) = m.path.strip_prefix(prefix.as_str()) {
+            let rest = (m.path.len() > prefix.len() && m.path[..prefix.len()].eq_ignore_ascii_case(&prefix))
+                .then(|| &m.path[prefix.len()..]);
+            if let Some(rest) = rest {
                 if let Some(first) = rest.split('/').next().filter(|s| !s.is_empty()) {
                     if !names.iter().any(|n| n == first) {
                         names.push(String::from(first));
@@ -186,13 +192,32 @@ impl VfsManager {
         }
     }
 
-    /// Delete a file at `path`. Routes to the mounted filesystem.
+    /// Delete a file (or empty directory) at `path`. Routes to the mounted filesystem.
     pub fn delete_file(&self, path: &str) -> Result<(), VfsError> {
         match self.resolve(path) {
             Some((m, rel)) => m.fs.delete_file(&*m.device, &rel),
             None => Err(VfsError::FileNotFound),
         }
     }
+
+    /// Create a directory at `path` (its parent must exist).
+    pub fn create_dir(&self, path: &str) -> Result<(), VfsError> {
+        match self.resolve(path) {
+            Some((m, rel)) => m.fs.create_dir(&*m.device, &rel),
+            None => Err(VfsError::FileNotFound),
+        }
+    }
 }
 
 pub static VFS: VfsManager = VfsManager::new();
+
+/// Directories the kernel writes into (`/etc/users.vdb`, `/tmp/...`
+/// checkpoints, `/net/...`, `/home/<user>`). Created on the root volume at
+/// boot if missing; a read-only root just leaves them absent.
+pub fn ensure_standard_dirs() {
+    for dir in ["/etc", "/tmp", "/var", "/net", "/home"] {
+        if let Err(e) = VFS.create_dir(dir) {
+            crate::serial_println!("[VFS] could not create {}: {:?}", dir, e);
+        }
+    }
+}

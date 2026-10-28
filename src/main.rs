@@ -19,8 +19,7 @@ pub mod pci;
 pub mod ahci;
 pub mod ide;
 pub mod vfs;
-pub mod fat32;
-pub mod fat16;
+pub mod fat;
 pub mod exfat;
 pub mod ntfs;
 pub mod executable;
@@ -257,6 +256,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Pass the hardware tree to the AHCI module to initialize storage
     ahci::init(&hardware_tree, &mut mapper, &mut frame_allocator, phys_mem_offset);
+    crate::vfs::ensure_standard_dirs();
 
     // Phase 13: initialise the network stack (VirtIO-net + smoltcp).
     // Must come after PCI scan so hardware_tree is populated.

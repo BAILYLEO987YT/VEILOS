@@ -347,8 +347,7 @@ pub fn mount_disk(disk: Arc<Disk>) {
 fn detect_filesystem(device: &Partition) -> Option<(Box<dyn crate::vfs::FileSystem>, &'static str)> {
     if let Some(fs) = crate::ntfs::detect(device) { return Some((fs, "NTFS")); }
     if let Some(fs) = crate::exfat::detect(device) { return Some((fs, "exFAT")); }
-    if let Some(fs) = crate::fat32::detect(device) { return Some((fs, "FAT32")); }
-    if let Some((fs, name)) = crate::fat16::detect(device) { return Some((fs, name)); }
+    if let Some((fs, name)) = crate::fat::detect(device) { return Some((fs, name)); }
     None
 }
 
