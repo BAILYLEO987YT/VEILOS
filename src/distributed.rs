@@ -2349,8 +2349,8 @@ pub fn rdp_handle_input(data: &[u8]) {
                 let buttons = payload[8];
                 
                 if let Some(mut state) = crate::task::mouse::MOUSE_STATE.try_lock() {
-                    state.x = x.clamp(0, 1023);
-                    state.y = y.clamp(0, 767);
+                    state.x = x.clamp(0, crate::ui::screen_w() as i32 - 1);
+                    state.y = y.clamp(0, crate::ui::screen_h() as i32 - 1);
                     state.left_button = (buttons & 1) != 0;
                     state.right_button = (buttons & 2) != 0;
                 }

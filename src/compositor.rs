@@ -617,8 +617,8 @@ impl Compositor {
 
     /// Create the desktop background surface and the cursor surface.
     pub fn init_desktop(&mut self) {
-        let sw = crate::ui::SCREEN_W as u32;
-        let sh = crate::ui::SCREEN_H as u32;
+        let sw = crate::ui::screen_w() as u32;
+        let sh = crate::ui::screen_h() as u32;
 
         let desktop_id = self.create_surface(SurfaceKind::Desktop, 0, 0, 0, sw, sh, "Desktop");
         let _cursor_id = self.create_surface(SurfaceKind::Cursor,  0, 0, 0, 8, 8,  "Cursor");

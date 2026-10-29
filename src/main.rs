@@ -700,14 +700,14 @@ async fn gui_refresh_task() {
             match crate::ui::painter_surface() {
                 Some(target) => {
                     let op = crate::lgpu::Op::Fill {
-                        rect: crate::lgpu::Rect::new(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H),
+                        rect: crate::lgpu::Rect::new(0, 0, crate::ui::screen_w(), crate::ui::screen_h()),
                         color: 0x14_14_23, // r 20, g 20, b 35
                     };
                     if !crate::lgpu::dl_record(op) {
                         crate::lgpu::execute(&[op], &target);
                     }
                 }
-                None => crate::ui::draw_rect_atomic(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H, crate::graphics::Color { r: 20, g: 20, b: 35 }),
+                None => crate::ui::draw_rect_atomic(0, 0, crate::ui::screen_w(), crate::ui::screen_h(), crate::graphics::Color { r: 20, g: 20, b: 35 }),
             }
             let t_b = rdtsc();
 

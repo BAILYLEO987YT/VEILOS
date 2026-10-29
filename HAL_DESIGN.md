@@ -1,6 +1,6 @@
 # VEILOS HAL: design proposal (step 7)
 
-**Status:** 7A and 7B done; 7C mostly done (see the table); 7D–7E to do.
+**Status:** 7A, 7B and 7D done; 7C mostly done (see the table); 7E to do.
 
 ## Goal
 
@@ -69,7 +69,7 @@ work over are **CPU cores acting as software rasterisers** and **remote mesh nod
 | 7B ✅ | APs run kernel threads. `workers::for_each(n, f)` spreads work over every CPU, with the caller taking part. A user process on an AP is preempted every 10 ms so pool work isn't stuck behind it. | `WORKERS` benchmark: 3.7× on 4 CPUs (183 → 50 ms), unchanged with gui_test.exe busy on an AP; 1 CPU runs everything on the caller |
 | 7C (part 1 ✅) | `lgpu.rs`: `Op` lists (fill, copy with transparent key) against a `Surface`, cut into horizontal bands and rendered on every CPU through the worker pool by the `CpuRaster` backend. The frame clear, the wallpaper blit and the back-buffer flush go through it. | Full desktop frame 19–20 → 15–16 Mcycles on 4 CPUs (clear 4.1 → 2.0, flush 2.8 → 1.4); 1 CPU unchanged |
 | 7C (part 2) | **Frame display list** (`lgpu::dl_*`): while a frame is painted, fills, text (8×8 glyphs) and the wallpaper blit are recorded, then rendered banded on every CPU in one go. Code that needs the raw buffer (image decoders, `render2d`) gets `ui::painter_ptr_flushed()`, which renders everything recorded first; recording is suspended inside `render2d_kernel::with_backbuffer`. Large opaque ops drop earlier ops they fully cover (overdraw elimination, e.g. the clear under the wallpaper). Typical frame: 2 flushes, ~276 ops. **Measured (QEMU TCG):** rendering the list takes ~7 Mcycles on 4 CPUs vs ~10.5 on 1, but whole frames are about the same as before the list on 4 CPUs (14–16) and ~1–2 Mcycles slower on 1 CPU (18–20 vs 17–18). Pixel work under TCG is bound by emulated memory speed, and ~6 Mcycles of each frame is CPU logic (layout, `render2d` shapes) on the main CPU. The list is kept as the structure other backends need: ops are data that a GPU or mesh node can take. **Still to do:** `render2d` shapes as ops; `gpu_driver` batches and Win32 surfaces through the logical GPU; re-measure on real hardware. | Correct rendering verified (text-heavy terminal, file manager, taskbar) |
-| 7D | Display abstraction: real mode and stride, no `SCREEN_W/H` constants | Other resolutions work |
+| 7D ✅ | Display mode at run time. `ui::screen_w()/screen_h()` replace the `SCREEN_W/H` constants (~100 uses in 10 files). The Bochs driver sets the mode from `/etc/display.cfg` (`WIDTHxHEIGHT`, checked against VRAM), reads back the real size and stride, and publishes them before the back buffer is allocated. Mouse clamps follow the mode. | 1024×768 (default), 1280×720 and 800×600 render correctly; an invalid request falls back to the default with a log line. Still one display; multi-display desktop and the MMIO-only `bochs-display` register path are open. |
 | 7E | Mesh backends for the logical GPU; NIC aggregation | Remote devices join the pool |
 
 ## Decisions (agreed 2026-10-28)

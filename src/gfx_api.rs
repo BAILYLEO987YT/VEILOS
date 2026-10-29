@@ -254,8 +254,8 @@ impl VkIcd {
                     crate::gpu_driver::submit(self.pid, GpuCommand::Present {
                         surface_vram_offset: vram_off + image_index as u64 * (1024 * 768 * 4),
                         x: 0, y: 0,
-                        w: crate::ui::SCREEN_W as u32,
-                        h: crate::ui::SCREEN_H as u32,
+                        w: crate::ui::screen_w() as u32,
+                        h: crate::ui::screen_h() as u32,
                     });
                 }
                 0
@@ -384,7 +384,7 @@ impl D3D9Translator {
     pub fn new(pid: u32) -> Self {
         let mut icd = VkIcd::new(pid);
         let sc = icd.submit(VkIrCommand::CreateSwapchain {
-            width: crate::ui::SCREEN_W as u32, height: crate::ui::SCREEN_H as u32,
+            width: crate::ui::screen_w() as u32, height: crate::ui::screen_h() as u32,
             format: 0x2C, // VK_FORMAT_B8G8R8A8_UNORM
             present_mode: 1, // VK_PRESENT_MODE_FIFO_KHR
         });
@@ -392,8 +392,8 @@ impl D3D9Translator {
             icd, vert_shader: 0, frag_shader: 0, vertex_buf: 0, index_buf: 0,
             swapchain: sc,
             vp_x: 0.0, vp_y: 0.0,
-            vp_w: crate::ui::SCREEN_W as f32,
-            vp_h: crate::ui::SCREEN_H as f32,
+            vp_w: crate::ui::screen_w() as f32,
+            vp_h: crate::ui::screen_h() as f32,
         }
     }
 
@@ -464,7 +464,7 @@ impl D3D11Translator {
     pub fn new(pid: u32) -> Self {
         let mut icd = VkIcd::new(pid);
         let sc = icd.submit(VkIrCommand::CreateSwapchain {
-            width: crate::ui::SCREEN_W as u32, height: crate::ui::SCREEN_H as u32,
+            width: crate::ui::screen_w() as u32, height: crate::ui::screen_h() as u32,
             format: 0x2C, present_mode: 1,
         });
         Self { icd, deferred_cmds: Vec::new(), swapchain: sc }
@@ -559,7 +559,7 @@ impl D3D12Translator {
     pub fn new(pid: u32) -> Self {
         let mut icd = VkIcd::new(pid);
         let sc = icd.submit(VkIrCommand::CreateSwapchain {
-            width: crate::ui::SCREEN_W as u32, height: crate::ui::SCREEN_H as u32,
+            width: crate::ui::screen_w() as u32, height: crate::ui::screen_h() as u32,
             format: 0x2C, present_mode: 0, // VK_PRESENT_MODE_IMMEDIATE_KHR
         });
         Self { icd, swapchain: sc }
@@ -596,7 +596,7 @@ impl GlTranslator {
     pub fn new(pid: u32) -> Self {
         let mut icd = VkIcd::new(pid);
         let sc = icd.submit(VkIrCommand::CreateSwapchain {
-            width: crate::ui::SCREEN_W as u32, height: crate::ui::SCREEN_H as u32,
+            width: crate::ui::screen_w() as u32, height: crate::ui::screen_h() as u32,
             format: 0x2C, present_mode: 1,
         });
         Self {
@@ -614,8 +614,8 @@ impl GlTranslator {
                   |  (b * 255.0) as u32;
         crate::gpu_driver::submit(self.icd.pid, GpuCommand::FillRect {
             x: 0, y: 0,
-            w: crate::ui::SCREEN_W as u32,
-            h: crate::ui::SCREEN_H as u32,
+            w: crate::ui::screen_w() as u32,
+            h: crate::ui::screen_h() as u32,
             color,
         });
     }
@@ -657,8 +657,8 @@ impl GlTranslator {
 
     /// glRectf — translated to a 2D FillRect.
     pub fn rectf(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
-        let sw = crate::ui::SCREEN_W as f32;
-        let sh = crate::ui::SCREEN_H as f32;
+        let sw = crate::ui::screen_w() as f32;
+        let sh = crate::ui::screen_h() as f32;
         // NDC [-1,1] → screen pixels
         let px = ((x1 + 1.0) * 0.5 * sw) as u32;
         let py = ((1.0 - y2) * 0.5 * sh) as u32;

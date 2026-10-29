@@ -456,7 +456,7 @@ pub fn pump(ms: u64) -> bool {
         let scopes = sh.scopes();
         let mut ev = Eval { interp: &mut **eng, scopes, now };
         changed = sh.refresh(&mut ev, now_sec);
-        changed |= sh.layout((crate::ui::SCREEN_W as i32, crate::ui::SCREEN_H as i32), fonts);
+        changed |= sh.layout((crate::ui::screen_w() as i32, crate::ui::screen_h() as i32), fonts);
         changed |= core::mem::replace(&mut sh.state_changed, false);
         errs.extend(sh.take_errors());
     }

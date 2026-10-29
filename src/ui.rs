@@ -4,8 +4,32 @@ use spin::Mutex;
 // -----| screen dimensions |-----
 // These match the resolution set by the display driver (graphics::probe_display).
 // Update both here and there if you change the resolution.
-pub const SCREEN_W: usize = 1024;
-pub const SCREEN_H: usize = 768;
+/// Current screen size in pixels. Set from the display mode by the display
+/// driver (`set_screen_size`) before the back buffer is allocated; 1024×768
+/// until then. These were compile-time constants, which tied every window,
+/// clip and buffer to one resolution (HAL step 7D).
+static SCREEN_W_RT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1024);
+static SCREEN_H_RT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(768);
+
+/// Screen width in pixels.
+#[inline]
+pub fn screen_w() -> usize {
+    SCREEN_W_RT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Screen height in pixels.
+#[inline]
+pub fn screen_h() -> usize {
+    SCREEN_H_RT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Adopt a new screen size: called by the display driver once the mode is
+/// set, before `init_back_buffer`. Also resets the clip to the whole screen.
+pub fn set_screen_size(w: usize, h: usize) {
+    SCREEN_W_RT.store(w, core::sync::atomic::Ordering::Relaxed);
+    SCREEN_H_RT.store(h, core::sync::atomic::Ordering::Relaxed);
+    clip_reset();
+}
 
 // -----| primitive drawing |-----
 
@@ -290,8 +314,8 @@ pub fn clip_set(x: i32, y: i32, w: u32, h: u32) {
 pub fn clip_reset() {
     CLIP_X .store(0,              AtomicOrd::Relaxed);
     CLIP_Y .store(0,              AtomicOrd::Relaxed);
-    CLIP_X2.store(SCREEN_W as i32, AtomicOrd::Relaxed);
-    CLIP_Y2.store(SCREEN_H as i32, AtomicOrd::Relaxed);
+    CLIP_X2.store(screen_w() as i32, AtomicOrd::Relaxed);
+    CLIP_Y2.store(screen_h() as i32, AtomicOrd::Relaxed);
 }
 
 // -----| double buffering subsystem |-----
@@ -357,7 +381,7 @@ impl BackBufferGuard {
         PAINTER_PTR.store(ptr, AtomicOrd::Release);
         PAINTER_ACTIVE.store(true, AtomicOrd::Release);
         // Record this frame's drawing into the logical GPU's display list.
-        crate::lgpu::dl_begin(crate::lgpu::Surface { ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W });
+        crate::lgpu::dl_begin(crate::lgpu::Surface { ptr, width: screen_w(), height: screen_h(), stride: screen_w() });
         Some(Self { _guard: guard })
     }
 }
@@ -377,17 +401,17 @@ impl Drop for BackBufferGuard {
 pub fn init_back_buffer() {
     let mut bb = BACK_BUFFER.lock();
     let mut vec = alloc::vec::Vec::new();
-    vec.reserve_exact(SCREEN_W * SCREEN_H);
+    vec.reserve_exact(screen_w() * screen_h());
     unsafe {
-        core::ptr::write_bytes(vec.as_mut_ptr(), 0, SCREEN_W * SCREEN_H);
-        vec.set_len(SCREEN_W * SCREEN_H);
+        core::ptr::write_bytes(vec.as_mut_ptr(), 0, screen_w() * screen_h());
+        vec.set_len(screen_w() * screen_h());
     }
     *bb = Some(vec);
 }
 
 /// Commits the ENTIRE off-screen buffer to the real hardware.
 pub fn commit_back_buffer() {
-    commit_dirty_rect(0, 0, SCREEN_W, SCREEN_H);
+    commit_dirty_rect(0, 0, screen_w(), screen_h());
 }
 
 /// The back buffer's raw pointer for code that writes pixels itself (image
@@ -405,7 +429,7 @@ pub fn painter_surface() -> Option<crate::lgpu::Surface> {
         return None;
     }
     let ptr = PAINTER_PTR.load(AtomicOrd::Relaxed);
-    (!ptr.is_null()).then_some(crate::lgpu::Surface { ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W })
+    (!ptr.is_null()).then_some(crate::lgpu::Surface { ptr, width: screen_w(), height: screen_h(), stride: screen_w() })
 }
 
 /// Commits only a specific portion of the off-screen buffer to the real hardware.
@@ -423,7 +447,7 @@ pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
                 let target = crate::lgpu::Surface {
                     ptr: fb.base_addr as *mut u32, width: fb.width, height: fb.height, stride: fb.stride,
                 };
-                let src = crate::lgpu::Surface { ptr: bb_ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W };
+                let src = crate::lgpu::Surface { ptr: bb_ptr, width: screen_w(), height: screen_h(), stride: screen_w() };
                 let dst = crate::lgpu::Rect::new(x, y, (x + w).min(fb.width), (y + h).min(fb.height));
                 crate::lgpu::execute(&[crate::lgpu::Op::Copy { src, src_x: x, src_y: y, dst, transparent: None }], &target);
             }
@@ -442,7 +466,7 @@ pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
             if py >= fb.height { break; }
             
             let row_start = (fb.base_addr + (py * fb.stride + x) as u64 * 4) as *mut u32;
-            let src_start = py * SCREEN_W + x;
+            let src_start = py * screen_w() + x;
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     bb.as_ptr().add(src_start),
@@ -484,8 +508,8 @@ pub fn draw_rect_atomic(x: usize, y: usize, w: usize, h: usize, color: Color) {
     // Intersect the requested rect with the clip.
     let rx  = x.max(cx);
     let ry  = y.max(cy);
-    let rx2 = (x + w).min(cx2).min(SCREEN_W);
-    let ry2 = (y + h).min(cy2).min(SCREEN_H);
+    let rx2 = (x + w).min(cx2).min(screen_w());
+    let ry2 = (y + h).min(cy2).min(screen_h());
     if rx >= rx2 || ry >= ry2 { return; }
     let dw = rx2 - rx;
     let dh = ry2 - ry;
@@ -500,7 +524,7 @@ pub fn draw_rect_atomic(x: usize, y: usize, w: usize, h: usize, color: Color) {
             // Through the logical GPU (HAL step 7C): large fills (window and
             // panel backgrounds) are banded over every CPU, small ones run here.
             // Each fill completes before this returns, so drawing order is kept.
-            let target = crate::lgpu::Surface { ptr: bb_ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W };
+            let target = crate::lgpu::Surface { ptr: bb_ptr, width: screen_w(), height: screen_h(), stride: screen_w() };
             let op = crate::lgpu::Op::Fill { rect: crate::lgpu::Rect::new(rx, ry, rx + dw, ry + dh), color: pixel_val };
             if !crate::lgpu::dl_record(op) {
                 crate::lgpu::execute(&[op], &target);
@@ -514,7 +538,7 @@ pub fn draw_rect_atomic(x: usize, y: usize, w: usize, h: usize, color: Color) {
     if let Some(ref mut bb) = *bb_lock {
         for dy in 0..dh {
             let py = ry + dy;
-            let start = py * SCREEN_W + rx;
+            let start = py * screen_w() + rx;
             bb[start..start + dw].fill(pixel_val);
         }
     }
@@ -560,7 +584,7 @@ pub fn draw_string_atomic(s: &str, x: usize, y: usize, color: Color) {
         let bb_ptr = PAINTER_PTR.load(AtomicOrd::Relaxed);
         if !bb_ptr.is_null() {
             let pixel_val = (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16);
-            let clip = crate::lgpu::Rect::new(cx, cy, cx2.min(SCREEN_W), cy2.min(SCREEN_H));
+            let clip = crate::lgpu::Rect::new(cx, cy, cx2.min(screen_w()), cy2.min(screen_h()));
             let mut offset = 0;
             for c in s.chars() {
                 let char_x = x + offset;
@@ -603,7 +627,7 @@ pub fn draw_string_atomic(s: &str, x: usize, y: usize, color: Color) {
 /// in draw_string_atomic.
 ///
 /// # Safety
-/// `bb_ptr` must point to a valid SCREEN_W × SCREEN_H pixel buffer. Caller
+/// `bb_ptr` must point to a valid screen_w() × screen_h() pixel buffer. Caller
 /// guarantees this by only calling this when PAINTER_PTR is non-null.
 unsafe fn draw_char_raw_ptr(bb_ptr: *mut u32, c: char, x: usize, y: usize, color: Color,
                              cx: usize, cy: usize, cx2: usize, cy2: usize) {
@@ -612,13 +636,13 @@ unsafe fn draw_char_raw_ptr(bb_ptr: *mut u32, c: char, x: usize, y: usize, color
     let pixel_val = (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16);
     for dy in 0..8 {
         let py = y + dy;
-        if py < cy || py >= cy2 || py >= SCREEN_H { continue; }
+        if py < cy || py >= cy2 || py >= screen_h() { continue; }
         let row_bits = FONT[offset + dy];
         for dx in 0..8 {
             if (row_bits & (0x80 >> dx)) != 0 {
                 let px = x + dx;
-                if px >= cx && px < cx2 && px < SCREEN_W {
-                    unsafe { *bb_ptr.add(py * SCREEN_W + px) = pixel_val; }
+                if px >= cx && px < cx2 && px < screen_w() {
+                    unsafe { *bb_ptr.add(py * screen_w() + px) = pixel_val; }
                 }
             }
         }
@@ -633,13 +657,13 @@ fn draw_char_atomic_raw(bb: &mut alloc::vec::Vec<u32>, c: char, x: usize, y: usi
 
     for dy in 0..8 {
         let py = y + dy;
-        if py < cy || py >= cy2 || py >= SCREEN_H { continue; }
+        if py < cy || py >= cy2 || py >= screen_h() { continue; }
         let row_bits = FONT[offset + dy];
         for dx in 0..8 {
             if (row_bits & (0x80 >> dx)) != 0 {
                 let px = x + dx;
-                if px >= cx && px < cx2 && px < SCREEN_W {
-                    bb[py * SCREEN_W + px] = pixel_val;
+                if px >= cx && px < cx2 && px < screen_w() {
+                    bb[py * screen_w() + px] = pixel_val;
                 }
             }
         }
@@ -689,7 +713,7 @@ pub fn draw_bmp_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
 
     for r in 0..th {
         let py = y + r;
-        if py < cy || py >= cy2 || py >= SCREEN_H as i32 { continue; }
+        if py < cy || py >= cy2 || py >= screen_h() as i32 { continue; }
 
         let src_r = (r as i64 * h_abs as i64 / th as i64) as i32;
         let src_y = if bottom_up { h_abs - 1 - src_r } else { src_r };
@@ -698,7 +722,7 @@ pub fn draw_bmp_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
 
         for c in 0..tw {
             let px = x + c;
-            if px < cx || px >= cx2 || px >= SCREEN_W as i32 { continue; }
+            if px < cx || px >= cx2 || px >= screen_w() as i32 { continue; }
 
             let src_x = (c as i64 * width as i64 / tw as i64) as usize;
             let px_off = row_offset + src_x * (bpp as usize / 8);
@@ -713,9 +737,9 @@ pub fn draw_bmp_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
             let pixel_val = (b as u32) | ((g as u32) << 8) | ((rd as u32) << 16);
 
             if direct && !bb_ptr.is_null() {
-                unsafe { *bb_ptr.add((py as usize) * SCREEN_W + (px as usize)) = pixel_val; }
+                unsafe { *bb_ptr.add((py as usize) * screen_w() + (px as usize)) = pixel_val; }
             } else if let Some(ref mut vec) = fallback_bb {
-                vec[(py as usize) * SCREEN_W + (px as usize)] = pixel_val;
+                vec[(py as usize) * screen_w() + (px as usize)] = pixel_val;
             }
         }
     }
@@ -771,7 +795,7 @@ pub fn draw_tga_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
 
     for r in 0..th {
         let py = y + r;
-        if py < cy || py >= cy2 || py >= SCREEN_H as i32 { continue; }
+        if py < cy || py >= cy2 || py >= screen_h() as i32 { continue; }
 
         let src_r = (r as i64 * height as i64 / th as i64) as i32;
         let src_y = if top_down { src_r } else { height - 1 - src_r };
@@ -780,7 +804,7 @@ pub fn draw_tga_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
 
         for c in 0..tw {
             let px = x + c;
-            if px < cx || px >= cx2 || px >= SCREEN_W as i32 { continue; }
+            if px < cx || px >= cx2 || px >= screen_w() as i32 { continue; }
 
             let src_x = (c as i64 * width as i64 / tw as i64) as usize;
             let px_off = row_offset + src_x * bytes_per_pixel;
@@ -797,9 +821,9 @@ pub fn draw_tga_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
             let pixel_val = (b as u32) | ((g as u32) << 8) | ((rd as u32) << 16);
 
             if direct && !bb_ptr.is_null() {
-                unsafe { *bb_ptr.add((py as usize) * SCREEN_W + (px as usize)) = pixel_val; }
+                unsafe { *bb_ptr.add((py as usize) * screen_w() + (px as usize)) = pixel_val; }
             } else if let Some(ref mut vec) = fallback_bb {
-                vec[(py as usize) * SCREEN_W + (px as usize)] = pixel_val;
+                vec[(py as usize) * screen_w() + (px as usize)] = pixel_val;
             }
         }
     }
@@ -953,21 +977,21 @@ fn build_scaled(pixels: &[u8], width: i32, height: i32, channels: usize, tw: i32
     Some((px, opaque))
 }
 
-/// Copy the visible part of a cached image into `dst` (a SCREEN_W x SCREEN_H back buffer),
+/// Copy the visible part of a cached image into `dst` (a screen_w() x screen_h() back buffer),
 /// honouring the clip rectangle exactly like the per-pixel path.
 fn blit_scaled(img: &ScaledImage, x: i32, y: i32, tw: i32, th: i32,
                cx: i32, cy: i32, cx2: i32, cy2: i32, dst: &mut [u32]) {
     let left  = cx.max(x).max(0);
-    let right = cx2.min(x + tw).min(SCREEN_W as i32);
+    let right = cx2.min(x + tw).min(screen_w() as i32);
     if left >= right { return; }
     let c0 = (left - x) as usize;
     let n  = (right - left) as usize;
     for r in 0..th {
         let py = y + r;
-        if py < cy || py >= cy2 || py >= SCREEN_H as i32 { continue; }
+        if py < cy || py >= cy2 || py >= screen_h() as i32 { continue; }
         let s0 = (r as usize) * (tw as usize) + c0;
         let src = &img.px[s0..s0 + n];
-        let d0 = (py as usize) * SCREEN_W + left as usize;
+        let d0 = (py as usize) * screen_w() + left as usize;
         let d = &mut dst[d0..d0 + n];
         if img.opaque {
             d.copy_from_slice(src);
@@ -1051,9 +1075,9 @@ fn draw_scaled_cached(pixels: &[u8], width: i32, height: i32, channels: usize,
         // Through the logical GPU: banded over every CPU (lgpu, HAL step 7C).
         // Same clipping as blit_scaled: the draw rect, the clip, the screen.
         let x0 = cx.max(x).max(0);
-        let x1 = cx2.min(x + tw).min(SCREEN_W as i32);
+        let x1 = cx2.min(x + tw).min(screen_w() as i32);
         let y0 = cy.max(y).max(0);
-        let y1 = cy2.min(y + th).min(SCREEN_H as i32);
+        let y1 = cy2.min(y + th).min(screen_h() as i32);
         if x0 < x1 && y0 < y1 {
             let src = crate::lgpu::Surface {
                 ptr: img.px.as_ptr() as *mut u32, width: tw as usize, height: th as usize, stride: tw as usize,
@@ -1073,7 +1097,7 @@ fn draw_scaled_cached(pixels: &[u8], width: i32, height: i32, channels: usize,
     }
     let mut bb_lock = BACK_BUFFER.lock();
     if let Some(ref mut v) = *bb_lock {
-        if v.len() >= SCREEN_W * SCREEN_H {
+        if v.len() >= screen_w() * screen_h() {
             blit_scaled(img, x, y, tw, th, cx, cy, cx2, cy2, &mut v[..]);
             return true;
         }
@@ -1105,7 +1129,7 @@ pub fn draw_decoded_rgb_ext(pixels: &[u8], width: i32, height: i32, channels: us
 
     for r in 0..th {
         let py = y + r;
-        if py < cy || py >= cy2 || py >= SCREEN_H as i32 { continue; }
+        if py < cy || py >= cy2 || py >= screen_h() as i32 { continue; }
 
         let src_y = (r as i64 * height as i64 / th as i64) as usize;
         let row_offset = src_y * row_bytes;
@@ -1113,7 +1137,7 @@ pub fn draw_decoded_rgb_ext(pixels: &[u8], width: i32, height: i32, channels: us
 
         for c in 0..tw {
             let px = x + c;
-            if px < cx || px >= cx2 || px >= SCREEN_W as i32 { continue; }
+            if px < cx || px >= cx2 || px >= screen_w() as i32 { continue; }
 
             let src_x = (c as i64 * width as i64 / tw as i64) as usize;
             let off = row_offset + src_x * channels;
@@ -1130,9 +1154,9 @@ pub fn draw_decoded_rgb_ext(pixels: &[u8], width: i32, height: i32, channels: us
             let pixel_val = (b as u32) | ((g as u32) << 8) | ((rd as u32) << 16);
 
             if direct && !bb_ptr.is_null() {
-                unsafe { *bb_ptr.add((py as usize) * SCREEN_W + (px as usize)) = pixel_val; }
+                unsafe { *bb_ptr.add((py as usize) * screen_w() + (px as usize)) = pixel_val; }
             } else if let Some(ref mut vec) = fallback_bb {
-                vec[(py as usize) * SCREEN_W + (px as usize)] = pixel_val;
+                vec[(py as usize) * screen_w() + (px as usize)] = pixel_val;
             }
         }
     }
@@ -1367,7 +1391,7 @@ impl WindowManager {
     fn draw_to_backbuffer_full(&self) {
         // The cursor is deliberately NOT drawn here. The back buffer is the
         // clean scene; the cursor lives only on the hardware surface.
-        draw_rect_atomic(0, 0, SCREEN_W, SCREEN_H, Color { r: 20, g: 20, b: 35 });
+        draw_rect_atomic(0, 0, screen_w(), screen_h(), Color { r: 20, g: 20, b: 35 });
         self.draw_status_bar_atomic();
         for win in &self.windows {
             if win.visible && !win.minimized {
@@ -1438,10 +1462,10 @@ pub fn blit_window(win: &WindowState) {
     if let (Some(bb), Some(src)) = (&mut *bb_lock, &win.backing) {
         for dy in 0..win.h {
             let py = win.y + dy;
-            if py >= SCREEN_H { break; }
-            let dst_start = py * SCREEN_W + win.x;
+            if py >= screen_h() { break; }
+            let dst_start = py * screen_w() + win.x;
             let src_start = dy * win.w;
-            let draw_w = if win.x + win.w > SCREEN_W { SCREEN_W.saturating_sub(win.x) } else { win.w };
+            let draw_w = if win.x + win.w > screen_w() { screen_w().saturating_sub(win.x) } else { win.w };
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr().add(src_start),
@@ -1561,10 +1585,10 @@ pub fn sync_window_backing_from_bb(id: usize) {
         if let Some(ref bb) = *bb_lock {
             for dy in 0..wh {
                 let py = wy + dy;
-                if py >= SCREEN_H { break; }
-                let copy_w = (wx + ww).min(SCREEN_W).saturating_sub(wx);
+                if py >= screen_h() { break; }
+                let copy_w = (wx + ww).min(screen_w()).saturating_sub(wx);
                 if copy_w == 0 { continue; }
-                let src = py * SCREEN_W + wx;
+                let src = py * screen_w() + wx;
                 let dst = dy * ww;
                 tmp[dst..dst + copy_w].copy_from_slice(&bb[src..src + copy_w]);
             }

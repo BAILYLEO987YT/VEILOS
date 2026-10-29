@@ -79,8 +79,8 @@ pub fn add_byte_and_process(byte: u8) {
             // Fold in movement from any packets that arrived while the lock was busy.
             let dx = dx + PENDING_DX.swap(0, Ordering::Relaxed);
             let dy = dy + PENDING_DY.swap(0, Ordering::Relaxed);
-            state.x = (state.x + dx).clamp(0, 1023);
-            state.y = (state.y - dy).clamp(0, 767); // PS/2 Y is inverted
+            state.x = (state.x + dx).clamp(0, crate::ui::screen_w() as i32 - 1);
+            state.y = (state.y - dy).clamp(0, crate::ui::screen_h() as i32 - 1); // PS/2 Y is inverted
             state.left_button  = (flags & 0x01) != 0;
             state.right_button = (flags & 0x02) != 0;
         } else {
@@ -321,8 +321,8 @@ fn process_packet(p: [u8; 3]) {
     let right = (flags & 0x02) != 0;
 
     let mut state = MOUSE_STATE.lock();
-    state.x = (state.x + dx).clamp(0, 1023);
-    state.y = (state.y - dy).clamp(0, 767); // Y is inverted in PS/2
+    state.x = (state.x + dx).clamp(0, crate::ui::screen_w() as i32 - 1);
+    state.y = (state.y - dy).clamp(0, crate::ui::screen_h() as i32 - 1); // Y is inverted in PS/2
     state.left_button  = left;
     state.right_button = right;
     state.dx = state.dx.saturating_add(dx);

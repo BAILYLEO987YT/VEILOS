@@ -303,7 +303,7 @@ impl GpuDevice {
 
     /// Execute one command against the BGA framebuffer model.
     fn execute_command(&self, cmd: GpuCommand) {
-        use crate::ui::{draw_rect_atomic, SCREEN_W};
+        use crate::ui::{draw_rect_atomic, screen_w};
         use crate::graphics::{Color, FRAMEBUFFER};
 
         match cmd {
@@ -318,7 +318,7 @@ impl GpuDevice {
             GpuCommand::BitBlt { src_x, src_y, dst_x, dst_y, w, h } => {
                 // Software BitBlt via back-buffer copy.
                 if let Some(ref fb) = *FRAMEBUFFER.lock() {
-                    let sw = SCREEN_W;
+                    let sw = screen_w();
                     for row in 0..h as usize {
                         let sy = src_y as usize + row;
                         let dy = dst_y as usize + row;
@@ -577,7 +577,7 @@ pub fn init() {
             vendor, dev.device_id as u32,
             regs_bar.base, regs_bar.size as usize,
             vram_bar.base, vram_size,
-            crate::ui::SCREEN_W as u32, crate::ui::SCREEN_H as u32, 32,
+            crate::ui::screen_w() as u32, crate::ui::screen_h() as u32, 32,
         ));
 
         println!("[GPU] Registered {:?} device {:#06x} regs={:#X} VRAM_base={:#X} ({} MiB)",
@@ -591,9 +591,9 @@ pub fn init() {
         let sw_gpu = Arc::new(GpuDevice::new(
             GpuVendor::Bochs, 0x1234,
             0, 0,
-            crate::ui::SCREEN_W as u64 * crate::ui::SCREEN_H as u64 * 4, // dummy BAR1
-            crate::ui::SCREEN_W * crate::ui::SCREEN_H * 4,
-            crate::ui::SCREEN_W as u32, crate::ui::SCREEN_H as u32, 32,
+            crate::ui::screen_w() as u64 * crate::ui::screen_h() as u64 * 4, // dummy BAR1
+            crate::ui::screen_w() * crate::ui::screen_h() * 4,
+            crate::ui::screen_w() as u32, crate::ui::screen_h() as u32, 32,
         ));
         println!("[GPU] No PCI GPU found — using software BGA fallback.");
         gpus.push(sw_gpu);

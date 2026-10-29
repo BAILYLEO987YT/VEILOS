@@ -468,8 +468,8 @@ impl DriverStressTester {
         let errors = 0u64;
         let count  = 1000u64;
         for i in 0..count {
-            let x = ((i * 7) % crate::ui::SCREEN_W as u64) as u32;
-            let y = ((i * 3) % crate::ui::SCREEN_H as u64) as u32;
+            let x = ((i * 7) % crate::ui::screen_w() as u64) as u32;
+            let y = ((i * 3) % crate::ui::screen_h() as u64) as u32;
             crate::gpu_driver::submit(0, crate::gpu_driver::GpuCommand::FillRect {
                 x, y, w: 2, h: 2, color: 0x1A6BC4,
             });

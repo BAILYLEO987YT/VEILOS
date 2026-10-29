@@ -42,7 +42,7 @@ use alloc::boxed::Box;
 use spin::Mutex;
 use core::sync::atomic::{AtomicU32, AtomicU8, AtomicBool, Ordering};
 use crate::println;
-use crate::ui::{SCREEN_W, SCREEN_H};
+use crate::ui::{screen_w, screen_h};
 use crate::graphics::Color;
 use crate::gui_toolkit::{Widget, Renderer, Rect, ThemeKind, ACTIVE_THEME};
 use crate::distributed::NodeId;
@@ -307,7 +307,7 @@ impl DesktopWindowManager {
         let mut x_lines = Vec::new();
         let mut y_lines = Vec::new();
         
-        let screen_w = crate::ui::SCREEN_W as i32;
+        let screen_w = crate::ui::screen_w() as i32;
         let (top, bottom) = work_area();
 
         x_lines.push(0);
@@ -493,7 +493,7 @@ impl DesktopWindowManager {
                 WindowState::Normal => {
                     w.saved_rect = w.rect;
                     let (top, bottom) = work_area();
-                    w.rect  = Rect::new(0, top, SCREEN_W as u32, (bottom - top) as u32);
+                    w.rect  = Rect::new(0, top, screen_w() as u32, (bottom - top) as u32);
                     w.state = WindowState::Maximized;
                 }
                 _ => {}
@@ -1001,8 +1001,8 @@ impl DesktopBackground {
             };
 
             if img_w > 0 && img_h > 0 {
-                let sw = crate::ui::SCREEN_W as i32;
-                let sh = crate::ui::SCREEN_H as i32;
+                let sw = crate::ui::screen_w() as i32;
+                let sh = crate::ui::screen_h() as i32;
                 
                 let draw = |x: i32, y: i32, tw: i32, th: i32| {
                     if let Some(ref frames) = self.gif_frames {
@@ -1130,9 +1130,9 @@ pub const SHELL_TASKBAR_HEIGHT: usize = 32;
 /// top strip; a running VSH shell replaces it with its own bar at the bottom.
 pub fn work_area() -> (i32, i32) {
     if crate::shell::is_active() {
-        (0, (crate::ui::SCREEN_H - SHELL_TASKBAR_HEIGHT) as i32)
+        (0, (crate::ui::screen_h() - SHELL_TASKBAR_HEIGHT) as i32)
     } else {
-        (PANEL_HEIGHT as i32, crate::ui::SCREEN_H as i32)
+        (PANEL_HEIGHT as i32, crate::ui::screen_h() as i32)
     }
 }
 
@@ -1189,9 +1189,9 @@ impl Panel {
         let mode = crate::policy::POLICY.lock().get_mode();
 
         // Background bar
-        r.fill_rect(Rect::new(0, 0, SCREEN_W as u32, PANEL_HEIGHT as u32), titlebar_c);
+        r.fill_rect(Rect::new(0, 0, screen_w() as u32, PANEL_HEIGHT as u32), titlebar_c);
         // Bottom border
-        r.fill_rect(Rect::new(0, PANEL_HEIGHT as i32 - 1, SCREEN_W as u32, 1), border_c);
+        r.fill_rect(Rect::new(0, PANEL_HEIGHT as i32 - 1, screen_w() as u32, 1), border_c);
 
         // VEILOS logo / launcher button
         r.fill_rect(Rect::new(0, 0, PANEL_HEIGHT as u32, PANEL_HEIGHT as u32), accent_c);
@@ -1214,15 +1214,15 @@ impl Panel {
         let mins  = secs / 60 % 60;
         let hrs   = secs / 3600 % 24;
         let clock = alloc::format!("{:02}:{:02}:{:02}", hrs, mins, secs % 60);
-        r.draw_text(&clock, SCREEN_W as i32 - 80, 14, text_secondary_c);
+        r.draw_text(&clock, screen_w() as i32 - 80, 14, text_secondary_c);
 
         // Policy mode indicator (far right)
         let (mode_str, mode_col) = match mode {
             crate::policy::PolicyMode::Security    => ("SEC", Color { r: 55, g: 185, b: 95  }),
             crate::policy::PolicyMode::Performance => ("PRF", Color { r: 220, g: 55, b: 55 }),
         };
-        r.fill_rect(Rect::new(SCREEN_W as i32 - 120, 6, 36, PANEL_HEIGHT as u32 - 12), mode_col);
-        r.draw_text(mode_str, SCREEN_W as i32 - 114, 14, text_primary_c);
+        r.fill_rect(Rect::new(screen_w() as i32 - 120, 6, 36, PANEL_HEIGHT as u32 - 12), mode_col);
+        r.draw_text(mode_str, screen_w() as i32 - 114, 14, text_primary_c);
     }
 
     /// Hit-test a click at (x, y) against the panel.
@@ -1306,8 +1306,8 @@ impl NotificationSystem {
 
     pub fn paint(&self) {
         let r = Renderer::new(0);
-        let mut y = SCREEN_H as i32 - TOAST_H as i32 - 8;
-        let x     = SCREEN_W as i32 - TOAST_W as i32 - 8;
+        let mut y = screen_h() as i32 - TOAST_H as i32 - 8;
+        let x     = screen_w() as i32 - TOAST_W as i32 - 8;
 
         for toast in self.toasts.iter().rev() {
             let t  = ACTIVE_THEME.lock();
@@ -1744,8 +1744,8 @@ impl PendingRoleDialog {
         if !self.visible { return; }
         
         use crate::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
-        let sw = crate::ui::SCREEN_W;
-        let sh = crate::ui::SCREEN_H;
+        let sw = crate::ui::screen_w();
+        let sh = crate::ui::screen_h();
         
         let t = ACTIVE_THEME.lock();
         let p = t.palette;
@@ -1813,8 +1813,8 @@ impl PendingRoleDialog {
         if !self.visible { return false; }
         let dlg_w: i32 = 300;
         let dlg_h: i32 = 120;
-        let cx = (crate::ui::SCREEN_W as i32 - dlg_w) / 2;
-        let cy = (crate::ui::SCREEN_H as i32 - dlg_h) / 2;
+        let cx = (crate::ui::screen_w() as i32 - dlg_w) / 2;
+        let cy = (crate::ui::screen_h() as i32 - dlg_h) / 2;
 
         let btn_w: i32 = 80;
         let btn_h: i32 = 24;
@@ -1990,8 +1990,8 @@ impl LoginScreen {
     pub fn paint(&self) {
         use crate::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
 
-        let sw = SCREEN_W;
-        let sh = SCREEN_H;
+        let sw = screen_w();
+        let sh = screen_h();
 
         // Background — deep navy.
         draw_rect_atomic(0, 0, sw, sh, Color { r: 8, g: 12, b: 28 });
@@ -2157,8 +2157,8 @@ impl LockScreen {
     pub fn paint(&self, ms: u64) {
         use crate::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
 
-        let sw = SCREEN_W;
-        let sh = SCREEN_H;
+        let sw = screen_w();
+        let sh = screen_h();
 
         // Dark overlay.
         draw_rect_atomic(0, 0, sw, sh, Color { r: 4, g: 6, b: 16 });
@@ -2772,7 +2772,7 @@ pub fn init() {
 /// Must only be called when the desktop phase is `Desktop` and no other
 /// `ui_dirty` event is pending (gui_refresh_task handles the guard).
 pub fn repaint_panel_only(ms: u64) {
-    use crate::ui::{SCREEN_W, commit_dirty_rect};
+    use crate::ui::{screen_w, commit_dirty_rect};
     // Only meaningful on the desktop.
     let phase = DesktopPhase::from_u8(DESKTOP_PHASE.load(Ordering::Acquire));
     if phase != DesktopPhase::Desktop { return; }
@@ -2788,7 +2788,7 @@ pub fn repaint_panel_only(ms: u64) {
     panel.paint(); // writes into the back-buffer, clipped to the panel strip
 
     // Flush only the panel rows to hardware — ~40 rows × 1024 px.
-    commit_dirty_rect(0, 0, SCREEN_W, PANEL_HEIGHT);
+    commit_dirty_rect(0, 0, screen_w(), PANEL_HEIGHT);
     // Re-draw cursor if it overlaps the panel area.
     {
         let wm = crate::ui::WINDOW_MANAGER.lock();

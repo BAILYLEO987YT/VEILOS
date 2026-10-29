@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 use crate::font::{Font, FontLibrary, GlyphCache};
 use crate::render2d::{Cache, Canvas, IRect};
-use crate::ui::{BACK_BUFFER, CLIP_X, CLIP_X2, CLIP_Y, CLIP_Y2, PAINTER_ACTIVE, SCREEN_H, SCREEN_W};
+use crate::ui::{BACK_BUFFER, CLIP_X, CLIP_X2, CLIP_Y, CLIP_Y2, PAINTER_ACTIVE, screen_h, screen_w};
 
 /// Shared corner-mask and shadow-mask cache. Keeping it across frames is what
 /// makes shadows cheap: a mask is built once, then blitted.
@@ -54,10 +54,10 @@ pub fn with_backbuffer<R>(f: impl FnOnce(&mut Canvas, &mut Cache) -> R) -> Optio
         // Renders the frame's recorded display list first (see ui::painter_ptr_flushed).
         let ptr = crate::ui::painter_ptr_flushed();
         if !ptr.is_null() {
-            // SAFETY: the guard keeps SCREEN_W * SCREEN_H pixels alive at `ptr`
+            // SAFETY: the guard keeps screen_w() * screen_h() pixels alive at `ptr`
             // for the duration of the frame (same assumption as draw_rect_atomic).
-            let px = unsafe { core::slice::from_raw_parts_mut(ptr, SCREEN_W * SCREEN_H) };
-            let mut canvas = Canvas::new_opaque(px, SCREEN_W as i32, SCREEN_H as i32)?;
+            let px = unsafe { core::slice::from_raw_parts_mut(ptr, screen_w() * screen_h()) };
+            let mut canvas = Canvas::new_opaque(px, screen_w() as i32, screen_h() as i32)?;
             canvas.set_clip(clip);
             // Recording is off while the canvas holds the raw buffer.
             return Some(crate::lgpu::suspended(|| f(&mut canvas, cache)));
@@ -67,7 +67,7 @@ pub fn with_backbuffer<R>(f: impl FnOnce(&mut Canvas, &mut Cache) -> R) -> Optio
     // Normal path: take the back buffer mutex for the duration of the call.
     let mut bb = BACK_BUFFER.lock();
     let buf = bb.as_mut()?;
-    let mut canvas = Canvas::new_opaque(&mut buf[..], SCREEN_W as i32, SCREEN_H as i32)?;
+    let mut canvas = Canvas::new_opaque(&mut buf[..], screen_w() as i32, screen_h() as i32)?;
     canvas.set_clip(clip);
     Some(f(&mut canvas, cache))
 }
