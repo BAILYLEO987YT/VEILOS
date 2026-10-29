@@ -4,3 +4,7 @@
 /*.exe
 /scratch/*.exe
 *.log
+
+# Runtime state written by VEILOS (user database, last login)
+storage/etc/users.vdb
+storage/etc/last_user
