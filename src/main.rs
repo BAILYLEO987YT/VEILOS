@@ -751,6 +751,9 @@ async fn gui_refresh_task() {
             }
         }
 
+        // Process GPU command batches queued since the last iteration.
+        crate::gpu_driver::tick();
+
         // ---- frame-time diagnostics ----
         if ui_dirty {
             diag_full += 1;
@@ -763,14 +766,16 @@ async fn gui_refresh_task() {
             let avg_mc = if diag_full > 0 { diag_full_cycles / diag_full / 1_000_000 } else { 0 };
             let per = |c: u64| if diag_full > 0 { c / diag_full / 100_000 } else { 0 }; // tenths of Mcycles
             let (dl_flushes, dl_ops, dl_cycles) = crate::lgpu::take_stats();
+            let shell_cycles = crate::shell::take_paint_cycles();
             serial_println!(
-                "[GUI] perf: {} loop iters, {} full frames (avg {} Mcycles each: clear {}.{} paint {}.{} flush {}.{}; display list {} flushes, {} ops, {}.{} rendering), {} cursor-only; {} Mcycles elapsed over {} ticks",
+                "[GUI] perf: {} loop iters, {} full frames (avg {} Mcycles each: clear {}.{} paint {}.{} flush {}.{}; display list {} flushes, {} ops, {}.{} rendering; shell {}.{}), {} cursor-only; {} Mcycles elapsed over {} ticks",
                 diag_iters, diag_full, avg_mc,
                 per(diag_stage[0]) / 10, per(diag_stage[0]) % 10,
                 per(diag_stage[1]) / 10, per(diag_stage[1]) % 10,
                 per(diag_stage[2]) / 10, per(diag_stage[2]) % 10,
                 dl_flushes / diag_full.max(1), dl_ops / diag_full.max(1),
                 per(dl_cycles) / 10, per(dl_cycles) % 10,
+                per(shell_cycles) / 10, per(shell_cycles) % 10,
                 diag_cursor,
                 now_tsc.wrapping_sub(diag_tsc0) / 1_000_000,
                 ms.wrapping_sub(diag_ticks0));

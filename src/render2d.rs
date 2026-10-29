@@ -1410,6 +1410,17 @@ fn fill_u32(dst: &mut [u32], v: u32) {
     }
 }
 
+/// Lets a canvas hand shape draws to another renderer (the kernel's logical
+/// GPU, which splits them over every CPU). The canvas calls `sync` before
+/// every pixel it writes or reads itself, so drawing order is kept.
+pub trait Offload {
+    /// Take over a fill (`borders` None) or a border stroke of `shape`, drawn
+    /// inside `clip`. Returning false means the canvas draws it itself.
+    fn shape(&self, shape: &Shape, borders: Option<&Borders>, paint: &Paint, opacity: u8, clip: IRect) -> bool;
+    /// Make everything taken over so far land in the pixels.
+    fn sync(&self);
+}
+
 /// A drawing surface: the back buffer (opaque 0x00RRGGBB) or a `Layer`
 /// (premultiplied ARGB), with a clip rectangle and dirty-rect tracking.
 pub struct Canvas<'a> {
@@ -1420,6 +1431,7 @@ pub struct Canvas<'a> {
     clip: IRect,
     amask: u32,
     dirty: IRect,
+    offload: Option<&'a dyn Offload>,
 }
 
 impl<'a> Canvas<'a> {
@@ -1432,13 +1444,27 @@ impl<'a> Canvas<'a> {
         if px.len() < need {
             return None;
         }
-        Some(Canvas { px, w, h, stride: w as usize, clip: IRect::new(0, 0, w, h), amask: 0x00FF_FFFF, dirty: IRect::EMPTY })
+        Some(Canvas { px, w, h, stride: w as usize, clip: IRect::new(0, 0, w, h), amask: 0x00FF_FFFF, dirty: IRect::EMPTY, offload: None })
+    }
+
+    /// Hand shape fills and strokes to `o` (see `Offload`). Only for opaque
+    /// canvases: what `o` draws is opaque-target pixels.
+    pub fn set_offload(&mut self, o: &'a dyn Offload) {
+        self.offload = Some(o);
+    }
+
+    /// Let everything offloaded so far land before touching pixels here.
+    #[inline]
+    fn sync(&self) {
+        if let Some(o) = self.offload {
+            o.sync();
+        }
     }
 
     /// Draw into a layer (premultiplied ARGB, keeps alpha).
     pub fn from_layer(layer: &'a mut Layer) -> Canvas<'a> {
         let (w, h) = (layer.w, layer.h);
-        Canvas { px: &mut layer.px[..], w, h, stride: w as usize, clip: IRect::new(0, 0, w, h), amask: 0xFFFF_FFFF, dirty: IRect::EMPTY }
+        Canvas { px: &mut layer.px[..], w, h, stride: w as usize, clip: IRect::new(0, 0, w, h), amask: 0xFFFF_FFFF, dirty: IRect::EMPTY, offload: None }
     }
 
     pub fn bounds(&self) -> IRect {
@@ -1469,6 +1495,7 @@ impl<'a> Canvas<'a> {
     }
     /// Raw pixel (0 outside the canvas). Mostly for tests.
     pub fn pixel(&self, x: i32, y: i32) -> u32 {
+        self.sync();
         if x < 0 || y < 0 || x >= self.w || y >= self.h {
             0
         } else {
@@ -1585,6 +1612,7 @@ impl<'a> Canvas<'a> {
         if r.is_empty() || opacity == 0 {
             return;
         }
+        self.sync();
         for y in r.y..r.bottom() {
             self.blend_span_const(y, r.x, r.right(), color, opacity as u32);
         }
@@ -1597,6 +1625,7 @@ impl<'a> Canvas<'a> {
         if r.is_empty() {
             return;
         }
+        self.sync();
         let v = color.premul_px() & self.amask;
         for y in r.y..r.bottom() {
             for p in self.row_mut(y, r.x, r.w as usize).iter_mut() {
@@ -1617,6 +1646,13 @@ impl<'a> Canvas<'a> {
         let bounds = shape_bounds(rect, shape.rotation).intersect(&self.clip);
         if bounds.is_empty() {
             return;
+        }
+        if let Some(o) = self.offload {
+            if o.shape(shape, None, paint, opacity, self.clip) {
+                self.mark_dirty(bounds);
+                return;
+            }
+            o.sync();
         }
         let radii = shape.radii.clamped(rect.w, rect.h);
         cache.ensure_corners(&radii);
@@ -1644,6 +1680,13 @@ impl<'a> Canvas<'a> {
         let bounds = shape_bounds(rect, shape.rotation).intersect(&self.clip);
         if bounds.is_empty() {
             return;
+        }
+        if let Some(o) = self.offload {
+            if o.shape(shape, Some(b), paint, opacity, self.clip) {
+                self.mark_dirty(bounds);
+                return;
+            }
+            o.sync();
         }
         let radii = shape.radii.clamped(rect.w, rect.h);
         let inner_rect = IRect {
@@ -1708,6 +1751,7 @@ impl<'a> Canvas<'a> {
         if mw <= 0 || mh <= 0 || opacity == 0 || mask.len() < mw as usize * mh as usize {
             return;
         }
+        self.sync();
         let dst = IRect::new(x, y, mw, mh).intersect(&self.clip);
         if dst.is_empty() {
             return;
@@ -1727,6 +1771,7 @@ impl<'a> Canvas<'a> {
         if rect.is_empty() || opacity == 0 || sh.color.a == 0 {
             return;
         }
+        self.sync();
         let spread = sh.spread.clamp(-512, 512);
         let sr = IRect { x: rect.x - spread, y: rect.y - spread, w: rect.w + 2 * spread, h: rect.h + 2 * spread };
         if sr.is_empty() {
@@ -1887,6 +1932,7 @@ impl<'a> Canvas<'a> {
 
     /// Composite a layer 1:1 with its top-left at (x, y).
     pub fn draw_layer(&mut self, layer: &Layer, x: i32, y: i32, opacity: u8) {
+        self.sync();
         if opacity == 0 {
             return;
         }
@@ -1912,6 +1958,7 @@ impl<'a> Canvas<'a> {
     /// Composite a layer scaled (permille, 1000 = 1:1) and rotated clockwise
     /// about its centre, which is placed at (cx, cy).
     pub fn draw_layer_xf(&mut self, layer: &Layer, cx: i32, cy: i32, rot: Angle, scale_pm: u32, opacity: u8, smooth: bool) {
+        self.sync();
         if opacity == 0 {
             return;
         }

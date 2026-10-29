@@ -49,6 +49,15 @@ impl Framebuffer {
 
 pub static FRAMEBUFFER: Mutex<Option<Framebuffer>> = Mutex::new(None);
 
+/// The display adapter's whole VRAM aperture (physical base = kernel address,
+/// identity-mapped, and size). The visible framebuffer is its start; the rest
+/// is where `gpu_driver` keeps surfaces.
+static VRAM: Mutex<Option<(u64, usize)>> = Mutex::new(None);
+
+pub fn vram_mapping() -> Option<(u64, usize)> {
+    *VRAM.lock()
+}
+
 // -----| manual gpu probe |-----
 
 use x86_64::instructions::port::Port;
@@ -144,15 +153,18 @@ fn probe_display(dev: &pci::PciDevice) -> Result<(), alloc::string::String> {
     println!("[GRAPHICS] Hardware Resolution Set: {}x{}x32 (stride {})", width, height, stride);
     crate::serial_println!("[GRAPHICS] mode {}x{} stride {} (requested {}x{})", width, height, stride, want_w, want_h);
 
-    // Identity-map the framebuffer (write-combining, see map_direct_hw).
+    // Identity-map the whole aperture (write-combining, see map_direct_hw):
+    // the framebuffer at its start, GPU surfaces (gpu_driver) after it.
     let mut mapper = unsafe { crate::memory::get_mapper() };
     let mut frame_allocator = crate::memory::GlobalFrameAllocator;
 
     let fb_size = stride * height * 4;
-    if let Err(e) = map_direct_hw(phys_addr as u64, fb_size as u64, phys_addr as u64, &mut mapper, &mut frame_allocator) {
+    let vram_size = (bar0.size as usize).max(fb_size);
+    if let Err(e) = map_direct_hw(phys_addr as u64, vram_size as u64, phys_addr as u64, &mut mapper, &mut frame_allocator) {
         println!("[GRAPHICS] ERROR: Failed to map framebuffer: {}", e);
         return Err(alloc::format!("framebuffer mapping failed: {}", e));
     }
+    *VRAM.lock() = Some((phys_addr as u64, vram_size));
 
     // Everything sized from the screen (back buffer, clip, layout, mouse)
     // follows this mode from here on.

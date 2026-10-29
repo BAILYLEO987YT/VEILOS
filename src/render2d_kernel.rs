@@ -59,8 +59,11 @@ pub fn with_backbuffer<R>(f: impl FnOnce(&mut Canvas, &mut Cache) -> R) -> Optio
             let px = unsafe { core::slice::from_raw_parts_mut(ptr, screen_w() * screen_h()) };
             let mut canvas = Canvas::new_opaque(px, screen_w() as i32, screen_h() as i32)?;
             canvas.set_clip(clip);
-            // Recording is off while the canvas holds the raw buffer.
-            return Some(crate::lgpu::suspended(|| f(&mut canvas, cache)));
+            // Large shapes go to the frame's display list (rendered banded on
+            // every CPU); the canvas renders what's recorded before drawing
+            // anything itself, so order holds with `ui::draw_*` calls too.
+            canvas.set_offload(&crate::lgpu::ShapeOffload);
+            return Some(f(&mut canvas, cache));
         }
     }
 

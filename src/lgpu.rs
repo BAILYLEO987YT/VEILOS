@@ -15,17 +15,20 @@
 // whichever backend owns it.
 //
 // Desktop frames go through a display list (part 2): while a frame is being
-// painted (`ui::BackBufferGuard`), fills, text and the wallpaper blit are
-// recorded instead of drawn, and the list is rendered banded on every CPU at
-// once, so even small ops are shared out. Code that still needs the raw
-// back buffer (image decoders, the taskbar's `render2d` shapes) gets it from
-// `ui::painter_ptr_flushed`, which renders everything recorded so far first,
-// so drawing order is never changed. The back-buffer -> framebuffer flush is
-// a direct `execute`.
+// painted (`ui::BackBufferGuard`), fills, text, the wallpaper blit and large
+// `render2d` shapes (`ShapeOffload`) are recorded instead of drawn, and the
+// list is rendered banded on every CPU at once, so even small ops are shared
+// out. Code that still needs the raw back buffer (image decoders, the
+// `render2d` canvas for anything it doesn't offload) gets it from
+// `ui::painter_ptr_flushed` or `ShapeOffload::sync`, which render everything
+// recorded so far first, so drawing order is never changed. The back-buffer
+// -> framebuffer flush and `gpu_driver` command batches are direct `execute`s.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::render2d::{self, Borders, Cache, Canvas, IRect, Paint, Shape, Stop};
 use crate::workers;
 
 /// A 32-bit-per-pixel image somewhere in kernel memory.
@@ -73,7 +76,57 @@ pub enum Op {
     /// An 8×8 1-bit glyph (`bits`: 8 rows, MSB = leftmost pixel) at (x, y)
     /// in `color`, drawn only inside `clip`.
     Glyph8 { bits: &'static [u8], x: usize, y: usize, color: u32, clip: Rect },
+    /// A `render2d` shape fill or stroke (anti-aliased, rounded, gradient),
+    /// touching only `bounds`. The record lives in the display list until
+    /// the list is rendered.
+    Shape { rec: ShapeRef, bounds: Rect },
 }
+
+/// A `render2d` shape draw with everything it needs owned, so it can wait in
+/// the display list after the caller's borrowed paint is gone.
+pub struct ShapeRec {
+    shape: Shape,
+    borders: Option<Borders>,
+    paint: OwnedPaint,
+    opacity: u8,
+}
+
+enum OwnedPaint {
+    Solid(render2d::Color32),
+    Linear { angle: render2d::Angle, stops: Vec<Stop> },
+    Radial { cx: u16, cy: u16, stops: Vec<Stop> },
+}
+
+impl OwnedPaint {
+    /// Image paints borrow their pixels, so they are never offloaded.
+    fn from(p: &Paint) -> Option<OwnedPaint> {
+        Some(match *p {
+            Paint::Solid(c) => OwnedPaint::Solid(c),
+            Paint::Linear { angle, stops } => OwnedPaint::Linear { angle, stops: stops.to_vec() },
+            Paint::Radial { cx, cy, stops } => OwnedPaint::Radial { cx, cy, stops: stops.to_vec() },
+            Paint::Image(_) => return None,
+        })
+    }
+
+    fn paint(&self) -> Paint<'_> {
+        match self {
+            OwnedPaint::Solid(c) => Paint::Solid(*c),
+            OwnedPaint::Linear { angle, stops } => Paint::Linear { angle: *angle, stops },
+            OwnedPaint::Radial { cx, cy, stops } => Paint::Radial { cx: *cx, cy: *cy, stops },
+        }
+    }
+}
+
+/// Points at a `ShapeRec` boxed in the display list; read-only while bands render.
+#[derive(Clone, Copy)]
+pub struct ShapeRef(*const ShapeRec);
+
+unsafe impl Send for ShapeRef {}
+unsafe impl Sync for ShapeRef {}
+
+/// Shape masks (rounded corners) built by each CPU's bands, kept across
+/// frames like `render2d_kernel::GFX_CACHE`. One per CPU, so never contended.
+static SHAPE_CACHES: [Mutex<Cache>; crate::smp::MAX_CPUS] = [const { Mutex::new(Cache::new()) }; crate::smp::MAX_CPUS];
 
 /// Something that can render ops into one band of a target.
 pub trait Backend: Sync {
@@ -113,6 +166,28 @@ impl Backend for CpuRaster {
                                 unsafe { *target.ptr.add(py * target.stride + px) = color; }
                             }
                         }
+                    }
+                }
+                Op::Shape { rec, bounds } => {
+                    let Some(r) = bounds.intersect(&band) else { continue };
+                    // SAFETY: the record stays boxed in the display list until
+                    // `execute` returns (dl_flush).
+                    let rec = unsafe { &*rec.0 };
+                    // A canvas over just this band's rows, so no two CPUs ever
+                    // hold the same pixels; the shape moves up by the band's
+                    // first row (coverage and paint only depend on positions
+                    // relative to the shape, so this is exact).
+                    let rows = r.y1 - r.y0;
+                    let px = unsafe { core::slice::from_raw_parts_mut(target.ptr.add(r.y0 * target.stride), rows * target.stride) };
+                    let Some(mut c) = Canvas::new_opaque(px, target.stride as i32, rows as i32) else { continue };
+                    c.set_clip(IRect::new(r.x0 as i32, 0, (r.x1 - r.x0) as i32, rows as i32));
+                    let mut shape = rec.shape;
+                    shape.rect.y -= r.y0 as i32;
+                    let paint = rec.paint.paint();
+                    let mut cache = SHAPE_CACHES[crate::smp::cpu_index()].lock();
+                    match &rec.borders {
+                        None => c.fill_shape(&shape, &paint, rec.opacity, &mut cache),
+                        Some(b) => c.stroke_shape(&shape, b, &paint, rec.opacity, &mut cache),
                     }
                 }
                 Op::Copy { src, src_x, src_y, dst, transparent } => {
@@ -165,6 +240,7 @@ fn op_rect(op: &Op) -> Rect {
         Op::Fill { rect, .. } => rect,
         Op::Copy { dst, .. } => dst,
         Op::Glyph8 { x, y, clip, .. } => Rect::new(x, y, x + 8, y + 8).intersect(&clip).unwrap_or(Rect::new(0, 0, 0, 0)),
+        Op::Shape { bounds, .. } => bounds,
     }
 }
 
@@ -203,29 +279,34 @@ pub fn execute(ops: &[Op], target: &Surface) {
 struct DisplayList {
     target: Option<Surface>,
     ops: Vec<Op>,
-    /// While > 0 nothing is recorded: someone holds the raw buffer and
-    /// expects draws to land immediately, in order (`suspended`).
-    suspended: u32,
+    /// What the list's `Op::Shape`s point at.
+    shapes: Vec<Box<ShapeRec>>,
 }
 
 /// Only the painting thread (the executor's GUI task) records and flushes;
 /// the lock just makes that explicit.
-static DISPLAY_LIST: Mutex<DisplayList> = Mutex::new(DisplayList { target: None, ops: Vec::new(), suspended: 0 });
+static DISPLAY_LIST: Mutex<DisplayList> = Mutex::new(DisplayList { target: None, ops: Vec::new(), shapes: Vec::new() });
 
 /// Start recording a frame for `target` (`ui::BackBufferGuard::acquire`).
 pub fn dl_begin(target: Surface) {
     let mut dl = DISPLAY_LIST.lock();
     dl.target = Some(target);
     dl.ops.clear();
+    dl.shapes.clear();
 }
 
 /// Record `op` into the current frame. Returns false if no frame is being
 /// recorded; the caller then draws directly.
 pub fn dl_record(op: Op) -> bool {
     let mut dl = DISPLAY_LIST.lock();
-    if dl.target.is_none() || dl.suspended > 0 {
+    if dl.target.is_none() {
         return false;
     }
+    record_locked(&mut dl, op);
+    true
+}
+
+fn record_locked(dl: &mut DisplayList, op: Op) {
     // Overdraw elimination: a large opaque op hides every earlier op it fully
     // covers (e.g. the frame clear under a full-screen wallpaper), so those
     // never need rendering. Only large ops check, to keep recording cheap.
@@ -238,7 +319,41 @@ pub fn dl_record(op: Op) -> bool {
         }
     }
     dl.ops.push(op);
-    true
+}
+
+/// Shapes smaller than this are drawn by the canvas on the spot: recording
+/// one costs an allocation and a later flush, which only pays off when the
+/// shape is big enough to be split over CPUs.
+const MIN_OFFLOAD_PIXELS: usize = MIN_PARALLEL_PIXELS;
+
+/// `render2d` canvases over the frame's back buffer hand large shapes to the
+/// display list through this (`render2d_kernel::with_backbuffer`).
+pub struct ShapeOffload;
+
+impl render2d::Offload for ShapeOffload {
+    fn shape(&self, shape: &Shape, borders: Option<&Borders>, paint: &Paint, opacity: u8, clip: IRect) -> bool {
+        let b = render2d::shape_bounds(shape.rect, shape.rotation).intersect(&clip);
+        if b.is_empty() || (b.w as usize) * (b.h as usize) < MIN_OFFLOAD_PIXELS {
+            return false;
+        }
+        let Some(paint) = OwnedPaint::from(paint) else { return false };
+        let mut dl = DISPLAY_LIST.lock();
+        let Some(target) = dl.target else { return false };
+        // The canvas clip is inside its bounds, which are the target's.
+        let bounds = Rect::new(b.x as usize, b.y as usize, (b.x + b.w) as usize, (b.y + b.h) as usize);
+        if bounds.x1 > target.width || bounds.y1 > target.height {
+            return false;
+        }
+        let rec = Box::new(ShapeRec { shape: *shape, borders: borders.copied(), paint, opacity });
+        let ptr: *const ShapeRec = &*rec;
+        dl.shapes.push(rec);
+        record_locked(&mut dl, Op::Shape { rec: ShapeRef(ptr), bounds });
+        true
+    }
+
+    fn sync(&self) {
+        dl_flush();
+    }
 }
 
 /// The area `op` overwrites completely, if it is opaque.
@@ -251,21 +366,18 @@ fn opaque_rect(op: &Op) -> Option<Rect> {
             let h = src.height.saturating_sub(src_y).min(dst.y1 - dst.y0);
             Some(Rect::new(dst.x0, dst.y0, dst.x0 + w, dst.y0 + h))
         }
+        Op::Shape { rec, bounds } => {
+            // A plain opaque rectangle (e.g. a full-screen root panel).
+            let rec = unsafe { &*rec.0 };
+            let plain = rec.borders.is_none()
+                && rec.opacity == 255
+                && rec.shape.radii.is_zero()
+                && rec.shape.rotation.is_zero()
+                && matches!(rec.paint, OwnedPaint::Solid(c) if c.a == 255);
+            plain.then_some(bounds)
+        }
         _ => None,
     }
-}
-
-/// Run `f` with recording off: everything recorded so far is rendered first,
-/// and draws made inside `f` go straight to the buffer. For code that writes
-/// the raw buffer across a callback which may also call the `ui::draw_*`
-/// functions (`render2d_kernel::with_backbuffer`), where a recorded draw
-/// would otherwise land after raw writes that follow it.
-pub fn suspended<R>(f: impl FnOnce() -> R) -> R {
-    dl_flush();
-    DISPLAY_LIST.lock().suspended += 1;
-    let r = f();
-    DISPLAY_LIST.lock().suspended -= 1;
-    r
 }
 
 /// (flushes that rendered something, ops rendered, TSC cycles spent
@@ -283,19 +395,21 @@ static OPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0
 /// Render everything recorded so far. Call before touching the target's
 /// pixels directly (see `ui::painter_ptr_flushed`).
 pub fn dl_flush() {
-    let (target, ops) = {
+    let (target, ops, shapes) = {
         let mut dl = DISPLAY_LIST.lock();
         let Some(target) = dl.target else { return };
         if dl.ops.is_empty() {
             return;
         }
-        (target, core::mem::take(&mut dl.ops))
+        (target, core::mem::take(&mut dl.ops), core::mem::take(&mut dl.shapes))
     };
     FLUSHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     OPS.fetch_add(ops.len() as u64, core::sync::atomic::Ordering::Relaxed);
     let t0 = crate::time::rdtsc();
     execute(&ops, &target);
     FLUSH_CYCLES.fetch_add(crate::time::rdtsc() - t0, core::sync::atomic::Ordering::Relaxed);
+    // The ops that pointed at these are rendered.
+    drop(shapes);
     // Hand the allocation back so the next frame doesn't regrow it.
     let mut dl = DISPLAY_LIST.lock();
     if dl.ops.is_empty() {

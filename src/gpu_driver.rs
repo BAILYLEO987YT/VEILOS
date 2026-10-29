@@ -17,8 +17,9 @@
 //     A fixed-size circular buffer of GpuCommand entries backed by a
 //     contiguous memory region. The GPU reads from HEAD; the driver writes
 //     to TAIL. In a real GPU this maps directly to a hardware DMA ring
-//     (e.g. AMD CP, Intel EXECLIST, Nvidia PUSHBUF). Here we model the
-//     data structure faithfully and call process_ring() from the scheduler.
+//     (e.g. AMD CP, Intel EXECLIST, Nvidia PUSHBUF). Here `flush` drains it
+//     as one batch and runs the batch on the logical GPU (`lgpu`, HAL step
+//     7C), which splits the pixel work over every CPU.
 //
 //   SubmissionQueue  (per-process user-mode interface)
 //     Each process that opens the GPU gets a SubmissionQueue. User code
@@ -34,7 +35,15 @@
 //   VRAM Allocator  (block allocator over GPU BAR1)
 //     Simple first-fit block allocator over the GPU's BAR1 aperture.
 //     Allocations are page-aligned (4 KiB). Each allocation is backed by
-//     a VramBlock describing its physical GPU address.
+//     a VramBlock describing its physical GPU address. The visible
+//     framebuffer (scanout) is the start of the aperture and is reserved.
+//
+//   Command semantics (software model)
+//     FillRect, BitBlt and Present draw on the scanout in screen pixels;
+//     UploadSurface copies CPU memory into VRAM at `vram_offset` (rows of
+//     `width` pixels read `stride` bytes apart); Present copies a VRAM
+//     surface (`w` x `h`, packed) to the screen at (x, y). 3D commands are
+//     accepted and ignored until a shader compiler exists.
 //
 //   Policy integration
 //     Security Mode:  VRAM is NOT accessible from user space. All draw
@@ -258,6 +267,9 @@ pub struct GpuDevice {
     pub fence:     AtomicU64,
     /// Total commands processed since boot.
     pub cmds_processed: AtomicU64,
+    /// Kernel address of the VRAM aperture, or 0 when it isn't mapped (the
+    /// software fallback device): surface commands are then skipped.
+    pub vram_virt: u64,
 }
 
 impl GpuDevice {
@@ -266,12 +278,14 @@ impl GpuDevice {
         bar0_phys: u64, bar0_size: usize,
         bar1_phys: u64, bar1_size: usize,
         width: u32, height: u32, bpp: u8,
+        vram_virt: u64,
     ) -> Self {
         Self {
             vendor, device_id,
             bar0_phys, bar0_size,
             bar1_phys, bar1_size,
             width, height, bpp,
+            vram_virt,
             ring:  Mutex::new(CommandRing::new()),
             vram:  Mutex::new(VramAllocator::new(bar1_phys, bar1_size)),
             fence: AtomicU64::new(0),
@@ -284,91 +298,94 @@ impl GpuDevice {
         self.ring.lock().push(cmd)
     }
 
-    /// Flush and execute all pending ring commands.
-    /// This is where we talk to real GPU hardware (or our BGA software model).
+    /// Flush and execute all pending ring commands as one batch.
     pub fn flush(&self) {
-        let mut processed = 0u64;
-        loop {
-            let cmd = self.ring.lock().pop();
-            match cmd {
-                None    => break,
-                Some(c) => { self.execute_command(c); processed += 1; }
+        let mut batch = Vec::new();
+        {
+            let mut ring = self.ring.lock();
+            while let Some(c) = ring.pop() {
+                batch.push(c);
             }
         }
-        if processed > 0 {
-            self.cmds_processed.fetch_add(processed, Ordering::Relaxed);
-            self.fence.fetch_add(1, Ordering::Release);
+        if batch.is_empty() {
+            return;
         }
+        self.execute_batch(&batch);
+        self.cmds_processed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        self.fence.fetch_add(1, Ordering::Release);
     }
 
-    /// Execute one command against the BGA framebuffer model.
-    fn execute_command(&self, cmd: GpuCommand) {
-        use crate::ui::{draw_rect_atomic, screen_w};
-        use crate::graphics::{Color, FRAMEBUFFER};
-
-        match cmd {
-            GpuCommand::FillRect { x, y, w, h, color } => {
-                let r = ((color >> 16) & 0xFF) as u8;
-                let g = ((color >>  8) & 0xFF) as u8;
-                let b = ( color        & 0xFF) as u8;
-                draw_rect_atomic(x as usize, y as usize, w as usize, h as usize,
-                    Color { r, g, b });
-            }
-
-            GpuCommand::BitBlt { src_x, src_y, dst_x, dst_y, w, h } => {
-                // Software BitBlt via back-buffer copy.
-                if let Some(ref fb) = *FRAMEBUFFER.lock() {
-                    let sw = screen_w();
-                    for row in 0..h as usize {
-                        let sy = src_y as usize + row;
-                        let dy = dst_y as usize + row;
-                        if sy >= fb.height || dy >= fb.height { break; }
-                        let src_ptr = (fb.base_addr + ((sy * fb.stride + src_x as usize) as u64 * 4)) as *const u32;
-                        let dst_ptr = (fb.base_addr + ((dy * fb.stride + dst_x as usize) as u64 * 4)) as *mut u32;
-                        let copy_w  = (w as usize).min(sw.saturating_sub(src_x as usize))
-                                                  .min(sw.saturating_sub(dst_x as usize));
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_w);
-                        }
+    /// Run a batch on the logical GPU: the 2D commands become `lgpu` ops
+    /// rendered together, banded over every CPU. A screen-to-screen BitBlt
+    /// reads pixels earlier commands write, and an upload overwrites a surface
+    /// an earlier Present reads, so each of those first renders the ops
+    /// collected so far and then runs on its own.
+    fn execute_batch(&self, batch: &[GpuCommand]) {
+        use crate::lgpu::{execute, Op};
+        let Some(screen) = scanout() else { return };
+        let mut ops: Vec<Op> = Vec::new();
+        for cmd in batch {
+            match *cmd {
+                GpuCommand::FillRect { x, y, w, h, color } => {
+                    ops.push(Op::Fill { rect: screen_rect(&screen, x, y, w, h), color: color & 0x00FF_FFFF });
+                }
+                GpuCommand::Present { surface_vram_offset, x, y, w, h } => {
+                    if let Some(src) = self.vram_surface(surface_vram_offset, w, h) {
+                        ops.push(Op::Copy { src, src_x: 0, src_y: 0, dst: screen_rect(&screen, x, y, w, h), transparent: None });
                     }
                 }
-            }
-
-            GpuCommand::UploadSurface { vram_offset: _, width, height, stride, src_ptr } => {
-                // Copy a CPU buffer straight to the framebuffer.
-                if let Some(ref fb) = *FRAMEBUFFER.lock() {
-                    for row in 0..height as usize {
-                        let src = (src_ptr + (row * stride as usize) as u64) as *const u32;
-                        let dst = (fb.base_addr + (row * fb.stride) as u64 * 4) as *mut u32;
-                        unsafe { core::ptr::copy_nonoverlapping(src, dst, width as usize); }
-                    }
+                GpuCommand::BitBlt { src_x, src_y, dst_x, dst_y, w, h } => {
+                    execute(&ops, &screen);
+                    ops.clear();
+                    blit_within(&screen, src_x as usize, src_y as usize, dst_x as usize, dst_y as usize, w as usize, h as usize);
                 }
+                GpuCommand::UploadSurface { vram_offset, width, height, stride, src_ptr } => {
+                    execute(&ops, &screen);
+                    ops.clear();
+                    self.upload(vram_offset, width, height, stride, src_ptr);
+                }
+                // 3D commands: accepted, not executed until a shader
+                // compiler (Phase 6 extension) exists.
+                GpuCommand::BeginRenderPass { .. } |
+                GpuCommand::EndRenderPass           |
+                GpuCommand::SetVertexShader { .. }  |
+                GpuCommand::SetFragmentShader { .. }|
+                GpuCommand::BindVertexBuffer { .. } |
+                GpuCommand::BindIndexBuffer { .. }  |
+                GpuCommand::DrawIndexed { .. }      |
+                GpuCommand::Draw { .. }             |
+                GpuCommand::BindDescriptorSet { .. }|
+                GpuCommand::SetViewport { .. }      |
+                GpuCommand::SetScissor { .. }       |
+                GpuCommand::PipelineBarrier { .. }  |
+                GpuCommand::Nop => {}
             }
+        }
+        execute(&ops, &screen);
+    }
 
-            GpuCommand::Present { surface_vram_offset, x, y, w, h } => {
-                // In our BGA model, "present" = copy from the VRAM aperture
-                // to the scanout region. The VRAM aperture *is* the framebuffer,
-                // so this is a memcpy within the framebuffer.
-                let _ = (surface_vram_offset, x, y, w, h);
-                // Full-screen present: hardware scanout already points at BAR1.
-                // Nothing to do — the framebuffer IS the display.
-            }
+    /// A packed `w` x `h` surface at `offset` in VRAM, if it fits the aperture.
+    fn vram_surface(&self, offset: u64, w: u32, h: u32) -> Option<crate::lgpu::Surface> {
+        let bytes = (w as u64) * (h as u64) * 4;
+        if self.vram_virt == 0 || bytes == 0 || offset.checked_add(bytes)? > self.bar1_size as u64 {
+            return None;
+        }
+        Some(crate::lgpu::Surface { ptr: (self.vram_virt + offset) as *mut u32, width: w as usize, height: h as usize, stride: w as usize })
+    }
 
-            // 3D commands: record fence but skip real execution.
-            // These become real when a shader compiler (Phase 6 extension) exists.
-            GpuCommand::BeginRenderPass { .. } |
-            GpuCommand::EndRenderPass           |
-            GpuCommand::SetVertexShader { .. }  |
-            GpuCommand::SetFragmentShader { .. }|
-            GpuCommand::BindVertexBuffer { .. } |
-            GpuCommand::BindIndexBuffer { .. }  |
-            GpuCommand::DrawIndexed { .. }      |
-            GpuCommand::Draw { .. }             |
-            GpuCommand::BindDescriptorSet { .. }|
-            GpuCommand::SetViewport { .. }      |
-            GpuCommand::SetScissor { .. }       |
-            GpuCommand::PipelineBarrier { .. }  |
-            GpuCommand::Nop => {}
+    /// UploadSurface: `height` rows of `width` pixels, `stride` bytes apart
+    /// at `src_ptr` (kernel memory or the current address space), into the
+    /// packed VRAM surface at `vram_offset`.
+    fn upload(&self, vram_offset: u64, width: u32, height: u32, stride: u32, src_ptr: u64) {
+        let Some(dst) = self.vram_surface(vram_offset, width, height) else { return };
+        if src_ptr == 0 || (stride as usize) < width as usize * 4 && height > 1 {
+            return;
+        }
+        for row in 0..dst.height {
+            let src = (src_ptr + (row * stride as usize) as u64) as *const u32;
+            // SAFETY: the destination was bounds-checked against the aperture;
+            // the source is the submitter's buffer (unchecked, as before).
+            unsafe { core::ptr::copy_nonoverlapping(src, dst.ptr.add(row * dst.stride), dst.width); }
         }
     }
 
@@ -504,8 +521,7 @@ impl GpuScheduler {
         self.queues.iter_mut().find(|q| q.pid == pid)
     }
 
-    /// Drain all submission queues into the GPU ring and flush the hardware.
-    /// Called by the kernel timer tick (vsync cadence).
+    /// Drain all submission queues into the GPU ring (`tick` then runs it).
     pub fn tick(&mut self, gpu: &GpuDevice) {
         if self.queues.is_empty() { return; }
 
@@ -518,9 +534,6 @@ impl GpuScheduler {
             self.queues[idx].flush_into_ring(&mut ring);
         }
         self.round_robin = (self.round_robin + 1) % n;
-
-        // Execute all newly enqueued commands.
-        gpu.flush();
     }
 
     /// Performance Mode: bypass scheduler entirely. Commands go directly
@@ -537,6 +550,41 @@ impl GpuScheduler {
 
 pub static GPU_DEVICES:  Mutex<Vec<Arc<GpuDevice>>>  = Mutex::new(Vec::new());
 pub static GPU_SCHEDULER: Mutex<GpuScheduler>        = Mutex::new(GpuScheduler::new());
+
+/// The visible framebuffer as a logical-GPU target.
+fn scanout() -> Option<crate::lgpu::Surface> {
+    let fb = crate::graphics::FRAMEBUFFER.lock();
+    let fb = fb.as_ref()?;
+    Some(crate::lgpu::Surface { ptr: fb.base_addr as *mut u32, width: fb.width, height: fb.height, stride: fb.stride })
+}
+
+/// A command's rectangle in screen pixels, cut to the screen.
+fn screen_rect(s: &crate::lgpu::Surface, x: u32, y: u32, w: u32, h: u32) -> crate::lgpu::Rect {
+    let x0 = (x as usize).min(s.width);
+    let y0 = (y as usize).min(s.height);
+    crate::lgpu::Rect::new(x0, y0, (x as usize + w as usize).min(s.width), (y as usize + h as usize).min(s.height))
+}
+
+/// Screen-to-screen copy with memmove semantics: overlapping source and
+/// destination (scrolling) come out right.
+fn blit_within(s: &crate::lgpu::Surface, sx: usize, sy: usize, dx: usize, dy: usize, w: usize, h: usize) {
+    let w = w.min(s.width.saturating_sub(sx)).min(s.width.saturating_sub(dx));
+    let h = h.min(s.height.saturating_sub(sy)).min(s.height.saturating_sub(dy));
+    if w == 0 || h == 0 {
+        return;
+    }
+    let copy_row = |row: usize| unsafe {
+        let src = s.ptr.add((sy + row) * s.stride + sx);
+        let dst = s.ptr.add((dy + row) * s.stride + dx);
+        core::ptr::copy(src, dst, w);
+    };
+    // Moving down: copy the bottom row first so no source row is overwritten early.
+    if dy > sy {
+        (0..h).rev().for_each(copy_row);
+    } else {
+        (0..h).for_each(copy_row);
+    }
+}
 
 /// Discover GPUs from the PCI device tree and register them.
 pub fn init() {
@@ -573,12 +621,23 @@ pub fn init() {
         let vram_size = vram_bar.size as usize;
         dev.enable_decode();
 
+        // Surfaces need the aperture mapped; the display driver maps it.
+        let vram_virt = match crate::graphics::vram_mapping() {
+            Some((base, size)) if base == vram_bar.base && size >= vram_size => base,
+            _ => 0,
+        };
         let gpu = Arc::new(GpuDevice::new(
             vendor, dev.device_id as u32,
             regs_bar.base, regs_bar.size as usize,
             vram_bar.base, vram_size,
             crate::ui::screen_w() as u32, crate::ui::screen_h() as u32, 32,
+            vram_virt,
         ));
+        // The aperture starts with the visible framebuffer: never hand it out.
+        let scanout_bytes = crate::graphics::FRAMEBUFFER.lock().as_ref().map_or(0, |fb| fb.stride * fb.height * 4);
+        if scanout_bytes > 0 {
+            gpu.vram.lock().alloc(scanout_bytes, "scanout");
+        }
 
         println!("[GPU] Registered {:?} device {:#06x} regs={:#X} VRAM_base={:#X} ({} MiB)",
             vendor, dev.device_id, regs_bar.base, vram_bar.base, vram_size / (1024 * 1024));
@@ -594,6 +653,7 @@ pub fn init() {
             crate::ui::screen_w() as u64 * crate::ui::screen_h() as u64 * 4, // dummy BAR1
             crate::ui::screen_w() * crate::ui::screen_h() * 4,
             crate::ui::screen_w() as u32, crate::ui::screen_h() as u32, 32,
+            0,
         ));
         println!("[GPU] No PCI GPU found — using software BGA fallback.");
         gpus.push(sw_gpu);
@@ -617,6 +677,16 @@ pub fn submit(pid: u32, cmd: GpuCommand) {
             }
         }
         PolicyMode::Security => {
+            // An upload reads the submitter's memory, which is not mapped when
+            // the queued batch runs (from the GUI loop, in another address
+            // space), so it is done now. A Present still queued from the same
+            // surface would then show the new pixels.
+            if let GpuCommand::UploadSurface { vram_offset, width, height, stride, src_ptr } = cmd {
+                if let Some(gpu) = primary() {
+                    gpu.upload(vram_offset, width, height, stride, src_ptr);
+                }
+                return;
+            }
             let mut sched = GPU_SCHEDULER.lock();
             if let Some(q) = sched.queue_for(pid) {
                 q.record(cmd);
@@ -630,6 +700,70 @@ pub fn submit(pid: u32, cmd: GpuCommand) {
             }
         }
     }
+}
+
+/// Run what processes queued since the last call (Security Mode) as one
+/// batch. Performance Mode runs each command as it is submitted. Called once
+/// per GUI loop iteration.
+pub fn tick() {
+    let Some(gpu) = primary() else { return };
+    GPU_SCHEDULER.lock().tick(&gpu);
+    gpu.flush();
+}
+
+/// `GPUTEST`: one batch through the ring (a full-screen fill, an upload, a
+/// present, an overlapping blit, another fill), the pixels it leaves checked,
+/// and the batch timed. Draws on the screen; the desktop paints over it on
+/// its next frame.
+pub fn self_test() -> Vec<String> {
+    use alloc::format;
+    let mut out = Vec::new();
+    let (Some(gpu), Some(screen)) = (primary(), scanout()) else {
+        out.push(String::from("gputest: no GPU or no framebuffer"));
+        return out;
+    };
+    let (iw, ih) = (256u32, 256u32);
+    let img_px = |x: u32, y: u32| (x << 16) | (y << 8) | 0x40;
+    let img: Vec<u32> = (0..iw * ih).map(|i| img_px(i % iw, i / iw)).collect();
+    let Some(surf) = gpu.vram.lock().alloc((iw * ih * 4) as usize, "gputest") else {
+        out.push(String::from("gputest: no free VRAM"));
+        return out;
+    };
+    let (sw, sh) = (screen.width as u32, screen.height as u32);
+    let batch = [
+        GpuCommand::FillRect { x: 0, y: 0, w: sw, h: sh, color: 0x20_30_40 },
+        GpuCommand::UploadSurface { vram_offset: surf, width: iw, height: ih, stride: iw * 4, src_ptr: img.as_ptr() as u64 },
+        GpuCommand::Present { surface_vram_offset: surf, x: 100, y: 100, w: iw, h: ih },
+        // Overlaps its own source: the image moves down 50 rows.
+        GpuCommand::BitBlt { src_x: 100, src_y: 100, dst_x: 100, dst_y: 150, w: iw, h: ih },
+        GpuCommand::FillRect { x: 600, y: 100, w: 200, h: 200, color: 0xFF_00_00 },
+    ];
+    let t0 = crate::time::rdtsc();
+    for c in batch.iter().cloned() {
+        gpu.submit(c);
+    }
+    gpu.flush();
+    let cycles = crate::time::rdtsc() - t0;
+    let px = |x: usize, y: usize| unsafe { *screen.ptr.add(y * screen.stride + x) } & 0x00FF_FFFF;
+    let checks = [
+        ("fill", px(5, 5), 0x20_30_40),
+        ("present", px(110, 110), img_px(10, 10)),
+        ("blit", px(110, 160), img_px(10, 10)),
+        ("blit end", px(110, 350), img_px(10, 200)),
+        ("fill 2", px(700, 200), 0xFF_00_00),
+    ];
+    gpu.vram.lock().free(surf);
+    let failed: Vec<_> = checks.iter().filter(|c| c.1 != c.2).collect();
+    out.push(format!("gputest: {} commands in one batch, {}.{} Mcycles on {} CPUs",
+        batch.len(), cycles / 1_000_000, cycles / 100_000 % 10,
+        crate::smp::CPU_COUNT.load(Ordering::Relaxed)));
+    if failed.is_empty() {
+        out.push(format!("gputest: all {} pixel checks passed", checks.len()));
+    }
+    for (name, got, want) in failed {
+        out.push(format!("gputest: {} FAILED: got {:06x}, want {:06x}", name, got, want));
+    }
+    out
 }
 
 /// Allocate a VRAM surface. Returns the GPU-physical offset.

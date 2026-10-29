@@ -44,7 +44,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from("VEILOS SHELL - AVAILABLE COMMANDS:"));
             history.push(String::from(" FS:      LS [PATH]  CAT [FILE]  HEAD [FILE]  MKDIR [DIR]  RM [FILE]  PWD"));
             history.push(String::from(" PROC:    PS  KILL [PID]  CAPS [PID]"));
-            history.push(String::from(" HW:      DEVICES  WORKERS"));
+            history.push(String::from(" HW:      DEVICES  WORKERS  GPUTEST"));
             history.push(String::from(" PKG:     PKG LIST  PKG INSTALL [NAME]  PKG REMOVE [NAME]"));
             history.push(String::from(" DEBUG:   TRACE [N]  PROFILE [START|STOP|REPORT]  DBG [ATTACH|BP] [PID/ADDR]"));
             history.push(String::from(" POLICY:  POLICY  POLICY SET [PROFILE] [PID]  MODE [SECURITY|PERFORMANCE]"));
@@ -618,6 +618,13 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(alloc::format!("workers: 64 chunks  1 CPU {} ms  all CPUs {} ms  speedup {}.{}x",
                 seq / 1000, par / 1000, seq / par.max(1), (seq * 10 / par.max(1)) % 10));
             history.push(alloc::format!("chunks run per CPU: {:?}", per_cpu));
+        }
+        "GPUTEST" => {
+            // A gpu_driver batch through the logical GPU, checked and timed.
+            for line in crate::gpu_driver::self_test() {
+                crate::serial_println!("[GPU] {}", line);
+                history.push(line);
+            }
         }
         "DEVICES" => {
             // Every PCI device and the driver bound to it (hal::describe).

@@ -550,10 +550,19 @@ pub fn pointer_hook(mx: i32, my: i32, mb: bool, last_mb: bool) -> bool {
     took
 }
 
+/// TSC cycles spent in `paint` since the last `take_paint_cycles` (the
+/// `[GUI] perf` line's "shell" figure).
+static PAINT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn take_paint_cycles() -> u64 {
+    PAINT_CYCLES.swap(0, Ordering::Relaxed)
+}
+
 fn paint(desktop: bool) {
     if !is_active() {
         return;
     }
+    let t0 = crate::time::rdtsc();
     // Same order as pump(): FONTS before SHELL.
     let fonts_guard = crate::render2d_kernel::FONTS.lock();
     let fonts = if fonts_guard.is_empty() { None } else { Some(&*fonts_guard) };
@@ -572,6 +581,7 @@ fn paint(desktop: bool) {
             sh.paint_overlay(c, cache, fonts, glyphs, ver);
         }
     });
+    PAINT_CYCLES.fetch_add(crate::time::rdtsc() - t0, Ordering::Relaxed);
 }
 
 /// desktop.rs paint_desktop, right before `bg.paint()` (the wallpaper).
