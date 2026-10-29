@@ -58,6 +58,7 @@ pub mod kthread;
 pub mod address_space;
 pub mod block;
 pub mod hal;
+pub mod hotplug;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;
@@ -256,6 +257,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // queries the registry from here on; nothing may rescan the bus.
     pci::init();
     crate::hal::init();
+    // Hot-plug slots: empty ones are powered off before drivers bind.
+    crate::hotplug::init();
 
     // Storage first: the filesystems are needed by most of the rest of boot.
     crate::hal::bind(crate::hal::DeviceClass::Storage);
@@ -294,6 +297,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // -----| multitasking setup |-----
 
     crate::hal::bind(crate::hal::DeviceClass::Display);
+    // Every class is bound: devices nobody drives can sleep.
+    crate::hal::power_down_idle();
     if crate::graphics::FRAMEBUFFER.lock().is_none() {
         println!("[GRAPHICS] No supported display adapter. Falling back to VGA Text Mode.");
     }
@@ -753,6 +758,9 @@ async fn gui_refresh_task() {
 
         // Process GPU command batches queued since the last iteration.
         crate::gpu_driver::tick();
+
+        // Cards inserted into or removed from PCIe hot-plug slots.
+        crate::hotplug::poll();
 
         // ---- frame-time diagnostics ----
         if ui_dirty {

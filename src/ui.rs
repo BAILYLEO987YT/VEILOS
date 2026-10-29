@@ -433,6 +433,8 @@ pub fn painter_surface() -> Option<crate::lgpu::Surface> {
 }
 
 /// Commits only a specific portion of the off-screen buffer to the real hardware.
+/// The back buffer is the logical display; each head takes the part of the
+/// rectangle that lies on it (graphics::HEADS).
 pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
     // Fast path: if a BackBufferGuard is active, read through the raw pointer
     // so we never try to re-acquire BACK_BUFFER (which would deadlock since
@@ -440,41 +442,33 @@ pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
     if PAINTER_ACTIVE.load(AtomicOrd::Acquire) {
         let bb_ptr = painter_ptr_flushed();
         if !bb_ptr.is_null() {
-            let mut fb_lock = FRAMEBUFFER.lock();
-            if let Some(ref mut fb) = *fb_lock {
-                // Back buffer -> framebuffer through the logical GPU: split into
-                // bands and copied on every CPU (lgpu, HAL step 7C).
-                let target = crate::lgpu::Surface {
-                    ptr: fb.base_addr as *mut u32, width: fb.width, height: fb.height, stride: fb.stride,
-                };
-                let src = crate::lgpu::Surface { ptr: bb_ptr, width: screen_w(), height: screen_h(), stride: screen_w() };
-                let dst = crate::lgpu::Rect::new(x, y, (x + w).min(fb.width), (y + h).min(fb.height));
-                crate::lgpu::execute(&[crate::lgpu::Op::Copy { src, src_x: x, src_y: y, dst, transparent: None }], &target);
-            }
+            commit_from(bb_ptr, x, y, w, h);
             return;
         }
     }
 
-    // Normal path: acquire both locks.
-    let bb_lock = BACK_BUFFER.lock();
-    let mut fb_lock = FRAMEBUFFER.lock();
-    
-    if let (Some(bb), Some(fb)) = (&*bb_lock, &mut *fb_lock) {
-        let draw_w = if x + w > fb.width { fb.width.saturating_sub(x) } else { w };
-        for dy in 0..h {
-            let py = y + dy;
-            if py >= fb.height { break; }
-            
-            let row_start = (fb.base_addr + (py * fb.stride + x) as u64 * 4) as *mut u32;
-            let src_start = py * screen_w() + x;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bb.as_ptr().add(src_start),
-                    row_start,
-                    draw_w
-                );
-            }
+    // Normal path: hold the back buffer while copying from it.
+    let mut bb_lock = BACK_BUFFER.lock();
+    if let Some(bb) = bb_lock.as_mut() {
+        commit_from(bb.as_mut_ptr(), x, y, w, h);
+    }
+}
+
+/// Back buffer -> every head the rectangle touches, through the logical GPU:
+/// split into bands and copied on every CPU (lgpu, HAL step 7C).
+fn commit_from(bb_ptr: *mut u32, x: usize, y: usize, w: usize, h: usize) {
+    let src = crate::lgpu::Surface { ptr: bb_ptr, width: screen_w(), height: screen_h(), stride: screen_w() };
+    let (x1, y1) = ((x + w).min(screen_w()), (y + h).min(screen_h()));
+    for head in crate::graphics::HEADS.lock().iter() {
+        let fb = &head.fb;
+        let (hx0, hx1) = (x.max(head.x), x1.min(head.x + fb.width));
+        let hy1 = y1.min(fb.height);
+        if hx0 >= hx1 || y >= hy1 {
+            continue;
         }
+        let target = crate::lgpu::Surface { ptr: fb.base_addr as *mut u32, width: fb.width, height: fb.height, stride: fb.stride };
+        let dst = crate::lgpu::Rect::new(hx0 - head.x, y, hx1 - head.x, hy1);
+        crate::lgpu::execute(&[crate::lgpu::Op::Copy { src, src_x: hx0, src_y: y, dst, transparent: None }], &target);
     }
 }
 
@@ -554,18 +548,18 @@ fn plot_pixel_raw(fb: &mut crate::graphics::Framebuffer, x: usize, y: usize, col
 
 /// Fills a rectangle directly on the hardware framebuffer (does NOT touch the back buffer).
 /// Used exclusively for cursor rendering so the back buffer stays cursor-free.
+/// `x`, `y` are logical-display coordinates; each head draws its part.
 pub fn plot_pixels_hw(x: usize, y: usize, w: usize, h: usize, color: Color) {
-    let mut fb_lock = FRAMEBUFFER.lock();
-    if let Some(ref mut fb) = *fb_lock {
-        let pixel_val = (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16);
-        for dy in 0..h {
-            let py = y + dy;
-            if py >= fb.height { break; }
-            let draw_w = (x + w).min(fb.width).saturating_sub(x);
-            if draw_w == 0 { continue; }
-            let row_ptr = (fb.base_addr + (py * fb.stride + x) as u64 * 4) as *mut u32;
+    let pixel_val = (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16);
+    for head in crate::graphics::HEADS.lock().iter() {
+        let fb = &head.fb;
+        let x0 = x.max(head.x);
+        let x1 = (x + w).min(head.x + fb.width);
+        if x0 >= x1 { continue; }
+        for py in y..(y + h).min(fb.height) {
+            let row_ptr = (fb.base_addr + (py * fb.stride + x0 - head.x) as u64 * 4) as *mut u32;
             unsafe {
-                core::slice::from_raw_parts_mut(row_ptr, draw_w).fill(pixel_val);
+                core::slice::from_raw_parts_mut(row_ptr, x1 - x0).fill(pixel_val);
             }
         }
     }

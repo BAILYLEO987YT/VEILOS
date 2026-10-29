@@ -115,13 +115,12 @@ pub struct VirtQueueMem {
 
 // The device reads each queue at QueuePFN * 4096 as one physically
 // contiguous block (3 pages for N=256), so queues live in DMA regions (one
-// set per NIC, owned by its `VirtioNet`), never freed.
+// set per NIC, owned by its `VirtioNet` and freed when it is dropped, after
+// the device has been reset).
 
-/// Allocate zeroed, contiguous memory for one virtqueue. Returns (CPU pointer, physical address).
-fn alloc_queue() -> Option<(*mut VirtQueueMem, u64)> {
-    let region = crate::memory::DmaRegion::new(core::mem::size_of::<VirtQueueMem>())?;
-    let (phys, ptr) = region.leak();
-    Some((ptr as *mut VirtQueueMem, phys))
+/// Allocate zeroed, contiguous memory for one virtqueue.
+fn alloc_queue() -> Option<crate::memory::DmaRegion> {
+    crate::memory::DmaRegion::new(core::mem::size_of::<VirtQueueMem>())
 }
 
 // DMA buffers: each slot is 2048 bytes (virtio-net header + MTU frame)
@@ -166,6 +165,17 @@ pub struct VirtioNet {
     bufs_phys: u64,
     /// The device reports link state (VIRTIO_NET_F_STATUS negotiated).
     has_status: bool,
+    /// The memory `rxq`, `txq` and `bufs` point into.
+    dma: Vec<crate::memory::DmaRegion>,
+}
+
+impl Drop for VirtioNet {
+    /// Reset the device first, so it stops DMA into memory about to be freed.
+    /// (A device already gone with its slot ignores the write.)
+    fn drop(&mut self) {
+        unsafe { Port::<u8>::new(self.io_base + 0x12).write(0) };
+        crate::serial_println!("[NET] VirtIO-net at I/O {:#x} released", self.io_base);
+    }
 }
 
 // The raw pointers are this NIC's own DMA memory; the NIC is only driven by
@@ -174,9 +184,9 @@ unsafe impl Send for VirtioNet {}
 
 impl VirtioNet {
     pub fn new(io_base: u16) -> Result<Self, &'static str> {
-        let (bufs_phys, bufs_ptr) = crate::memory::DmaRegion::new(core::mem::size_of::<VirtBuffers>())
-            .ok_or("no DMA memory for packet buffers")?
-            .leak();
+        let bufs_region = crate::memory::DmaRegion::new(core::mem::size_of::<VirtBuffers>())
+            .ok_or("no DMA memory for packet buffers")?;
+        let (bufs_phys, bufs_ptr) = (bufs_region.phys(), bufs_region.as_mut_ptr::<u8>());
 
         // 1. Read MAC address (available before reset on legacy devices)
         let mac_bytes: [u8; 6] = core::array::from_fn(|i| unsafe {
@@ -228,6 +238,7 @@ impl VirtioNet {
             bufs: bufs_ptr as *mut VirtBuffers,
             bufs_phys,
             has_status,
+            dma: alloc::vec![bufs_region],
         };
 
         // 7. Setup virtqueues (before setting DRIVER_OK)
@@ -278,11 +289,13 @@ impl VirtioNet {
             }
 
             // Write physical page frame number of the queue
-            let Some((rx_ptr, rx_phys)) = alloc_queue() else {
+            let Some(rx_region) = alloc_queue() else {
                 crate::serial_println!("[NET] ERROR: no contiguous DMA memory for the RX queue");
                 return;
             };
-            self.rxq = rx_ptr;
+            let rx_phys = rx_region.phys();
+            self.rxq = rx_region.as_mut_ptr::<VirtQueueMem>();
+            self.dma.push(rx_region);
 
             // Verify layout assumptions
             let base_ptr = self.rxq as usize;
@@ -312,11 +325,13 @@ impl VirtioNet {
             let tx_qsize = q_size_port.read();
             crate::serial_println!("[NET] TX queue size from device: {}", tx_qsize);
 
-            let Some((tx_ptr, tx_phys)) = alloc_queue() else {
+            let Some(tx_region) = alloc_queue() else {
                 crate::serial_println!("[NET] ERROR: no contiguous DMA memory for the TX queue");
                 return;
             };
-            self.txq = tx_ptr;
+            let tx_phys = tx_region.phys();
+            self.txq = tx_region.as_mut_ptr::<VirtQueueMem>();
+            self.dma.push(tx_region);
             crate::serial_println!("[NET] TX queue phys addr: 0x{:x}, PFN: 0x{:x}", tx_phys, tx_phys / 4096);
             q_addr.write((tx_phys / 4096) as u32);
         }

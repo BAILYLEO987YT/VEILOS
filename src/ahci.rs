@@ -14,6 +14,8 @@ pub const DRIVER: crate::hal::Driver = crate::hal::Driver {
     class: crate::hal::DeviceClass::Storage,
     matches: is_ahci,
     probe,
+    // Mounted volumes can't be detached yet, so the controller can't be released.
+    remove: None,
 };
 
 fn is_ahci(dev: &PciDevice) -> bool {

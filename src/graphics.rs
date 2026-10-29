@@ -12,6 +12,7 @@ pub struct Color {
     pub b: u8,
 }
 
+#[derive(Clone, Copy)]
 pub struct Framebuffer {
     pub base_addr: u64,
     pub width: usize,
@@ -47,36 +48,117 @@ impl Framebuffer {
     }
 }
 
+/// The first display head's framebuffer: boot console text and the GPU
+/// command model's scanout. The desktop draws through `HEADS`.
 pub static FRAMEBUFFER: Mutex<Option<Framebuffer>> = Mutex::new(None);
 
-/// The display adapter's whole VRAM aperture (physical base = kernel address,
-/// identity-mapped, and size). The visible framebuffer is its start; the rest
-/// is where `gpu_driver` keeps surfaces.
-static VRAM: Mutex<Option<(u64, usize)>> = Mutex::new(None);
+// -----| logical display (HAL step 7D) |-----
+//
+// Every display adapter bound is one head. The desktop sees one logical
+// display: the heads side by side, left to right in the order they bound,
+// all in the same mode (so their rows line up). `ui::commit_dirty_rect` and
+// the hardware cursor split their work over the heads; everything else draws
+// into the one back buffer and never knows how many screens there are.
 
-pub fn vram_mapping() -> Option<(u64, usize)> {
-    *VRAM.lock()
+/// One display head: an adapter's framebuffer and where it sits on the desktop.
+pub struct Head {
+    pub fb: Framebuffer,
+    /// Left edge on the logical display.
+    pub x: usize,
+    /// The adapter's whole VRAM aperture (identity-mapped): the framebuffer is
+    /// its start, `gpu_driver` keeps surfaces after it.
+    pub vram_base: u64,
+    pub vram_size: usize,
+    pub location: alloc::string::String,
 }
 
-// -----| manual gpu probe |-----
+pub static HEADS: Mutex<alloc::vec::Vec<Head>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Size of the VRAM aperture starting at `base`, if a head maps it.
+pub fn vram_mapping(base: u64) -> Option<usize> {
+    HEADS.lock().iter().find(|h| h.vram_base == base).map(|h| h.vram_size)
+}
+
+/// Bytes at the start of the aperture at `base` that are scanout.
+pub fn scanout_bytes(base: u64) -> usize {
+    HEADS.lock().iter().find(|h| h.vram_base == base).map_or(0, |h| h.fb.stride * h.fb.height * 4)
+}
+
+/// One line per head, for the terminal's DISPLAYS command.
+pub fn describe_heads() -> alloc::vec::Vec<alloc::string::String> {
+    let heads = HEADS.lock();
+    let mut out: alloc::vec::Vec<_> = heads.iter().enumerate().map(|(i, h)| alloc::format!(
+        "  head {}: {} {}x{} at x={} (VRAM {} MiB)",
+        i, h.location, h.fb.width, h.fb.height, h.x, h.vram_size >> 20
+    )).collect();
+    out.push(alloc::format!("  logical display: {}x{}", crate::ui::screen_w(), crate::ui::screen_h()));
+    out
+}
+
+// -----| Bochs DISPI registers |-----
 
 use x86_64::instructions::port::Port;
 
-fn bga_write(index: u16, data: u16) {
-    let mut index_port = Port::<u16>::new(0x1CE);
-    let mut data_port = Port::<u16>::new(0x1CF);
-    unsafe {
-        index_port.write(index);
-        data_port.write(data);
-    }
+/// VBE_DISPI register indices.
+const DISPI_XRES: u16 = 1;
+const DISPI_YRES: u16 = 2;
+const DISPI_BPP: u16 = 3;
+const DISPI_ENABLE: u16 = 4;
+const DISPI_VIRT_WIDTH: u16 = 6;
+const DISPI_ENABLED: u16 = 0x01;
+const DISPI_LFB_ENABLED: u16 = 0x40;
+
+/// Where an adapter's DISPI registers are. The I/O ports (0x1CE/0x1CF) only
+/// reach the legacy VGA device, of which there is at most one; the MMIO block
+/// in BAR2 (DISPI at +0x500, one u16 per index) reaches each adapter, and is
+/// the only way into `bochs-display`, which has no I/O ports at all.
+#[derive(Clone, Copy)]
+enum Dispi {
+    Ports,
+    Mmio(u64),
 }
 
-fn bga_read(index: u16) -> u16 {
-    let mut index_port = Port::<u16>::new(0x1CE);
-    let mut data_port = Port::<u16>::new(0x1CF);
-    unsafe {
-        index_port.write(index);
-        data_port.read()
+impl Dispi {
+    const MMIO_OFFSET: u64 = 0x500;
+
+    fn for_device(dev: &pci::PciDevice) -> Result<Self, &'static str> {
+        let bar2 = dev.bar(2);
+        let Some(base) = bar2.mem_base().filter(|_| bar2.size >= 0x600) else {
+            return Ok(Dispi::Ports);
+        };
+        // Registers: uncached, unlike the framebuffer.
+        let mut mapper = unsafe { crate::memory::get_mapper() };
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(base));
+        let frame = x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(base));
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        match unsafe { mapper.map_to(page, frame, flags, &mut crate::memory::GlobalFrameAllocator) } {
+            Ok(f) => f.flush(),
+            Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => {}
+            Err(_) => return Err("could not map the register BAR"),
+        }
+        Ok(Dispi::Mmio(base))
+    }
+
+    fn write(self, index: u16, data: u16) {
+        match self {
+            Dispi::Ports => unsafe {
+                Port::<u16>::new(0x1CE).write(index);
+                Port::<u16>::new(0x1CF).write(data);
+            },
+            Dispi::Mmio(base) => unsafe {
+                core::ptr::write_volatile((base + Self::MMIO_OFFSET + index as u64 * 2) as *mut u16, data);
+            },
+        }
+    }
+
+    fn read(self, index: u16) -> u16 {
+        match self {
+            Dispi::Ports => unsafe {
+                Port::<u16>::new(0x1CE).write(index);
+                Port::<u16>::new(0x1CF).read()
+            },
+            Dispi::Mmio(base) => unsafe { core::ptr::read_volatile((base + Self::MMIO_OFFSET + index as u64 * 2) as *const u16) },
+        }
     }
 }
 
@@ -104,7 +186,8 @@ fn requested_mode(vram_bytes: usize) -> Option<(usize, usize)> {
 }
 
 /// Bochs/QEMU display adapters (stdvga, bochs-display): a linear framebuffer
-/// in BAR0, mode set through the BGA ports. Bound by `hal::bind`.
+/// in BAR0, mode set through the DISPI registers. Bound by `hal::bind`; every
+/// adapter becomes a head of the logical display.
 ///
 /// Matching on the Bochs vendor ID matters: on Intel/AMD/NVIDIA cards BAR0 is
 /// the register block, and the old "first display device's BAR0" logic would
@@ -114,6 +197,8 @@ pub const LFB_DISPLAY_DRIVER: crate::hal::Driver = crate::hal::Driver {
     class: crate::hal::DeviceClass::Display,
     matches: is_bochs_display,
     probe: probe_display,
+    // The logical display's size is fixed once the back buffer exists.
+    remove: None,
 };
 
 fn is_bochs_display(dev: &pci::PciDevice) -> bool {
@@ -121,37 +206,45 @@ fn is_bochs_display(dev: &pci::PciDevice) -> bool {
 }
 
 fn probe_display(dev: &pci::PciDevice) -> Result<(), alloc::string::String> {
-    // The desktop drives one scanout for now; more displays are HAL step 7D.
-    if FRAMEBUFFER.lock().is_some() {
-        return Err(alloc::string::String::from("second display not driven yet"));
+    // The back buffer is sized from the logical display once, at boot.
+    if crate::ui::BACK_BUFFER.lock().is_some() {
+        return Err(alloc::string::String::from("display added after boot: not driven"));
     }
-    println!("[GRAPHICS] Probing for Bochs/QEMU GPU (BGA)...");
+    let location = alloc::format!("{:02x}:{:02x}.{}", dev.bus, dev.device, dev.function);
+    println!("[GRAPHICS] Probing Bochs/QEMU display adapter at {}...", location);
 
     // The display controller's linear framebuffer (BAR0 on BGA).
     let bar0 = dev.bar(0);
     let phys_addr = bar0.mem_base().unwrap_or(0);
     dev.enable_decode();
-    println!("[GRAPHICS] Found GPU at PCI {:02X}:{:02X}. BAR0: {:#X}", dev.bus, dev.device, phys_addr);
+    let regs = Dispi::for_device(dev).map_err(alloc::string::String::from)?;
+    if matches!(regs, Dispi::Ports) && !HEADS.lock().is_empty() {
+        // The ports belong to the legacy VGA device, already driven.
+        return Err(alloc::string::String::from("no MMIO registers and the I/O ports are taken"));
+    }
 
     // Mode: /etc/display.cfg ("WIDTHxHEIGHT") if present and it fits the
-    // adapter's memory, else 1024x768. 32 bpp.
-    let (want_w, want_h) = requested_mode(bar0.size as usize).unwrap_or(DEFAULT_MODE);
-    bga_write(4, 0x00); // VBE_DISPI_INDEX_ENABLE -> Disable
-    bga_write(1, want_w as u16); // VBE_DISPI_INDEX_XRES
-    bga_write(2, want_h as u16); // VBE_DISPI_INDEX_YRES
-    bga_write(3, 32);   // VBE_DISPI_INDEX_BPP
-    bga_write(4, 0x01 | 0x40); // VBE_DISPI_INDEX_ENABLE -> (Enabled | LFB)
+    // adapter's memory, else 1024x768, 32 bpp. Later heads take the first
+    // head's mode so the logical display's rows line up.
+    let first = HEADS.lock().first().map(|h| (h.fb.width, h.fb.height));
+    let (want_w, want_h) = first.unwrap_or_else(|| requested_mode(bar0.size as usize).unwrap_or(DEFAULT_MODE));
+    regs.write(DISPI_ENABLE, 0);
+    regs.write(DISPI_XRES, want_w as u16);
+    regs.write(DISPI_YRES, want_h as u16);
+    regs.write(DISPI_BPP, 32);
+    regs.write(DISPI_ENABLE, DISPI_ENABLED | DISPI_LFB_ENABLED);
 
     // Use what the adapter actually set, and its line pitch (virtual width),
     // rather than assuming the request was honoured and stride == width.
-    let width = bga_read(1) as usize;
-    let height = bga_read(2) as usize;
-    let stride = (bga_read(6) as usize).max(width);
-    if width == 0 || height == 0 {
-        return Err(alloc::format!("adapter rejected mode {}x{}", want_w, want_h));
+    let width = regs.read(DISPI_XRES) as usize;
+    let height = regs.read(DISPI_YRES) as usize;
+    let stride = (regs.read(DISPI_VIRT_WIDTH) as usize).max(width);
+    if width == 0 || height == 0 || first.is_some_and(|f| f != (width, height)) {
+        return Err(alloc::format!("adapter rejected mode {}x{} (set {}x{})", want_w, want_h, width, height));
     }
     println!("[GRAPHICS] Hardware Resolution Set: {}x{}x32 (stride {})", width, height, stride);
-    crate::serial_println!("[GRAPHICS] mode {}x{} stride {} (requested {}x{})", width, height, stride, want_w, want_h);
+    crate::serial_println!("[GRAPHICS] {} mode {}x{} stride {} (requested {}x{}, registers {})", location, width, height, stride,
+        want_w, want_h, if matches!(regs, Dispi::Mmio(_)) { "MMIO" } else { "I/O ports" });
 
     // Identity-map the whole aperture (write-combining, see map_direct_hw):
     // the framebuffer at its start, GPU surfaces (gpu_driver) after it.
@@ -164,21 +257,19 @@ fn probe_display(dev: &pci::PciDevice) -> Result<(), alloc::string::String> {
         println!("[GRAPHICS] ERROR: Failed to map framebuffer: {}", e);
         return Err(alloc::format!("framebuffer mapping failed: {}", e));
     }
-    *VRAM.lock() = Some((phys_addr as u64, vram_size));
+
+    let fb = Framebuffer { base_addr: phys_addr as u64, width, height, stride };
+    fb.clear(Color { r: 20, g: 20, b: 35 });
+    let mut heads = HEADS.lock();
+    let x = heads.iter().map(|h| h.fb.width).sum();
+    if heads.is_empty() {
+        *FRAMEBUFFER.lock() = Some(fb);
+    }
+    heads.push(Head { fb, x, vram_base: phys_addr as u64, vram_size, location });
 
     // Everything sized from the screen (back buffer, clip, layout, mouse)
-    // follows this mode from here on.
-    crate::ui::set_screen_size(width, height);
-
-    let fb = Framebuffer {
-        base_addr: phys_addr as u64,
-        width,
-        height,
-        stride,
-    };
-
-    fb.clear(Color { r: 20, g: 20, b: 35 });
-    *FRAMEBUFFER.lock() = Some(fb);
+    // follows the logical display from here on.
+    crate::ui::set_screen_size(x + width, height);
     println!("[GRAPHICS] Manually mapped framebuffer at {:#X}", phys_addr);
     Ok(())
 }

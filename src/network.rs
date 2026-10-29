@@ -203,9 +203,24 @@ impl LogicalNic {
         self.members.push(nic);
     }
 
+    /// Drop the member at `io_base` (hot-removal). Traffic moves to another
+    /// member; with none left the interface is down until a NIC is added.
+    pub fn remove_member(&mut self, io_base: u16) -> bool {
+        let Some(i) = self.members.iter().position(|m| m.io_base == io_base) else { return false };
+        self.members.remove(i);
+        if i < self.active {
+            self.active -= 1;
+        } else if i == self.active {
+            self.active = self.members.iter().position(|m| m.link_up()).unwrap_or(0);
+        }
+        crate::serial_println!("[NET] logical NIC: member {} removed, {} left{}", i, self.members.len(),
+            if self.members.is_empty() { alloc::string::String::new() } else { alloc::format!(", member {} active", self.active) });
+        true
+    }
+
     /// Switch away from the active member if its link is down.
     fn check_links(&mut self) {
-        if self.members[self.active].link_up() {
+        if self.members.is_empty() || self.members[self.active].link_up() {
             return;
         }
         let n = self.members.len();
@@ -225,7 +240,10 @@ impl LogicalNic {
     }
 
     fn transmit(&mut self, frame: &[u8]) {
-        self.members[self.active].hw_transmit(frame);
+        // No member: the frame is dropped, as on a cable pulled out.
+        if let Some(m) = self.members.get_mut(self.active) {
+            m.hw_transmit(frame);
+        }
     }
 
     /// One line per member, for `NET STATUS`.
@@ -1001,7 +1019,16 @@ pub const VIRTIO_NET_DRIVER: crate::hal::Driver = crate::hal::Driver {
     class: crate::hal::DeviceClass::Network,
     matches: is_virtio_net,
     probe: probe_virtio_net,
+    remove: Some(remove_virtio_net),
 };
+
+/// Hot-removal: the NIC leaves the logical NIC (dropping it resets the
+/// device and frees its DMA memory).
+fn remove_virtio_net(dev: &crate::pci::PciDevice) -> Result<(), alloc::string::String> {
+    let io_base = dev.bar(0).io_port().ok_or_else(|| alloc::string::String::from("BAR0 is not an I/O BAR"))?;
+    let removed = NETWORK.lock().as_mut().is_some_and(|stack| stack.device.remove_member(io_base));
+    if removed { Ok(()) } else { Err(alloc::format!("no member at I/O {:#x}", io_base)) }
+}
 
 fn is_virtio_net(d: &crate::pci::PciDevice) -> bool {
     d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_NET_DEV

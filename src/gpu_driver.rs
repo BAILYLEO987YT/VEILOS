@@ -622,8 +622,8 @@ pub fn init() {
         dev.enable_decode();
 
         // Surfaces need the aperture mapped; the display driver maps it.
-        let vram_virt = match crate::graphics::vram_mapping() {
-            Some((base, size)) if base == vram_bar.base && size >= vram_size => base,
+        let vram_virt = match crate::graphics::vram_mapping(vram_bar.base) {
+            Some(size) if size >= vram_size => vram_bar.base,
             _ => 0,
         };
         let gpu = Arc::new(GpuDevice::new(
@@ -634,7 +634,7 @@ pub fn init() {
             vram_virt,
         ));
         // The aperture starts with the visible framebuffer: never hand it out.
-        let scanout_bytes = crate::graphics::FRAMEBUFFER.lock().as_ref().map_or(0, |fb| fb.stride * fb.height * 4);
+        let scanout_bytes = crate::graphics::scanout_bytes(vram_bar.base);
         if scanout_bytes > 0 {
             gpu.vram.lock().alloc(scanout_bytes, "scanout");
         }

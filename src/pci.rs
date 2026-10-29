@@ -10,7 +10,9 @@
 // Why only once: sizing a BAR means writing all-ones to it with decode
 // disabled. Doing that on a live device (e.g. the scanout framebuffer, or a
 // NIC mid-DMA) would glitch or break it, so it must happen before any driver
-// has touched the hardware.
+// has touched the hardware. The one exception is a device hot-plugged later
+// (`hotplug.rs`): no driver has touched it either, so `read_function` sizes
+// it and `register` adds it.
 //
 // Access mechanism: legacy port I/O (0xCF8/0xCFC), which only reaches the
 // first 256 bytes of config space. PCIe extended config (ECAM via the ACPI
@@ -280,6 +282,31 @@ fn probe_bars_inner(addr: PciAddress, bar_count: usize, keep_decode: bool) -> [B
 // =====================================================================
 
 /// One entry in a device's capability list.
+/// PCI power management device states (PMCSR bits 1:0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerState {
+    D0 = 0,
+    D1 = 1,
+    D2 = 2,
+    D3hot = 3,
+}
+
+impl PowerState {
+    fn from_bits(csr: u16) -> Self {
+        match csr & PM_CSR_STATE {
+            0 => PowerState::D0,
+            1 => PowerState::D1,
+            2 => PowerState::D2,
+            _ => PowerState::D3hot,
+        }
+    }
+}
+
+/// Power management capability: control/status register and its fields.
+const PM_CSR: u8 = 0x04;
+const PM_CSR_STATE: u16 = 0x3;
+const PM_CSR_PME_STATUS: u16 = 1 << 15;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capability {
     pub id: u8,
@@ -367,6 +394,31 @@ impl PciDevice {
 
     pub fn find_capability(&self, id: u8) -> Option<u8> {
         self.capabilities.iter().find(|c| c.id == id).map(|c| c.offset)
+    }
+
+    /// Current power state, if the device has the power management capability.
+    pub fn power_state(&self) -> Option<PowerState> {
+        let cap = self.find_capability(CAP_ID_POWER_MGMT)?;
+        Some(PowerState::from_bits(self.address().read_u16(cap + PM_CSR)))
+    }
+
+    /// Move to `state` (D0 or D3hot). False if the device has no power
+    /// management capability. Leaving D3hot resets most of a device's state,
+    /// so this is for devices no driver is using: D0 before a probe, D3hot
+    /// for one nobody drives.
+    pub fn set_power_state(&self, state: PowerState) -> bool {
+        let Some(cap) = self.find_capability(CAP_ID_POWER_MGMT) else { return false };
+        let addr = self.address();
+        let csr = addr.read_u16(cap + PM_CSR);
+        if PowerState::from_bits(csr) == state {
+            return true;
+        }
+        // PME_Status (bit 15) is write-1-to-clear: write it back as 0.
+        addr.write_u16(cap + PM_CSR, (csr & !(PM_CSR_STATE | PM_CSR_PME_STATUS)) | state as u16);
+        // Transitions to or from D3hot need 10 ms before the device is
+        // accessed again (PCI PM 1.2, 5.6.1).
+        crate::time::delay_ms(10);
+        true
     }
 
     pub fn msi(&self) -> Option<MsiInfo> {
@@ -497,6 +549,25 @@ fn scan_bus(bus: u8, out: &mut Vec<PciDevice>, visited: &mut [bool; 256]) {
 }
 
 fn scan_function(addr: PciAddress, out: &mut Vec<PciDevice>, visited: &mut [bool; 256]) {
+    let dev = read_function(addr);
+
+    // A PCI-to-PCI bridge hides a whole secondary bus behind it.
+    let secondary_bus = if dev.is_bridge() {
+        Some((addr.read_u32(REG_BUS_NUMBERS) >> 8) as u8)
+    } else {
+        None
+    };
+
+    out.push(dev);
+
+    if let Some(bus) = secondary_bus {
+        if bus != 0 { scan_bus(bus, out, visited); }
+    }
+}
+
+/// Decode one function: IDs, class, BARs (sized), capabilities. Only for a
+/// function no driver is using (see the module comment).
+pub fn read_function(addr: PciAddress) -> PciDevice {
     let id = addr.read_u32(REG_VENDOR_ID);
     let class_reg = addr.read_u32(REG_CLASS);
     let header_type = addr.read_u8(REG_HEADER_TYPE) & 0x7F;
@@ -528,19 +599,18 @@ fn scan_function(addr: PciAddress, out: &mut Vec<PciDevice>, visited: &mut [bool
         bars: probe_bars(addr, bar_count, is_host_bridge),
         capabilities: walk_capabilities(addr),
     };
+    dev
+}
 
-    // A PCI-to-PCI bridge hides a whole secondary bus behind it.
-    let secondary_bus = if dev.is_bridge() {
-        Some((addr.read_u32(REG_BUS_NUMBERS) >> 8) as u8)
-    } else {
-        None
-    };
+/// Add a hot-plugged function to the registry.
+pub fn register(dev: PciDevice) {
+    log_device(&dev);
+    DEVICES.lock().push(dev);
+}
 
-    out.push(dev);
-
-    if let Some(bus) = secondary_bus {
-        if bus != 0 { scan_bus(bus, out, visited); }
-    }
+/// Drop a function that has been removed from the registry.
+pub fn unregister(bus: u8, device: u8, function: u8) {
+    DEVICES.lock().retain(|d| (d.bus, d.device, d.function) != (bus, device, function));
 }
 
 fn log_device(dev: &PciDevice) {
