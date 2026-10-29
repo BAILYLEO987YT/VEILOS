@@ -703,12 +703,10 @@ async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
         // The pid travels with the work item so the AP can find the right
         // process — previously the SMP path did NO cleanup at all.
         crate::smp::AP_WORK_QUEUE.lock().push(crate::smp::ApWorkItem {
-            entry:     process.entry_point,
-            stack_top: process.stack_top,
             teb_base,
-            pid:       process.pid,
-            cr3:       process.cr3,
+            pid: process.pid,
         });
+        crate::smp::wake_aps();
         return;
     }
 
@@ -717,8 +715,17 @@ async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
     // switches between the two (see kthread). It used to call
     // launch_into_usermode right here, which froze the executor until the
     // process exited and left the timer ISR painting the desktop.
+    spawn_user_thread(process, teb_base);
+}
+
+/// Run `process` on a new kernel thread on this CPU, in its own address
+/// space; the thread tears the process down when it stops. Used by the BSP
+/// (single CPU) and by each AP's worker loop (`smp::park_and_wait_for_work`).
+pub fn spawn_user_thread(process: Arc<Process>, teb_base: u64) {
+    let cpu = crate::smp::cpu_index();
     let pid = process.pid;
     let cr3 = process.cr3;
+    crate::smp::USER_THREAD_ON[cpu].store(true, core::sync::atomic::Ordering::Release);
     crate::kthread::spawn_in("user-process", cr3, move || {
         unsafe { crate::loader::launch_into_usermode(process.entry_point, process.stack_top, teb_base); }
 
@@ -734,9 +741,11 @@ async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
 
         on_process_exit(&process);
 
-        crate::serial_println!("[SCHED] Process {} completed execution on BSP.", process.pid);
+        let cpu = crate::smp::cpu_index();
+        crate::smp::USER_THREAD_ON[cpu].store(false, core::sync::atomic::Ordering::Release);
+        crate::serial_println!("[SCHED] Process {} completed execution on CPU {}.", process.pid, cpu);
     });
-    crate::serial_println!("[SCHED] Pid={} runs on a kernel thread (BSP)", pid);
+    crate::serial_println!("[SCHED] Pid={} runs on a kernel thread (CPU {})", pid, cpu);
 }
 
 /// Everything that must happen once a user process stops running, regardless

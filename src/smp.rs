@@ -726,50 +726,79 @@ pub fn parse_madt() -> Option<Madt> {
 
 // ── AP entry point ─────────────────────────────────────────────────────
 
-/// A unit of ring-3 work handed to an idle AP.
-///
-/// This used to be a bare `(u64, u64, u64)` tuple with no pid, so the AP path
-/// had no way to find the `Arc<Process>` again once the app exited — it just
-/// cleared `USER_PROCESS_ACTIVE` and parked.  Windows were never destroyed,
-/// the process was never marked dead, and its memory was never reclaimed on
-/// an SMP boot.  The pid lets `park_and_wait_for_work` call the same
-/// `on_process_exit()` the BSP path uses.
+/// A Windows process queued for an AP. The AP looks the process up by pid and
+/// runs it with `loader::spawn_user_thread`, the same path the BSP uses
+/// (entry point, stack and page tables all come from the `Process`).
 pub struct ApWorkItem {
-    pub entry:     u64,
-    pub stack_top: u64,
-    pub teb_base:  u64,
-    pub pid:       u32,
-    /// The process's page tables (address_space).
-    pub cr3:       u64,
+    pub teb_base: u64,
+    pub pid:      u32,
 }
 
 pub static AP_WORK_QUEUE: spin::Mutex<alloc::vec::Vec<ApWorkItem>> = spin::Mutex::new(alloc::vec::Vec::new());
 
-pub fn park_and_wait_for_work() -> ! {
-    loop {
-        let work = AP_WORK_QUEUE.lock().pop();
-        if let Some(ApWorkItem { entry, stack_top, teb_base, pid, cr3 }) = work {
-            crate::address_space::activate(cr3);
-            unsafe { crate::loader::launch_into_usermode(entry, stack_top, teb_base); }
-            // return_from_usermode() longjmps here with IF=0 — re-enable.
-            unsafe { core::arch::asm!("sti"); }
+/// True while a CPU has a user-process thread (one per CPU: the user
+/// long-jump context, RSP0 and syscall stacks are per CPU).
+pub static USER_THREAD_ON: [core::sync::atomic::AtomicBool; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS];
 
-            // Process exited (ExitProcess syscall or a fault handler called
-            // return_from_usermode()).  Run the SAME teardown the BSP path
-            // uses instead of just clearing the flag.
-            // (Bound first so PROCESSOR isn't held across on_process_exit.)
-            let process = crate::process::PROCESSOR.lock().find(pid);
-            if let Some(process) = process {
-                crate::loader::on_process_exit(&process);
-            } else {
-                // Process already reaped from under us — still clear the flag.
-                crate::interrupts::USER_PROCESS_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
-                crate::address_space::activate(0);
-            }
-            crate::serial_println!("[SMP] AP process (pid {}) completed, parking.", pid);
+/// An AP's boot thread: the CPU's worker loop (HAL step 7B).
+///
+/// Each pass it helps with any posted `workers::for_each` batch, starts a
+/// queued Windows process on its own kernel thread if this CPU has none,
+/// gives the CPU to that thread if it is waiting, and otherwise halts until
+/// an interrupt: the 1 ms LAPIC tick or a wake IPI from `wake_aps`. A
+/// running process is preempted back to this loop every slice (the AP timer
+/// handler calls `kthread::preempt_from_timer`), so batches never wait
+/// behind it for long. APs used to run one process to completion here and
+/// do nothing else.
+pub fn park_and_wait_for_work() -> ! {
+    let cpu = cpu_index();
+    loop {
+        if crate::workers::help() {
+            continue;
         }
-        unsafe { core::arch::asm!("hlt"); }
+        if !USER_THREAD_ON[cpu].load(Ordering::Acquire) {
+            let work = AP_WORK_QUEUE.lock().pop();
+            if let Some(ApWorkItem { teb_base, pid, .. }) = work {
+                let process = crate::process::PROCESSOR.lock().find(pid);
+                match process {
+                    Some(process) => crate::loader::spawn_user_thread(process, teb_base),
+                    None => crate::serial_println!("[SMP] queued pid {} no longer exists", pid),
+                }
+                continue;
+            }
+        }
+        if crate::kthread::others_ready() {
+            crate::kthread::yield_now();
+            continue;
+        }
+        x86_64::instructions::interrupts::disable();
+        if crate::workers::pending() || (!USER_THREAD_ON[cpu].load(Ordering::Acquire) && !AP_WORK_QUEUE.lock().is_empty()) {
+            x86_64::instructions::interrupts::enable();
+        } else {
+            x86_64::instructions::interrupts::enable_and_hlt();
+        }
     }
+}
+
+/// Wake every other CPU from `hlt` (fixed IPI on the AP timer vector, whose
+/// handler only acknowledges it). Used when work is posted for them.
+pub fn wake_aps() {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 || CPU_ONLINE.load(Ordering::Acquire).count_ones() <= 1 {
+        return;
+    }
+    // ICR: destination shorthand "all excluding self" (bits 18-19 = 11),
+    // level assert, fixed delivery.
+    let icr = 0x000C_4000 | crate::interrupts::AP_TIMER_VECTOR as u32;
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        lapic_write(LAPIC_ICR_HIGH, 0);
+        lapic_write(LAPIC_ICR_LOW, icr);
+        let mut spins = 0u32;
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 && spins < 100_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    });
 }
 
 /// Each AP jumps here after the SIPI.

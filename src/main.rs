@@ -58,6 +58,7 @@ pub mod kthread;
 pub mod address_space;
 pub mod block;
 pub mod hal;
+pub mod workers;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;

@@ -1,6 +1,6 @@
 # VEILOS HAL: design proposal (step 7)
 
-**Status:** 7A (device registry and driver binding) done; 7B–7E to do.
+**Status:** 7A (device registry and driver binding) and 7B (worker pool) done; 7C–7E to do.
 
 ## Goal
 
@@ -66,7 +66,7 @@ work over are **CPU cores acting as software rasterisers** and **remote mesh nod
 | Part | Content | Visible result |
 |---|---|---|
 | 7A ✅ | `hal` device registry and driver binding; AHCI, virtio-net and Bochs display drivers bind through it | No behaviour change; the terminal's `DEVICES` lists every device with its driver, or why it isn't driven |
-| 7B | APs run kernel threads: a per-CPU scheduler on every CPU, and a HAL job queue workers pull from | Idle CPUs can do kernel work |
+| 7B ✅ | APs run kernel threads. `workers::for_each(n, f)` spreads work over every CPU, with the caller taking part. A user process on an AP is preempted every 10 ms so pool work isn't stuck behind it. | `WORKERS` benchmark: 3.7× on 4 CPUs (183 → 50 ms), unchanged with gui_test.exe busy on an AP; 1 CPU runs everything on the caller |
 | 7C | `LogicalGpu` with CPU-worker backends and tile split; the desktop and Win32 surfaces render through it | Frame time on 4 CPUs vs 1 measured in the `[GUI] perf` line |
 | 7D | Display abstraction: real mode and stride, no `SCREEN_W/H` constants | Other resolutions work |
 | 7E | Mesh backends for the logical GPU; NIC aggregation | Remote devices join the pool |

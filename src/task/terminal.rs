@@ -44,7 +44,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from("VEILOS SHELL - AVAILABLE COMMANDS:"));
             history.push(String::from(" FS:      LS [PATH]  CAT [FILE]  HEAD [FILE]  MKDIR [DIR]  RM [FILE]  PWD"));
             history.push(String::from(" PROC:    PS  KILL [PID]  CAPS [PID]"));
-            history.push(String::from(" HW:      DEVICES"));
+            history.push(String::from(" HW:      DEVICES  WORKERS"));
             history.push(String::from(" PKG:     PKG LIST  PKG INSTALL [NAME]  PKG REMOVE [NAME]"));
             history.push(String::from(" DEBUG:   TRACE [N]  PROFILE [START|STOP|REPORT]  DBG [ATTACH|BP] [PID/ADDR]"));
             history.push(String::from(" POLICY:  POLICY  POLICY SET [PROFILE] [PID]  MODE [SECURITY|PERFORMANCE]"));
@@ -610,6 +610,14 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(alloc::format!("  Session: {} m {} s",
                     s.duration_secs()/60, s.duration_secs()%60));
             }
+        }
+        "WORKERS" => {
+            // Worker-pool benchmark: 64 chunks of busy work, run on this CPU
+            // alone and then spread over every CPU (workers::for_each).
+            let (seq, par, per_cpu) = crate::workers::benchmark(64, 2_000_000);
+            history.push(alloc::format!("workers: 64 chunks  1 CPU {} ms  all CPUs {} ms  speedup {}.{}x",
+                seq / 1000, par / 1000, seq / par.max(1), (seq * 10 / par.max(1)) % 10));
+            history.push(alloc::format!("chunks run per CPU: {:?}", per_cpu));
         }
         "DEVICES" => {
             // Every PCI device and the driver bound to it (hal::describe).

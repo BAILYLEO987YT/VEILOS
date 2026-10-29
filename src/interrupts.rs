@@ -899,11 +899,16 @@ impl core::future::Future for SleepFuture {
     }
 }
 
-/// Per-AP LAPIC timer tick. Deliberately does nothing but acknowledge the local APIC: no
-/// TICKS, no scheduler, no PIC. Returning from this ISR is what wakes the AP out of `hlt`
-/// so `park_and_wait_for_work` can poll the work queue again.
-extern "x86-interrupt" fn ap_timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// Per-AP LAPIC timer tick (1 ms), also used as the wake IPI (`smp::wake_aps`).
+/// No TICKS, no scheduler tick, no PIC. Returning from it wakes an idle AP out of
+/// `hlt` so its worker loop runs again; if it interrupted a user process whose
+/// slice is used up, it switches back to that loop (same rule as the BSP timer:
+/// only ring 3 is ever preempted).
+extern "x86-interrupt" fn ap_timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     crate::smp::lapic_eoi();
+    if stack_frame.code_segment & 0x3 == 3 {
+        crate::kthread::preempt_from_timer();
+    }
 }
 
 /// LAPIC spurious-interrupt vector. A spurious interrupt is not recorded in the ISR, so it
