@@ -241,7 +241,7 @@ impl HbaPort {
     /// Wait for the command in `slot` to complete. False on a task-file error
     /// (PxIS.TFES) or timeout. An unbounded spin here would hang the whole
     /// kernel on a stalled DMA.
-    fn wait_for_command(&self, slot: usize, what: &str) -> bool {
+    fn wait_for_command(&mut self, slot: usize, what: &str) -> bool {
         let mut fatal = false;
         let done = crate::time::spin_until(AHCI_COMMAND_TIMEOUT_US, || {
             if self.command_issue.read() & (1 << slot) == 0 { return true; }
@@ -249,14 +249,35 @@ impl HbaPort {
             fatal
         });
         if fatal {
-            crate::serial_println!("[AHCI] {}: fatal error bit set", what);
+            let tfd = self.task_file_data.read();
+            crate::serial_println!(
+                "[AHCI] {}: device reported an error (status {:#04x}, error {:#04x})",
+                what, tfd & 0xFF, (tfd >> 8) & 0xFF
+            );
+            self.recover();
             false
         } else if !done {
             crate::serial_println!("[AHCI] {}: command timed out", what);
+            self.recover();
             false
         } else {
             true
         }
+    }
+
+    /// Put the port back in a usable state after a failed command (AHCI 1.3
+    /// §6.2.2.1): stop the command engine, clear the error and interrupt
+    /// status, restart. Without this the stale error status made every later
+    /// command fail too, so one refused write left the whole disk unreadable.
+    fn recover(&mut self) {
+        let _ = self.stop();
+        self.sata_error.write(0xFFFF_FFFF);
+        self.interrupt_status.write(0xFFFF_FFFF);
+        if self.task_file_data.read() & (0x80 | 0x08) != 0 {
+            // BSY/DRQ still set: only a COMRESET clears that, not done yet.
+            crate::serial_println!("[AHCI] port still busy after error; needs a COMRESET (not implemented)");
+        }
+        let _ = self.start();
     }
     pub fn stop(&mut self) -> bool {
         let mut command = self.command_and_status.read();
@@ -326,6 +347,9 @@ impl HbaPort {
         
         if !self.wait_not_busy() { return false; }
 
+        // PxIS bits are sticky (write 1 to clear): clear any left from an
+        // earlier command so this one's completion check reads its own status.
+        self.interrupt_status.write(0xFFFF_FFFF);
         self.command_issue.write(1 << slot);
         self.wait_for_command(slot, "identify()")
     }
@@ -371,6 +395,9 @@ impl HbaPort {
 
         if !self.wait_not_busy() { return false; }
 
+        // PxIS bits are sticky (write 1 to clear): clear any left from an
+        // earlier command so this one's completion check reads its own status.
+        self.interrupt_status.write(0xFFFF_FFFF);
         self.command_issue.write(1 << slot);
         let ok = self.wait_for_command(slot, "read_sectors()");
         if !ok {
@@ -429,6 +456,9 @@ impl HbaPort {
         // Wait for BSY/DRQ to clear before issuing.
         if !self.wait_not_busy() { return false; }
 
+        // PxIS bits are sticky (write 1 to clear): clear any left from an
+        // earlier command so this one's completion check reads its own status.
+        self.interrupt_status.write(0xFFFF_FFFF);
         self.command_issue.write(1 << slot);
         let ok = self.wait_for_command(slot, "write_sectors()");
         if !ok {
