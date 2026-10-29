@@ -386,6 +386,16 @@ pub fn commit_back_buffer() {
     commit_dirty_rect(0, 0, SCREEN_W, SCREEN_H);
 }
 
+/// The back buffer as a logical-GPU target, while a `BackBufferGuard` is held
+/// (the painter fast path). None otherwise.
+pub fn painter_surface() -> Option<crate::lgpu::Surface> {
+    if !PAINTER_ACTIVE.load(AtomicOrd::Acquire) {
+        return None;
+    }
+    let ptr = PAINTER_PTR.load(AtomicOrd::Relaxed);
+    (!ptr.is_null()).then_some(crate::lgpu::Surface { ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W })
+}
+
 /// Commits only a specific portion of the off-screen buffer to the real hardware.
 pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
     // Fast path: if a BackBufferGuard is active, read through the raw pointer
@@ -396,16 +406,14 @@ pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
         if !bb_ptr.is_null() {
             let mut fb_lock = FRAMEBUFFER.lock();
             if let Some(ref mut fb) = *fb_lock {
-                let draw_w = if x + w > fb.width { fb.width.saturating_sub(x) } else { w };
-                for dy in 0..h {
-                    let py = y + dy;
-                    if py >= fb.height { break; }
-                    let row_start = (fb.base_addr + (py * fb.stride + x) as u64 * 4) as *mut u32;
-                    let src_start = py * SCREEN_W + x;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(bb_ptr.add(src_start), row_start, draw_w);
-                    }
-                }
+                // Back buffer -> framebuffer through the logical GPU: split into
+                // bands and copied on every CPU (lgpu, HAL step 7C).
+                let target = crate::lgpu::Surface {
+                    ptr: fb.base_addr as *mut u32, width: fb.width, height: fb.height, stride: fb.stride,
+                };
+                let src = crate::lgpu::Surface { ptr: bb_ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W };
+                let dst = crate::lgpu::Rect::new(x, y, (x + w).min(fb.width), (y + h).min(fb.height));
+                crate::lgpu::execute(&[crate::lgpu::Op::Copy { src, src_x: x, src_y: y, dst, transparent: None }], &target);
             }
             return;
         }
@@ -1014,10 +1022,26 @@ fn draw_scaled_cached(pixels: &[u8], width: i32, height: i32, channels: usize,
     // Same destination selection as the per-pixel path.
     let direct = PAINTER_ACTIVE.load(AtomicOrd::Acquire);
     if direct {
-        let bb_ptr = PAINTER_PTR.load(AtomicOrd::Relaxed);
-        if bb_ptr.is_null() { return false; }
-        let dst = unsafe { core::slice::from_raw_parts_mut(bb_ptr, SCREEN_W * SCREEN_H) };
-        blit_scaled(img, x, y, tw, th, cx, cy, cx2, cy2, dst);
+        let Some(target) = painter_surface() else { return false };
+        // Through the logical GPU: banded over every CPU (lgpu, HAL step 7C).
+        // Same clipping as blit_scaled: the draw rect, the clip, the screen.
+        let x0 = cx.max(x).max(0);
+        let x1 = cx2.min(x + tw).min(SCREEN_W as i32);
+        let y0 = cy.max(y).max(0);
+        let y1 = cy2.min(y + th).min(SCREEN_H as i32);
+        if x0 < x1 && y0 < y1 {
+            let src = crate::lgpu::Surface {
+                ptr: img.px.as_ptr() as *mut u32, width: tw as usize, height: th as usize, stride: tw as usize,
+            };
+            let op = crate::lgpu::Op::Copy {
+                src,
+                src_x: (x0 - x) as usize,
+                src_y: (y0 - y) as usize,
+                dst: crate::lgpu::Rect::new(x0 as usize, y0 as usize, x1 as usize, y1 as usize),
+                transparent: if img.opaque { None } else { Some(SCALED_TRANSPARENT) },
+            };
+            crate::lgpu::execute(&[op], &target);
+        }
         return true;
     }
     let mut bb_lock = BACK_BUFFER.lock();

@@ -1,6 +1,6 @@
 # VEILOS HAL: design proposal (step 7)
 
-**Status:** 7A (device registry and driver binding) and 7B (worker pool) done; 7C–7E to do.
+**Status:** 7A and 7B done; 7C started (first part done); 7D–7E to do.
 
 ## Goal
 
@@ -67,7 +67,8 @@ work over are **CPU cores acting as software rasterisers** and **remote mesh nod
 |---|---|---|
 | 7A ✅ | `hal` device registry and driver binding; AHCI, virtio-net and Bochs display drivers bind through it | No behaviour change; the terminal's `DEVICES` lists every device with its driver, or why it isn't driven |
 | 7B ✅ | APs run kernel threads. `workers::for_each(n, f)` spreads work over every CPU, with the caller taking part. A user process on an AP is preempted every 10 ms so pool work isn't stuck behind it. | `WORKERS` benchmark: 3.7× on 4 CPUs (183 → 50 ms), unchanged with gui_test.exe busy on an AP; 1 CPU runs everything on the caller |
-| 7C | `LogicalGpu` with CPU-worker backends and tile split; the desktop and Win32 surfaces render through it | Frame time on 4 CPUs vs 1 measured in the `[GUI] perf` line |
+| 7C (part 1 ✅) | `lgpu.rs`: `Op` lists (fill, copy with transparent key) against a `Surface`, cut into horizontal bands and rendered on every CPU through the worker pool by the `CpuRaster` backend. The frame clear, the wallpaper blit and the back-buffer flush go through it. | Full desktop frame 19–20 → 15–16 Mcycles on 4 CPUs (clear 4.1 → 2.0, flush 2.8 → 1.4); 1 CPU unchanged |
+| 7C (part 2) | Widget and text painting as ops: it still runs on one CPU through the global painter (`ui::PAINTER_PTR`, `ui::CLIP_*`), about 12 Mcycles of each frame. Also route `gpu_driver` command batches and Win32 surfaces through the logical GPU. | Paint stage scales with CPUs too |
 | 7D | Display abstraction: real mode and stride, no `SCREEN_W/H` constants | Other resolutions work |
 | 7E | Mesh backends for the logical GPU; NIC aggregation | Remote devices join the pool |
 

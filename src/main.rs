@@ -59,6 +59,7 @@ pub mod address_space;
 pub mod block;
 pub mod hal;
 pub mod workers;
+pub mod lgpu;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;
@@ -441,6 +442,8 @@ async fn gui_refresh_task() {
     let mut diag_full: u64 = 0;
     let mut diag_cursor: u64 = 0;
     let mut diag_full_cycles: u64 = 0;
+    // Per-stage split of full frames: (clear, paint, flush) cycles.
+    let mut diag_stage: [u64; 3] = [0; 3];
 
     loop {
         let ms = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
@@ -690,14 +693,29 @@ async fn gui_refresh_task() {
             // This collapses ~30 lock/unlock round-trips per frame down to 1.
             let _painter = crate::ui::BackBufferGuard::acquire();
 
-            // (a) Clear the back buffer.
-            crate::ui::draw_rect_atomic(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H, crate::graphics::Color { r: 20, g: 20, b: 35 });
+            let rdtsc = || unsafe { core::arch::x86_64::_rdtsc() };
+            let t_a = rdtsc();
+            // (a) Clear the back buffer (through the logical GPU when the painter
+            //     fast path is up, which the guard above guarantees).
+            match crate::ui::painter_surface() {
+                Some(target) => crate::lgpu::execute(&[crate::lgpu::Op::Fill {
+                    rect: crate::lgpu::Rect::new(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H),
+                    color: 0x14_14_23, // r 20, g 20, b 35
+                }], &target),
+                None => crate::ui::draw_rect_atomic(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H, crate::graphics::Color { r: 20, g: 20, b: 35 }),
+            }
+            let t_b = rdtsc();
 
             // (b) Phase 18 DE (panel, app windows, notifs) composites on top.
             crate::desktop::paint_desktop(ms);
+            let t_c = rdtsc();
 
             // (c) One full flush to hardware (also uses the fast path).
             crate::ui::commit_back_buffer();
+            let t_d = rdtsc();
+            diag_stage[0] += t_b - t_a;
+            diag_stage[1] += t_c - t_b;
+            diag_stage[2] += t_d - t_c;
 
             // (d) Release the guard — restores normal per-call locking.
             drop(_painter);
@@ -738,11 +756,17 @@ async fn gui_refresh_task() {
         if sec >= diag_sec + 5 {
             let now_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             let avg_mc = if diag_full > 0 { diag_full_cycles / diag_full / 1_000_000 } else { 0 };
+            let per = |c: u64| if diag_full > 0 { c / diag_full / 100_000 } else { 0 }; // tenths of Mcycles
             serial_println!(
-                "[GUI] perf: {} loop iters, {} full frames (avg {} Mcycles each), {} cursor-only; {} Mcycles elapsed over {} ticks",
-                diag_iters, diag_full, avg_mc, diag_cursor,
+                "[GUI] perf: {} loop iters, {} full frames (avg {} Mcycles each: clear {}.{} paint {}.{} flush {}.{}), {} cursor-only; {} Mcycles elapsed over {} ticks",
+                diag_iters, diag_full, avg_mc,
+                per(diag_stage[0]) / 10, per(diag_stage[0]) % 10,
+                per(diag_stage[1]) / 10, per(diag_stage[1]) % 10,
+                per(diag_stage[2]) / 10, per(diag_stage[2]) % 10,
+                diag_cursor,
                 now_tsc.wrapping_sub(diag_tsc0) / 1_000_000,
                 ms.wrapping_sub(diag_ticks0));
+            diag_stage = [0; 3];
             diag_sec = sec;
             diag_tsc0 = now_tsc;
             diag_ticks0 = ms;
