@@ -698,10 +698,15 @@ async fn gui_refresh_task() {
             // (a) Clear the back buffer (through the logical GPU when the painter
             //     fast path is up, which the guard above guarantees).
             match crate::ui::painter_surface() {
-                Some(target) => crate::lgpu::execute(&[crate::lgpu::Op::Fill {
-                    rect: crate::lgpu::Rect::new(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H),
-                    color: 0x14_14_23, // r 20, g 20, b 35
-                }], &target),
+                Some(target) => {
+                    let op = crate::lgpu::Op::Fill {
+                        rect: crate::lgpu::Rect::new(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H),
+                        color: 0x14_14_23, // r 20, g 20, b 35
+                    };
+                    if !crate::lgpu::dl_record(op) {
+                        crate::lgpu::execute(&[op], &target);
+                    }
+                }
                 None => crate::ui::draw_rect_atomic(0, 0, crate::ui::SCREEN_W, crate::ui::SCREEN_H, crate::graphics::Color { r: 20, g: 20, b: 35 }),
             }
             let t_b = rdtsc();
@@ -757,12 +762,15 @@ async fn gui_refresh_task() {
             let now_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             let avg_mc = if diag_full > 0 { diag_full_cycles / diag_full / 1_000_000 } else { 0 };
             let per = |c: u64| if diag_full > 0 { c / diag_full / 100_000 } else { 0 }; // tenths of Mcycles
+            let (dl_flushes, dl_ops, dl_cycles) = crate::lgpu::take_stats();
             serial_println!(
-                "[GUI] perf: {} loop iters, {} full frames (avg {} Mcycles each: clear {}.{} paint {}.{} flush {}.{}), {} cursor-only; {} Mcycles elapsed over {} ticks",
+                "[GUI] perf: {} loop iters, {} full frames (avg {} Mcycles each: clear {}.{} paint {}.{} flush {}.{}; display list {} flushes, {} ops, {}.{} rendering), {} cursor-only; {} Mcycles elapsed over {} ticks",
                 diag_iters, diag_full, avg_mc,
                 per(diag_stage[0]) / 10, per(diag_stage[0]) % 10,
                 per(diag_stage[1]) / 10, per(diag_stage[1]) % 10,
                 per(diag_stage[2]) / 10, per(diag_stage[2]) % 10,
+                dl_flushes / diag_full.max(1), dl_ops / diag_full.max(1),
+                per(dl_cycles) / 10, per(dl_cycles) % 10,
                 diag_cursor,
                 now_tsc.wrapping_sub(diag_tsc0) / 1_000_000,
                 ms.wrapping_sub(diag_ticks0));

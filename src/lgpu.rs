@@ -14,11 +14,17 @@
 // (`distributed::remote_gpu_submit`, step 7E): a band can be given to
 // whichever backend owns it.
 //
-// What goes through it now: clearing the desktop frame, the wallpaper blit
-// and the flush of the back buffer to the framebuffer, the pixel-heavy part
-// of each frame. Widget and text drawing still runs on one CPU through the
-// global painter (`ui::PAINTER_PTR`, `ui::CLIP_*`), which isn't safe to run on
-// several CPUs at once; moving it to ops is the next part of this step.
+// Desktop frames go through a display list (part 2): while a frame is being
+// painted (`ui::BackBufferGuard`), fills, text and the wallpaper blit are
+// recorded instead of drawn, and the list is rendered banded on every CPU at
+// once, so even small ops are shared out. Code that still needs the raw
+// back buffer (image decoders, the taskbar's `render2d` shapes) gets it from
+// `ui::painter_ptr_flushed`, which renders everything recorded so far first,
+// so drawing order is never changed. The back-buffer -> framebuffer flush is
+// a direct `execute`.
+
+use alloc::vec::Vec;
+use spin::Mutex;
 
 use crate::workers;
 
@@ -64,6 +70,9 @@ pub enum Op {
     /// (x - dst.x0 + src_x, y - dst.y0 + src_y). Source pixels equal to
     /// `transparent` are skipped.
     Copy { src: Surface, src_x: usize, src_y: usize, dst: Rect, transparent: Option<u32> },
+    /// An 8×8 1-bit glyph (`bits`: 8 rows, MSB = leftmost pixel) at (x, y)
+    /// in `color`, drawn only inside `clip`.
+    Glyph8 { bits: &'static [u8], x: usize, y: usize, color: u32, clip: Rect },
 }
 
 /// Something that can render ops into one band of a target.
@@ -93,6 +102,17 @@ impl Backend for CpuRaster {
                             core::slice::from_raw_parts_mut(target.ptr.add(y * target.stride + r.x0), r.x1 - r.x0)
                         };
                         row.fill(color);
+                    }
+                }
+                Op::Glyph8 { bits, x, y, color, clip } => {
+                    let Some(r) = Rect::new(x, y, x + 8, y + 8).intersect(&clip).and_then(|r| r.intersect(&band)) else { continue };
+                    for py in r.y0..r.y1 {
+                        let row_bits = bits[py - y];
+                        for px in r.x0..r.x1 {
+                            if row_bits & (0x80 >> (px - x)) != 0 {
+                                unsafe { *target.ptr.add(py * target.stride + px) = color; }
+                            }
+                        }
                     }
                 }
                 Op::Copy { src, src_x, src_y, dst, transparent } => {
@@ -144,6 +164,7 @@ fn op_rect(op: &Op) -> Rect {
     match *op {
         Op::Fill { rect, .. } => rect,
         Op::Copy { dst, .. } => dst,
+        Op::Glyph8 { x, y, clip, .. } => Rect::new(x, y, x + 8, y + 8).intersect(&clip).unwrap_or(Rect::new(0, 0, 0, 0)),
     }
 }
 
@@ -175,4 +196,117 @@ pub fn execute(ops: &[Op], target: &Surface) {
             backend.render(ops, target, Rect::new(area.x0, y0, area.x1, y1));
         }
     });
+}
+
+// -----| frame display list |-----
+
+struct DisplayList {
+    target: Option<Surface>,
+    ops: Vec<Op>,
+    /// While > 0 nothing is recorded: someone holds the raw buffer and
+    /// expects draws to land immediately, in order (`suspended`).
+    suspended: u32,
+}
+
+/// Only the painting thread (the executor's GUI task) records and flushes;
+/// the lock just makes that explicit.
+static DISPLAY_LIST: Mutex<DisplayList> = Mutex::new(DisplayList { target: None, ops: Vec::new(), suspended: 0 });
+
+/// Start recording a frame for `target` (`ui::BackBufferGuard::acquire`).
+pub fn dl_begin(target: Surface) {
+    let mut dl = DISPLAY_LIST.lock();
+    dl.target = Some(target);
+    dl.ops.clear();
+}
+
+/// Record `op` into the current frame. Returns false if no frame is being
+/// recorded; the caller then draws directly.
+pub fn dl_record(op: Op) -> bool {
+    let mut dl = DISPLAY_LIST.lock();
+    if dl.target.is_none() || dl.suspended > 0 {
+        return false;
+    }
+    // Overdraw elimination: a large opaque op hides every earlier op it fully
+    // covers (e.g. the frame clear under a full-screen wallpaper), so those
+    // never need rendering. Only large ops check, to keep recording cheap.
+    if let Some(cover) = opaque_rect(&op) {
+        if (cover.x1 - cover.x0) * (cover.y1 - cover.y0) >= MIN_PARALLEL_PIXELS {
+            dl.ops.retain(|old| {
+                let r = op_rect(old);
+                !(r.x0 >= cover.x0 && r.y0 >= cover.y0 && r.x1 <= cover.x1 && r.y1 <= cover.y1)
+            });
+        }
+    }
+    dl.ops.push(op);
+    true
+}
+
+/// The area `op` overwrites completely, if it is opaque.
+fn opaque_rect(op: &Op) -> Option<Rect> {
+    match *op {
+        Op::Fill { rect, .. } => Some(rect),
+        Op::Copy { dst, transparent: None, src, src_x, src_y } => {
+            // Only the part the source actually covers is overwritten.
+            let w = src.width.saturating_sub(src_x).min(dst.x1 - dst.x0);
+            let h = src.height.saturating_sub(src_y).min(dst.y1 - dst.y0);
+            Some(Rect::new(dst.x0, dst.y0, dst.x0 + w, dst.y0 + h))
+        }
+        _ => None,
+    }
+}
+
+/// Run `f` with recording off: everything recorded so far is rendered first,
+/// and draws made inside `f` go straight to the buffer. For code that writes
+/// the raw buffer across a callback which may also call the `ui::draw_*`
+/// functions (`render2d_kernel::with_backbuffer`), where a recorded draw
+/// would otherwise land after raw writes that follow it.
+pub fn suspended<R>(f: impl FnOnce() -> R) -> R {
+    dl_flush();
+    DISPLAY_LIST.lock().suspended += 1;
+    let r = f();
+    DISPLAY_LIST.lock().suspended -= 1;
+    r
+}
+
+/// (flushes that rendered something, ops rendered, TSC cycles spent
+/// rendering them) since the last call: diagnostics for the `[GUI] perf` line.
+pub fn take_stats() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (FLUSHES.swap(0, Relaxed), OPS.swap(0, Relaxed), FLUSH_CYCLES.swap(0, Relaxed))
+}
+
+static FLUSH_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+static FLUSHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static OPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Render everything recorded so far. Call before touching the target's
+/// pixels directly (see `ui::painter_ptr_flushed`).
+pub fn dl_flush() {
+    let (target, ops) = {
+        let mut dl = DISPLAY_LIST.lock();
+        let Some(target) = dl.target else { return };
+        if dl.ops.is_empty() {
+            return;
+        }
+        (target, core::mem::take(&mut dl.ops))
+    };
+    FLUSHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    OPS.fetch_add(ops.len() as u64, core::sync::atomic::Ordering::Relaxed);
+    let t0 = crate::time::rdtsc();
+    execute(&ops, &target);
+    FLUSH_CYCLES.fetch_add(crate::time::rdtsc() - t0, core::sync::atomic::Ordering::Relaxed);
+    // Hand the allocation back so the next frame doesn't regrow it.
+    let mut dl = DISPLAY_LIST.lock();
+    if dl.ops.is_empty() {
+        let mut ops = ops;
+        ops.clear();
+        dl.ops = ops;
+    }
+}
+
+/// Render what's left and stop recording (`ui::BackBufferGuard` drop).
+pub fn dl_end() {
+    dl_flush();
+    DISPLAY_LIST.lock().target = None;
 }

@@ -356,12 +356,16 @@ impl BackBufferGuard {
         // code observing PAINTER_ACTIVE = true always sees a valid pointer.
         PAINTER_PTR.store(ptr, AtomicOrd::Release);
         PAINTER_ACTIVE.store(true, AtomicOrd::Release);
+        // Record this frame's drawing into the logical GPU's display list.
+        crate::lgpu::dl_begin(crate::lgpu::Surface { ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W });
         Some(Self { _guard: guard })
     }
 }
 
 impl Drop for BackBufferGuard {
     fn drop(&mut self) {
+        // Render anything still recorded while the buffer is still ours.
+        crate::lgpu::dl_end();
         // Clear the flag first so that after the MutexGuard releases the
         // lock, no code can observe PAINTER_ACTIVE = true with a stale ptr.
         PAINTER_ACTIVE.store(false, AtomicOrd::Release);
@@ -386,6 +390,14 @@ pub fn commit_back_buffer() {
     commit_dirty_rect(0, 0, SCREEN_W, SCREEN_H);
 }
 
+/// The back buffer's raw pointer for code that writes pixels itself (image
+/// decoders, `render2d`), after rendering everything the frame's display list
+/// has recorded so far, so those writes land on top in the right order.
+pub fn painter_ptr_flushed() -> *mut u32 {
+    crate::lgpu::dl_flush();
+    PAINTER_PTR.load(AtomicOrd::Relaxed)
+}
+
 /// The back buffer as a logical-GPU target, while a `BackBufferGuard` is held
 /// (the painter fast path). None otherwise.
 pub fn painter_surface() -> Option<crate::lgpu::Surface> {
@@ -402,7 +414,7 @@ pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
     // so we never try to re-acquire BACK_BUFFER (which would deadlock since
     // the guard already holds it).
     if PAINTER_ACTIVE.load(AtomicOrd::Acquire) {
-        let bb_ptr = PAINTER_PTR.load(AtomicOrd::Relaxed);
+        let bb_ptr = painter_ptr_flushed();
         if !bb_ptr.is_null() {
             let mut fb_lock = FRAMEBUFFER.lock();
             if let Some(ref mut fb) = *fb_lock {
@@ -489,8 +501,10 @@ pub fn draw_rect_atomic(x: usize, y: usize, w: usize, h: usize, color: Color) {
             // panel backgrounds) are banded over every CPU, small ones run here.
             // Each fill completes before this returns, so drawing order is kept.
             let target = crate::lgpu::Surface { ptr: bb_ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W };
-            let rect = crate::lgpu::Rect::new(rx, ry, rx + dw, ry + dh);
-            crate::lgpu::execute(&[crate::lgpu::Op::Fill { rect, color: pixel_val }], &target);
+            let op = crate::lgpu::Op::Fill { rect: crate::lgpu::Rect::new(rx, ry, rx + dw, ry + dh), color: pixel_val };
+            if !crate::lgpu::dl_record(op) {
+                crate::lgpu::execute(&[op], &target);
+            }
             return;
         }
     }
@@ -545,11 +559,20 @@ pub fn draw_string_atomic(s: &str, x: usize, y: usize, color: Color) {
     if PAINTER_ACTIVE.load(AtomicOrd::Acquire) {
         let bb_ptr = PAINTER_PTR.load(AtomicOrd::Relaxed);
         if !bb_ptr.is_null() {
+            let pixel_val = (color.b as u32) | ((color.g as u32) << 8) | ((color.r as u32) << 16);
+            let clip = crate::lgpu::Rect::new(cx, cy, cx2.min(SCREEN_W), cy2.min(SCREEN_H));
             let mut offset = 0;
             for c in s.chars() {
                 let char_x = x + offset;
                 if char_x + 8 > cx && char_x < cx2 {
-                    unsafe { draw_char_raw_ptr(bb_ptr, c, char_x, y, color, cx, cy, cx2, cy2); }
+                    // Recorded into the frame's display list (glyph rows are static font data).
+                    let font_at = get_font_offset(c);
+                    let recorded = font_at + 8 <= FONT.len() && crate::lgpu::dl_record(crate::lgpu::Op::Glyph8 {
+                        bits: &FONT[font_at..font_at + 8], x: char_x, y, color: pixel_val, clip,
+                    });
+                    if !recorded {
+                        unsafe { draw_char_raw_ptr(bb_ptr, c, char_x, y, color, cx, cy, cx2, cy2); }
+                    }
                 }
                 offset += 9;
                 if char_x >= cx2 { break; }
@@ -659,7 +682,7 @@ pub fn draw_bmp_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
     let bottom_up = height > 0;
 
     let direct = PAINTER_ACTIVE.load(AtomicOrd::Acquire);
-    let bb_ptr = if direct { PAINTER_PTR.load(AtomicOrd::Relaxed) } else { core::ptr::null_mut() };
+    let bb_ptr = if direct { painter_ptr_flushed() } else { core::ptr::null_mut() };
 
     let mut bb_lock_opt = if !direct { Some(BACK_BUFFER.lock()) } else { None };
     let mut fallback_bb = if let Some(ref mut guard) = bb_lock_opt { (**guard).as_mut() } else { None };
@@ -742,7 +765,7 @@ pub fn draw_tga_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target
     let cy2 = CLIP_Y2.load(AtomicOrd::Relaxed).max(0) as i32;
 
     let direct = PAINTER_ACTIVE.load(AtomicOrd::Acquire);
-    let bb_ptr = if direct { PAINTER_PTR.load(AtomicOrd::Relaxed) } else { core::ptr::null_mut() };
+    let bb_ptr = if direct { painter_ptr_flushed() } else { core::ptr::null_mut() };
     let mut bb_lock_opt = if !direct { Some(BACK_BUFFER.lock()) } else { None };
     let mut fallback_bb = if let Some(ref mut guard) = bb_lock_opt { (**guard).as_mut() } else { None };
 
@@ -995,6 +1018,8 @@ fn draw_scaled_cached(pixels: &[u8], width: i32, height: i32, channels: usize,
                 cache.seen_next = (n + 1) % 2;
                 return false;
             }
+            // A recorded copy may still point into the slot about to be replaced.
+            crate::lgpu::dl_flush();
             let (px, opaque) = match build_scaled(pixels, width, height, channels, tw, th) {
                 Some(v) => v,
                 None => return false,
@@ -1040,7 +1065,9 @@ fn draw_scaled_cached(pixels: &[u8], width: i32, height: i32, channels: usize,
                 dst: crate::lgpu::Rect::new(x0 as usize, y0 as usize, x1 as usize, y1 as usize),
                 transparent: if img.opaque { None } else { Some(SCALED_TRANSPARENT) },
             };
-            crate::lgpu::execute(&[op], &target);
+            if !crate::lgpu::dl_record(op) {
+                crate::lgpu::execute(&[op], &target);
+            }
         }
         return true;
     }
@@ -1070,7 +1097,7 @@ pub fn draw_decoded_rgb_ext(pixels: &[u8], width: i32, height: i32, channels: us
     }
 
     let direct = PAINTER_ACTIVE.load(AtomicOrd::Acquire);
-    let bb_ptr = if direct { PAINTER_PTR.load(AtomicOrd::Relaxed) } else { core::ptr::null_mut() };
+    let bb_ptr = if direct { painter_ptr_flushed() } else { core::ptr::null_mut() };
     let mut bb_lock_opt = if !direct { Some(BACK_BUFFER.lock()) } else { None };
     let mut fallback_bb = if let Some(ref mut guard) = bb_lock_opt { (**guard).as_mut() } else { None };
 
