@@ -75,6 +75,7 @@ run-args = [
     "-accel", "tcg,thread=multi",
     "-device", "usb-ehci,id=usb",
     "-device", "usb-tablet,bus=usb.0",
+    "-vga", "none",
     "-device", "bochs-display",
     "-drive", "id=disk,file=fat:rw:storage,if=none,format=raw",
     "-device", "ahci,id=ahci",
