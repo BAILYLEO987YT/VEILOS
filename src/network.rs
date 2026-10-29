@@ -172,8 +172,74 @@ use crate::virtio_net::*;
 
 // ---- smoltcp Device impl --------------------------------------------
 
+// ---- Logical NIC (HAL step 7E) ----------------------------------------
+//
+// The network stack sees one NIC however many are bound. `LogicalNic`
+// bonds them in active-backup mode (Linux bonding mode 1): frames go out
+// through the active member, frames are taken in from every member, and if
+// the active member's link drops (VIRTIO_NET_F_STATUS) traffic moves to the
+// next member that is up. The interface keeps the first member's MAC
+// throughout, so peers see one address.
+
+pub struct LogicalNic {
+    members: Vec<VirtioNet>,
+    active: usize,
+    /// The interface's MAC (the first member's).
+    pub mac: smoltcp::wire::EthernetAddress,
+    /// Frames received on any member, oldest first, for smoltcp.
+    pub rx_queue: Vec<PacketBuf>,
+    pub rx_count: u64,
+}
+
+impl LogicalNic {
+    fn new(first: VirtioNet) -> Self {
+        let mac = first.mac;
+        Self { members: alloc::vec![first], active: 0, mac, rx_queue: Vec::new(), rx_count: 0 }
+    }
+
+    /// Add another NIC. It takes over if the active member fails.
+    pub fn add_member(&mut self, nic: VirtioNet) {
+        crate::serial_println!("[NET] logical NIC: member {} added (MAC {})", self.members.len(), nic.mac);
+        self.members.push(nic);
+    }
+
+    /// Switch away from the active member if its link is down.
+    fn check_links(&mut self) {
+        if self.members[self.active].link_up() {
+            return;
+        }
+        let n = self.members.len();
+        if let Some(next) = (1..n).map(|k| (self.active + k) % n).find(|&i| self.members[i].link_up()) {
+            crate::serial_println!("[NET] logical NIC: member {} link down, failing over to member {}", self.active, next);
+            self.active = next;
+        }
+    }
+
+    /// Poll every member and gather what they received.
+    pub fn poll_rx(&mut self) {
+        self.check_links();
+        for m in self.members.iter_mut() {
+            m.poll_rx();
+            self.rx_queue.append(&mut m.rx_queue);
+        }
+    }
+
+    fn transmit(&mut self, frame: &[u8]) {
+        self.members[self.active].hw_transmit(frame);
+    }
+
+    /// One line per member, for `NET STATUS`.
+    pub fn describe(&self) -> Vec<alloc::string::String> {
+        self.members.iter().enumerate().map(|(i, m)| alloc::format!(
+            "  NIC {}: {} link {} rx {} tx {}{}",
+            i, m.mac, if m.link_up() { "up" } else { "DOWN" }, m.rx_count, m.tx_count,
+            if i == self.active { "  (active)" } else { "" }
+        )).collect()
+    }
+}
+
 pub struct VirtioRxToken(Vec<u8>);
-pub struct VirtioTxToken(*mut VirtioNet);
+pub struct VirtioTxToken(*mut LogicalNic);
 
 impl RxToken for VirtioRxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -185,14 +251,14 @@ impl TxToken for VirtioTxToken {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf);
-        // SAFETY: token is valid only as long as the VirtioNet is alive;
+        // SAFETY: token is valid only as long as the LogicalNic is alive;
         // enforced by the borrow structure of smoltcp's poll().
-        unsafe { (*self.0).hw_transmit(&buf); }
+        unsafe { (*self.0).transmit(&buf); }
         result
     }
 }
 
-impl Device for VirtioNet {
+impl Device for LogicalNic {
     type RxToken<'a> = VirtioRxToken where Self: 'a;
     type TxToken<'a> = VirtioTxToken where Self: 'a;
 
@@ -252,7 +318,7 @@ pub enum SocketState { Open, Connected, Listening, Closed }
 pub struct NetworkStack {
     pub iface:   Interface,
     pub sockets: SocketSet<'static>,
-    pub device:  VirtioNet,
+    pub device:  LogicalNic,
     pub socket_meta: BTreeMap<SocketHandle, SocketMeta>,
     /// Handle to the active DHCP socket (if DHCP is in progress).
     dhcp_handle: Option<SocketHandle>,
@@ -266,7 +332,7 @@ pub struct NetworkStack {
 }
 
 impl NetworkStack {
-    fn new(device: VirtioNet) -> Self {
+    fn new(device: LogicalNic) -> Self {
         let mac = device.mac;
         let config = Config::new(smoltcp::wire::HardwareAddress::Ethernet(mac));
 
@@ -886,19 +952,21 @@ fn is_virtio_net(d: &crate::pci::PciDevice) -> bool {
 /// Initialise the NIC, build the smoltcp stack on it and start DHCP.
 fn probe_virtio_net(dev: &crate::pci::PciDevice) -> Result<(), alloc::string::String> {
     use alloc::string::String;
-    // One stack, one NIC for now; more NICs are the logical-NIC work (HAL_DESIGN.md 7E).
-    if NETWORK.lock().is_some() {
-        return Err(String::from("only one NIC is used for now"));
-    }
     // Legacy virtio-net exposes its registers through an I/O BAR0.
     let io_base = dev.bar(0).io_port().ok_or_else(|| String::from("BAR0 is not an I/O BAR"))?;
     // The virtqueues are DMA'd by the device: bus mastering is required.
     dev.enable_for_driver();
     println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
     crate::serial_println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
-    let device = VirtioNet::new(io_base);
+    let nic = VirtioNet::new(io_base).map_err(String::from)?;
 
-    let mut stack = NetworkStack::new(device);
+    // Every NIC after the first joins the one logical NIC the stack uses.
+    if let Some(stack) = NETWORK.lock().as_mut() {
+        stack.device.add_member(nic);
+        return Ok(());
+    }
+
+    let mut stack = NetworkStack::new(LogicalNic::new(nic));
 
     // Set the V-Mesh NodeId from the real NIC MAC right now. The MAC is
     // already known at this point (it's read off the device before this
@@ -934,4 +1002,9 @@ pub fn poll() {
     if let Some(ref mut stack) = *NETWORK.lock() {
         stack.poll();
     }
+}
+
+/// The logical NIC's members, one line each (terminal `NET STATUS`).
+pub fn nic_status() -> Vec<alloc::string::String> {
+    NETWORK.lock().as_ref().map(|s| s.device.describe()).unwrap_or_default()
 }

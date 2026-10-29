@@ -645,6 +645,9 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                         history.push(alloc::format!("  IP:      {}/{}", cfg.ip.address(), cfg.ip.prefix_len()));
                         if let Some(gw) = cfg.gateway { history.push(alloc::format!("  Gateway: {}", gw)); }
                         if let Some(dns) = cfg.dns     { history.push(alloc::format!("  DNS:     {}", dns)); }
+                        drop(cfg);
+                        // The NICs behind the one logical interface (HAL 7E).
+                        history.extend(crate::network::nic_status());
                     } else {
                         history.push(String::from("  Network: OFFLINE (no NIC or DHCP pending)"));
                     }

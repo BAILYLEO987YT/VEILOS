@@ -9,17 +9,8 @@
 // legacy I/O port registers.
 
 use smoltcp::wire::EthernetAddress;
-use crate::memory::get_mapper;
-use x86_64::{VirtAddr, structures::paging::Translate};
 use x86_64::instructions::port::Port;
 use alloc::vec::Vec;
-
-fn virt_to_phys(vaddr: u64) -> u64 {
-    let mapper = unsafe { get_mapper() };
-    mapper.translate_addr(VirtAddr::new(vaddr))
-        .expect("virt_to_phys translation failed")
-        .as_u64()
-}
 
 pub const MTU: usize = 1514;
 
@@ -123,11 +114,8 @@ pub struct VirtQueueMem {
 }
 
 // The device reads each queue at QueuePFN * 4096 as one physically
-// contiguous block (3 pages for N=256), so they live in DMA regions, not
-// statics: a static's pages are only virtually contiguous. Set by
-// `init_queues` and never freed.
-static mut RX_QUEUE: *mut VirtQueueMem = core::ptr::null_mut();
-static mut TX_QUEUE: *mut VirtQueueMem = core::ptr::null_mut();
+// contiguous block (3 pages for N=256), so queues live in DMA regions (one
+// set per NIC, owned by its `VirtioNet`), never freed.
 
 /// Allocate zeroed, contiguous memory for one virtqueue. Returns (CPU pointer, physical address).
 fn alloc_queue() -> Option<(*mut VirtQueueMem, u64)> {
@@ -152,11 +140,17 @@ impl VirtBuffers {
     }
 }
 
-static mut BUFFERS: VirtBuffers = VirtBuffers::new();
 
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 const VIRTIO_NET_HDR_SIZE: usize = 10; // Legacy virtio-net header
 
+/// Legacy virtio-net feature bits used here.
+const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
+
+/// One virtio-net NIC. Each instance owns its own virtqueues and packet
+/// buffers, so several NICs can run at once (they were global statics,
+/// which allowed exactly one).
 pub struct VirtioNet {
     pub io_base: u16,
     pub mac: EthernetAddress,
@@ -165,10 +159,25 @@ pub struct VirtioNet {
     pub tx_count: u64,
     rx_last_used: u16,
     tx_avail_idx: u16,
+    rxq: *mut VirtQueueMem,
+    txq: *mut VirtQueueMem,
+    /// RX then TX packet buffers, one contiguous DMA block.
+    bufs: *mut VirtBuffers,
+    bufs_phys: u64,
+    /// The device reports link state (VIRTIO_NET_F_STATUS negotiated).
+    has_status: bool,
 }
 
+// The raw pointers are this NIC's own DMA memory; the NIC is only driven by
+// whoever holds the network stack lock.
+unsafe impl Send for VirtioNet {}
+
 impl VirtioNet {
-    pub fn new(io_base: u16) -> Self {
+    pub fn new(io_base: u16) -> Result<Self, &'static str> {
+        let (bufs_phys, bufs_ptr) = crate::memory::DmaRegion::new(core::mem::size_of::<VirtBuffers>())
+            .ok_or("no DMA memory for packet buffers")?
+            .leak();
+
         // 1. Read MAC address (available before reset on legacy devices)
         let mac_bytes: [u8; 6] = core::array::from_fn(|i| unsafe {
             let mut p = Port::<u8>::new(io_base + 0x14 + i as u16);
@@ -197,14 +206,15 @@ impl VirtioNet {
             let host_features = host_features_port.read();
             crate::serial_println!("[NET] Host features: {:#010x}", host_features);
 
-            // 6. Write guest features: only VIRTIO_NET_F_MAC (bit 5)
-            // Do NOT set VIRTIO_NET_F_STATUS or any other feature we don't support
+            // 6. Write guest features: MAC, and STATUS (link up/down, used by
+            // the logical NIC to fail over) when the device offers it.
             let mut guest_features_port: Port<u32> = Port::new(io_base + 0x04);
-            let negotiated = host_features & (1 << 5); // Only MAC
+            let negotiated = host_features & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
             guest_features_port.write(negotiated);
             crate::serial_println!("[NET] Negotiated features: {:#010x}", negotiated);
         }
 
+        let has_status = unsafe { Port::<u32>::new(io_base + 0x04).read() } & VIRTIO_NET_F_STATUS != 0;
         let mut net = Self {
             io_base,
             mac,
@@ -213,6 +223,11 @@ impl VirtioNet {
             tx_count: 0,
             rx_last_used: 0,
             tx_avail_idx: 0,
+            rxq: core::ptr::null_mut(),
+            txq: core::ptr::null_mut(),
+            bufs: bufs_ptr as *mut VirtBuffers,
+            bufs_phys,
+            has_status,
         };
 
         // 7. Setup virtqueues (before setting DRIVER_OK)
@@ -224,8 +239,26 @@ impl VirtioNet {
             status_port.write(1 | 2 | 4);
         }
 
-        crate::serial_println!("[NET] VirtIO-net driver initialized successfully");
-        net
+        if net.rxq.is_null() || net.txq.is_null() {
+            return Err("virtqueue setup failed");
+        }
+        crate::serial_println!("[NET] VirtIO-net driver initialized successfully (link status {})",
+            if has_status { "reported" } else { "not reported" });
+        Ok(net)
+    }
+
+    /// Link state. Devices that don't report it are assumed up.
+    pub fn link_up(&self) -> bool {
+        // Legacy config space: MAC at +0x14..0x1A, status (u16) at +0x1A; bit 0 = link up.
+        !self.has_status || unsafe { Port::<u16>::new(self.io_base + 0x1A).read() } & 1 != 0
+    }
+
+    fn rx_buf_phys(&self, i: usize) -> u64 {
+        self.bufs_phys + (i * 2048) as u64
+    }
+
+    fn tx_buf_phys(&self, i: usize) -> u64 {
+        self.bufs_phys + ((VIRTQ_SIZE + i) * 2048) as u64
     }
 
     fn init_queues(&mut self) {
@@ -249,12 +282,12 @@ impl VirtioNet {
                 crate::serial_println!("[NET] ERROR: no contiguous DMA memory for the RX queue");
                 return;
             };
-            RX_QUEUE = rx_ptr;
+            self.rxq = rx_ptr;
 
             // Verify layout assumptions
-            let base_ptr = RX_QUEUE as usize;
-            let avail_ptr = &raw const (*RX_QUEUE).avail as usize;
-            let used_ptr = &raw const (*RX_QUEUE).used as usize;
+            let base_ptr = self.rxq as usize;
+            let avail_ptr = &raw const (*self.rxq).avail as usize;
+            let used_ptr = &raw const (*self.rxq).used as usize;
             crate::serial_println!("[NET] RX queue layout: base=0x{:x}, avail=+0x{:x}, used=+0x{:x}",
                 base_ptr, avail_ptr - base_ptr, used_ptr - base_ptr);
             crate::serial_println!("[NET] RX queue phys addr: 0x{:x}, PFN: 0x{:x}", rx_phys, rx_phys / 4096);
@@ -262,17 +295,17 @@ impl VirtioNet {
 
             // Populate RX descriptors: each points to a DMA buffer for receiving
             for i in 0..VIRTQ_SIZE {
-                let buf_phys = virt_to_phys(&raw const BUFFERS.rx[i] as u64);
-                (*RX_QUEUE).desc[i].addr = buf_phys;
-                (*RX_QUEUE).desc[i].len = 2048;
-                (*RX_QUEUE).desc[i].flags = VIRTQ_DESC_F_WRITE; // Device writes to this buffer
-                (*RX_QUEUE).desc[i].next = 0;
+                let buf_phys = self.rx_buf_phys(i);
+                (*self.rxq).desc[i].addr = buf_phys;
+                (*self.rxq).desc[i].len = 2048;
+                (*self.rxq).desc[i].flags = VIRTQ_DESC_F_WRITE; // Device writes to this buffer
+                (*self.rxq).desc[i].next = 0;
 
                 // Add to available ring
-                (*RX_QUEUE).avail.ring[i] = i as u16;
+                (*self.rxq).avail.ring[i] = i as u16;
             }
             // Tell device all descriptors are available
-            core::ptr::write_volatile(&raw mut (*RX_QUEUE).avail.idx, VIRTQ_SIZE as u16);
+            core::ptr::write_volatile(&raw mut (*self.rxq).avail.idx, VIRTQ_SIZE as u16);
 
             // ---- TX Queue (index 1) ----
             q_select.write(1);
@@ -283,7 +316,7 @@ impl VirtioNet {
                 crate::serial_println!("[NET] ERROR: no contiguous DMA memory for the TX queue");
                 return;
             };
-            TX_QUEUE = tx_ptr;
+            self.txq = tx_ptr;
             crate::serial_println!("[NET] TX queue phys addr: 0x{:x}, PFN: 0x{:x}", tx_phys, tx_phys / 4096);
             q_addr.write((tx_phys / 4096) as u32);
         }
@@ -300,20 +333,21 @@ impl VirtioNet {
     /// Poll the RX virtqueue for completed (received) frames.
     pub fn poll_rx(&mut self) {
         unsafe {
-            if RX_QUEUE.is_null() { return; } // init_queues failed
+            if self.rxq.is_null() { return; } // init_queues failed
             // Check used ring for new entries
-            let used_idx = core::ptr::read_volatile(&raw const (*RX_QUEUE).used.idx);
+            let used_idx = core::ptr::read_volatile(&raw const (*self.rxq).used.idx);
 
             while self.rx_last_used != used_idx {
                 let ring_idx = self.rx_last_used as usize % VIRTQ_SIZE;
-                let elem = core::ptr::read_volatile(&raw const (*RX_QUEUE).used.ring[ring_idx]);
+                let elem = core::ptr::read_volatile(&raw const (*self.rxq).used.ring[ring_idx]);
                 let desc_idx = elem.id as usize;
                 let total_len = elem.len as usize;
 
                 // The buffer contains: [virtio-net header (10 bytes)][ethernet frame]
                 if total_len > VIRTIO_NET_HDR_SIZE + 14 && desc_idx < VIRTQ_SIZE {
                     let frame_len = total_len - VIRTIO_NET_HDR_SIZE;
-                    let frame_data = &BUFFERS.rx[desc_idx][VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame_len];
+                    let bufs = &*self.bufs;
+                    let frame_data = &bufs.rx[desc_idx][VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame_len];
 
                     let mut pkt = PacketBuf::new();
                     let copy_len = frame_len.min(MTU);
@@ -338,13 +372,13 @@ impl VirtioNet {
                 }
 
                 // Re-add descriptor to available ring for reuse
-                let avail_idx = core::ptr::read_volatile(&raw const (*RX_QUEUE).avail.idx);
+                let avail_idx = core::ptr::read_volatile(&raw const (*self.rxq).avail.idx);
                 core::ptr::write_volatile(
-                    &raw mut (*RX_QUEUE).avail.ring[avail_idx as usize % VIRTQ_SIZE],
+                    &raw mut (*self.rxq).avail.ring[avail_idx as usize % VIRTQ_SIZE],
                     desc_idx as u16,
                 );
                 core::ptr::write_volatile(
-                    &raw mut (*RX_QUEUE).avail.idx,
+                    &raw mut (*self.rxq).avail.idx,
                     avail_idx.wrapping_add(1),
                 );
 
@@ -361,29 +395,30 @@ impl VirtioNet {
         if frame.len() > MTU || frame.len() == 0 { return; }
 
         unsafe {
-            if TX_QUEUE.is_null() { return; } // init_queues failed
+            if self.txq.is_null() { return; } // init_queues failed
             let desc_idx = self.tx_avail_idx as usize % VIRTQ_SIZE;
 
             // Write virtio-net header (10 bytes of zeros) + frame into TX buffer
-            BUFFERS.tx[desc_idx][..VIRTIO_NET_HDR_SIZE].fill(0);
-            BUFFERS.tx[desc_idx][VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame.len()]
+            let bufs = &mut *self.bufs;
+            bufs.tx[desc_idx][..VIRTIO_NET_HDR_SIZE].fill(0);
+            bufs.tx[desc_idx][VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame.len()]
                 .copy_from_slice(frame);
 
             // Setup descriptor
-            let buf_phys = virt_to_phys(&raw const BUFFERS.tx[desc_idx] as u64);
-            (*TX_QUEUE).desc[desc_idx].addr = buf_phys;
-            (*TX_QUEUE).desc[desc_idx].len = (VIRTIO_NET_HDR_SIZE + frame.len()) as u32;
-            (*TX_QUEUE).desc[desc_idx].flags = 0; // Device reads from this buffer
-            (*TX_QUEUE).desc[desc_idx].next = 0;
+            let buf_phys = self.tx_buf_phys(desc_idx);
+            (*self.txq).desc[desc_idx].addr = buf_phys;
+            (*self.txq).desc[desc_idx].len = (VIRTIO_NET_HDR_SIZE + frame.len()) as u32;
+            (*self.txq).desc[desc_idx].flags = 0; // Device reads from this buffer
+            (*self.txq).desc[desc_idx].next = 0;
 
             // Add to available ring
-            let avail_idx = core::ptr::read_volatile(&raw const (*TX_QUEUE).avail.idx);
+            let avail_idx = core::ptr::read_volatile(&raw const (*self.txq).avail.idx);
             core::ptr::write_volatile(
-                &raw mut (*TX_QUEUE).avail.ring[avail_idx as usize % VIRTQ_SIZE],
+                &raw mut (*self.txq).avail.ring[avail_idx as usize % VIRTQ_SIZE],
                 desc_idx as u16,
             );
             core::ptr::write_volatile(
-                &raw mut (*TX_QUEUE).avail.idx,
+                &raw mut (*self.txq).avail.idx,
                 avail_idx.wrapping_add(1),
             );
 
@@ -395,7 +430,7 @@ impl VirtioNet {
             // used.idx is also logged so we can see whether the device is still
             // acknowledging TX completions (host consuming the ring) or whether
             // avail.idx and used.idx have started diverging (ring backing up).
-            let tx_used_idx = core::ptr::read_volatile(&raw const (*TX_QUEUE).used.idx);
+            let tx_used_idx = core::ptr::read_volatile(&raw const (*self.txq).used.idx);
             crate::serial_println!(
                 "[NET] TX #{}: {} bytes, desc={}, avail.idx={}, used.idx={}",
                 self.tx_count, frame.len(), desc_idx, avail_idx.wrapping_add(1), tx_used_idx
