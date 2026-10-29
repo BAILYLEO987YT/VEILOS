@@ -485,12 +485,12 @@ pub fn draw_rect_atomic(x: usize, y: usize, w: usize, h: usize, color: Color) {
     if PAINTER_ACTIVE.load(AtomicOrd::Acquire) {
         let bb_ptr = PAINTER_PTR.load(AtomicOrd::Relaxed);
         if !bb_ptr.is_null() {
-            for dy in 0..dh {
-                let start = (ry + dy) * SCREEN_W + rx;
-                unsafe {
-                    core::slice::from_raw_parts_mut(bb_ptr.add(start), dw).fill(pixel_val);
-                }
-            }
+            // Through the logical GPU (HAL step 7C): large fills (window and
+            // panel backgrounds) are banded over every CPU, small ones run here.
+            // Each fill completes before this returns, so drawing order is kept.
+            let target = crate::lgpu::Surface { ptr: bb_ptr, width: SCREEN_W, height: SCREEN_H, stride: SCREEN_W };
+            let rect = crate::lgpu::Rect::new(rx, ry, rx + dw, ry + dh);
+            crate::lgpu::execute(&[crate::lgpu::Op::Fill { rect, color: pixel_val }], &target);
             return;
         }
     }
