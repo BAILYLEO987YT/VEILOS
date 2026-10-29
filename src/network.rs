@@ -329,7 +329,17 @@ pub struct NetworkStack {
     /// DHCP state machine phase.
     dhcp_done:       bool,
     dhcp_start_tick: Option<u64>,
+    /// Next port `udp_bind(.., 0)` tries (IANA ephemeral range).
+    next_ephemeral: u16,
+    /// UDP sockets closed while datagrams were still queued: removed once
+    /// those have been sent, or at the deadline (TICKS).
+    closing: Vec<(SocketHandle, u64)>,
 }
+
+/// IANA dynamic/ephemeral port range.
+const EPHEMERAL_PORTS: core::ops::RangeInclusive<u16> = 49152..=65535;
+/// How long a closed UDP socket may keep its queued datagrams (ms).
+const UDP_CLOSE_LINGER_MS: u64 = 2000;
 
 impl NetworkStack {
     fn new(device: LogicalNic) -> Self {
@@ -355,6 +365,8 @@ impl NetworkStack {
             dns_query:       None,
             dhcp_done:       false,
             dhcp_start_tick: None,
+            next_ephemeral: *EPHEMERAL_PORTS.start(),
+            closing: Vec::new(),
         }
     }
 
@@ -367,6 +379,7 @@ impl NetworkStack {
         let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.process_dhcp();
         self.process_dns();
+        self.reap_closing(crate::interrupts::TICKS.load(Ordering::Relaxed));
     }
 
     // ---- DHCP -------------------------------------------------------
@@ -683,6 +696,17 @@ impl NetworkStack {
 
     /// Close a socket and remove it from the tracking table.
     pub fn close_socket(&mut self, handle: SocketHandle) {
+        // A UDP send only queues the datagram; it goes out on a later poll
+        // (after ARP, the first time). Removing the socket now would drop it,
+        // which is why one-shot senders (PING, NTP, mesh broadcasts) never
+        // got anything out. Let it drain first.
+        let is_udp = matches!(self.socket_meta.get(&handle), Some(m) if m.proto == SocketProto::Udp);
+        if is_udp && self.sockets.get::<udp::Socket>(handle).send_queue() > 0 {
+            self.socket_meta.remove(&handle);
+            let deadline = crate::interrupts::TICKS.load(Ordering::Relaxed) + UDP_CLOSE_LINGER_MS;
+            self.closing.push((handle, deadline));
+            return;
+        }
         if let Some(m) = self.socket_meta.get(&handle) {
             match m.proto {
                 SocketProto::Tcp => {
@@ -720,12 +744,46 @@ impl NetworkStack {
     }
 
     /// Bind a UDP socket to a local port.
+    /// Bind a UDP socket. Port 0 means "any free port": smoltcp itself treats
+    /// 0 as unbound and refuses to send, so an ephemeral port is picked here.
     pub fn udp_bind(&mut self, handle: SocketHandle, port: u16) -> NetResult<()> {
         let pid = self.socket_meta.get(&handle).map(|m| m.pid).unwrap_or(0);
         check_net_cap(pid, Capability::NetBind)?;
+        let port = if port == 0 { self.free_ephemeral_port().ok_or(NetError::BindFailed)? } else { port };
         self.sockets.get_mut::<udp::Socket>(handle)
             .bind(port)
             .map_err(|_| NetError::BindFailed)
+    }
+
+    /// A UDP port in the ephemeral range no socket is bound to.
+    fn free_ephemeral_port(&mut self) -> Option<u16> {
+        let span = (EPHEMERAL_PORTS.end() - EPHEMERAL_PORTS.start()) as u32 + 1;
+        for _ in 0..span {
+            let port = self.next_ephemeral;
+            self.next_ephemeral = if port == *EPHEMERAL_PORTS.end() { *EPHEMERAL_PORTS.start() } else { port + 1 };
+            let in_use = self.sockets.iter().any(|(_, s)| matches!(s,
+                smoltcp::socket::Socket::Udp(u) if u.endpoint().port == port));
+            if !in_use {
+                return Some(port);
+            }
+        }
+        None
+    }
+
+    /// Remove closed UDP sockets whose queued datagrams have gone out (or
+    /// whose linger time is up).
+    fn reap_closing(&mut self, now: u64) {
+        let mut i = 0;
+        while i < self.closing.len() {
+            let (handle, deadline) = self.closing[i];
+            if self.sockets.get::<udp::Socket>(handle).send_queue() == 0 || now >= deadline {
+                self.sockets.get_mut::<udp::Socket>(handle).close();
+                self.sockets.remove(handle);
+                self.closing.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Send a UDP datagram.
