@@ -422,6 +422,18 @@ impl DesktopWindowManager {
                 // If the app then has no windows but keeps running, it's ended
                 // (win32_user::check_close_watch).
                 crate::win32_user::watch_close(pid);
+            } else if let Some(console) = crate::apps::TERMINAL_POOL.iter()
+                .filter_map(|t| t.try_lock())
+                .find(|t| t.window_id == id)
+                .and_then(|t| t.console.clone())
+                .filter(|c| c.is_live())
+            {
+                // A console window: closing it ends its program, as on Windows
+                // (exit code STATUS_CONTROL_C_EXIT).
+                if let Some(proc) = crate::process::PROCESSOR.lock().find(console.pid()) {
+                    proc.terminate(0xC000_013Au32 as i32);
+                    crate::loader::request_kill(console.pid());
+                }
             } else {
                 // Non-Win32 window: just terminate the owning process.
                 if pid > 0 {

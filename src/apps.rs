@@ -700,6 +700,7 @@ pub fn open_file_absolute(path: &str, name: &str) {
                         let mut term = TERMINAL_POOL[idx].lock();
                         term.history.clear();
                         term.history.push(alloc::format!("=== {} ===", name));
+                        term.console = Some(console.clone());
                         drop(term);
                         console.attach(idx);
                     }
@@ -841,6 +842,11 @@ pub struct TerminalEmulator {
     /// Selection state: (row, col) of start and end.
     pub selection_start: Option<(usize, usize)>,
     pub selection_end:   Option<(usize, usize)>,
+    /// This terminal's TERMINAL_POOL slot.
+    pub slot: usize,
+    /// The console of the program running in this terminal: while it runs,
+    /// typed lines go to it instead of the command line (console.rs).
+    pub console: Option<alloc::sync::Arc<crate::console::Console>>,
 }
 
 impl TerminalEmulator {
@@ -855,6 +861,28 @@ impl TerminalEmulator {
             blink_tick:   0,
             selection_start: None,
             selection_end: None,
+            slot: 0,
+            console: None,
+        }
+    }
+
+    /// RUN: start a Windows program. A console program runs in this
+    /// terminal (its output appears here, typed lines go to it); a GUI
+    /// program opens its own window.
+    fn run_program(&mut self, path: &str) {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let mut frame_allocator = crate::memory::GlobalFrameAllocator;
+        match crate::loader::load_and_spawn_pe(path, &mut frame_allocator) {
+            Ok(process) => match &process.console {
+                // It hasn't run yet (it's queued on the executor this runs
+                // on), so nothing it writes is missed.
+                Some(console) => {
+                    console.attach(self.slot);
+                    self.console = Some(console.clone());
+                }
+                None => self.history.push(alloc::format!("  started {}", name)),
+            },
+            Err(e) => self.history.push(alloc::format!("  RUN {}: {}", path, e)),
         }
     }
 
@@ -918,11 +946,27 @@ impl TerminalEmulator {
     }
 
     pub fn on_key(&mut self, ch: char) {
+        // A program is running here: the input line is its console's.
+        if let Some(console) = self.console.clone().filter(|c| c.is_live()) {
+            match ch {
+                '\n' | '\r' => {
+                    let line = core::mem::take(&mut self.input_buf);
+                    console.typed_line(self, &line);
+                }
+                '\x08' => { self.input_buf.pop(); }
+                c if !c.is_control() => self.input_buf.push(c),
+                _ => {}
+            }
+            return;
+        }
         match ch {
             '\n' | '\r' => {
                 let cmd = self.input_buf.trim().to_uppercase();
                 self.history.push(alloc::format!("> {}", self.input_buf));
-                crate::task::terminal::execute_command_pub(&cmd, &mut self.history);
+                match cmd.strip_prefix("RUN ") {
+                    Some(arg) => self.run_program(&arg.trim().to_ascii_lowercase()),
+                    None => crate::task::terminal::execute_command_pub(&cmd, &mut self.history),
+                }
                 self.input_buf.clear();
             }
             '\x08' => { self.input_buf.pop(); }
@@ -969,6 +1013,7 @@ pub fn open_terminal(x: i32, y: i32, w: u32, h: u32, z: u32) -> (u32, usize) {
                 // Claim this slot for the new window.
                 *term = TerminalEmulator::new_const();
                 term.window_id = id;
+                term.slot = idx;
                 term.populate_welcome();
                 return (id, idx);
             }

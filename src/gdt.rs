@@ -140,6 +140,21 @@ pub fn get_selectors() -> &'static Selectors {
     &GDT.1
 }
 
+/// Each CPU's loaded TSS, so its RSP0 can be changed on a thread switch.
+static TSS_PTRS: [core::sync::atomic::AtomicPtr<TaskStateSegment>; crate::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; crate::smp::MAX_CPUS];
+
+/// The stack the CPU switches to when an interrupt arrives from ring 3. The
+/// scheduler points it at the kernel stack of the user thread it switches to
+/// (kthread). The CPU reads it from the TSS at each ring transition, so no
+/// reload is needed.
+pub fn set_rsp0(cpu: usize, top: u64) {
+    let tss = TSS_PTRS[cpu].load(core::sync::atomic::Ordering::Acquire);
+    if !tss.is_null() {
+        unsafe { (*tss).privilege_stack_table[0] = VirtAddr::new(top) };
+    }
+}
+
 /// Load the BSP (CPU 0) GDT and TSS.
 pub fn init() {
     use x86_64::instructions::tables::load_tss;
@@ -154,6 +169,7 @@ pub fn init() {
         SS::set_reg(selectors.kernel_data_selector);
         load_tss(selectors.tss_selector);
     }
+    TSS_PTRS[0].store(&*TSS as *const TaskStateSegment as *mut TaskStateSegment, core::sync::atomic::Ordering::Release);
     // Set up the BSP's per-CPU block (KERNEL_GS_BASE → block, for swapgs).
     crate::smp::init_percpu(0);
 }
@@ -207,6 +223,7 @@ pub fn init_ap(cpu_index: usize) {
         SS::set_reg(kernel_ds);
         load_tss(tss_sel);
     }
+    TSS_PTRS[cpu_index].store(&mut guard.tss as *mut TaskStateSegment, core::sync::atomic::Ordering::Release);
     // Set up this AP's per-CPU block (KERNEL_GS_BASE → block, for swapgs).
     crate::smp::init_percpu(cpu_index);
 }

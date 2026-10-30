@@ -16,9 +16,13 @@
 //   • Kernel code switches only where it chooses to (`yield_now`), at points
 //     where it holds nothing: the executor between task polls, or when idle.
 //
-// Limits for now: one user thread per CPU at a time, since the user long-jump
-// context (`loader` EXEC_CTX), the TSS RSP0 stack and the syscall stack are
-// still per CPU. Threads never move between CPUs.
+// User threads. A thread running a Windows process carries what used to be
+// per CPU (`UserCtx`): the kernel stack that syscalls and ring-3 interrupts
+// enter on, the long-jump context back to its launch point, its process and
+// a kill flag. A switch installs the next thread's kernel stack in the TSS
+// (RSP0) and the per-CPU block (syscall entry), and swaps GS_BASE and
+// KERNEL_GS_BASE, which hold the user TEB on one side or the other. So any
+// number of processes can share a CPU. Threads never move between CPUs.
 
 use alloc::{boxed::Box, vec::Vec};
 use spin::Mutex;
@@ -27,6 +31,9 @@ use x86_64::instructions::interrupts::without_interrupts;
 use crate::smp::MAX_CPUS;
 
 const STACK_SIZE: usize = 64 * 1024;
+/// A user thread's stack is also its kernel stack for syscalls and
+/// interrupts from ring 3.
+const USER_STACK_SIZE: usize = 256 * 1024;
 
 /// How long a ring-3 thread runs before the timer may switch away from it.
 pub const USER_SLICE_MS: u64 = 10;
@@ -46,10 +53,33 @@ enum State {
     Dead,
 }
 
+/// Per-thread state of a thread that runs a Windows process.
+pub struct UserCtx {
+    /// Long-jump context saved by `loader::launch_into_usermode`.
+    pub jump: [u64; 8],
+    pub jump_valid: bool,
+    /// Kernel stack top for syscalls and ring-3 interrupts (0: not a user thread).
+    pub kernel_rsp: u64,
+    pub pid: u32,
+    /// Set by `kill_pid`; acted on in ring 3 (timer) or by a blocking syscall.
+    pub kill: bool,
+}
+
+impl UserCtx {
+    const fn new(pid: u32) -> Self {
+        UserCtx { jump: [0; 8], jump_valid: false, kernel_rsp: 0, pid, kill: false }
+    }
+}
+
 struct Thread {
     id: u64,
     name: &'static str,
     state: State,
+    user: UserCtx,
+    /// GS_BASE and KERNEL_GS_BASE while switched out (one holds the user TEB
+    /// while the thread is in user mode or a syscall).
+    gs_base: u64,
+    kernel_gs_base: u64,
     /// Lives inside the Box, so its address is stable while the thread exists.
     saved: SavedState,
     /// None for a CPU's boot thread, which runs on the stack it booted on.
@@ -79,6 +109,9 @@ impl CpuThreads {
                 id: 0,
                 name: "boot",
                 state: State::Running,
+                user: UserCtx::new(0),
+                gs_base: 0,
+                kernel_gs_base: 0,
                 saved: SavedState { rsp: 0, _pad: 0, fx: [0; 512] },
                 stack: None,
                 entry: None,
@@ -161,6 +194,19 @@ unsafe fn reschedule(cpu: usize, becomes: State) -> bool {
         // Kernel memory (including every thread's stack) is mapped in every
         // address space, so switching tables before the stack is safe.
         crate::address_space::activate(ct.threads[next].cr3);
+        unsafe {
+            use x86_64::registers::model_specific::Msr;
+            let (mut gs, mut kgs) = (Msr::new(0xC000_0101), Msr::new(0xC000_0102));
+            ct.threads[cur].gs_base = gs.read();
+            ct.threads[cur].kernel_gs_base = kgs.read();
+            gs.write(ct.threads[next].gs_base);
+            kgs.write(ct.threads[next].kernel_gs_base);
+        }
+        let krsp = ct.threads[next].user.kernel_rsp;
+        if krsp != 0 {
+            crate::gdt::set_rsp0(cpu, krsp);
+            crate::smp::set_syscall_stack(cpu, krsp);
+        }
         (
             &mut ct.threads[cur].saved as *mut SavedState,
             &ct.threads[next].saved as *const SavedState,
@@ -179,8 +225,18 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> u64 {
 /// Like `spawn`, but the thread runs on the page tables at `cr3` (a process's
 /// address space; 0 = the kernel's).
 pub fn spawn_in(name: &'static str, cr3: u64, f: impl FnOnce() + Send + 'static) -> u64 {
-    let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
-    let top = (stack.as_mut_ptr() as u64 + STACK_SIZE as u64) & !0xF;
+    spawn_with(name, cr3, 0, STACK_SIZE, f)
+}
+
+/// A thread for process `pid`, on its page tables, with a stack big enough
+/// to also serve its syscalls and interrupts from ring 3.
+pub fn spawn_user(name: &'static str, cr3: u64, pid: u32, f: impl FnOnce() + Send + 'static) -> u64 {
+    spawn_with(name, cr3, pid, USER_STACK_SIZE, f)
+}
+
+fn spawn_with(name: &'static str, cr3: u64, pid: u32, stack_size: usize, f: impl FnOnce() + Send + 'static) -> u64 {
+    let mut stack = alloc::vec![0u8; stack_size].into_boxed_slice();
+    let top = (stack.as_mut_ptr() as u64 + stack_size as u64) & !0xF;
 
     // Initial frame, in the order switch_context pops it: r15 r14 r13 r12 rbx
     // rbp, RFLAGS (IF=0), return address, then a dummy return slot so
@@ -191,10 +247,14 @@ pub fn spawn_in(name: &'static str, cr3: u64, f: impl FnOnce() + Send + 'static)
         core::ptr::copy_nonoverlapping(frame.as_ptr(), rsp as *mut u64, frame.len());
     }
 
+    let cpu = crate::smp::cpu_index();
     let mut thread = Box::new(Thread {
         id: 0,
         name,
         state: State::Ready,
+        user: UserCtx::new(pid),
+        gs_base: 0,
+        kernel_gs_base: crate::smp::percpu_base(cpu),
         saved: SavedState { rsp, _pad: 0, fx: [0; 512] },
         stack: Some(stack),
         entry: Some(Box::new(f)),
@@ -205,7 +265,6 @@ pub fn spawn_in(name: &'static str, cr3: u64, f: impl FnOnce() + Send + 'static)
         core::arch::asm!("fxsave64 [{}]", in(reg) thread.saved.fx.as_mut_ptr(), options(nostack));
     }
 
-    let cpu = crate::smp::cpu_index();
     without_interrupts(|| {
         let mut ct = CPUS[cpu].lock();
         ct.ensure_boot_thread();
@@ -280,6 +339,53 @@ pub fn preempt_from_timer() {
     if due {
         unsafe { reschedule(cpu, State::Ready) };
     }
+}
+
+/// The running thread's user state. The pointer stays valid while the
+/// thread exists (threads are boxed); only that thread itself uses it.
+pub fn current_user() -> *mut UserCtx {
+    let cpu = crate::smp::cpu_index();
+    without_interrupts(|| {
+        let mut ct = CPUS[cpu].lock();
+        ct.ensure_boot_thread();
+        let cur = ct.current;
+        &mut ct.threads[cur].user as *mut UserCtx
+    })
+}
+
+/// The process the running thread belongs to (0: a kernel thread).
+pub fn current_pid() -> u32 {
+    unsafe { (*current_user()).pid }
+}
+
+/// Set the running thread's kernel stack for syscalls and ring-3 interrupts,
+/// and install it now.
+pub fn set_kernel_entry_stack(top: u64) {
+    let cpu = crate::smp::cpu_index();
+    without_interrupts(|| {
+        unsafe { (*current_user()).kernel_rsp = top };
+        crate::gdt::set_rsp0(cpu, top);
+        crate::smp::set_syscall_stack(cpu, top);
+    });
+}
+
+/// Ask every thread of process `pid`, on any CPU, to end it.
+pub fn kill_pid(pid: u32) {
+    for cpu in CPUS.iter() {
+        without_interrupts(|| {
+            for t in cpu.lock().threads.iter_mut() {
+                if t.user.pid == pid {
+                    t.user.kill = true;
+                }
+            }
+        });
+    }
+}
+
+/// True (once) if the running thread has been asked to end its process.
+pub fn take_kill() -> bool {
+    let u = current_user();
+    unsafe { core::mem::replace(&mut (*u).kill, false) }
 }
 
 /// Free the stacks of threads that have exited on `cpu`.

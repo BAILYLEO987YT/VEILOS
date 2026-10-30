@@ -980,7 +980,7 @@ pub fn check_close_watch() {
     }
     crate::serial_println!("[WIN32] pid {} still running {} ms after its last window closed: ending it", pid, CLOSE_GRACE_MS);
     proc.terminate(0);
-    crate::loader::request_kill();
+    crate::loader::request_kill(pid);
 }
 
 // =====================================================================

@@ -291,7 +291,7 @@ impl Subsystem for WindowsSubsystem {
                 } else { 0 }
             }
             0x1005 => { println!("[KERNEL32] GetProcAddress"); 0 }
-            0x1006 => crate::process::PROCESSOR.lock().current_pid.unwrap_or(0) as u64,
+            0x1006 => crate::process::PROCESSOR.lock().get_active().map_or(0, |p| p.pid) as u64,
             0x1007 => 1,
             0x1008 => 0x400000, 
 

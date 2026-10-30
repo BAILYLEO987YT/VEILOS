@@ -23,6 +23,8 @@ unsafe extern "system" {
     fn NtTerminateProcess(process: Handle, status: NtStatus) -> NtStatus;
     fn NtWriteFile(file: Handle, event: Handle, apc: usize, apc_context: usize, iosb: *mut IoStatusBlock,
                    buffer: *const u8, length: u32, offset: *const i64, key: *const u32) -> NtStatus;
+    fn NtReadFile(file: Handle, event: Handle, apc: usize, apc_context: usize, iosb: *mut IoStatusBlock,
+                  buffer: *mut u8, length: u32, offset: *const i64, key: *const u32) -> NtStatus;
     fn NtClose(handle: Handle) -> NtStatus;
     fn RtlNtStatusToDosError(status: NtStatus) -> u32;
 }
@@ -126,6 +128,60 @@ pub unsafe extern "system" fn WriteConsoleW(console: Handle, buffer: *const u16,
     }
     if !written.is_null() {
         unsafe { *written = length };
+    }
+    1
+}
+
+/// On a console, waits for a whole typed line and returns it with its "\r\n"
+/// (or the first `length` bytes of it). End of input reads 0 bytes, TRUE.
+#[no_mangle]
+pub unsafe extern "system" fn ReadFile(file: Handle, buffer: *mut u8, length: u32, read: *mut u32, overlapped: usize) -> Bool {
+    if !read.is_null() {
+        unsafe { *read = 0 };
+    }
+    if overlapped != 0 {
+        return fail(nt_abi::status::NOT_IMPLEMENTED); // overlapped I/O comes later
+    }
+    let mut iosb = IoStatusBlock::default();
+    let s = unsafe { NtReadFile(file, 0, 0, 0, &mut iosb, buffer, length, core::ptr::null(), core::ptr::null()) };
+    if s == nt_abi::status::END_OF_FILE {
+        return 1;
+    }
+    if !nt_abi::status::is_success(s) {
+        return fail(s);
+    }
+    if !read.is_null() {
+        unsafe { *read = iosb.information as u32 };
+    }
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ReadConsoleA(console: Handle, buffer: *mut u8, length: u32, read: *mut u32, _control: usize) -> Bool {
+    unsafe { ReadFile(console, buffer, length, read, 0) }
+}
+
+/// The typed line as UTF-16; `read` counts UTF-16 units.
+#[no_mangle]
+pub unsafe extern "system" fn ReadConsoleW(console: Handle, buffer: *mut u16, length: u32, read: *mut u32, _control: usize) -> Bool {
+    // A UTF-16 unit needs at most 3 UTF-8 bytes; keep the line within both.
+    let mut bytes = [0u8; 1024];
+    let want = (length as usize).min(bytes.len() / 3).max(1) as u32;
+    let mut got = 0u32;
+    if unsafe { ReadFile(console, bytes.as_mut_ptr(), want, &mut got, 0) } == 0 {
+        return 0;
+    }
+    let text = core::str::from_utf8(&bytes[..got as usize]).unwrap_or("?");
+    let mut n = 0usize;
+    for unit in text.encode_utf16() {
+        if n == length as usize {
+            break;
+        }
+        unsafe { *buffer.add(n) = unit };
+        n += 1;
+    }
+    if !read.is_null() {
+        unsafe { *read = n as u32 };
     }
     1
 }

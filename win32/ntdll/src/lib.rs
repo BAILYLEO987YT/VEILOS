@@ -30,6 +30,7 @@ syscall_stubs! {
     NtTerminateProcess, ZwTerminateProcess => sys::NT_TERMINATE_PROCESS;
     NtWriteFile, ZwWriteFile => sys::NT_WRITE_FILE;
     NtClose, ZwClose => sys::NT_CLOSE;
+    NtReadFile, ZwReadFile => sys::NT_READ_FILE;
 }
 
 /// The Win32 error code for an NTSTATUS (the common ones; anything else maps
@@ -43,6 +44,7 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
         status::OBJECT_TYPE_MISMATCH => 6, // ERROR_INVALID_HANDLE
         status::INVALID_PARAMETER => 87,   // ERROR_INVALID_PARAMETER
         status::ACCESS_VIOLATION => 998,   // ERROR_NOACCESS
+        status::END_OF_FILE => 38,         // ERROR_HANDLE_EOF
         _ => 317,                          // ERROR_MR_MID_NOT_FOUND
     }
 }

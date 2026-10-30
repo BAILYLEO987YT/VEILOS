@@ -19,6 +19,7 @@ pub mod status {
     pub const INVALID_PARAMETER: NtStatus = 0xC000_000Du32 as i32;
     pub const ACCESS_VIOLATION: NtStatus = 0xC000_0005u32 as i32;
     pub const OBJECT_TYPE_MISMATCH: NtStatus = 0xC000_0024u32 as i32;
+    pub const END_OF_FILE: NtStatus = 0xC000_0011u32 as i32;
 
     /// True for success and informational codes.
     pub const fn is_success(s: NtStatus) -> bool {
@@ -33,8 +34,9 @@ pub mod sys {
     pub const NT_TERMINATE_PROCESS: u32 = BASE;
     pub const NT_WRITE_FILE: u32 = BASE + 1;
     pub const NT_CLOSE: u32 = BASE + 2;
+    pub const NT_READ_FILE: u32 = BASE + 3;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 3;
+    pub const END: u32 = BASE + 4;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).

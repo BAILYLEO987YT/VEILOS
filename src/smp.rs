@@ -145,6 +145,18 @@ fn write_kernel_gs_base(value: u64) {
     }
 }
 
+/// Address of `cpu`'s per-CPU block (what KERNEL_GS_BASE holds outside a
+/// syscall).
+pub fn percpu_base(cpu: usize) -> u64 {
+    percpu_ptr(cpu) as u64
+}
+
+/// The stack `syscall_entry` switches to on `cpu`. The scheduler points it at
+/// the kernel stack of the user thread it switches to (kthread).
+pub fn set_syscall_stack(cpu: usize, top: u64) {
+    unsafe { (*percpu_ptr(cpu)).kernel_rsp = top };
+}
+
 /// Set up the calling CPU's `PerCpu` block and point `KERNEL_GS_BASE` at it.
 /// Must run on the CPU being initialised (called from `gdt::init`/`init_ap`).
 pub fn init_percpu(cpu_index: usize) {
@@ -736,10 +748,19 @@ pub struct ApWorkItem {
 
 pub static AP_WORK_QUEUE: spin::Mutex<alloc::vec::Vec<ApWorkItem>> = spin::Mutex::new(alloc::vec::Vec::new());
 
-/// True while a CPU has a user-process thread (one per CPU: the user
-/// long-jump context, RSP0 and syscall stacks are per CPU).
-pub static USER_THREAD_ON: [core::sync::atomic::AtomicBool; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS];
+/// How many user-process threads each CPU runs. A CPU can run any number
+/// (kthread switches between them); APs take new processes least-loaded first.
+pub static USER_THREADS: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
+
+/// True if no online AP runs fewer user threads than `cpu`.
+fn least_loaded_ap(cpu: usize) -> bool {
+    let online = CPU_ONLINE.load(Ordering::Acquire);
+    let mine = USER_THREADS[cpu].load(Ordering::Acquire);
+    (1..MAX_CPUS)
+        .filter(|&c| online & (1 << c) != 0)
+        .all(|c| USER_THREADS[c].load(Ordering::Acquire) >= mine)
+}
 
 /// An AP's boot thread: the CPU's worker loop (HAL step 7B).
 ///
@@ -757,7 +778,7 @@ pub fn park_and_wait_for_work() -> ! {
         if crate::workers::help() {
             continue;
         }
-        if !USER_THREAD_ON[cpu].load(Ordering::Acquire) {
+        if least_loaded_ap(cpu) {
             let work = AP_WORK_QUEUE.lock().pop();
             if let Some(ApWorkItem { teb_base, pid, .. }) = work {
                 let process = crate::process::PROCESSOR.lock().find(pid);
@@ -773,7 +794,7 @@ pub fn park_and_wait_for_work() -> ! {
             continue;
         }
         x86_64::instructions::interrupts::disable();
-        if crate::workers::pending() || (!USER_THREAD_ON[cpu].load(Ordering::Acquire) && !AP_WORK_QUEUE.lock().is_empty()) {
+        if crate::workers::pending() || (least_loaded_ap(cpu) && !AP_WORK_QUEUE.lock().is_empty()) {
             x86_64::instructions::interrupts::enable();
         } else {
             x86_64::instructions::interrupts::enable_and_hlt();

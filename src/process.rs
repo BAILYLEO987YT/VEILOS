@@ -198,8 +198,13 @@ impl ProcessManager {
         self.current_pid = Some(pid);
     }
 
+    /// The process the running thread belongs to; on a kernel thread, the
+    /// one launched last.
     pub fn get_active(&self) -> Option<Arc<Process>> {
-        let pid = self.current_pid?;
+        let pid = match crate::kthread::current_pid() {
+            0 => self.current_pid?,
+            pid => pid,
+        };
         self.find(pid)
     }
 

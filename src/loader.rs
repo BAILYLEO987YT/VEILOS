@@ -41,12 +41,6 @@ pub struct NtEnv {
 /// Held from the start of `load_and_spawn_pe` until `on_process_exit` has
 /// released the process's memory.
 ///
-/// One Windows process at a time. Each process now has its own page tables
-/// (address_space), but the syscall layer still dispatches to a single
-/// "active" process (`ProcessManager::get_active`), and the user long-jump
-/// context is per CPU, so a second concurrent process would receive the first
-/// one's syscalls. Lifting this belongs with the Win32/EXE work.
-static USER_PROCESS_SLOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Load a PE into a fresh address space and queue it to run.
 ///
@@ -57,13 +51,7 @@ pub fn load_and_spawn_pe(
     path: &str,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<Arc<Process>, &'static str> {
-    use core::sync::atomic::Ordering;
-    if USER_PROCESS_SLOT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        crate::serial_println!("[LOADER] Refusing to load {}: another Windows process is still running", path);
-        return Err("Another Windows program is still running (one at a time for now)");
-    }
     let Some(cr3) = crate::address_space::create() else {
-        USER_PROCESS_SLOT.store(false, Ordering::Release);
         return Err("Out of memory for page tables");
     };
 
@@ -85,7 +73,6 @@ pub fn load_and_spawn_pe(
 
     if result.is_err() {
         crate::address_space::destroy(cr3);
-        USER_PROCESS_SLOT.store(false, Ordering::Release);
     }
     result
 }
@@ -647,8 +634,8 @@ pub fn spawn_user_thread(process: Arc<Process>, teb_base: u64) {
     let cpu = crate::smp::cpu_index();
     let pid = process.pid;
     let cr3 = process.cr3;
-    crate::smp::USER_THREAD_ON[cpu].store(true, core::sync::atomic::Ordering::Release);
-    crate::kthread::spawn_in("user-process", cr3, move || {
+    crate::smp::USER_THREADS[cpu].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    crate::kthread::spawn_user("user-process", cr3, pid, move || {
         unsafe { crate::loader::launch_into_usermode(process.entry_point, process.stack_top, teb_base); }
 
         // ── Post-exit ────────────────────────────────────────────────────
@@ -664,7 +651,7 @@ pub fn spawn_user_thread(process: Arc<Process>, teb_base: u64) {
         on_process_exit(&process);
 
         let cpu = crate::smp::cpu_index();
-        crate::smp::USER_THREAD_ON[cpu].store(false, core::sync::atomic::Ordering::Release);
+        crate::smp::USER_THREADS[cpu].fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
         crate::serial_println!("[SCHED] Process {} completed execution on CPU {}.", process.pid, cpu);
     });
     crate::serial_println!("[SCHED] Pid={} runs on a kernel thread (CPU {})", pid, cpu);
@@ -748,7 +735,6 @@ pub fn on_process_exit(process: &Arc<Process>) {
     crate::kthread::set_current_cr3(0);
     crate::address_space::activate(0);
     crate::address_space::destroy(process.cr3);
-    USER_PROCESS_SLOT.store(false, core::sync::atomic::Ordering::Release);
 
     // Reset LAST_USER_MODE_TICK so the timer ISR's recently_in_user_mode
     // grace period ends immediately, preventing the ISR from painting
@@ -785,54 +771,32 @@ pub fn release_process_memory(process: &Arc<Process>) {
 // -----| Ring-3 launch / long-jump context |-----
 // =====================================================================
 //
-// One saved kernel context per CPU.  launch_into_usermode() fills it in;
-// return_from_usermode() jumps back through it from a syscall or a fault.
+// One saved kernel context per user thread (kthread::UserCtx).
+// launch_into_usermode() fills it in; return_from_usermode() jumps back
+// through it from a syscall or a fault.
 //
-// The slot is now guarded by a validity flag.  Without it, a stray ring-3
-// fault at a moment when no process was live (a stale slot from a launch
-// that had already returned, or a fault on a CPU that never launched
-// anything) would `jmp` onto a dead stack frame and corrupt the kernel in
-// an unattributable way.
+// The slot is guarded by a validity flag. Without it, a stray ring-3 fault
+// at a moment when no process was live would `jmp` onto a dead stack frame
+// and corrupt the kernel in an unattributable way.
 
 pub const MAX_EXEC_CPUS: usize = 8;
 
-#[repr(C, align(64))]
-pub struct ExecContext {
-    pub regs: [u64; 8],
-}
-
-struct ExecContexts(core::cell::UnsafeCell<[ExecContext; MAX_EXEC_CPUS]>);
-unsafe impl Sync for ExecContexts {}
-
-static EXEC_CONTEXTS: ExecContexts = ExecContexts(core::cell::UnsafeCell::new(
-    [const { ExecContext { regs: [0; 8] } }; MAX_EXEC_CPUS]
-));
-
-static EXEC_CTX_VALID: [core::sync::atomic::AtomicBool; MAX_EXEC_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_EXEC_CPUS];
-
+/// The CPU index lock tracking (lock_guard) is keyed by.
 #[inline]
 pub fn current_exec_cpu() -> usize {
-    // Dense CPU index, not the raw APIC ID: APIC IDs can be sparse or
-    // exceed MAX_EXEC_CPUS on real hardware, and `id % 8` made CPUs collide.
     crate::smp::cpu_index().min(MAX_EXEC_CPUS - 1)
 }
 
-#[inline]
-fn exec_ctx_ptr(cpu: usize) -> *mut u64 {
-    unsafe { (*EXEC_CONTEXTS.0.get())[cpu].regs.as_mut_ptr() }
-}
-
-/// Clear this CPU's long-jump slot once the process it belonged to is gone.
+/// Clear the running thread's long-jump slot once its process is gone.
 pub fn invalidate_exec_context() {
-    EXEC_CTX_VALID[current_exec_cpu()]
-        .store(false, core::sync::atomic::Ordering::Release);
+    if crate::kthread::current_pid() != 0 {
+        unsafe { (*crate::kthread::current_user()).jump_valid = false };
+    }
 }
 
-/// True if this CPU currently has a live launch context to return to.
+/// True if the running thread has a live launch context to return to.
 pub fn has_exec_context() -> bool {
-    EXEC_CTX_VALID[current_exec_cpu()]
-        .load(core::sync::atomic::Ordering::Acquire)
+    crate::kthread::current_pid() != 0 && unsafe { (*crate::kthread::current_user()).jump_valid }
 }
 
 /// Long-jump out of ring-3 back into the kernel context that launched it.
@@ -841,21 +805,19 @@ pub fn has_exec_context() -> bool {
 /// that unwinds nothing, every spinlock held at this instant would stay
 /// locked forever — so we force-release the tracked ones first.  See
 /// `lock_guard`.
-/// Set when the running Windows process must be ended from outside
-/// (`request_kill`). One Windows process runs at a time, so any ring-3 code
-/// a timer interrupts belongs to it.
-static KILL_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// End the running Windows process the next time a timer interrupt finds it
-/// in user mode (within a tick). Its exit code must already be set.
-pub fn request_kill() {
-    KILL_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
+/// End process `pid` from outside: its thread stops the next time a timer
+/// interrupt finds it in user mode (within a tick), or when a blocking
+/// syscall it's waiting in checks (`kill_if_requested`). Its exit code must
+/// already be set.
+pub fn request_kill(pid: u32) {
+    crate::kthread::kill_pid(pid);
 }
 
-/// Timer ISRs call this when they interrupted ring 3: carries out a pending
-/// `request_kill` the way ExitProcess would. Returns if nothing is pending.
+/// Called with the running thread in ring 3 (timer ISRs) or waiting in a
+/// syscall: carries out a pending `request_kill` the way ExitProcess would.
+/// Returns if nothing is pending.
 pub fn kill_if_requested() {
-    if KILL_REQUESTED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+    if crate::kthread::current_pid() != 0 && crate::kthread::take_kill() {
         crate::interrupts::USER_PROCESS_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
         unsafe { return_from_usermode() }
     }
@@ -869,7 +831,8 @@ pub unsafe fn return_from_usermode() -> ! {
     // syscall used to leave WIN32_USER (or PROCESSOR, or the heap) locked.
     lock_guard::release_all_for_cpu(cpu_id);
 
-    if !EXEC_CTX_VALID[cpu_id].load(core::sync::atomic::Ordering::Acquire) {
+    let user = crate::kthread::current_user();
+    if crate::kthread::current_pid() == 0 || !unsafe { (*user).jump_valid } {
         // Nothing to return to.  Jumping would be worse than stopping.
         crate::serial_println!(
             "[LOADER] return_from_usermode() on CPU {} with no valid context — halting CPU",
@@ -882,10 +845,10 @@ pub unsafe fn return_from_usermode() -> ! {
     }
 
     // Consume the context: a second fault must not reuse it.
-    EXEC_CTX_VALID[cpu_id].store(false, core::sync::atomic::Ordering::Release);
+    unsafe { (*user).jump_valid = false };
 
     unsafe {
-        let ctx_ptr = exec_ctx_ptr(cpu_id);
+        let ctx_ptr = (*user).jump.as_mut_ptr();
         core::arch::asm!(
             "mov rbx, [rdi + 0]",
             "mov rbp, [rdi + 8]",
@@ -1029,12 +992,18 @@ pub unsafe fn launch_into_usermode(entry: u64, stack_top: u64, teb_base: u64) {
     let sel = crate::gdt::get_selectors();
     let ucs = sel.user_code_selector.0 as u64;
     let uds = sel.user_data_selector.0 as u64;
-    let cpu_id = current_exec_cpu();
-    let ctx_ptr = exec_ctx_ptr(cpu_id);
+    let user = crate::kthread::current_user();
+    let ctx_ptr = (*user).jump.as_mut_ptr();
+
+    // Syscalls and interrupts from ring 3 enter on this thread's own stack,
+    // below this frame (which the long jump returns to).
+    let rsp: u64;
+    core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    crate::kthread::set_kernel_entry_stack((rsp - 512) & !0xF);
 
     // Arm the long-jump slot *before* entering ring 3 — the very first
     // instruction of the entry point can fault.
-    EXEC_CTX_VALID[cpu_id].store(true, core::sync::atomic::Ordering::Release);
+    (*user).jump_valid = true;
 
     // syscall_entry swapgs's into the per-CPU block. If the previous process
     // left via a long-jump out of a syscall, the exit swapgs never ran and
@@ -1087,6 +1056,6 @@ pub unsafe fn launch_into_usermode(entry: u64, stack_top: u64, teb_base: u64) {
 
     // Control reaches here only via return_from_usermode(), which already
     // cleared the flag.  Clearing again is harmless and documents intent.
-    EXEC_CTX_VALID[cpu_id].store(false, core::sync::atomic::Ordering::Release);
+    (*crate::kthread::current_user()).jump_valid = false;
     }
 }
