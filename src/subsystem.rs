@@ -186,6 +186,11 @@ impl Subsystem for WindowsSubsystem {
 
     fn handle_syscall(&self, id: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 
+        // ---- NT system services for VEILOS's ntdll.dll ----
+        if crate::nt_syscalls::handles(id) {
+            return crate::nt_syscalls::dispatch(id, arg0, arg1, arg2, arg3);
+        }
+
         // ---- An import nothing provides (modules.rs stub): log it once, return 0 ----
         if (crate::modules::UNRESOLVED_SYSCALL_BASE..crate::modules::UNRESOLVED_SYSCALL_BASE + 0x0100_0000).contains(&id) {
             if let Some(name) = crate::modules::unresolved_call(id) {

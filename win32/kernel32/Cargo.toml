@@ -1,0 +1,11 @@
+[package]
+name = "kernel32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS kernel32.dll: the Win32 base API over ntdll"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nt_abi = { path = "../nt_abi" }

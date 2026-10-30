@@ -1,0 +1,13 @@
+# VEILOS's own Windows system DLLs (WIN32_DESIGN.md): no_std Rust built as
+# real PE DLLs for x86_64-pc-windows-msvc. `sh build.sh` builds them and
+# installs them into storage/system.
+[workspace]
+resolver = "2"
+members = ["nt_abi", "ntdll", "kernel32"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

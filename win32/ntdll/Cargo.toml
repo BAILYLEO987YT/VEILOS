@@ -1,0 +1,11 @@
+[package]
+name = "ntdll"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS ntdll.dll: NT system call stubs and Rtl helpers"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nt_abi = { path = "../nt_abi" }

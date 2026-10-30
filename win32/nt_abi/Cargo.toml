@@ -1,0 +1,7 @@
+[package]
+name = "nt_abi"
+version = "0.1.0"
+edition = "2021"
+description = "The syscall ABI shared by the VEILOS kernel and VEILOS's ntdll.dll"
+
+[dependencies]

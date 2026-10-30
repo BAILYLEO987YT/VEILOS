@@ -111,6 +111,13 @@ fn load_and_spawn_pe_inner(
     };
     pe.print_info();
 
+    // IMAGE_SUBSYSTEM_WINDOWS_CUI: a console program gets a console, and a
+    // terminal window to show it (apps::open_file_absolute).
+    let is_console = {
+        let opt = u32::from_le_bytes(data[0x3C..0x40].try_into().map_err(|_| "truncated PE")?) as usize + 24;
+        data.get(opt + 68..opt + 70).map(|b| u16::from_le_bytes([b[0], b[1]])) == Some(3)
+    };
+
     // 3. Map the EXE (headers + sections, relocated). Its DLLs are loaded and
     //    every import bound once the NT environment exists (3c below).
     let exe_entry_rva = pe.entry_point;
@@ -200,6 +207,9 @@ fn load_and_spawn_pe_inner(
     }
     
     process_inner.image_base = mapped_image_base;
+    if is_console {
+        process_inner.console = Some(Arc::new(crate::console::Console::new(pid)));
+    }
     process_inner.stack_base = stack_base;
     // mapped_pages is transferred to the process at the very end of this
     // function, once nothing else can fail — until then the caller's rollback
@@ -378,6 +388,17 @@ fn load_and_spawn_pe_inner(
         *(pp.add(0x70) as *mut u16) = (14 * 2) as u16;
         *(pp.add(0x72) as *mut u16) = (15 * 2) as u16;
         *(pp.add(0x78) as *mut u64) = str_buf;
+    }
+
+    // Standard handles (StandardInput/Output/Error): a console program's all
+    // refer to its console; a GUI program has none (0), as on Windows.
+    if let Some(console) = &process.console {
+        use nt_abi::layout::{PARAMS_STD_ERROR, PARAMS_STD_INPUT, PARAMS_STD_OUTPUT};
+        let mut handles = process.handles.lock();
+        for offset in [PARAMS_STD_INPUT, PARAMS_STD_OUTPUT, PARAMS_STD_ERROR] {
+            let h = handles.allocate_ref(crate::nt_objects::KernelObjectRef::Console(console.clone()), 0x001F_01FF, 0);
+            unsafe { *((params_base as usize + offset) as *mut u64) = h as u64 };
+        }
     }
 
     // -----| KUSER_SHARED_DATA (0x7FFE_0000) |-----
@@ -697,7 +718,10 @@ pub fn on_process_exit(process: &Arc<Process>) {
         tm.remove_threads_for_pid(process.pid);
     }
 
-    // 4. Close its NT handles and VADs.
+    // 4. Tell its console window, then close its NT handles and VADs.
+    if let Some(console) = &process.console {
+        console.finish(*process.exit_code.lock());
+    }
     if let Some(mut h) = process.handles.try_lock() { h.close_all(); }
 
     // 5. Re-focus the boot terminal so keyboard/mouse input is routed to a

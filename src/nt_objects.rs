@@ -34,6 +34,7 @@ pub enum ObjectType {
     Directory,  // Namespace directory node
     Process,
     Thread,
+    Console,
 }
 
 // =====================================================================
@@ -293,6 +294,7 @@ pub enum KernelObjectRef {
     Mutex(Arc<MutexObject>),
     Semaphore(Arc<SemaphoreObject>),
     Section(Arc<SectionObject>),
+    Console(Arc<crate::console::Console>),
 }
 
 impl KernelObjectRef {
@@ -302,6 +304,7 @@ impl KernelObjectRef {
             Self::Mutex(_)     => ObjectType::Mutex,
             Self::Semaphore(_) => ObjectType::Semaphore,
             Self::Section(_)   => ObjectType::Section,
+            Self::Console(_)   => ObjectType::Console,
         }
     }
 }

@@ -386,7 +386,14 @@ pub fn media_viewer_slot_for_window(id: u32) -> Option<usize> {
 }
 
 /// Checks if the currently focused window is an animated media viewer that needs a new frame.
+/// Set when a program writes to its console window (console.rs), so the
+/// desktop repaints.
+pub static TERMINAL_OUTPUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn needs_animation_refresh(ms: u64) -> bool {
+    if TERMINAL_OUTPUT.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return true;
+    }
     let focused_id = crate::desktop::DESKTOP_WM.lock().focused_id;
     if let Some(fid) = focused_id {
         for slot in MEDIA_VIEWER_POOL.iter() {
@@ -683,18 +690,19 @@ pub fn open_file_absolute(path: &str, name: &str) {
             // It's an executable, so attempt to load and spawn it.
             let mut frame_allocator = crate::memory::GlobalFrameAllocator;
             match crate::loader::load_and_spawn_pe(path, &mut frame_allocator) {
-                Ok(_) => {
+                Ok(process) => {
                     notify(NotifCategory::Success, "LAUNCHED", name);
-                    // Open a terminal to act as the "console window" for the executable
-                    let (_id, idx) = open_terminal(120, 100, 560, 400, 0);
-                    let mut term = TERMINAL_POOL[idx].lock();
-                    term.history.clear();
-                    term.history.push(alloc::format!("=== RUNNING: {} ===", name));
-                    term.history.push(String::from("(Runtime: PE32 / PE32+ Windows Subsystem)"));
-                    term.history.push(String::from("Standard output is routed to kernel serial console."));
-                    term.history.push(String::new());
-                    term.history.push(String::from("[OS]: Application is LIVE. Loading DLLs and jumping to Entry-Point..."));
-                    term.history.push(String::from("[OS]: IAT patched. CPU context switch initiated."));
+                    // A console program's window: its output appears here. The
+                    // program hasn't run yet (it's queued on the executor this
+                    // code runs on), so nothing it writes is missed.
+                    if let Some(console) = &process.console {
+                        let (_id, idx) = open_terminal(120, 100, 560, 400, 0);
+                        let mut term = TERMINAL_POOL[idx].lock();
+                        term.history.clear();
+                        term.history.push(alloc::format!("=== {} ===", name));
+                        drop(term);
+                        console.attach(idx);
+                    }
                 }
                 Err(e) => {
                     notify(

@@ -60,6 +60,8 @@ pub mod block;
 pub mod hal;
 pub mod hotplug;
 pub mod modules;
+pub mod console;
+pub mod nt_syscalls;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;
