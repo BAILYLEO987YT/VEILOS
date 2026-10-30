@@ -33,6 +33,7 @@ extern crate alloc;
 
 mod convert;
 mod ctype;
+mod eh;
 mod format;
 mod heap;
 mod math;

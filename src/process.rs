@@ -70,6 +70,9 @@ pub struct Process {
     pub console: Option<alloc::sync::Arc<crate::console::Console>>,
     /// The module loader, kept for LoadLibrary / GetProcAddress.
     pub linker: Mutex<Option<crate::modules::Linker>>,
+    /// ntdll's KiUserExceptionDispatcher, where CPU exceptions in user mode
+    /// are delivered (0: none, the process just ends).
+    pub exception_dispatcher: core::sync::atomic::AtomicU64,
 
     // -----| Lifecycle |-----
     pub exit_code: Mutex<Option<i32>>,
@@ -106,6 +109,7 @@ impl Process {
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             console:     None,
             linker:      Mutex::new(None),
+            exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
             exit_code:   Mutex::new(None),
         }
     }
@@ -176,6 +180,7 @@ impl ProcessManager {
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             console: None,
             linker: Mutex::new(None),
+            exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
             exit_code: Mutex::new(None),
         });
         self.processes.push(kernel_process);

@@ -917,6 +917,13 @@ impl Linker {
         self.builtin_address(mem, &p, sym).ok().flatten()
     }
 
+    /// An export of a loaded module by name ("ntdll.dll", "KiUserExceptionDispatcher"),
+    /// without falling back to built-ins.
+    pub fn module_export<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, dll: &str, sym: &str) -> Option<u64> {
+        let i = self.modules.iter().position(|m| m.name == dll)?;
+        self.export_address(mem, i, Sym::Name(sym), 0).ok().flatten()
+    }
+
     /// Every region the loader mapped, for the process's VAD (so VirtualAlloc
     /// never hands them out).
     pub fn regions(&self) -> Vec<(u64, usize)> {

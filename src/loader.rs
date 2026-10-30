@@ -559,6 +559,9 @@ fn load_and_spawn_pe_inner(
     {
         let mut mem = crate::modules::Mem { mapper: &mut *mapper, fa: &mut *frame_allocator, pages: &mut *mapped_pages };
         linker.link(&mut mem, teb_base, peb_base, ldr_base)?;
+        // Where the kernel sends this process's exceptions (nt_exception.rs).
+        let dispatcher = linker.module_export(&mut mem, "ntdll.dll", "KiUserExceptionDispatcher").unwrap_or(0);
+        process.exception_dispatcher.store(dispatcher, core::sync::atomic::Ordering::Release);
     }
     // VirtualAlloc must never hand out what the loader mapped.
     {

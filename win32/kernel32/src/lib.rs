@@ -16,6 +16,7 @@
 #![no_std]
 
 mod env;
+mod exception;
 mod file;
 mod mem;
 mod module;

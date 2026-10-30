@@ -8,6 +8,7 @@
 
 #![no_std]
 
+mod exception;
 mod heap;
 
 use core::arch::naked_asm;

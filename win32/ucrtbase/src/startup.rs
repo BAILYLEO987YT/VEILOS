@@ -827,35 +827,6 @@ pub extern "C" fn _XcptFilter(_code: u32, _ptrs: usize) -> i32 {
     0
 }
 
-/// No frame handles anything yet: ExceptionContinueSearch.
-#[no_mangle]
-pub extern "C" fn __C_specific_handler(_rec: usize, _frame: usize, _ctx: usize, _disp: usize) -> i32 {
-    1
-}
-
-#[no_mangle]
-pub extern "C" fn __CxxFrameHandler3(_rec: usize, _frame: usize, _ctx: usize, _disp: usize) -> i32 {
-    1
-}
-
-#[no_mangle]
-pub extern "C" fn __CxxFrameHandler4(_rec: usize, _frame: usize, _ctx: usize, _disp: usize) -> i32 {
-    1
-}
-
-#[no_mangle]
-pub extern "C" fn __GSHandlerCheck(_rec: usize, _frame: usize, _ctx: usize, _disp: usize) -> i32 {
-    1
-}
-
-#[no_mangle]
-pub extern "C" fn _CxxThrowException(_obj: usize, _info: usize) -> ! {
-    fatal("unhandled C++ exception (C++ exceptions arrive in W5b)", 0xE06D_7363)
-}
-
-#[no_mangle]
-pub extern "C" fn _local_unwind(_frame: usize, _target: usize) {}
-
 static mut CURRENT_EXCEPTION: usize = 0;
 static mut CURRENT_CONTEXT: usize = 0;
 

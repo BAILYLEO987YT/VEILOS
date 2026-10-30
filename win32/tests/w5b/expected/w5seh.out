@@ -1,0 +1,40 @@
+== access violation ==
+  filter write: code=C0000005 params=2 [1, 10] -> 1
+  caught C0000005
+  filter read: code=C0000005 params=2 [0, 20] -> 1
+  caught read fault
+== divide by zero ==
+  caught divide by zero
+== RaiseException ==
+  filter continue: code=E0000001 params=2 [11, 22] -> -1
+  continued after RaiseException
+  caught E0000002
+== __finally ==
+  inner body
+  finally 1 (abnormal=0)
+  outer filter runs before the finally blocks
+  finally 2 (abnormal=1)
+  finally 3 (abnormal=1)
+  outer handler after them
+  in __try, returning 7
+  __finally ran (abnormal=1)
+  finally_return() = 7
+== nested search ==
+  inner filter: continue search
+  outer filter: execute
+  outer caught E0000004
+== deep frames ==
+  caught from 11 frames down
+  caught through an _alloca frame
+== breakpoint and illegal instruction ==
+  caught breakpoint
+  caught illegal instruction
+== vectored ==
+  vectored handler saw E0000005
+  caught after the vectored handler
+  caught (vectored handler removed: 1 call)
+== many in a row ==
+  caught 200 of 200, filter calls 3
+== unhandled ==
+top-level filter: C0000005, exiting with it
+exit 139

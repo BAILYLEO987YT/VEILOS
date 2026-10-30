@@ -1,0 +1,69 @@
+== types ==
+kind 0
+  +middle local
+  +thrower local
+  -thrower local
+  -middle local
+  caught int 7
+kind 1
+  +middle local
+  +thrower local
+  -thrower local
+  -middle local
+  caught Base& -> Derived code 5
+kind 2
+  +middle local
+  +thrower local
+  -thrower local
+  -middle local
+  caught const char* "a string"
+kind 3
+  +middle local
+  +thrower local
+  -thrower local
+  -middle local
+  caught double 2.5
+kind 4
+  +middle local
+  +thrower local
+  -thrower local
+  -middle local
+  caught ...
+kind 5
+  +middle local
+  +thrower local
+  -thrower local
+  -middle local
+  caught std::exception "std exception"
+== by value ==
+  Base copied
+  caught Base by value: Base 9
+== rethrow ==
+  level 0 caught 100, rethrowing
+  level 1 caught 101, rethrowing
+  level 2 caught 102, rethrowing
+  main caught 103
+== throw from catch ==
+  +outer
+  +inner
+  -inner
+  +in catch
+  inner catch 1, throwing 2
+  -in catch
+  -outer
+  outer catch 2
+== try inside catch ==
+  nested catch 20 inside catch 10
+  back in outer catch 10
+== partial construction ==
+  +member a
+  -member a
+  constructor threw 42
+== loop ==
+  total 150
+== bad_alloc ==
+  caught bad_alloc: bad allocation
+== uncaught_exceptions ==
+  now 0
+live objects: 0
+exit 0

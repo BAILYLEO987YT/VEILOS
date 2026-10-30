@@ -94,27 +94,34 @@ lazy_static! {
         // Every vector gets a handler so a missing IDT entry never silently
         // cascades into a #GP → #DF.  Unknown vectors print the vector number
         // and the faulting RIP so we can identify them instantly.
-        idt.divide_error.set_handler_fn(divide_error_handler);
-        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        // Faults a Windows program can handle itself go through
+        // nt_exception's stubs: from ring 3 they become Windows exceptions,
+        // from ring 0 they reach the handlers below unchanged.
+        use crate::nt_exception as nx;
+        let addr = |f: unsafe extern "C" fn()| x86_64::VirtAddr::new(f as usize as u64);
+        unsafe {
+            idt.divide_error.set_handler_addr(addr(nx::divide_error));
+            idt.breakpoint.set_handler_addr(addr(nx::breakpoint)).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+            idt.overflow.set_handler_addr(addr(nx::overflow)).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+            idt.invalid_opcode.set_handler_addr(addr(nx::invalid_opcode));
+            idt.x87_floating_point.set_handler_addr(addr(nx::x87_floating_point));
+            idt.alignment_check.set_handler_addr(addr(nx::alignment_check));
+            idt.simd_floating_point.set_handler_addr(addr(nx::simd_floating_point));
+        }
         idt.device_not_available.set_handler_fn(device_not_available_handler);
-        idt.breakpoint.set_handler_fn(breakpoint_handler);
-        idt.overflow.set_handler_fn(overflow_handler);
         idt.bound_range_exceeded.set_handler_fn(bound_range_handler);
         idt.invalid_tss.set_handler_fn(invalid_tss_handler);
         idt.segment_not_present.set_handler_fn(segment_not_present_handler);
         idt.stack_segment_fault.set_handler_fn(stack_segment_fault_handler);
-        idt.alignment_check.set_handler_fn(alignment_check_handler);
-        idt.x87_floating_point.set_handler_fn(x87_fp_handler);
-        idt.simd_floating_point.set_handler_fn(simd_fp_handler);
 
         // #GP and #PF get dedicated IST stacks so a deep call stack cannot
         // overflow the fault-handler's stack and cause a secondary fault.
         unsafe {
             idt.page_fault
-                .set_handler_fn(page_fault_handler)
+                .set_handler_addr(addr(nx::page_fault))
                 .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
             idt.general_protection_fault
-                .set_handler_fn(general_protection_fault_handler)
+                .set_handler_addr(addr(nx::general_protection))
                 .set_stack_index(gdt::GPF_IST_INDEX);
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
@@ -467,14 +474,14 @@ macro_rules! user_recoverable_handler {
 }
 
 // ── #DE — Division by Zero (vector 0) ────────────────────────────────────────
-extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+pub(crate) extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
     user_recoverable_handler!("#DE divide-by-zero", frame);
 }
 
 // ── #UD — Invalid Opcode (vector 6) ──────────────────────────────────────────
 // Fires when the CPU encounters an illegal or unsupported instruction.
 // Common cause: SSE/AVX used while CR4.OSFXSR=0, or ISA feature not present.
-extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+pub(crate) extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
     // Dump the bytes at RIP so we can identify the faulting instruction —
     // but only if RIP is actually mapped.  The old code did a blind
     // core::ptr::read here, which is exactly the "nested kernel page fault"
@@ -529,7 +536,7 @@ extern "x86-interrupt" fn device_not_available_handler(frame: InterruptStackFram
 }
 
 // ── #OF — Overflow (vector 4) ────────────────────────────────────────────────
-extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
+pub(crate) extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
     user_recoverable_handler!("#OF overflow", frame);
 }
 
@@ -595,17 +602,17 @@ extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame
 // ── #AC — Alignment Check (vector 17) ────────────────────────────────────────
 // Only fires in ring 3 when CR0.AM=1 and EFLAGS.AC=1.  Typically not enabled
 // but handle it defensively.
-extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, _error: u64) {
+pub(crate) extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, _error: u64) {
     user_recoverable_handler!("#AC alignment-check", frame);
 }
 
 // ── #MF — x87 Floating Point Exception (vector 16) ───────────────────────────
-extern "x86-interrupt" fn x87_fp_handler(frame: InterruptStackFrame) {
+pub(crate) extern "x86-interrupt" fn x87_fp_handler(frame: InterruptStackFrame) {
     user_recoverable_handler!("#MF x87-fp-exception", frame);
 }
 
 // ── #XM/#XF — SIMD Floating Point Exception (vector 19) ─────────────────────
-extern "x86-interrupt" fn simd_fp_handler(frame: InterruptStackFrame) {
+pub(crate) extern "x86-interrupt" fn simd_fp_handler(frame: InterruptStackFrame) {
     let in_user = (frame.code_segment & 0x3) == 3;
     let mxcsr: u32;
     unsafe {
@@ -626,7 +633,7 @@ extern "x86-interrupt" fn simd_fp_handler(frame: InterruptStackFrame) {
     panic!("#XM with no active process! RIP={:#X}", frame.instruction_pointer.as_u64());
 }
 
-extern "x86-interrupt" fn breakpoint_handler(
+pub(crate) extern "x86-interrupt" fn breakpoint_handler(
     stack_frame: InterruptStackFrame)
 {
     crate::serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
@@ -653,7 +660,7 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 // Catches memory access violations (Segfaults)
-extern "x86-interrupt" fn page_fault_handler(
+pub(crate) extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode)
 {
     use x86_64::registers::control::Cr2;
@@ -725,7 +732,7 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 // Catches privilege violations (like executing data or invalid segments)
-extern "x86-interrupt" fn general_protection_fault_handler(
+pub(crate) extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame, error_code: u64)
 {
     let in_user_mode = (stack_frame.code_segment & 0x3) == 3;
