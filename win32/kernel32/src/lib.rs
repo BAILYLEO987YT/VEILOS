@@ -20,6 +20,7 @@ mod exception;
 mod file;
 mod mem;
 mod module;
+mod process;
 mod sync;
 mod time;
 mod util;

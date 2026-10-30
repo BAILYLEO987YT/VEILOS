@@ -15,7 +15,7 @@
 //! seen by the unwinder at the try's code. The `ACTIVE` list remembers each
 //! running catch so that frame isn't given the exception again (only try
 //! blocks around the whole try/catch may take it) and its locals aren't
-//! destroyed twice. One list per process until threads come (W6).
+//! destroyed twice. One list per thread.
 
 use crate::startup::fatal;
 use core::ptr::{null_mut, read_unaligned};
@@ -178,25 +178,46 @@ struct Active {
 }
 
 const MAX_ACTIVE: usize = 64;
-static mut ACTIVE: [Option<Active>; MAX_ACTIVE] = [None; MAX_ACTIVE];
-static mut ACTIVE_N: usize = 0;
-static mut UNCAUGHT: i32 = 0;
 
-fn active() -> &'static mut [Option<Active>] {
-    unsafe {
-        let all = &mut *(&raw mut ACTIVE);
-        &mut all[..ACTIVE_N]
+/// A thread's C++ exception state (threads.rs keeps one per thread).
+pub struct EhState {
+    active: [Option<Active>; MAX_ACTIVE],
+    n: usize,
+    /// Thrown and not yet caught.
+    uncaught: i32,
+}
+
+impl EhState {
+    pub const fn new() -> Self {
+        EhState { active: [None; MAX_ACTIVE], n: 0, uncaught: 0 }
     }
 }
 
+fn st() -> &'static mut EhState {
+    &mut crate::threads::this().eh
+}
+
+fn active() -> &'static mut [Option<Active>] {
+    let s = st();
+    &mut s.active[..s.n]
+}
+
 fn push_active(a: Active) {
-    unsafe {
-        if ACTIVE_N == MAX_ACTIVE {
-            fatal("too many nested C++ catch blocks", 3);
-        }
-        ACTIVE[ACTIVE_N] = Some(a);
-        ACTIVE_N += 1;
+    let s = st();
+    if s.n == MAX_ACTIVE {
+        fatal("too many nested C++ catch blocks", 3);
     }
+    s.active[s.n] = Some(a);
+    s.n += 1;
+}
+
+fn pop_active() -> Option<Active> {
+    let s = st();
+    if s.n == 0 {
+        return None;
+    }
+    s.n -= 1;
+    s.active[s.n].take()
 }
 
 /// The innermost running catch block's exception (for `throw;`).
@@ -220,7 +241,7 @@ pub unsafe extern "C" fn _CxxThrowException(object: u64, throw_info: u64) -> ! {
         unsafe { RtlPcToFileHeader(throw_info, &mut base) };
         (object, throw_info, base)
     };
-    unsafe { UNCAUGHT += 1 };
+    st().uncaught += 1;
     let args = [CXX_MAGIC, object, throw_info, base];
     unsafe { RaiseException(CXX_EXCEPTION, 1, 4, args.as_ptr()) };
     crate::startup::terminate()
@@ -228,17 +249,17 @@ pub unsafe extern "C" fn _CxxThrowException(object: u64, throw_info: u64) -> ! {
 
 #[no_mangle]
 pub extern "C" fn __uncaught_exception() -> bool {
-    unsafe { UNCAUGHT > 0 }
+    st().uncaught > 0
 }
 
 #[no_mangle]
 pub extern "C" fn __uncaught_exceptions() -> i32 {
-    unsafe { UNCAUGHT }
+    st().uncaught
 }
 
 #[no_mangle]
 pub extern "C" fn __processing_throw() -> *mut i32 {
-    &raw mut UNCAUGHT
+    &mut st().uncaught
 }
 
 // -----| C++ exceptions: the compilers' metadata |-----
@@ -579,7 +600,7 @@ unsafe extern "C" fn call_catch_block(rec: *mut Record) -> u64 {
         rethrown: false,
         exited: false,
     });
-    unsafe { UNCAUGHT -= 1 };
+    st().uncaught -= 1;
     let f: unsafe extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(funclet) };
     let mut continuation = unsafe { f(0, root) };
     // FH4 funclets may return an index into the handler's continuations.
@@ -587,10 +608,7 @@ unsafe extern "C" fn call_catch_block(rec: *mut Record) -> u64 {
     if count > 0 && continuation < count {
         continuation = info[6 + continuation as usize];
     }
-    let a = unsafe {
-        ACTIVE_N -= 1;
-        ACTIVE[ACTIVE_N].take().unwrap()
-    };
+    let a = pop_active().unwrap();
     if !a.rethrown {
         unsafe { destroy_object(a.object, a.throw_info, a.throw_base) };
     }
@@ -649,11 +667,8 @@ unsafe fn frame_handler(rec: *mut Record, frame: u64, ctx: *mut u8, dc: &mut Dis
             let to = if target { if ours { target_state } else { from } } else { -1 };
             unsafe { unwind_states(m, root, from, to, |_| true) };
             // This frame's running catch blocks are over.
-            unsafe {
-                while ACTIVE_N > 0 && ACTIVE[ACTIVE_N - 1].is_some_and(|a| a.try_frame == frame) {
-                    ACTIVE_N -= 1;
-                    ACTIVE[ACTIVE_N] = None;
-                }
+            while active().last().is_some_and(|a| a.is_some_and(|a| a.try_frame == frame)) {
+                pop_active();
             }
         }
         return CONTINUE_SEARCH;

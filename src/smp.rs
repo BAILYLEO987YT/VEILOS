@@ -742,8 +742,9 @@ pub fn parse_madt() -> Option<Madt> {
 /// runs it with `loader::spawn_user_thread`, the same path the BSP uses
 /// (entry point, stack and page tables all come from the `Process`).
 pub struct ApWorkItem {
-    pub teb_base: u64,
-    pub pid:      u32,
+    /// A Windows thread to start: process `pid`'s thread `tid`.
+    pub pid: u32,
+    pub tid: u32,
 }
 
 pub static AP_WORK_QUEUE: spin::Mutex<alloc::vec::Vec<ApWorkItem>> = spin::Mutex::new(alloc::vec::Vec::new());
@@ -780,11 +781,12 @@ pub fn park_and_wait_for_work() -> ! {
         }
         if least_loaded_ap(cpu) {
             let work = AP_WORK_QUEUE.lock().pop();
-            if let Some(ApWorkItem { teb_base, pid, .. }) = work {
+            if let Some(ApWorkItem { pid, tid }) = work {
                 let process = crate::process::PROCESSOR.lock().find(pid);
-                match process {
-                    Some(process) => crate::loader::spawn_user_thread(process, teb_base),
-                    None => crate::serial_println!("[SMP] queued pid {} no longer exists", pid),
+                let thread = process.as_ref().and_then(|p| p.threads.lock().iter().find(|t| t.tid == tid).cloned());
+                match (process, thread) {
+                    (Some(process), Some(thread)) => crate::nt_process::run_thread_here(process, thread),
+                    _ => crate::serial_println!("[SMP] queued thread {} of pid {} no longer exists", tid, pid),
                 }
                 continue;
             }

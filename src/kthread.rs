@@ -63,11 +63,15 @@ pub struct UserCtx {
     pub pid: u32,
     /// Set by `kill_pid`; acted on in ring 3 (timer) or by a blocking syscall.
     pub kill: bool,
+    /// Address of its process's `dying` flag (0: none), checked with `kill`.
+    pub dying: usize,
+    /// Its Windows thread id.
+    pub tid: u32,
 }
 
 impl UserCtx {
     const fn new(pid: u32) -> Self {
-        UserCtx { jump: [0; 8], jump_valid: false, kernel_rsp: 0, pid, kill: false }
+        UserCtx { jump: [0; 8], jump_valid: false, kernel_rsp: 0, pid, kill: false, dying: 0, tid: 0 }
     }
 }
 
@@ -382,10 +386,31 @@ pub fn kill_pid(pid: u32) {
     }
 }
 
-/// True (once) if the running thread has been asked to end its process.
+/// Ask thread `id` (any CPU) to stop.
+pub fn kill_thread(id: u64) {
+    if id == 0 {
+        return;
+    }
+    for cpu in CPUS.iter() {
+        without_interrupts(|| {
+            for t in cpu.lock().threads.iter_mut() {
+                if t.id == id {
+                    t.user.kill = true;
+                }
+            }
+        });
+    }
+}
+
+/// True (once) if the running thread has been asked to stop, or (every
+/// time) if its process is exiting.
 pub fn take_kill() -> bool {
     let u = current_user();
-    unsafe { core::mem::replace(&mut (*u).kill, false) }
+    unsafe {
+        let dying = (*u).dying;
+        core::mem::replace(&mut (*u).kill, false)
+            || (dying != 0 && (*(dying as *const core::sync::atomic::AtomicBool)).load(core::sync::atomic::Ordering::Acquire))
+    }
 }
 
 /// Free the stacks of threads that have exited on `cpu`.

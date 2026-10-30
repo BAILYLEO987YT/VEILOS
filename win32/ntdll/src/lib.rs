@@ -10,6 +10,7 @@
 
 mod exception;
 mod heap;
+mod thread;
 
 use core::arch::naked_asm;
 use nt_abi::{layout, status, sys, NtStatus};
@@ -49,9 +50,41 @@ syscall_stubs! {
     NtSetEvent, ZwSetEvent => sys::NT_SET_EVENT;
     NtResetEvent, ZwResetEvent => sys::NT_RESET_EVENT;
     NtWaitForSingleObject, ZwWaitForSingleObject => sys::NT_WAIT_FOR_SINGLE_OBJECT;
-    NtYieldExecution, ZwYieldExecution => sys::NT_YIELD_EXECUTION;
     VeilLoadDll, ZwVeilLoadDll => sys::VEIL_LOAD_DLL;
     VeilGetProcAddress, ZwVeilGetProcAddress => sys::VEIL_GET_PROC_ADDRESS;
+    NtWaitForMultipleObjects, ZwWaitForMultipleObjects => sys::NT_WAIT_FOR_MULTIPLE_OBJECTS;
+    NtQueryInformationProcess, ZwQueryInformationProcess => sys::NT_QUERY_INFORMATION_PROCESS;
+    NtQueryInformationThread, ZwQueryInformationThread => sys::NT_QUERY_INFORMATION_THREAD;
+    NtResumeThread, ZwResumeThread => sys::NT_RESUME_THREAD;
+    NtDuplicateObject, ZwDuplicateObject => sys::NT_DUPLICATE_OBJECT;
+    NtQueryVolumeInformationFile, ZwQueryVolumeInformationFile => sys::NT_QUERY_VOLUME_INFORMATION_FILE;
+    VeilCreateThread, ZwVeilCreateThread => sys::VEIL_CREATE_THREAD;
+    VeilCreateProcess, ZwVeilCreateProcess => sys::VEIL_CREATE_PROCESS;
+    VeilCreatePipe, ZwVeilCreatePipe => sys::VEIL_CREATE_PIPE;
+    VeilDebugPrint, ZwVeilDebugPrint => sys::VEIL_DEBUG_PRINT;
+    NtSetInformationObject, ZwSetInformationObject => sys::NT_SET_INFORMATION_OBJECT;
+    NtQueryObject, ZwQueryObject => sys::NT_QUERY_OBJECT;
+}
+
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn NtTerminateThread(_thread: u64, _code: NtStatus) -> NtStatus {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_TERMINATE_THREAD)
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn ZwTerminateThread(_thread: u64, _code: NtStatus) -> NtStatus {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_TERMINATE_THREAD)
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn NtYieldExecution() -> NtStatus {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_YIELD_EXECUTION)
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn ZwYieldExecution() -> NtStatus {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_YIELD_EXECUTION)
 }
 
 // The heap calls these from Rust, so they are declared with their types.
@@ -103,6 +136,9 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
         status::NOT_A_DIRECTORY => 267,         // ERROR_DIRECTORY
         status::DLL_NOT_FOUND => 126,           // ERROR_MOD_NOT_FOUND
         status::PROCEDURE_NOT_FOUND => 127,     // ERROR_PROC_NOT_FOUND
+        status::PIPE_BROKEN => 109,             // ERROR_BROKEN_PIPE
+        status::INVALID_IMAGE_FORMAT => 193,    // ERROR_BAD_EXE_FORMAT
+        status::PENDING => 997,                 // ERROR_IO_PENDING
         _ => 317,                               // ERROR_MR_MID_NOT_FOUND
     }
 }

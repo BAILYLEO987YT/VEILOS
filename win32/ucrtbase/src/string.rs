@@ -403,25 +403,23 @@ pub unsafe extern "C" fn wcspbrk(s: *const u16, set: *const u16) -> *mut u16 {
     if unsafe { *p } == 0 { core::ptr::null_mut() } else { p as *mut u16 }
 }
 
-static mut STRTOK: *mut u8 = core::ptr::null_mut();
-static mut WCSTOK: *mut u16 = core::ptr::null_mut();
 
 #[no_mangle]
 pub unsafe extern "C" fn strtok(s: *mut u8, delim: *const u8) -> *mut u8 {
-    unsafe { tokenize(s, delim, &raw mut STRTOK) }
+    unsafe { tokenize(s, delim, &mut crate::threads::this().strtok) }
 }
 
 /// The two-argument wcstok (msvcrt's, and UCRT's `_wcstok`).
 #[no_mangle]
 pub unsafe extern "C" fn _wcstok(s: *mut u16, delim: *const u16) -> *mut u16 {
-    unsafe { tokenize(s, delim, &raw mut WCSTOK) }
+    unsafe { tokenize(s, delim, &mut crate::threads::this().wcstok) }
 }
 
 /// UCRT's wcstok takes a context (C11's); msvcrt.dll's wcstok forwards to
 /// `_wcstok` instead.
 #[no_mangle]
 pub unsafe extern "C" fn wcstok(s: *mut u16, delim: *const u16, ctx: *mut *mut u16) -> *mut u16 {
-    let ctx = if ctx.is_null() { &raw mut WCSTOK } else { ctx };
+    let ctx = if ctx.is_null() { &raw mut crate::threads::this().wcstok } else { ctx };
     unsafe { tokenize(s, delim, ctx) }
 }
 

@@ -42,6 +42,7 @@ mod scan;
 mod startup;
 mod stdio;
 mod string;
+mod threads;
 mod time;
 
 type Handle = u64;
@@ -55,6 +56,7 @@ unsafe extern "system" {
     fn HeapReAlloc(heap: Handle, flags: u32, p: *mut u8, size: usize) -> *mut u8;
     fn HeapSize(heap: Handle, flags: u32, p: *mut u8) -> usize;
     fn GetStdHandle(which: u32) -> Handle;
+    fn SetStdHandle(which: u32, h: Handle) -> i32;
     fn WriteFile(h: Handle, buf: *const u8, len: u32, written: *mut u32, overlapped: usize) -> i32;
     fn ReadFile(h: Handle, buf: *mut u8, len: u32, read: *mut u32, overlapped: usize) -> i32;
     fn CreateFileW(name: *const u16, access: u32, share: u32, sa: usize, creation: u32, flags: u32, template: Handle) -> Handle;
@@ -84,6 +86,7 @@ unsafe extern "system" {
     fn FindClose(h: Handle) -> i32;
     fn GetModuleFileNameW(module: Handle, buf: *mut u16, len: u32) -> u32;
     fn GetCurrentProcessId() -> u32;
+    fn GetStartupInfoW(info: *mut u8);
     fn Sleep(ms: u32);
 }
 
@@ -106,17 +109,14 @@ pub mod errno {
     pub const STRUNCATE: i32 = 80;
 }
 
-static mut ERRNO: i32 = 0;
-static mut DOSERRNO: u32 = 0;
-
 pub fn set_errno(e: i32) {
-    unsafe { ERRNO = e };
+    threads::this().errno = e;
 }
 
 /// errno from the last Win32 error, as the CRT maps them.
 pub fn errno_from_win32() {
     let e = unsafe { GetLastError() };
-    unsafe { DOSERRNO = e };
+    threads::this().doserrno = e;
     set_errno(match e {
         2 | 3 | 15 | 18 | 53 | 161 => errno::ENOENT,
         5 | 19 | 32 | 33 | 82 => errno::EACCES,
@@ -131,17 +131,17 @@ pub fn errno_from_win32() {
 
 #[no_mangle]
 pub extern "C" fn _errno() -> *mut i32 {
-    &raw mut ERRNO
+    &mut threads::this().errno
 }
 
 #[no_mangle]
 pub extern "C" fn __doserrno() -> *mut u32 {
-    &raw mut DOSERRNO
+    &mut threads::this().doserrno
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn _get_errno(value: *mut i32) -> i32 {
-    unsafe { *value = ERRNO };
+    unsafe { *value = threads::this().errno };
     0
 }
 
@@ -286,9 +286,14 @@ static ALLOCATOR: ProcessHeap = ProcessHeap;
 
 #[no_mangle]
 pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) -> i32 {
-    if reason == 1 {
-        stdio::init();
-        time::init();
+    match reason {
+        1 => {
+            threads::init();
+            stdio::init();
+            time::init();
+        }
+        3 => threads::detach(), // DLL_THREAD_DETACH
+        _ => {}
     }
     1
 }

@@ -62,6 +62,54 @@ pub fn load_and_spawn_pe_with_args(
     args: &str,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<Arc<Process>, &'static str> {
+    let dos_path = alloc::format!("C:{}", path.replace('/', "\\"));
+    let command_line = if args.is_empty() { alloc::format!("\"{}\"", dos_path) } else { alloc::format!("\"{}\" {}", dos_path, args) };
+    let options = LaunchOptions { command_line: Some(command_line), ..LaunchOptions::default() };
+    load_and_spawn_pe_with(path, options, frame_allocator)
+}
+
+/// Which console a program gets.
+#[derive(Default)]
+pub enum ConsoleChoice {
+    /// A console program gets a new console (the caller shows it).
+    #[default]
+    New,
+    /// It shares this one (CreateProcess from a console program).
+    Inherit(Arc<crate::console::Console>),
+    /// None (DETACHED_PROCESS).
+    None,
+}
+
+/// How a program is started (CreateProcess); the default is RUN's.
+#[derive(Default)]
+pub struct LaunchOptions {
+    /// The whole command line (default: the quoted DOS path).
+    pub command_line: Option<String>,
+    /// Its current directory (default: the program's folder).
+    pub current_dir: Option<String>,
+    /// Its environment block (default: the system's).
+    pub environment: Option<Vec<u16>>,
+    pub console: ConsoleChoice,
+    /// The objects its standard handles refer to (default: its console's).
+    pub std_objects: Option<[Option<crate::nt_objects::KernelObjectRef>; 3]>,
+    /// Its first thread waits for NtResumeThread.
+    pub suspended: bool,
+    pub parent_pid: u32,
+    /// The caller's handles, copied to the same values (bInheritHandles).
+    pub inherited: Option<crate::nt_objects::HandleTable>,
+    /// STARTUPINFO's dwFlags and lpReserved2 bytes, for GetStartupInfo.
+    pub startup_flags: u32,
+    pub runtime_data: Vec<u8>,
+}
+
+/// Load `path` into a fresh address space with `options` and queue its
+/// first thread to run (unless suspended).
+pub fn load_and_spawn_pe_with(
+    path: &str,
+    options: LaunchOptions,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<Arc<Process>, &'static str> {
+    let args = &options;
     let Some(cr3) = crate::address_space::create() else {
         return Err("Out of memory for page tables");
     };
@@ -90,7 +138,7 @@ pub fn load_and_spawn_pe_with_args(
 
 fn load_and_spawn_pe_inner(
     path: &str,
-    args: &str,
+    options: &LaunchOptions,
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     mapped_pages: &mut Vec<u64>,
@@ -209,8 +257,13 @@ fn load_and_spawn_pe_inner(
     
     process_inner.image_base = mapped_image_base;
     if is_console {
-        process_inner.console = Some(Arc::new(crate::console::Console::new(pid)));
+        process_inner.console = match &options.console {
+            ConsoleChoice::New => Some(Arc::new(crate::console::Console::new(pid))),
+            ConsoleChoice::Inherit(c) => Some(c.clone()),
+            ConsoleChoice::None => None,
+        };
     }
+    process_inner.parent_pid.store(options.parent_pid, core::sync::atomic::Ordering::Relaxed);
     process_inner.stack_base = stack_base;
     // mapped_pages is transferred to the process at the very end of this
     // function, once nothing else can fail — until then the caller's rollback
@@ -271,8 +324,6 @@ fn load_and_spawn_pe_inner(
     // that made relaunching an app unpredictable.  Frames are reclaimed on
     // teardown (see memory::deallocate_frame); only the 48-bit address space
     // is consumed, at 20 KiB per launch.
-    static TEB_POOL_BASE: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0x7FF_0000_0000);
     // Layout (ENV_PAGES pages; pool slots never reused):
     //   +0x0000 TEB (two pages: TLS slots sit at 0x1480)
     //   +0x2000 PEB
@@ -282,7 +333,7 @@ fn load_and_spawn_pe_inner(
     //   +0x6000 RTL_USER_PROCESS_PARAMETERS, its strings after PARAMS_SIZE
     //   +0x7000 environment block (two pages)
     const ENV_PAGES: u64 = 9;
-    let teb_base = TEB_POOL_BASE.fetch_add((ENV_PAGES + 1) * 0x1000, core::sync::atomic::Ordering::Relaxed);
+    let teb_base = alloc_teb_range(ENV_PAGES);
     for i in 0..ENV_PAGES {
         let page  = Page::containing_address(VirtAddr::new(teb_base + i * 0x1000));
         let frame = memory::allocate_frame().ok_or("No frame for TEB/PEB")?;
@@ -313,7 +364,7 @@ fn load_and_spawn_pe_inner(
     }
 
     // -----| TEB |-----
-    static NEXT_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    let main_tid = crate::nt_process::alloc_tid();
     unsafe {
         use nt_abi::layout::*;
         let b = teb_base as *mut u8;
@@ -323,7 +374,7 @@ fn load_and_spawn_pe_inner(
         w(0x10, stack_base);                // StackLimit (low)
         w(0x30, teb_base);                  // Self
         w(TEB_PROCESS_ID, pid as u64);      // ClientId.UniqueProcess
-        w(TEB_THREAD_ID, NEXT_TID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) * 4); // ClientId.UniqueThread
+        w(TEB_THREAD_ID, main_tid as u64); // ClientId.UniqueThread
         w(TEB_PEB, peb_base);
     }
 
@@ -358,11 +409,15 @@ fn load_and_spawn_pe_inner(
     // DOS paths: VEILOS "/dir/x.exe" is "C:\dir\x.exe". The current
     // directory starts as the program's folder.
     let dos_path = alloc::format!("C:{}", path.replace('/', "\\"));
-    let exe_dir = match dos_path.rfind('\\') {
-        Some(i) => String::from(&dos_path[..=i]),
-        None => String::from("C:\\"),
+    let exe_dir = match &options.current_dir {
+        Some(d) if d.ends_with('\\') => d.clone(),
+        Some(d) => alloc::format!("{}\\", d),
+        None => match dos_path.rfind('\\') {
+            Some(i) => String::from(&dos_path[..=i]),
+            None => String::from("C:\\"),
+        },
     };
-    let command_line = if args.is_empty() { alloc::format!("\"{}\"", dos_path) } else { alloc::format!("\"{}\" {}", dos_path, args) };
+    let command_line = options.command_line.clone().unwrap_or_else(|| alloc::format!("\"{}\"", dos_path));
     unsafe {
         use nt_abi::layout::*;
         let pp = params_base as *mut u8;
@@ -407,27 +462,62 @@ fn load_and_spawn_pe_inner(
             String::from("windir=C:\\"),
         ];
         let mut at = env_base as *mut u16;
-        for v in vars.iter() {
-            for u in v.encode_utf16() {
-                *at = u;
+        if let Some(block) = &options.environment {
+            // The caller's block, as far as it fits (two pages).
+            let n = block.len().min(0x1000 - 2);
+            core::ptr::copy_nonoverlapping(block.as_ptr(), at, n);
+            at = at.add(n);
+            *at = 0;
+            *at.add(1) = 0;
+        } else {
+            for v in vars.iter() {
+                for u in v.encode_utf16() {
+                    *at = u;
+                    at = at.add(1);
+                }
+                *at = 0;
                 at = at.add(1);
             }
             *at = 0;
             at = at.add(1);
         }
-        *at = 0;
-        at = at.add(1);
         *(pp.add(PARAMS_ENVIRONMENT) as *mut u64) = env_base;
         *(pp.add(PARAMS_ENVIRONMENT_SIZE) as *mut u64) = at as u64 - env_base;
     }
 
-    // Standard handles (StandardInput/Output/Error): a console program's all
-    // refer to its console; a GUI program has none (0), as on Windows.
-    if let Some(console) = &process.console {
+    // Inherited handles first, so they keep their values.
+    if let Some(table) = &options.inherited {
+        *process.handles.lock() = table.duplicate_all();
+    }
+    unsafe {
+        use nt_abi::layout::{PARAMS_RUNTIME_DATA, PARAMS_WINDOW_FLAGS};
+        let pp = params_base as *mut u8;
+        *(pp.add(PARAMS_WINDOW_FLAGS) as *mut u32) = options.startup_flags;
+        // lpReserved2 goes in the params page's spare room, past the strings
+        // (the page's last 1 KiB).
+        let n = options.runtime_data.len().min(1024);
+        if n > 0 {
+            let at = params_base + 0x1000 - 1024;
+            core::ptr::copy_nonoverlapping(options.runtime_data.as_ptr(), at as *mut u8, n);
+            *(pp.add(PARAMS_RUNTIME_DATA) as *mut u16) = n as u16;
+            *(pp.add(PARAMS_RUNTIME_DATA + 2) as *mut u16) = n as u16;
+            *(pp.add(PARAMS_RUNTIME_DATA + 8) as *mut u64) = at;
+        }
+    }
+
+    // Standard handles (StandardInput/Output/Error): the objects the caller
+    // gave (CreateProcess), else a console program's all refer to its
+    // console; a GUI program has none (0), as on Windows.
+    {
         use nt_abi::layout::{PARAMS_STD_ERROR, PARAMS_STD_INPUT, PARAMS_STD_OUTPUT};
         let mut handles = process.handles.lock();
-        for offset in [PARAMS_STD_INPUT, PARAMS_STD_OUTPUT, PARAMS_STD_ERROR] {
-            let h = handles.allocate_ref(crate::nt_objects::KernelObjectRef::Console(console.clone()), 0x001F_01FF, 0);
+        for (i, offset) in [PARAMS_STD_INPUT, PARAMS_STD_OUTPUT, PARAMS_STD_ERROR].into_iter().enumerate() {
+            let object = match (&options.std_objects, &process.console) {
+                (Some(objects), _) => objects[i].clone(),
+                (None, Some(console)) => Some(crate::nt_objects::KernelObjectRef::Console(console.clone())),
+                (None, None) => None,
+            };
+            let h = object.map_or(0, |o| handles.allocate_ref(o, 0x001F_01FF, 0));
             unsafe { *((params_base as usize + offset) as *mut u64) = h as u64 };
         }
     }
@@ -559,10 +649,21 @@ fn load_and_spawn_pe_inner(
     {
         let mut mem = crate::modules::Mem { mapper: &mut *mapper, fa: &mut *frame_allocator, pages: &mut *mapped_pages };
         linker.link(&mut mem, teb_base, peb_base, ldr_base)?;
-        // Where the kernel sends this process's exceptions (nt_exception.rs).
+        // Where the kernel sends this process's exceptions (nt_exception.rs),
+        // and where its threads after the first start (nt_process.rs).
         let dispatcher = linker.module_export(&mut mem, "ntdll.dll", "KiUserExceptionDispatcher").unwrap_or(0);
         process.exception_dispatcher.store(dispatcher, core::sync::atomic::Ordering::Release);
+        let thread_start = linker.module_export(&mut mem, "ntdll.dll", "RtlUserThreadStart").unwrap_or(0);
+        process.thread_entry.store(thread_start, core::sync::atomic::Ordering::Release);
     }
+    // Its first thread (its stack and TEB belong to the process).
+    process.threads.lock().push(Arc::new(crate::nt_process::ThreadObj::new(
+        pid,
+        main_tid,
+        crate::nt_process::Start { rip: crate::modules::INIT_ENTRY, rsp: launch_rsp, teb: teb_base, rcx: 0, rdx: 0 },
+        options.suspended,
+        Vec::new(),
+    )));
     // VirtualAlloc must never hand out what the loader mapped.
     {
         let mut vad = process.vad.lock();
@@ -585,7 +686,10 @@ fn load_and_spawn_pe_inner(
 
     // 8. Spawn the Process Execution Task onto the Async Executor.
     crate::serial_println!("[LOADER] Spawning Execution Fiber for Pid={}...", pid);
-    crate::vnr::spawn_fiber(process_execution_task(process.clone(), teb_base));
+    if !options.suspended {
+        process.live_threads.store(1, core::sync::atomic::Ordering::Release);
+        crate::vnr::spawn_fiber(process_execution_task(process.clone(), teb_base));
+    }
 
     crate::serial_println!("[LOADER] Successfully prepared Windows executable at {:#X}", mapped_image_base + exe_entry_rva);
     Ok(process)
@@ -601,54 +705,13 @@ async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
     // takes over display duties from gui_refresh_task.
     crate::interrupts::USER_PROCESS_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
 
-    if crate::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) > 1 {
-        // The AP runs it and calls on_process_exit() itself when it returns.
-        // The pid travels with the work item so the AP can find the right
-        // process — previously the SMP path did NO cleanup at all.
-        crate::smp::AP_WORK_QUEUE.lock().push(crate::smp::ApWorkItem {
-            teb_base,
-            pid: process.pid,
-        });
-        crate::smp::wake_aps();
-        return;
+    // Its first thread, on the least-loaded CPU (nt_process.rs), so the
+    // executor (GUI, input, network) keeps running.
+    let _ = teb_base;
+    let main = process.threads.lock().first().cloned();
+    if let Some(main) = main {
+        crate::nt_process::start_thread(process, main);
     }
-
-    // Single CPU: run the process on its own kernel thread. This task returns
-    // at once, so the executor (GUI, input, network) keeps running; the timer
-    // switches between the two (see kthread). It used to call
-    // launch_into_usermode right here, which froze the executor until the
-    // process exited and left the timer ISR painting the desktop.
-    spawn_user_thread(process, teb_base);
-}
-
-/// Run `process` on a new kernel thread on this CPU, in its own address
-/// space; the thread tears the process down when it stops. Used by the BSP
-/// (single CPU) and by each AP's worker loop (`smp::park_and_wait_for_work`).
-pub fn spawn_user_thread(process: Arc<Process>, teb_base: u64) {
-    let cpu = crate::smp::cpu_index();
-    let pid = process.pid;
-    let cr3 = process.cr3;
-    crate::smp::USER_THREADS[cpu].fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    crate::kthread::spawn_user("user-process", cr3, pid, move || {
-        unsafe { crate::loader::launch_into_usermode(process.entry_point, process.stack_top, teb_base); }
-
-        // ── Post-exit ────────────────────────────────────────────────────
-        //
-        // return_from_usermode() longjmps here from either:
-        //   • ExitProcess syscall handler  (SYSCALL clears IF via SFMASK)
-        //   • Page fault / GPF handler     (exception entry clears IF)
-        //
-        // In BOTH cases the CPU's interrupt flag is still 0 because we
-        // bypassed the normal iretq that would restore RFLAGS.
-        unsafe { core::arch::asm!("sti"); }
-
-        on_process_exit(&process);
-
-        let cpu = crate::smp::cpu_index();
-        crate::smp::USER_THREADS[cpu].fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-        crate::serial_println!("[SCHED] Process {} completed execution on CPU {}.", process.pid, cpu);
-    });
-    crate::serial_println!("[SCHED] Pid={} runs on a kernel thread (CPU {})", pid, cpu);
 }
 
 /// Everything that must happen once a user process stops running, regardless
@@ -699,8 +762,9 @@ pub fn on_process_exit(process: &Arc<Process>) {
         tm.remove_threads_for_pid(process.pid);
     }
 
-    // 4. Tell its console window, then close its NT handles and VADs.
-    if let Some(console) = &process.console {
+    // 4. Tell its console window (if it owns it: a child shares its
+    //    parent's), then close its NT handles and VADs.
+    if let Some(console) = process.console.as_ref().filter(|c| c.pid() == process.pid) {
         console.finish(*process.exit_code.lock());
     }
     if let Some(mut h) = process.handles.try_lock() { h.close_all(); }
@@ -982,8 +1046,21 @@ pub mod lock_guard {
     }
 }
 
+/// Address space for a TEB (and, for a process, its environment pages):
+/// `pages` pages plus a guard page. The pool only moves forward.
+pub fn alloc_teb_range(pages: u64) -> u64 {
+    static TEB_POOL_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x7FF_0000_0000);
+    TEB_POOL_BASE.fetch_add((pages + 1) * 0x1000, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Transition from ring 0 to ring 3.
 pub unsafe fn launch_into_usermode(entry: u64, stack_top: u64, teb_base: u64) {
+    unsafe { launch_into_usermode_with(entry, stack_top, teb_base, 0, 0) }
+}
+
+/// Enter ring 3 at `entry` with RSP `stack_top`, GS_BASE `teb_base`, and
+/// RCX/RDX holding the first two arguments.
+pub unsafe fn launch_into_usermode_with(entry: u64, stack_top: u64, teb_base: u64, arg0: u64, arg1: u64) {
     unsafe {
     let sel = crate::gdt::get_selectors();
     let ucs = sel.user_code_selector.0 as u64;
@@ -1030,7 +1107,10 @@ pub unsafe fn launch_into_usermode(entry: u64, stack_top: u64, teb_base: u64) {
         "mov rdx, r14",
         "shr rdx, 32",
         "wrmsr",
-        
+        // The entry point's first two arguments.
+        "mov rcx, r12",
+        "mov rdx, r13",
+
         "push r8",
         "push r10",
         "push 0x202",
@@ -1044,6 +1124,8 @@ pub unsafe fn launch_into_usermode(entry: u64, stack_top: u64, teb_base: u64) {
         in("r10") stack_top,
         in("r11") entry,
         in("r14") teb_base,
+        in("r12") arg0,
+        in("r13") arg1,
         out("rax") _,
         out("rcx") _,
         out("rdx") _,

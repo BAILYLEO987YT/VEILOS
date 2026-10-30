@@ -73,6 +73,17 @@ pub struct Process {
     /// ntdll's KiUserExceptionDispatcher, where CPU exceptions in user mode
     /// are delivered (0: none, the process just ends).
     pub exception_dispatcher: core::sync::atomic::AtomicU64,
+    /// ntdll's RtlUserThreadStart, where threads after the first begin.
+    pub thread_entry: core::sync::atomic::AtomicU64,
+    /// Its Windows threads (nt_process.rs); the first is the main thread.
+    pub threads: Mutex<alloc::vec::Vec<alloc::sync::Arc<crate::nt_process::ThreadObj>>>,
+    /// Threads started and not yet stopped. The last one out ends the process.
+    pub live_threads: core::sync::atomic::AtomicUsize,
+    /// Exiting: every thread stops at its next chance.
+    pub dying: core::sync::atomic::AtomicBool,
+    /// Torn down: its handles are signalled.
+    pub ended: core::sync::atomic::AtomicBool,
+    pub parent_pid: core::sync::atomic::AtomicU32,
 
     // -----| Lifecycle |-----
     pub exit_code: Mutex<Option<i32>>,
@@ -110,6 +121,12 @@ impl Process {
             console:     None,
             linker:      Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
+            thread_entry: core::sync::atomic::AtomicU64::new(0),
+            threads: Mutex::new(alloc::vec::Vec::new()),
+            live_threads: core::sync::atomic::AtomicUsize::new(0),
+            dying: core::sync::atomic::AtomicBool::new(false),
+            ended: core::sync::atomic::AtomicBool::new(false),
+            parent_pid: core::sync::atomic::AtomicU32::new(0),
             exit_code:   Mutex::new(None),
         }
     }
@@ -181,6 +198,12 @@ impl ProcessManager {
             console: None,
             linker: Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
+            thread_entry: core::sync::atomic::AtomicU64::new(0),
+            threads: Mutex::new(alloc::vec::Vec::new()),
+            live_threads: core::sync::atomic::AtomicUsize::new(0),
+            dying: core::sync::atomic::AtomicBool::new(false),
+            ended: core::sync::atomic::AtomicBool::new(false),
+            parent_pid: core::sync::atomic::AtomicU32::new(0),
             exit_code: Mutex::new(None),
         });
         self.processes.push(kernel_process);

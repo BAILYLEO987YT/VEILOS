@@ -52,7 +52,53 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::NT_CREATE_EVENT => create_event(&proc, a0, a1, a3, stack(4).unwrap_or(0)),
         sys::NT_SET_EVENT => set_event(&proc, a0, a1, true),
         sys::NT_RESET_EVENT => set_event(&proc, a0, a1, false),
-        sys::NT_WAIT_FOR_SINGLE_OBJECT => wait_single(&proc, a0, a2),
+        sys::NT_WAIT_FOR_SINGLE_OBJECT => crate::nt_process::wait_single(&proc, a0, a2),
+        sys::NT_WAIT_FOR_MULTIPLE_OBJECTS => crate::nt_process::wait_multiple(&proc, a0, a1, a2),
+        sys::NT_TERMINATE_THREAD => crate::nt_process::terminate_thread(&proc, a0, a1),
+        sys::NT_QUERY_INFORMATION_PROCESS => crate::nt_process::query_process(&proc, a0, a1, a2, a3),
+        sys::NT_QUERY_INFORMATION_THREAD => crate::nt_process::query_thread(&proc, a0, a1, a2, a3),
+        sys::NT_RESUME_THREAD => crate::nt_process::resume_thread(&proc, a0, a1),
+        sys::NT_DUPLICATE_OBJECT => crate::nt_process::duplicate(&proc, a0, a1, a2, a3),
+        sys::VEIL_CREATE_THREAD => crate::nt_process::create_thread(&proc, a0, a1, a2, a3),
+        sys::VEIL_CREATE_PROCESS => crate::nt_process::create_process(&proc, a0, a1),
+        sys::VEIL_CREATE_PIPE => crate::nt_process::create_pipe(&proc, a0, a1, a2),
+        sys::NT_QUERY_VOLUME_INFORMATION_FILE => crate::nt_process::query_volume(&proc, a0, a1, a2, a3),
+        sys::NT_SET_INFORMATION_OBJECT => {
+            // ObjectHandleFlagInformation { Inherit: u8, ProtectFromClose: u8 }
+            if a1 as u32 != 4 || (a3 as u32) < 2 || !ptr_ok(a2, 2) {
+                status::INVALID_PARAMETER
+            } else {
+                let inherit = unsafe { *(a2 as *const u8) } != 0;
+                match u32::try_from(a0) {
+                    Ok(h) if proc.handles.lock().set_inheritable(h, inherit) => status::SUCCESS,
+                    _ => status::INVALID_HANDLE,
+                }
+            }
+        }
+        sys::NT_QUERY_OBJECT => {
+            if a1 as u32 != 4 || (a3 as u32) < 2 || !ptr_ok(a2, 2) {
+                status::INVALID_PARAMETER
+            } else {
+                match u32::try_from(a0).ok().and_then(|h| proc.handles.lock().inheritable(h)) {
+                    Some(inherit) => {
+                        unsafe {
+                            *(a2 as *mut u8) = inherit as u8;
+                            *((a2 + 1) as *mut u8) = 0;
+                        }
+                        status::SUCCESS
+                    }
+                    None => status::INVALID_HANDLE,
+                }
+            }
+        }
+        sys::VEIL_DEBUG_PRINT => {
+            let n = (a1 as usize).min(1024);
+            if ptr_ok(a0, n) {
+                let text = unsafe { core::slice::from_raw_parts(a0 as *const u8, n) };
+                crate::serial_println!("[DEBUG {}] {}", proc.pid, alloc::string::String::from_utf8_lossy(text).trim_end());
+            }
+            status::SUCCESS
+        }
         sys::NT_YIELD_EXECUTION => {
             if crate::kthread::others_ready() {
                 crate::kthread::yield_now();
@@ -76,15 +122,23 @@ fn st(e: u64) -> NtStatus {
     e as u32 as NtStatus
 }
 
-/// NtTerminateProcess(ProcessHandle, ExitStatus). Only the current process
-/// for now (other processes need process handles: W6).
+/// NtTerminateProcess(ProcessHandle, ExitStatus): this process (all its
+/// threads stop) or another one it has a handle to.
 fn terminate_process(proc: &Arc<Process>, handle: u64, exit_status: NtStatus) -> NtStatus {
     if handle != CURRENT_PROCESS {
-        return status::INVALID_HANDLE;
+        return match object(proc, handle) {
+            Some(KernelObjectRef::Process(p)) if p.pid != proc.pid => {
+                crate::serial_println!("[NT] pid {} ends pid {} with code {}", proc.pid, p.pid, exit_status);
+                crate::nt_process::kill_process(&p, exit_status);
+                status::SUCCESS
+            }
+            Some(KernelObjectRef::Process(_)) => terminate_process(proc, CURRENT_PROCESS, exit_status),
+            Some(_) => status::OBJECT_TYPE_MISMATCH,
+            None => status::INVALID_HANDLE,
+        };
     }
     crate::serial_println!("[NT] pid {} exits with code {}", proc.pid, exit_status);
-    proc.terminate(exit_status);
-    crate::interrupts::USER_PROCESS_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+    crate::nt_process::kill_process(proc, exit_status);
     unsafe { crate::loader::return_from_usermode() }
 }
 
@@ -118,6 +172,11 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
     match object(proc, handle) {
         Some(KernelObjectRef::File(f)) if writing => crate::nt_file::write(&f, iosb, buffer, length, offset),
         Some(KernelObjectRef::File(f)) => crate::nt_file::read(&f, iosb, buffer, length, offset),
+        Some(KernelObjectRef::Pipe(end)) => {
+            let (s, n) = crate::nt_process::pipe_io(&end, buffer, length, writing);
+            unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: s as u32 as u64, information: n as u64 } };
+            s
+        }
         Some(KernelObjectRef::Console(console)) if writing => {
             let mut data = Vec::with_capacity(length);
             data.extend_from_slice(unsafe { core::slice::from_raw_parts(buffer as *const u8, length) });
@@ -153,7 +212,7 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
 
 /// A timeout argument (LARGE_INTEGER*, 100 ns units: negative = relative,
 /// positive = absolute system time) as a TICKS deadline; None = forever.
-fn deadline(timeout: u64) -> Option<u64> {
+pub fn deadline(timeout: u64) -> Option<u64> {
     if timeout == 0 || !ptr_ok(timeout, 8) {
         return None;
     }
@@ -181,7 +240,7 @@ fn delay_execution(interval: u64) -> NtStatus {
 
 /// Inside a syscall (interrupts off, no locks held): let other threads run,
 /// or sleep until the next interrupt if there are none.
-fn wait_a_little() {
+pub fn wait_a_little() {
     if crate::kthread::others_ready() {
         crate::kthread::yield_now();
     } else {
@@ -317,28 +376,6 @@ fn set_event(proc: &Process, h: u64, prev: u64, set: bool) -> NtStatus {
         unsafe { *(prev as *mut i32) = was as i32 };
     }
     status::SUCCESS
-}
-
-/// NtWaitForSingleObject(Handle, Alertable, Timeout*). Events wait; other
-/// objects (files, consoles) are always signalled. Process and thread
-/// handles come with W6.
-fn wait_single(proc: &Process, h: u64, timeout: u64) -> NtStatus {
-    let ev = match object(proc, h) {
-        Some(KernelObjectRef::Event(ev)) => ev,
-        Some(_) => return status::SUCCESS,
-        None => return status::INVALID_HANDLE,
-    };
-    let until = deadline(timeout);
-    loop {
-        if ev.test_and_consume() {
-            return status::SUCCESS;
-        }
-        if until.is_some_and(|u| crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed) >= u) {
-            return status::TIMEOUT;
-        }
-        crate::loader::kill_if_requested();
-        wait_a_little();
-    }
 }
 
 // -----| run-time loading |-----

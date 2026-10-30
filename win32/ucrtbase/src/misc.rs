@@ -2,7 +2,7 @@
 //! file status, locale, setjmp/longjmp, operator new/delete.
 
 use crate::convert::{to_narrow, to_wide};
-use crate::errno::{EACCES, ENOENT, ERANGE};
+use crate::errno::{EACCES, ERANGE};
 use crate::string::{len, slice};
 use crate::{errno_from_win32, heap, invalid_parameter, set_errno};
 
@@ -130,20 +130,17 @@ pub unsafe extern "C" fn _lsearch(key: *const u8, base: *mut u8, n: *mut u32, si
 
 // -----| rand |-----
 
-static mut SEED: u32 = 1;
-
 /// Microsoft's generator, so seeded sequences match Windows.
 #[no_mangle]
 pub extern "C" fn rand() -> i32 {
-    unsafe {
-        SEED = SEED.wrapping_mul(214_013).wrapping_add(2_531_011);
-        ((SEED >> 16) & 0x7FFF) as i32
-    }
+    let t = crate::threads::this();
+    t.rand = t.rand.wrapping_mul(214_013).wrapping_add(2_531_011);
+    ((t.rand >> 16) & 0x7FFF) as i32
 }
 
 #[no_mangle]
 pub extern "C" fn srand(seed: u32) {
-    unsafe { SEED = seed };
+    crate::threads::this().rand = seed;
 }
 
 /// rand_s: "cryptographic" randomness from a mix of the clock and a
@@ -160,21 +157,6 @@ pub unsafe extern "C" fn rand_s(out: *mut u32) -> i32 {
 }
 
 // -----| processes |-----
-
-/// No command processor yet (cmd.exe is W7).
-#[no_mangle]
-pub unsafe extern "C" fn system(cmd: *const u8) -> i32 {
-    if cmd.is_null() {
-        return 0;
-    }
-    set_errno(ENOENT);
-    -1
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn _wsystem(cmd: *const u16) -> i32 {
-    unsafe { system(cmd as *const u8) }
-}
 
 #[no_mangle]
 pub extern "C" fn _getpid() -> i32 {

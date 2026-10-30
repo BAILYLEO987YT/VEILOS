@@ -66,6 +66,14 @@ fn bad_fd() -> i32 {
     -1
 }
 
+/// Descriptors 0-2 are the process's standard handles too (as msvcrt
+/// keeps them): a child started with inherited handles gets the same ones.
+fn set_std(fd: usize, handle: u64) {
+    if fd < 3 {
+        unsafe { crate::SetStdHandle(0xFFFF_FFF6 - fd as u32, handle) };
+    }
+}
+
 fn new_fd(handle: u64, mode: i32, append: bool) -> i32 {
     let Some(i) = fds().iter().position(|f| !f.open) else {
         set_errno(EMFILE);
@@ -81,6 +89,7 @@ fn new_fd(handle: u64, mode: i32, append: bool) -> i32 {
         eof: false,
         peek: None,
     };
+    set_std(i, handle);
     i as i32
 }
 
@@ -288,8 +297,9 @@ pub unsafe extern "C" fn _close(fd: i32) -> i32 {
     let Some(f) = fd_entry(fd) else { return bad_fd() };
     let h = f.handle;
     *f = CLOSED;
+    set_std(fd as usize, 0);
     // Descriptors made by _dup share the handle: close it with the last.
-    if fd > 2 && !fds().iter().any(|o| o.open && o.handle == h) {
+    if !fds().iter().any(|o| o.open && o.handle == h) {
         unsafe { CloseHandle(h) };
     }
     0
@@ -321,6 +331,7 @@ pub unsafe extern "C" fn _dup2(fd: i32, target: i32) -> i32 {
         unsafe { _close(target) };
     }
     fds()[target as usize] = Fd { peek: None, ..copy };
+    set_std(target as usize, copy.handle);
     0
 }
 
@@ -442,13 +453,6 @@ pub extern "C" fn _commit(fd: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn _locking(_fd: i32, _mode: i32, _n: i32) -> i32 {
     0
-}
-
-/// Pipes come with child processes (W6).
-#[no_mangle]
-pub extern "C" fn _pipe(_fds: *mut i32, _size: u32, _mode: i32) -> i32 {
-    set_errno(crate::errno::EMFILE);
-    -1
 }
 
 // -----| _fmode, _commode |-----
@@ -581,18 +585,59 @@ fn stream(i: usize) -> *mut File {
     unsafe { (&raw mut _iob as *mut File).add(i) }
 }
 
+/// A stream, with the stdio lock held (threads.rs).
 struct S {
     f: &'static mut File,
     s: &'static mut State,
+    _lock: crate::threads::Locked,
 }
 
 fn get(f: *mut File) -> Option<S> {
+    let lock = crate::threads::Locked::new();
     let i = index(f)?;
-    Some(S { f: unsafe { &mut *stream(i) }, s: unsafe { &mut (*(&raw mut STATE))[i] } })
+    Some(S { f: unsafe { &mut *stream(i) }, s: unsafe { &mut (*(&raw mut STATE))[i] }, _lock: lock })
+}
+
+/// Descriptors a parent C runtime passed in STARTUPINFO.lpReserved2:
+/// a count, a flags byte each, then a handle each.
+fn inherit_descriptors() {
+    let mut si = [0u8; 104];
+    unsafe { crate::GetStartupInfoW(si.as_mut_ptr()) };
+    let size = u16::from_le_bytes([si[66], si[67]]) as usize;
+    let data = u64::from_le_bytes(si[72..80].try_into().unwrap());
+    if size < 4 || data == 0 {
+        return;
+    }
+    let count = (unsafe { core::ptr::read_unaligned(data as *const i32) }.max(0) as usize).min(MAX_FDS).min((size - 4) / 9);
+    for i in 0..count {
+        let flags = unsafe { *((data + 4 + i as u64) as *const u8) };
+        let h = unsafe { core::ptr::read_unaligned((data + 4 + count as u64 + 8 * i as u64) as *const u64) };
+        // FOPEN, and not a pipe or device we'd mistake: take it.
+        if flags & 0x01 == 0 || h == 0 || h == INVALID {
+            continue;
+        }
+        fds()[i] = Fd {
+            handle: h,
+            open: true,
+            mode: if flags & 0x80 != 0 { O_TEXT } else { O_BINARY },
+            append: flags & 0x20 != 0,
+            device: unsafe { GetFileType(h) } == 2,
+            eof: false,
+            peek: None,
+        };
+    }
 }
 
 pub fn init() {
+    inherit_descriptors();
     for (i, which) in [(0, 0xFFFF_FFF6u32), (1, 0xFFFF_FFF5), (2, 0xFFFF_FFF4)] {
+        if fds()[i].open {
+            unsafe {
+                STATE[i] = State { in_use: true, unbuffered: i == 2, text: fds()[i].mode != O_BINARY, ..FREE };
+                _iob[i] = File { file: i as i32, flag: if i == 0 { IOREAD } else { IOWRT }, ..NO_FILE };
+            }
+            continue;
+        }
         let h = unsafe { GetStdHandle(which) };
         fds()[i] = Fd {
             handle: h,
@@ -1502,10 +1547,14 @@ pub unsafe extern "C" fn _fileno(f: *mut File) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn _lock_file(_f: *mut File) {}
+pub extern "C" fn _lock_file(_f: *mut File) {
+    crate::threads::lock();
+}
 
 #[no_mangle]
-pub extern "C" fn _unlock_file(_f: *mut File) {}
+pub extern "C" fn _unlock_file(_f: *mut File) {
+    crate::threads::unlock();
+}
 
 #[no_mangle]
 pub extern "C" fn _getmaxstdio() -> i32 {

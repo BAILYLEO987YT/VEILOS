@@ -207,14 +207,26 @@ fn set_info(h: Handle, class: u32, value: u64) -> NtStatus {
 
 #[no_mangle]
 pub extern "system" fn GetFileType(h: Handle) -> u32 {
-    match standard_info(h) {
-        Ok(_) => FILE_TYPE_DISK,
-        Err(status::OBJECT_TYPE_MISMATCH) => FILE_TYPE_CHAR,
-        Err(s) => {
+    // FileFsDeviceInformation: the device type.
+    let mut info = [0u32; 2];
+    let mut iosb = IoStatusBlock::default();
+    match unsafe { NtQueryVolumeInformationFile(h, &mut iosb, info.as_mut_ptr() as *mut u8, 8, 4) } {
+        status::SUCCESS => match info[0] {
+            0x07 | 0x08 => FILE_TYPE_DISK,
+            0x11 => 3, // FILE_TYPE_PIPE
+            0x50 | 0x14 => FILE_TYPE_CHAR,
+            _ => FILE_TYPE_UNKNOWN,
+        },
+        s => {
             fail(s);
             FILE_TYPE_UNKNOWN
         }
     }
+}
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn NtQueryVolumeInformationFile(h: Handle, iosb: *mut IoStatusBlock, info: *mut u8, length: u32, class: u32) -> NtStatus;
 }
 
 #[no_mangle]

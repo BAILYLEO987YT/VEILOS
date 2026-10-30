@@ -114,8 +114,15 @@ impl Heap {
     }
 
     fn lock(&self) -> Guard {
+        let mut spins = 0u32;
         while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
+            // Another thread holds it: let it run (it may share this CPU).
+            spins += 1;
+            if spins > 64 {
+                unsafe { crate::NtYieldExecution() };
+            } else {
+                core::hint::spin_loop();
+            }
         }
         Guard(&self.lock)
     }

@@ -1,0 +1,29 @@
+== critical section ==
+counter 150000, interlocked 150000, thread a returned 100, b 50
+== TLS ==
+thread 0: 50
+thread 1: 10061
+thread 2: 20072
+thread 3: 30083
+main: slot 1, tvar 5, errno 0
+== events ==
+0 100 1 101 2 102 3 103 4 104 | ponger returned 7
+== exit codes ==
+ExitThread: 77
+fault caught in the thread: C0000005
+== suspended ==
+suspended: wait 258 (timeout 258), id matches 1
+exit code while suspended: 259
+ResumeThread: 1
+after resume: 3003
+== _beginthread ==
+_beginthreadex: 42
+_beginthread ran: 9
+== strtok per thread ==
+abcd xyz
+== many ==
+sum 107996
+== wait any ==
+first done: 1
+main returns with a thread still running
+exit 3

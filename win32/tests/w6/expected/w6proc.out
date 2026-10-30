@@ -1,0 +1,36 @@
+== exit codes ==
+while running: 259 (STILL_ACTIVE 1)
+wait: 0
+exit code: 42
+exit 0: 0
+== arguments ==
+child: argc=5 [one] [two words] [three]
+== environment ==
+child: W6VAR=from parent ONLY=(none)
+child: W6VAR=replaced ONLY=custom block
+== pipe from the child ==
+read 65 bytes (then error 109):
+line 1 of 5
+line 2 of 5
+line 3 of 5
+line 4 of 5
+line 5 of 5
+child exit: 0
+== pipe to the child ==
+FIRST LINE
+SECOND LINE
+THIRD
+child: 3 lines
+child exit: 3
+== crash ==
+crashed child exit: C0000005
+== terminate ==
+wait 200ms: 258 (timeout 258)
+TerminateProcess: 1
+terminated exit: 99
+== wait for several ==
+wait all: 0, codes 5 6
+== missing program ==
+CreateProcess: 0, error 2
+done
+exit 0

@@ -35,6 +35,9 @@ pub mod status {
     pub const NOT_A_DIRECTORY: NtStatus = 0xC000_0103u32 as i32;
     pub const DLL_NOT_FOUND: NtStatus = 0xC000_0135u32 as i32;
     pub const PROCEDURE_NOT_FOUND: NtStatus = 0xC000_007Au32 as i32;
+    pub const PENDING: NtStatus = 0x0000_0103;
+    pub const PIPE_BROKEN: NtStatus = 0xC000_014Bu32 as i32;
+    pub const INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007Bu32 as i32;
 
     /// True for success and informational codes.
     pub const fn is_success(s: NtStatus) -> bool {
@@ -76,12 +79,92 @@ pub mod sys {
     /// and falling back to the kernel's built-ins
     /// (module_base, name: *const u8 or an ordinal below 0x10000, address_out: *mut u64).
     pub const VEIL_GET_PROC_ADDRESS: u32 = BASE + 22;
+    pub const NT_TERMINATE_THREAD: u32 = BASE + 23;
+    /// NtWaitForMultipleObjects(count, handles*, wait_type (0 all, 1 any),
+    /// alertable, timeout*).
+    pub const NT_WAIT_FOR_MULTIPLE_OBJECTS: u32 = BASE + 24;
+    /// NtQueryInformationProcess(handle, class (0: basic), info*, length, return_length*).
+    pub const NT_QUERY_INFORMATION_PROCESS: u32 = BASE + 25;
+    /// NtQueryInformationThread(handle, class (0: basic), info*, length, return_length*).
+    pub const NT_QUERY_INFORMATION_THREAD: u32 = BASE + 26;
+    /// NtResumeThread(handle, previous_count*).
+    pub const NT_RESUME_THREAD: u32 = BASE + 27;
+    /// NtDuplicateObject(source_process, source_handle, target_process,
+    /// target_handle*, access, attributes, options).
+    pub const NT_DUPLICATE_OBJECT: u32 = BASE + 28;
+    /// VEILOS-specific: start a thread in this process at ntdll's
+    /// RtlUserThreadStart(start, parameter)
+    /// (start, parameter, flags (CREATE_SUSPENDED), result: *mut ThreadResult).
+    pub const VEIL_CREATE_THREAD: u32 = BASE + 29;
+    /// VEILOS-specific: start a program (params: *const ProcessParams,
+    /// result: *mut ProcessResult).
+    pub const VEIL_CREATE_PROCESS: u32 = BASE + 30;
+    /// VEILOS-specific: an anonymous pipe (read_out*, write_out*, buffer_size).
+    pub const VEIL_CREATE_PIPE: u32 = BASE + 31;
+    /// NtQueryVolumeInformationFile(handle, iosb*, info*, length, class
+    /// (4: FileFsDeviceInformation)).
+    pub const NT_QUERY_VOLUME_INFORMATION_FILE: u32 = BASE + 32;
+    /// VEILOS-specific: OutputDebugString's text to the kernel log (text: *const u8, length).
+    pub const VEIL_DEBUG_PRINT: u32 = BASE + 33;
+    /// NtSetInformationObject(handle, class (4: ObjectHandleFlagInformation), info*, length).
+    pub const NT_SET_INFORMATION_OBJECT: u32 = BASE + 34;
+    /// NtQueryObject(handle, class (4: ObjectHandleFlagInformation), info*, length, return_length*).
+    pub const NT_QUERY_OBJECT: u32 = BASE + 35;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 23;
+    pub const END: u32 = BASE + 36;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
 pub const CURRENT_PROCESS: u64 = u64::MAX;
+/// The pseudo-handle for "this thread" (NtCurrentThread()).
+pub const CURRENT_THREAD: u64 = u64::MAX - 1;
+
+/// VEIL_CREATE_THREAD's result.
+#[repr(C)]
+#[derive(Default)]
+pub struct ThreadResult {
+    pub handle: u64,
+    pub tid: u64,
+}
+
+/// VEIL_CREATE_PROCESS's parameters. Strings are NUL-terminated UTF-16
+/// (0: none).
+#[repr(C)]
+pub struct ProcessParams {
+    /// The program, as a DOS path ("C:\dir\x.exe").
+    pub image: u64,
+    /// The whole command line the program will see.
+    pub command_line: u64,
+    /// Its current directory (0: the caller's).
+    pub current_directory: u64,
+    /// Its environment block (0: a copy of the caller's).
+    pub environment: u64,
+    /// CreateProcess's creation flags (CREATE_SUSPENDED, CREATE_NEW_CONSOLE,
+    /// DETACHED_PROCESS).
+    pub flags: u64,
+    /// If `use_std_handles`, the caller's handles to give the program as its
+    /// standard input, output and error (0: none).
+    pub std_handles: [u64; 3],
+    pub use_std_handles: u64,
+    /// bInheritHandles: the program gets a copy of the caller's handles,
+    /// with the same values.
+    pub inherit_handles: u64,
+    /// STARTUPINFO's dwFlags, and its lpReserved2/cbReserved2 (the C
+    /// runtime's inherited file descriptors), kept for GetStartupInfo.
+    pub startup_flags: u64,
+    pub runtime_data: u64,
+    pub runtime_size: u64,
+}
+
+/// VEIL_CREATE_PROCESS's result.
+#[repr(C)]
+#[derive(Default)]
+pub struct ProcessResult {
+    pub process: u64,
+    pub thread: u64,
+    pub pid: u64,
+    pub tid: u64,
+}
 
 /// IO_STATUS_BLOCK: the outcome of an I/O call.
 #[repr(C)]
@@ -190,6 +273,9 @@ pub mod layout {
     pub const PARAMS_COMMAND_LINE: usize = 0x70;
     /// Pointer to the environment block: "NAME=value\0" UTF-16 strings, then "\0".
     pub const PARAMS_ENVIRONMENT: usize = 0x80;
+    pub const PARAMS_WINDOW_FLAGS: usize = 0xA4;
+    /// UNICODE_STRING-shaped: STARTUPINFO's cbReserved2/lpReserved2.
+    pub const PARAMS_RUNTIME_DATA: usize = 0xE0;
     pub const PARAMS_ENVIRONMENT_SIZE: usize = 0x3F0;
     pub const PARAMS_SIZE: usize = 0x440;
     /// PEB_LDR_DATA: the module list in load order.

@@ -296,6 +296,9 @@ pub enum KernelObjectRef {
     Section(Arc<SectionObject>),
     Console(Arc<crate::console::Console>),
     File(Arc<crate::nt_file::FileObject>),
+    Process(Arc<crate::process::Process>),
+    Thread(Arc<crate::nt_process::ThreadObj>),
+    Pipe(Arc<crate::nt_process::PipeEnd>),
 }
 
 impl KernelObjectRef {
@@ -307,10 +310,18 @@ impl KernelObjectRef {
             Self::Section(_)   => ObjectType::Section,
             Self::Console(_)   => ObjectType::Console,
             Self::File(_)      => ObjectType::File,
+            Self::Process(_)   => ObjectType::Process,
+            Self::Thread(_)    => ObjectType::Thread,
+            Self::Pipe(_)      => ObjectType::File,
         }
     }
 }
 
+/// In `HandleEntry::attributes`: SetHandleInformation cleared
+/// HANDLE_FLAG_INHERIT (handles are inheritable unless told otherwise).
+pub const HANDLE_NO_INHERIT: u32 = 0x8000_0000;
+
+#[derive(Clone)]
 pub struct HandleEntry {
     pub object:      KernelObjectRef,
     pub access_mask: u32,
@@ -354,6 +365,36 @@ impl HandleTable {
     }
     pub fn allocate_section(&mut self, obj: Arc<SectionObject>, access_mask: u32) -> Handle {
         self.allocate_ref(KernelObjectRef::Section(obj), access_mask, 0)
+    }
+
+    /// A copy of every inheritable handle, at the same values.
+    pub fn duplicate_all(&self) -> Self {
+        let entries = self
+            .entries
+            .iter()
+            .map(|e| e.as_ref().filter(|e| e.attributes & HANDLE_NO_INHERIT == 0).cloned())
+            .collect();
+        Self { entries }
+    }
+
+    /// Whether children get a copy of `handle` (HANDLE_FLAG_INHERIT).
+    pub fn inheritable(&self, handle: Handle) -> Option<bool> {
+        let e = self.entries.get(handle as usize)?.as_ref()?;
+        Some(e.attributes & HANDLE_NO_INHERIT == 0)
+    }
+
+    pub fn set_inheritable(&mut self, handle: Handle, inherit: bool) -> bool {
+        match self.entries.get_mut(handle as usize).and_then(|e| e.as_mut()) {
+            Some(e) => {
+                if inherit {
+                    e.attributes &= !HANDLE_NO_INHERIT;
+                } else {
+                    e.attributes |= HANDLE_NO_INHERIT;
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Get the raw enum ref for any handle.
