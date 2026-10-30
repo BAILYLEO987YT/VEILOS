@@ -78,6 +78,16 @@ impl Console {
     /// Add `text` to `term`'s lines: a newline ends the current line, and at
     /// the start of a line it is an empty line of its own.
     fn append(&self, term: &mut TerminalEmulator, text: &str) {
+        // A form feed clears the terminal (kernel32's FillConsoleOutputCharacter
+        // sends one for `cls`).
+        let text = match text.rfind('\x0c') {
+            Some(i) => {
+                term.history.clear();
+                *self.line_open.lock() = false;
+                &text[i + 1..]
+            }
+            None => text,
+        };
         let mut open = self.line_open.lock();
         for (i, part) in text.split('\n').enumerate() {
             if i > 0 {

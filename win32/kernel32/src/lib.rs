@@ -18,9 +18,12 @@
 mod env;
 mod exception;
 mod file;
+mod locale;
 mod mem;
 mod module;
 mod process;
+mod resource;
+mod system;
 mod sync;
 mod time;
 mod util;

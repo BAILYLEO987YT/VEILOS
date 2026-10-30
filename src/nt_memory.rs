@@ -253,8 +253,9 @@ impl VadSpace {
         if size == 0 { return Err(STATUS_INVALID_PARAMETER); }
         let size = align_up(size, 0x1000);
 
-        // ---- MEM_RESERVE ----
-        if alloc_type & MEM_RESERVE != 0 {
+        // ---- MEM_RESERVE (or MEM_COMMIT with no address: Windows reserves
+        // and commits wherever there's room) ----
+        if alloc_type & MEM_RESERVE != 0 || (alloc_type & MEM_COMMIT != 0 && addr_hint == 0) {
             let base = self.find_free_region(addr_hint, size)
                 .ok_or(STATUS_NO_MEMORY)?;
 

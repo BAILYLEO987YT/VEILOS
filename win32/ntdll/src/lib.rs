@@ -10,6 +10,7 @@
 
 mod exception;
 mod heap;
+mod rtl;
 mod thread;
 
 use core::arch::naked_asm;
@@ -61,9 +62,19 @@ syscall_stubs! {
     VeilCreateThread, ZwVeilCreateThread => sys::VEIL_CREATE_THREAD;
     VeilCreateProcess, ZwVeilCreateProcess => sys::VEIL_CREATE_PROCESS;
     VeilCreatePipe, ZwVeilCreatePipe => sys::VEIL_CREATE_PIPE;
-    VeilDebugPrint, ZwVeilDebugPrint => sys::VEIL_DEBUG_PRINT;
     NtSetInformationObject, ZwSetInformationObject => sys::NT_SET_INFORMATION_OBJECT;
     NtQueryObject, ZwQueryObject => sys::NT_QUERY_OBJECT;
+}
+
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn VeilDebugPrint(_text: *const u8, _len: usize) -> NtStatus {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::VEIL_DEBUG_PRINT)
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn ZwVeilDebugPrint(_text: *const u8, _len: usize) -> NtStatus {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::VEIL_DEBUG_PRINT)
 }
 
 #[unsafe(naked)]

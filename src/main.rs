@@ -577,6 +577,14 @@ async fn gui_refresh_task() {
                                 }
                                 crate::desktop::dispatch_key(ch);
                             }
+                            // pc-keyboard 0.7 decodes the US backslash key
+                            // (scancode 0x2B) as Oem7, which its Us104 layout
+                            // doesn't map: it is '\' (or '|' with Shift).
+                            DecodedKey::RawKey(pc_keyboard::KeyCode::Oem7) => {
+                                crate::users::SESSION.lock().touch();
+                                let shift = SHIFT_HELD.load(core::sync::atomic::Ordering::Relaxed);
+                                crate::desktop::dispatch_key(if shift { '|' } else { '\\' });
+                            }
                             DecodedKey::RawKey(key) => {
                                 crate::users::SESSION.lock().touch();
                                 crate::desktop::dispatch_raw_key(key);

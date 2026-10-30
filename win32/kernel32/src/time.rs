@@ -59,14 +59,14 @@ pub unsafe extern "system" fn GetSystemTimePreciseAsFileTime(ft: *mut u64) {
 /// SYSTEMTIME: year, month, day of week, day, hour, minute, second, ms.
 #[repr(C)]
 pub struct SystemTime {
-    year: u16,
-    month: u16,
-    day_of_week: u16,
-    day: u16,
-    hour: u16,
-    minute: u16,
-    second: u16,
-    milliseconds: u16,
+    pub(crate) year: u16,
+    pub(crate) month: u16,
+    pub(crate) day_of_week: u16,
+    pub(crate) day: u16,
+    pub(crate) hour: u16,
+    pub(crate) minute: u16,
+    pub(crate) second: u16,
+    pub(crate) milliseconds: u16,
 }
 
 /// Days since 1601-01-01 → (year, month, day): civil_from_days (Howard
