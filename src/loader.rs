@@ -757,6 +757,8 @@ pub fn on_process_exit(process: &Arc<Process>) {
         crate::serial_println!("[EXIT] WIN32_USER busy — window teardown deferred");
     }
 
+    crate::nt_user::process_exited(process.pid);
+
     // 3. Drop the process's worker threads.
     if let Some(mut tm) = crate::process::THREAD_MANAGER.try_lock() {
         tm.remove_threads_for_pid(process.pid);

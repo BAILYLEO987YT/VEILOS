@@ -129,6 +129,7 @@ fn thread_stopped(process: &Arc<Process>, thread: &Arc<ThreadObj>) {
         let mut c = thread.exit_code.lock();
         *c.get_or_insert_with(|| process.exit_code.lock().map_or(0, |c| c as u32))
     };
+    crate::nt_user::thread_exited(thread.tid);
     let last = process.live_threads.fetch_sub(1, Ordering::AcqRel) == 1;
     if last {
         if process.is_alive() {

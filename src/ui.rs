@@ -664,6 +664,32 @@ fn draw_char_atomic_raw(bb: &mut alloc::vec::Vec<u32>, c: char, x: usize, y: usi
     }
 }
 
+/// Copy `cw` x `ch` pixels (0x00RRGGBB, `w` per row) to the back buffer at
+/// (x, y), within the clip: a Windows program's window content (nt_user).
+pub fn draw_pixels_atomic(pixels: &[u32], w: u32, h: u32, x: i32, y: i32, cw: u32, ch: u32) {
+    let (w, cw, ch) = (w as usize, cw.min(w) as i32, ch.min(h) as i32);
+    if pixels.len() < w * h as usize { return; }
+    let x0 = x.max(CLIP_X.load(AtomicOrd::Relaxed).max(0));
+    let y0 = y.max(CLIP_Y.load(AtomicOrd::Relaxed).max(0));
+    let x1 = (x + cw).min(CLIP_X2.load(AtomicOrd::Relaxed)).min(screen_w() as i32);
+    let y1 = (y + ch).min(CLIP_Y2.load(AtomicOrd::Relaxed)).min(screen_h() as i32);
+    if x0 >= x1 || y0 >= y1 { return; }
+    let (sx, n) = ((x0 - x) as usize, (x1 - x0) as usize);
+    let direct = PAINTER_ACTIVE.load(AtomicOrd::Acquire);
+    let bb_ptr = if direct { painter_ptr_flushed() } else { core::ptr::null_mut() };
+    let mut bb_lock = if !direct { Some(BACK_BUFFER.lock()) } else { None };
+    let mut fallback = bb_lock.as_mut().and_then(|g| (**g).as_mut());
+    for py in y0..y1 {
+        let src = &pixels[(py - y) as usize * w + sx..][..n];
+        let at = py as usize * screen_w() + x0 as usize;
+        if !bb_ptr.is_null() {
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), bb_ptr.add(at), n) };
+        } else if let Some(ref mut bb) = fallback {
+            bb[at..at + n].copy_from_slice(src);
+        }
+    }
+}
+
 pub fn draw_bmp_atomic(raw: &[u8], x: i32, y: i32, target_w: Option<i32>, target_h: Option<i32>) {
     if raw.len() < 54 { return; }
     if raw[0] != b'B' || raw[1] != b'M' { return; }

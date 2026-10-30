@@ -66,6 +66,7 @@ pub mod kusd;
 pub mod nt_file;
 pub mod nt_exception;
 pub mod nt_process;
+pub mod nt_user;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;

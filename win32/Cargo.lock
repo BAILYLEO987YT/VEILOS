@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "gdi32"
+version = "0.1.0"
+
+[[package]]
 name = "kernel32"
 version = "0.1.0"
 dependencies = [
@@ -31,4 +35,11 @@ name = "ucrtbase"
 version = "0.1.0"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "user32"
+version = "0.1.0"
+dependencies = [
+ "nt_abi",
 ]

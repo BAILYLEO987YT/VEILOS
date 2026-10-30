@@ -9,7 +9,7 @@ LLVM="/c/Program Files/LLVM/bin"
 OUT=target/x86_64-pc-windows-msvc/release
 cargo build --release
 mkdir -p ../storage/system
-for dll in ntdll kernel32 ucrtbase; do
+for dll in ntdll kernel32 ucrtbase gdi32 user32; do
     cp "$OUT/$dll.dll" "../storage/system/$dll.dll"
 done
 

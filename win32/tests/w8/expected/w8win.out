@@ -1,0 +1,79 @@
+register 1
+register again 0 error 1410
+rect pixels 000000 000000 008000 ffffff
+line pixels 000000 000000 ffffff
+set pixel 030201, outside ffffffff
+blt 000000 ffffff
+blackness 000000
+bitmap 64x32 32 bpp 1 planes
+empty text extent 0x0
+text metrics consistent 1
+old bitmap is a bitmap 1
+stock delete 1
+main WM_GETMINMAXINFO
+main WM_NCCREATE
+main WM_NCCALCSIZE
+main WM_CREATE
+  create params 77, 400x300
+client 0,0-384,261
+window 400x300
+adjust -8,-31-108,108
+visible 0, IsWindow 1, class extra 16
+long 1234 5678 style 0x4cf0000
+main WM_GETTEXT
+main WM_GETTEXTLENGTH
+title "G1 test" length 7
+ShowWindow
+main WM_SHOWWINDOW 1 0
+main WM_WINDOWPOSCHANGING 0x0 flags 0x43
+main WM_WINDOWPOSCHANGING 0x0 flags 0x3
+main WM_ERASEBKGND
+main WM_WINDOWPOSCHANGED 400x300 flags 0x43
+main WM_SIZE 0 384,261
+main WM_MOVE
+UpdateWindow
+main WM_PAINT
+  paint rect 0,0-384,261 erase 0
+child
+child WM_NCCREATE
+child WM_NCCALCSIZE
+child WM_CREATE
+child WM_SIZE 0 100,40
+child WM_MOVE 10,200
+main WM_PARENTNOTIFY 1 id 7
+child WM_SHOWWINDOW 1 0
+child WM_WINDOWPOSCHANGING 0,0 0x0 flags 0x57
+main WM_ERASEBKGND
+child WM_WINDOWPOSCHANGED 10,200 100x40 flags 0x57
+parent 1 id 7
+child at 10,200-110,240
+SetWindowText
+main WM_SETTEXT "G1 test, renamed"
+SetWindowPos
+main WM_WINDOWPOSCHANGING 500x350 flags 0x16
+main WM_GETMINMAXINFO
+main WM_NCCALCSIZE
+main WM_ERASEBKGND
+main WM_WINDOWPOSCHANGED 500x350 flags 0x16
+main WM_SIZE 0 484,311
+client now 484x311
+loop
+main WM_PAINT
+  paint rect 0,0-484,311 erase 0
+child WM_PAINT
+child WM_ERASEBKGND
+main WM_TIMER 1 0
+main WM_TIMER 1 0
+main WM_TIMER 1 0
+main WM_USER+1 11 12
+main WM_USER+2 21 22
+  send returned 42
+main WM_CLOSE
+main WM_WINDOWPOSCHANGING 0x0 flags 0x97
+main WM_WINDOWPOSCHANGED 500x350 flags 0x97
+main WM_DESTROY
+child WM_DESTROY
+child WM_NCDESTROY
+main WM_NCDESTROY
+GetMessage 0, quit code 3, IsWindow 0
+exit 3

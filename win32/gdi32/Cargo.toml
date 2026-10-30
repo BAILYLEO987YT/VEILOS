@@ -1,0 +1,8 @@
+[package]
+name = "gdi32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS gdi32.dll: device contexts and drawing into 32bpp pixels"
+
+[lib]
+crate-type = ["cdylib"]

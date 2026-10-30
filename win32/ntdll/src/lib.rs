@@ -64,6 +64,17 @@ syscall_stubs! {
     VeilCreatePipe, ZwVeilCreatePipe => sys::VEIL_CREATE_PIPE;
     NtSetInformationObject, ZwSetInformationObject => sys::NT_SET_INFORMATION_OBJECT;
     NtQueryObject, ZwQueryObject => sys::NT_QUERY_OBJECT;
+    VeilUserCreateWindow, ZwVeilUserCreateWindow => sys::VEIL_USER_CREATE_WINDOW;
+    VeilUserDestroyWindow, ZwVeilUserDestroyWindow => sys::VEIL_USER_DESTROY_WINDOW;
+    VeilUserShowWindow, ZwVeilUserShowWindow => sys::VEIL_USER_SHOW_WINDOW;
+    VeilUserSetText, ZwVeilUserSetText => sys::VEIL_USER_SET_TEXT;
+    VeilUserSetPos, ZwVeilUserSetPos => sys::VEIL_USER_SET_POS;
+    VeilUserGetPos, ZwVeilUserGetPos => sys::VEIL_USER_GET_POS;
+    VeilUserPresent, ZwVeilUserPresent => sys::VEIL_USER_PRESENT;
+    VeilUserPost, ZwVeilUserPost => sys::VEIL_USER_POST;
+    VeilUserGetMessage, ZwVeilUserGetMessage => sys::VEIL_USER_GET_MESSAGE;
+    VeilUserTimer, ZwVeilUserTimer => sys::VEIL_USER_TIMER;
+    VeilUserQuery, ZwVeilUserQuery => sys::VEIL_USER_QUERY;
 }
 
 #[unsafe(naked)]

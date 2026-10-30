@@ -168,6 +168,7 @@ impl DesktopWindow {
         r.fill_rect(Rect::new(self.rect.x + 1, content_y, self.rect.w - 2, content_h), p.background);
 
         // Paint widget tree
+        crate::nt_user::set_content_rect(self.id, self.rect.x + 1, content_y, self.rect.w - 2, content_h);
         if let Some(ref root) = self.root { root.paint(r); }
     }
 
@@ -403,6 +404,11 @@ impl DesktopWindowManager {
     }
 
     pub fn close(&mut self, id: u32) {
+        // A Windows program's window (nt_user): WM_CLOSE, and the program
+        // decides; DestroyWindow removes it.
+        if crate::nt_user::deliver(id, crate::nt_user::WM_CLOSE, 0, 0) {
+            return;
+        }
         if let Some(win) = self.windows.iter().find(|w| w.id == id) {
             let pid = win.owner_pid;
 
@@ -2333,6 +2339,11 @@ pub fn dispatch_pending_click(click: PendingClick) {
         PendingClick::RightClick { window_id, x, y } => (window_id, x, y, true),
     };
 
+    let button = if is_right { crate::nt_user::WM_RBUTTONDOWN } else { crate::nt_user::WM_LBUTTONDOWN };
+    if crate::nt_user::deliver(window_id, button, 0, (y as u16 as u64) << 16 | x as u16 as u64) {
+        return;
+    }
+
     if is_right {
         // Build the basic context menu with Copy, Cut, Paste and channel selection for now.
         let mut cm = CONTEXT_MENU.lock();
@@ -2697,6 +2708,14 @@ pub fn dispatch_raw_key(key: pc_keyboard::KeyCode) {
     match DesktopPhase::from_u8(DESKTOP_PHASE.load(Ordering::Acquire)) {
         DesktopPhase::Desktop => {
             let mut wm = DESKTOP_WM.lock();
+            if let Some(id) = wm.focused_id {
+                let vk = crate::nt_user::vk_for_key(key);
+                if vk != 0 && crate::nt_user::owns(id) {
+                    drop(wm);
+                    crate::nt_user::deliver_key(id, vk);
+                    return;
+                }
+            }
             let _ = wm.handle_arrow_navigation(key);
         }
         _ => {}
@@ -2725,6 +2744,9 @@ pub fn dispatch_key(ch: char) {
                 }
                 if let Some(idx) = crate::apps::launcher_slot_for_window(id) {
                     crate::apps::APP_LAUNCHER_POOL[idx].lock().handle_key(ch);
+                    return;
+                }
+                if crate::nt_user::deliver(id, crate::nt_user::WM_CHAR, ch as u64, 0) {
                     return;
                 }
                 // Check whether this is a live Win32 window before dispatching.

@@ -1,0 +1,11 @@
+[package]
+name = "user32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS user32.dll: windows, messages and painting"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nt_abi = { path = "../nt_abi" }

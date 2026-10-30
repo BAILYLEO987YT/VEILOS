@@ -105,6 +105,17 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
             status::SUCCESS
         }
+        sys::VEIL_USER_CREATE_WINDOW => crate::nt_user::create_window(proc.pid as u32, a0, a1),
+        sys::VEIL_USER_DESTROY_WINDOW => crate::nt_user::destroy_window(a0),
+        sys::VEIL_USER_SHOW_WINDOW => crate::nt_user::show_window(a0, a1),
+        sys::VEIL_USER_SET_TEXT => crate::nt_user::set_text(a0, a1),
+        sys::VEIL_USER_SET_POS => crate::nt_user::set_pos(a0, a1, a2),
+        sys::VEIL_USER_GET_POS => crate::nt_user::get_pos(a0, a1),
+        sys::VEIL_USER_PRESENT => crate::nt_user::present(a0, a1, a2, a3),
+        sys::VEIL_USER_POST => crate::nt_user::post(a0, a1, a2, a3),
+        sys::VEIL_USER_GET_MESSAGE => crate::nt_user::get_message(a0, a1, a2, a3),
+        sys::VEIL_USER_TIMER => crate::nt_user::timer(a0, a1, a2),
+        sys::VEIL_USER_QUERY => crate::nt_user::query(a0, a1),
         sys::VEIL_LOAD_DLL => load_dll(&proc, a0, a1, a2, a3),
         sys::VEIL_GET_PROC_ADDRESS => get_proc_address(&proc, a0, a1, a2),
         _ => status::NOT_IMPLEMENTED,

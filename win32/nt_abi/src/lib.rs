@@ -110,8 +110,32 @@ pub mod sys {
     pub const NT_SET_INFORMATION_OBJECT: u32 = BASE + 34;
     /// NtQueryObject(handle, class (4: ObjectHandleFlagInformation), info*, length, return_length*).
     pub const NT_QUERY_OBJECT: u32 = BASE + 35;
+    // -----| windows (user32, G1) |-----
+    /// VEIL_USER_CREATE_WINDOW(params: *const WindowParams, hwnd_out: *mut u64).
+    pub const VEIL_USER_CREATE_WINDOW: u32 = BASE + 36;
+    /// VEIL_USER_DESTROY_WINDOW(hwnd).
+    pub const VEIL_USER_DESTROY_WINDOW: u32 = BASE + 37;
+    /// VEIL_USER_SHOW_WINDOW(hwnd, show: 0 hide, 1 show, 2 minimize, 3 maximize, 4 restore).
+    pub const VEIL_USER_SHOW_WINDOW: u32 = BASE + 38;
+    /// VEIL_USER_SET_TEXT(hwnd, title: *const u16).
+    pub const VEIL_USER_SET_TEXT: u32 = BASE + 39;
+    /// VEIL_USER_SET_POS(hwnd, place: *const WindowPlace, flags: 1 move, 2 size).
+    pub const VEIL_USER_SET_POS: u32 = BASE + 40;
+    /// VEIL_USER_GET_POS(hwnd, place_out: *mut WindowPlace): client origin (screen) and size.
+    pub const VEIL_USER_GET_POS: u32 = BASE + 41;
+    /// VEIL_USER_PRESENT(hwnd, pixels: *const u32, stride_pixels, rect: *const [i32; 4] x, y, w, h).
+    pub const VEIL_USER_PRESENT: u32 = BASE + 42;
+    /// VEIL_USER_POST(hwnd, message, wparam, lparam, thread_id (when hwnd is 0)).
+    pub const VEIL_USER_POST: u32 = BASE + 43;
+    /// VEIL_USER_GET_MESSAGE(msg_out: *mut Msg, timeout_ms (u32::MAX: forever),
+    /// flags (1 remove, 2 no timers), hwnd filter, min, max).
+    pub const VEIL_USER_GET_MESSAGE: u32 = BASE + 44;
+    /// VEIL_USER_TIMER(hwnd, id, interval_ms (0: kill)).
+    pub const VEIL_USER_TIMER: u32 = BASE + 45;
+    /// VEIL_USER_QUERY(what: 0 screen size, 1 cursor position, out: *mut [i32; 2]).
+    pub const VEIL_USER_QUERY: u32 = BASE + 46;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 36;
+    pub const END: u32 = BASE + 47;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
@@ -154,6 +178,42 @@ pub struct ProcessParams {
     pub startup_flags: u64,
     pub runtime_data: u64,
     pub runtime_size: u64,
+}
+
+/// VEIL_USER_CREATE_WINDOW's parameters: the window's title, screen
+/// position (of its frame) and client size.
+#[repr(C)]
+pub struct WindowParams {
+    pub title: u64,
+    pub x: i32,
+    pub y: i32,
+    pub client_w: u32,
+    pub client_h: u32,
+    pub visible: u32,
+}
+
+/// A window's client area: its origin on the screen and its size.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct WindowPlace {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// MSG, as Windows lays it out.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct Msg {
+    pub hwnd: u64,
+    pub message: u32,
+    pub wparam: u64,
+    pub lparam: u64,
+    pub time: u32,
+    pub pt_x: i32,
+    pub pt_y: i32,
+    pub private: u32,
 }
 
 /// VEIL_CREATE_PROCESS's result.
