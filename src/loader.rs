@@ -6,6 +6,7 @@ use crate::subsystem::WindowsSubsystem;
 use x86_64::{VirtAddr, structures::paging::{Mapper, FrameAllocator, Size4KiB, Page, PageTableFlags}};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 // -----| per-process user-mode trampoline addresses |-----
@@ -51,6 +52,16 @@ pub fn load_and_spawn_pe(
     path: &str,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<Arc<Process>, &'static str> {
+    load_and_spawn_pe_with_args(path, "", frame_allocator)
+}
+
+/// Like `load_and_spawn_pe`, with `args` after the program's name on its
+/// command line.
+pub fn load_and_spawn_pe_with_args(
+    path: &str,
+    args: &str,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<Arc<Process>, &'static str> {
     let Some(cr3) = crate::address_space::create() else {
         return Err("Out of memory for page tables");
     };
@@ -58,7 +69,7 @@ pub fn load_and_spawn_pe(
     let result = crate::address_space::with(cr3, || {
         let mut mapper = unsafe { memory::get_mapper() }; // the new process's tables
         let mut scratch: Vec<u64> = Vec::new();
-        let result = load_and_spawn_pe_inner(path, &mut mapper, frame_allocator, &mut scratch);
+        let result = load_and_spawn_pe_inner(path, args, &mut mapper, frame_allocator, &mut scratch);
         if result.is_err() && !scratch.is_empty() {
             crate::serial_println!(
                 "[LOADER] Load failed — rolling back {} mapped pages", scratch.len()
@@ -79,6 +90,7 @@ pub fn load_and_spawn_pe(
 
 fn load_and_spawn_pe_inner(
     path: &str,
+    args: &str,
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     mapped_pages: &mut Vec<u64>,
@@ -120,10 +132,12 @@ fn load_and_spawn_pe_inner(
         core::sync::atomic::AtomicU64::new(0);
     let proc_idx = PROC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     
-    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x100000); // Shift each stack by 1MB
-    let stack_size = 16 * 4096;
-    
-    for i in 0..16 {
+    // 1 MiB, Windows' default reserve (committed up front).
+    const STACK_PAGES: u64 = 256;
+    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x200000);
+    let stack_size = STACK_PAGES * 4096;
+
+    for i in 0..STACK_PAGES {
         let page = Page::containing_address(VirtAddr::new(stack_base + (i as u64 * 4096)));
         let stack_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let frame = memory::allocate_frame().ok_or("No frames for stack")?;
@@ -259,122 +273,152 @@ fn load_and_spawn_pe_inner(
     // is consumed, at 20 KiB per launch.
     static TEB_POOL_BASE: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0x7FF_0000_0000);
-    let teb_base = TEB_POOL_BASE.fetch_add(0x5000, core::sync::atomic::Ordering::Relaxed);
-
-    for page_offset in [0x0000u64, 0x1000u64, 0x2000u64, 0x3000u64, 0x4000u64] {
-        let page  = Page::containing_address(VirtAddr::new(teb_base + page_offset));
+    // Layout (ENV_PAGES pages; pool slots never reused):
+    //   +0x0000 TEB (two pages: TLS slots sit at 0x1480)
+    //   +0x2000 PEB
+    //   +0x3000 PEB_LDR_DATA
+    //   +0x4000 _initterm / _initterm_e user-mode code
+    //   +0x5000 __argc / __argv data
+    //   +0x6000 RTL_USER_PROCESS_PARAMETERS, its strings after PARAMS_SIZE
+    //   +0x7000 environment block (two pages)
+    const ENV_PAGES: u64 = 9;
+    let teb_base = TEB_POOL_BASE.fetch_add((ENV_PAGES + 1) * 0x1000, core::sync::atomic::Ordering::Relaxed);
+    for i in 0..ENV_PAGES {
+        let page  = Page::containing_address(VirtAddr::new(teb_base + i * 0x1000));
         let frame = memory::allocate_frame().ok_or("No frame for TEB/PEB")?;
         memory::map_page(
             page, frame,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE,
             mapper, frame_allocator,
         );
         mapped_pages.push(page.start_address().as_u64());
-        unsafe { core::ptr::write_bytes((teb_base + page_offset) as *mut u8, 0, 4096); }
+        unsafe { core::ptr::write_bytes((teb_base + i * 0x1000) as *mut u8, 0, 4096); }
+    }
+    // The _initterm page holds code.
+    unsafe {
+        let _ = mapper.update_flags(Page::containing_address(VirtAddr::new(teb_base + 0x4000)),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE).map(|f| f.flush());
     }
 
-    let peb_base = teb_base + 0x1000;
-    let ldr_base = teb_base + 0x2000;  // PEB_LDR_DATA
-    let params_base = ldr_base + 0x100; // RTL_USER_PROCESS_PARAMETERS (same page, offset 0x100)
-    let initterm_code_base = teb_base + 0x3000; // user-mode _initterm code
-    let argv_data_base = teb_base + 0x4000; // __argc/__argv data page
-
-    // -----| TEB fields |-----
-    unsafe {
-        let b = teb_base as *mut u64;
-        *b.add(0)  = 0xFFFF_FFFF_FFFF_FFFFu64;  // 0x00: ExceptionList end sentinel
-        *b.add(1)  = stack_top;                   // 0x08: StackBase  (high address)
-        *b.add(2)  = stack_base;                  // 0x10: StackLimit (low address)
-        *b.add(6)  = teb_base;                    // 0x30: Self (NtCurrentTeb returns this)
-        *b.add(8)  = pid as u64;                  // 0x40: ClientId.UniqueProcess
-        *b.add(9)  = 1u64;                        // 0x48: ClientId.UniqueThread
-        *b.add(12) = peb_base;                    // 0x60: ProcessEnvironmentBlock pointer
+    let peb_base = teb_base + 0x2000;
+    let ldr_base = teb_base + 0x3000;
+    let initterm_code_base = teb_base + 0x4000;
+    let argv_data_base = teb_base + 0x5000;
+    let params_base = teb_base + 0x6000;
+    let env_base = teb_base + 0x7000;
+    {
+        let mut vad = process.vad.lock();
+        vad.record_image(teb_base, (ENV_PAGES * 0x1000) as usize);
+        vad.record_image(stack_base, stack_size as usize);
     }
 
-    // -----| PEB fields |-----
-    //   0x02 (u8) : BeingDebugged = 0
-    //   0x08      : Mutant = -1 (standard)
-    //   0x10      : ImageBaseAddress
-    //   0x18      : Ldr pointer → PEB_LDR_DATA
-    //   0x20      : ProcessParameters pointer → RTL_USER_PROCESS_PARAMETERS
-    //   0x28      : SubSystemData = 0
-    //   0x30      : ProcessHeap (fake heap handle)
-    //   0x78 (u32): NtGlobalFlag = 0
-    //   0x118 (u32): OSMajorVersion = 10
-    //   0x11C (u32): OSMinorVersion = 0
-    //   0x120 (u16): OSBuildNumber = 19041
-    //   0x122 (u16): OSPlatformId = 2 (VER_PLATFORM_WIN32_NT)
+    // -----| TEB |-----
+    static NEXT_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
     unsafe {
+        use nt_abi::layout::*;
+        let b = teb_base as *mut u8;
+        let w = |o: usize, v: u64| core::ptr::write_unaligned(b.add(o) as *mut u64, v);
+        w(0x00, u64::MAX);                  // ExceptionList: end of chain
+        w(0x08, stack_top);                 // StackBase (high)
+        w(0x10, stack_base);                // StackLimit (low)
+        w(0x30, teb_base);                  // Self
+        w(TEB_PROCESS_ID, pid as u64);      // ClientId.UniqueProcess
+        w(TEB_THREAD_ID, NEXT_TID.fetch_add(1, core::sync::atomic::Ordering::Relaxed) * 4); // ClientId.UniqueThread
+        w(TEB_PEB, peb_base);
+    }
+
+    // -----| PEB |-----
+    // The process heap (PEB.ProcessHeap) is created by ntdll when it loads.
+    unsafe {
+        use nt_abi::layout::*;
         let p = peb_base as *mut u8;
-        // 0x08: Mutant = -1
-        *(p.add(0x08) as *mut u64) = 0xFFFF_FFFF_FFFF_FFFFu64;
-        // 0x10: ImageBaseAddress
-        *(p.add(0x10) as *mut u64) = mapped_image_base;
-        // 0x18: Ldr → PEB_LDR_DATA
-        *(p.add(0x18) as *mut u64) = ldr_base;
-        // 0x20: ProcessParameters
-        *(p.add(0x20) as *mut u64) = params_base;
-        // 0x30: ProcessHeap (fake heap handle — non-null so HeapAlloc checks pass)
-        *(p.add(0x30) as *mut u64) = 0x1000_0000u64;
-        // Version info
-        *(p.add(0x118) as *mut u32) = 10;      // OSMajorVersion
-        *(p.add(0x11C) as *mut u32) = 0;       // OSMinorVersion
-        *(p.add(0x120) as *mut u16) = 19041;   // OSBuildNumber
-        *(p.add(0x122) as *mut u16) = 2;       // OSPlatformId = VER_PLATFORM_WIN32_NT
+        *(p.add(0x08) as *mut u64) = u64::MAX;          // Mutant
+        *(p.add(PEB_IMAGE_BASE) as *mut u64) = mapped_image_base;
+        *(p.add(PEB_LDR) as *mut u64) = ldr_base;
+        *(p.add(PEB_PROCESS_PARAMETERS) as *mut u64) = params_base;
+        *(p.add(0x118) as *mut u32) = 10;              // OSMajorVersion
+        *(p.add(0x11C) as *mut u32) = 0;               // OSMinorVersion
+        *(p.add(0x120) as *mut u16) = 19041;           // OSBuildNumber
+        *(p.add(0x122) as *mut u16) = 2;               // OSPlatformId = VER_PLATFORM_WIN32_NT
+        *(p.add(0xB8) as *mut u32) = crate::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed); // NumberOfProcessors
     }
 
-    // -----| PEB_LDR_DATA |-----
-    //   0x00 (u32): Length = 0x30 (standard size)
-    //   0x04 (u32): Initialized = 1
-    //   0x10       : InLoadOrderModuleList (LIST_ENTRY — circular, self-linked = empty)
-    //   0x20       : InMemoryOrderModuleList (LIST_ENTRY)
-    //   0x30       : InInitializationOrderModuleList (LIST_ENTRY)
+    // -----| PEB_LDR_DATA |----- (modules.rs fills the lists)
     unsafe {
         let l = ldr_base as *mut u8;
-        *(l.add(0x00) as *mut u32) = 0x30;
+        *(l.add(0x00) as *mut u32) = 0x58;
         *(l.add(0x04) as *mut u32) = 1;
-        // Self-linked circular LIST_ENTRY means "empty list"
-        let in_load   = ldr_base + 0x10;
-        let in_mem    = ldr_base + 0x20;
-        let in_init   = ldr_base + 0x30;
-        *(l.add(0x10) as *mut u64) = in_load;   // Flink = self
-        *(l.add(0x18) as *mut u64) = in_load;   // Blink = self
-        *(l.add(0x20) as *mut u64) = in_mem;
-        *(l.add(0x28) as *mut u64) = in_mem;
-        *(l.add(0x30) as *mut u64) = in_init;
-        *(l.add(0x38) as *mut u64) = in_init;
+        for head in [0x10usize, 0x20, 0x30] {
+            *(l.add(head) as *mut u64) = ldr_base + head as u64;
+            *(l.add(head + 8) as *mut u64) = ldr_base + head as u64;
+        }
     }
 
     // -----| RTL_USER_PROCESS_PARAMETERS |-----
-    //   0x00 (u32): MaximumLength = 0x100
-    //   0x04 (u32): Length = 0x100
-    //   0x60       : ImagePathName (UNICODE_STRING — Length, MaxLength, Buffer)
-    //   0x70       : CommandLine   (UNICODE_STRING)
-    // We place the actual string data at params_base + 0xC0.
+    // DOS paths: VEILOS "/dir/x.exe" is "C:\dir\x.exe". The current
+    // directory starts as the program's folder.
+    let dos_path = alloc::format!("C:{}", path.replace('/', "\\"));
+    let exe_dir = match dos_path.rfind('\\') {
+        Some(i) => String::from(&dos_path[..=i]),
+        None => String::from("C:\\"),
+    };
+    let command_line = if args.is_empty() { alloc::format!("\"{}\"", dos_path) } else { alloc::format!("\"{}\" {}", dos_path, args) };
     unsafe {
+        use nt_abi::layout::*;
         let pp = params_base as *mut u8;
-        *(pp.add(0x00) as *mut u32) = 0x100;
-        *(pp.add(0x04) as *mut u32) = 0x100;
+        *(pp.add(0x00) as *mut u32) = PARAMS_SIZE as u32; // MaximumLength
+        *(pp.add(0x04) as *mut u32) = PARAMS_SIZE as u32; // Length
+        *(pp.add(0x08) as *mut u32) = 1;                  // Flags: PROCESS_PARAMETERS_NORMALIZED
+        let mut next = params_base + PARAMS_SIZE as u64;
+        // A UNICODE_STRING at `field` holding `text`, with room for `capacity` units.
+        let mut put = |field: usize, text: &str, capacity: usize| {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            let cap = capacity.max(units.len() + 1);
+            core::ptr::copy_nonoverlapping(units.as_ptr(), next as *mut u16, units.len());
+            *(pp.add(field) as *mut u16) = (units.len() * 2) as u16;
+            *(pp.add(field + 2) as *mut u16) = (cap * 2) as u16;
+            *(pp.add(field + 8) as *mut u64) = next;
+            next += (cap as u64 * 2 + 15) & !15;
+        };
+        put(PARAMS_CURRENT_DIRECTORY, &exe_dir, 261);
+        put(PARAMS_IMAGE_PATH_NAME, &dos_path, 0);
+        put(PARAMS_COMMAND_LINE, &command_line.chars().take(1000).collect::<String>(), 0);
 
-        // ImagePathName: L"C:\\VEILAPP.EXE\0"
-        let img_str: [u16; 15] = [
-            b'C' as u16, b':' as u16, b'\\' as u16,
-            b'V' as u16, b'E' as u16, b'I' as u16, b'L' as u16,
-            b'A' as u16, b'P' as u16, b'P' as u16,
-            b'.' as u16, b'E' as u16, b'X' as u16, b'E' as u16,
-            0,
+        // Environment: "NAME=value\0" ... "\0".
+        let cpus = crate::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+        let vars = [
+            String::from("ALLUSERSPROFILE=C:\\ProgramData"),
+            String::from("COMPUTERNAME=VEILOS"),
+            String::from("ComSpec=C:\\cmd.exe"),
+            String::from("HOMEDRIVE=C:"),
+            String::from("HOMEPATH=\\home"),
+            alloc::format!("NUMBER_OF_PROCESSORS={}", cpus),
+            String::from("OS=Windows_NT"),
+            String::from("Path=C:\\SYSTEM;C:\\"),
+            String::from("PATHEXT=.COM;.EXE;.BAT;.CMD"),
+            String::from("PROCESSOR_ARCHITECTURE=AMD64"),
+            String::from("PROMPT=$P$G"),
+            String::from("SystemDrive=C:"),
+            String::from("SystemRoot=C:\\"),
+            String::from("TEMP=C:\\tmp"),
+            String::from("TMP=C:\\tmp"),
+            String::from("USERNAME=user"),
+            String::from("USERPROFILE=C:\\home"),
+            String::from("windir=C:\\"),
         ];
-        let str_buf = params_base + 0xC0;
-        core::ptr::copy_nonoverlapping(img_str.as_ptr(), str_buf as *mut u16, img_str.len());
-        // UNICODE_STRING at 0x60: Length (bytes), MaxLength, Buffer
-        *(pp.add(0x60) as *mut u16) = (14 * 2) as u16; // Length (bytes, excl NUL)
-        *(pp.add(0x62) as *mut u16) = (15 * 2) as u16; // MaximumLength
-        *(pp.add(0x68) as *mut u64) = str_buf;          // Buffer pointer
-
-        // CommandLine: same string for simplicity
-        *(pp.add(0x70) as *mut u16) = (14 * 2) as u16;
-        *(pp.add(0x72) as *mut u16) = (15 * 2) as u16;
-        *(pp.add(0x78) as *mut u64) = str_buf;
+        let mut at = env_base as *mut u16;
+        for v in vars.iter() {
+            for u in v.encode_utf16() {
+                *at = u;
+                at = at.add(1);
+            }
+            *at = 0;
+            at = at.add(1);
+        }
+        *at = 0;
+        at = at.add(1);
+        *(pp.add(PARAMS_ENVIRONMENT) as *mut u64) = env_base;
+        *(pp.add(PARAMS_ENVIRONMENT_SIZE) as *mut u64) = at as u64 - env_base;
     }
 
     // Standard handles (StandardInput/Output/Error): a console program's all
@@ -389,64 +433,9 @@ fn load_and_spawn_pe_inner(
     }
 
     // -----| KUSER_SHARED_DATA (0x7FFE_0000) |-----
-    // This is a system-wide page. Map it once if not already done.
-    static KUSD_MAPPED: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-    if !KUSD_MAPPED.load(core::sync::atomic::Ordering::Acquire) {
-        let kusd_addr: u64 = 0x7FFE_0000;
-        let kusd_page = Page::containing_address(VirtAddr::new(kusd_addr));
-        let kusd_frame = memory::allocate_frame().ok_or("No frame for KUSER_SHARED_DATA")?;
-        memory::map_page(
-            kusd_page, kusd_frame,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
-            mapper, frame_allocator,
-        );
-        // DELIBERATELY NOT added to mapped_pages / the rollback list.
-        //
-        // KUSER_SHARED_DATA is system-wide, not per-process.  It used to be
-        // recorded as process 1's page, so reap_zombies unmapped it when that
-        // process died — while KUSD_MAPPED stayed true, so it was never
-        // remapped.  Every subsequent launch then faulted the moment the CRT
-        // touched 0x7FFE0000.
-        unsafe {
-            let k = kusd_addr as *mut u8;
-            core::ptr::write_bytes(k, 0, 4096);
-            
-            // 0x000: TickCountLowDeprecated
-            core::ptr::write_unaligned(k.add(0x000) as *mut u32, 0x0001_0000);
-            // 0x004: TickCountMultiplier = 0x0FA0_0000 (standard 15.625 ms)
-            core::ptr::write_unaligned(k.add(0x004) as *mut u32, 0x0FA0_0000);
-            
-            // 0x008: InterruptTime (KSYSTEM_TIME) - Note: offset 0x008, 0x00C, 0x010
-            core::ptr::write_unaligned(k.add(0x008) as *mut u32, 0x0001_0000);
-            core::ptr::write_unaligned(k.add(0x00C) as *mut u32, 0);
-            core::ptr::write_unaligned(k.add(0x010) as *mut u32, 0);
-
-            // 0x014: SystemTime (KSYSTEM_TIME) - Note: offset 0x014, 0x018, 0x01C
-            // This is what was causing the alignment panic (0x14 is not 8-aligned for u64).
-            core::ptr::write_unaligned(k.add(0x014) as *mut u32, 0x12345678); // low
-            core::ptr::write_unaligned(k.add(0x018) as *mut u32, 0x00000000); // high1
-            core::ptr::write_unaligned(k.add(0x01C) as *mut u32, 0x00000000); // high2
-
-            // 0x260: NtMajorVersion / NtMinorVersion
-            core::ptr::write_unaligned(k.add(0x260) as *mut u32, 10);
-            core::ptr::write_unaligned(k.add(0x264) as *mut u32, 0);
-
-            // 0x26C: NtProductType = 1 (WinNt)
-            core::ptr::write_unaligned(k.add(0x26C) as *mut u32, 1);
-
-            // 0x2D0: Cookie (security cookie seed)
-            core::ptr::write_unaligned(k.add(0x2D0) as *mut u64, 0xBAAD_F00D_CAFE_BEEFu64);
-
-            // 0x320: TickCount (KSYSTEM_TIME)
-            core::ptr::write_unaligned(k.add(0x320) as *mut u32, 0x0001_0000);
-            core::ptr::write_unaligned(k.add(0x324) as *mut u32, 0);
-            core::ptr::write_unaligned(k.add(0x328) as *mut u32, 0);
-
-        }
-        KUSD_MAPPED.store(true, core::sync::atomic::Ordering::Release);
-        crate::serial_println!("[LOADER] KUSER_SHARED_DATA mapped at {:#X}", kusd_addr);
-    }
+    // One shared frame, mapped read-only into every process (kusd.rs). Not
+    // in mapped_pages: it outlives the process.
+    crate::kusd::map_into(mapper, frame_allocator)?;
 
     // -----| _initterm user-mode trampoline |-----
     // Writes a small piece of x86_64 machine code at initterm_code_base that
@@ -579,6 +568,8 @@ fn load_and_spawn_pe_inner(
         }
     }
     *process.unresolved_imports.lock() = linker.unresolved.iter().map(|n| (n.clone(), false)).collect();
+    // Kept for LoadLibrary / GetProcAddress.
+    *process.linker.lock() = Some(linker);
 
     // Everything that can fail has now succeeded — hand ownership of the page
     // list to the process so teardown (not rollback) reclaims it.
@@ -710,6 +701,8 @@ pub fn on_process_exit(process: &Arc<Process>) {
         console.finish(*process.exit_code.lock());
     }
     if let Some(mut h) = process.handles.try_lock() { h.close_all(); }
+    if let Some(mut vad) = process.vad.try_lock() { vad.release_all(); }
+    process.linker.lock().take();
 
     // 5. Re-focus the boot terminal so keyboard/mouse input is routed to a
     //    live kernel window rather than landing on the Settings window.

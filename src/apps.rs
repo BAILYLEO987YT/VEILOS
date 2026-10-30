@@ -869,10 +869,10 @@ impl TerminalEmulator {
     /// RUN: start a Windows program. A console program runs in this
     /// terminal (its output appears here, typed lines go to it); a GUI
     /// program opens its own window.
-    fn run_program(&mut self, path: &str) {
+    fn run_program(&mut self, path: &str, args: &str) {
         let name = path.rsplit('/').next().unwrap_or(path);
         let mut frame_allocator = crate::memory::GlobalFrameAllocator;
-        match crate::loader::load_and_spawn_pe(path, &mut frame_allocator) {
+        match crate::loader::load_and_spawn_pe_with_args(path, args, &mut frame_allocator) {
             Ok(process) => match &process.console {
                 // It hasn't run yet (it's queued on the executor this runs
                 // on), so nothing it writes is missed.
@@ -963,9 +963,13 @@ impl TerminalEmulator {
             '\n' | '\r' => {
                 let cmd = self.input_buf.trim().to_uppercase();
                 self.history.push(alloc::format!("> {}", self.input_buf));
-                match cmd.strip_prefix("RUN ") {
-                    Some(arg) => self.run_program(&arg.trim().to_ascii_lowercase()),
-                    None => crate::task::terminal::execute_command_pub(&cmd, &mut self.history),
+                if cmd.starts_with("RUN ") {
+                    // As typed: arguments keep their case.
+                    let rest = String::from(self.input_buf.trim()[4..].trim());
+                    let (path, args) = rest.split_once(' ').unwrap_or((rest.as_str(), ""));
+                    self.run_program(&path.to_ascii_lowercase(), args.trim());
+                } else {
+                    crate::task::terminal::execute_command_pub(&cmd, &mut self.history);
                 }
                 self.input_buf.clear();
             }

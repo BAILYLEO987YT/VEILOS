@@ -940,6 +940,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     };
 
     crate::scheduler::scheduler_tick(tick);
+    crate::kusd::tick(tick);
     crate::debugger::profiler_tick(tick);
 
     // Wake any SleepFutures whose deadline has been reached.

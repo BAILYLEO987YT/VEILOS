@@ -3,12 +3,15 @@
 //! The `Nt*`/`Zw*` exports are system call stubs written exactly like
 //! Windows' own (`mov r10, rcx; mov eax, ID; syscall; ret`), so arguments past
 //! the fourth are where the kernel expects them on the caller's stack. The
-//! numbers come from `nt_abi`. `Rtl*` helpers run entirely in user mode.
+//! numbers come from `nt_abi`. `Rtl*` helpers run entirely in user mode: the
+//! heap (`heap.rs`) is created as the process heap when this DLL loads.
 
 #![no_std]
 
+mod heap;
+
 use core::arch::naked_asm;
-use nt_abi::{status, sys, NtStatus};
+use nt_abi::{layout, status, sys, NtStatus};
 
 /// Export `$nt` and `$zw` as stubs for syscall `$id`.
 macro_rules! syscall_stubs {
@@ -31,6 +34,45 @@ syscall_stubs! {
     NtWriteFile, ZwWriteFile => sys::NT_WRITE_FILE;
     NtClose, ZwClose => sys::NT_CLOSE;
     NtReadFile, ZwReadFile => sys::NT_READ_FILE;
+    NtDelayExecution, ZwDelayExecution => sys::NT_DELAY_EXECUTION;
+    NtProtectVirtualMemory, ZwProtectVirtualMemory => sys::NT_PROTECT_VIRTUAL_MEMORY;
+    NtQueryVirtualMemory, ZwQueryVirtualMemory => sys::NT_QUERY_VIRTUAL_MEMORY;
+    NtCreateFile, ZwCreateFile => sys::NT_CREATE_FILE;
+    NtQueryInformationFile, ZwQueryInformationFile => sys::NT_QUERY_INFORMATION_FILE;
+    NtSetInformationFile, ZwSetInformationFile => sys::NT_SET_INFORMATION_FILE;
+    NtQueryDirectoryFile, ZwQueryDirectoryFile => sys::NT_QUERY_DIRECTORY_FILE;
+    NtQueryAttributesFile, ZwQueryAttributesFile => sys::NT_QUERY_ATTRIBUTES_FILE;
+    NtDeleteFile, ZwDeleteFile => sys::NT_DELETE_FILE;
+    NtFlushBuffersFile, ZwFlushBuffersFile => sys::NT_FLUSH_BUFFERS_FILE;
+    NtCreateEvent, ZwCreateEvent => sys::NT_CREATE_EVENT;
+    NtSetEvent, ZwSetEvent => sys::NT_SET_EVENT;
+    NtResetEvent, ZwResetEvent => sys::NT_RESET_EVENT;
+    NtWaitForSingleObject, ZwWaitForSingleObject => sys::NT_WAIT_FOR_SINGLE_OBJECT;
+    NtYieldExecution, ZwYieldExecution => sys::NT_YIELD_EXECUTION;
+    VeilLoadDll, ZwVeilLoadDll => sys::VEIL_LOAD_DLL;
+    VeilGetProcAddress, ZwVeilGetProcAddress => sys::VEIL_GET_PROC_ADDRESS;
+}
+
+// The heap calls these from Rust, so they are declared with their types.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn NtAllocateVirtualMemory(_process: u64, _base: *mut usize, _zero_bits: usize, _size: *mut usize, _kind: u32, _protect: u32) -> i32 {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_ALLOCATE_VIRTUAL_MEMORY)
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn ZwAllocateVirtualMemory(_process: u64, _base: *mut usize, _zero_bits: usize, _size: *mut usize, _kind: u32, _protect: u32) -> i32 {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_ALLOCATE_VIRTUAL_MEMORY)
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn NtFreeVirtualMemory(_process: u64, _base: *mut usize, _size: *mut usize, _kind: u32) -> i32 {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_FREE_VIRTUAL_MEMORY)
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "system" fn ZwFreeVirtualMemory(_process: u64, _base: *mut usize, _size: *mut usize, _kind: u32) -> i32 {
+    naked_asm!("mov r10, rcx", "mov eax, {id}", "syscall", "ret", id = const sys::NT_FREE_VIRTUAL_MEMORY)
 }
 
 /// The Win32 error code for an NTSTATUS (the common ones; anything else maps
@@ -38,19 +80,107 @@ syscall_stubs! {
 #[no_mangle]
 pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
     match s {
-        status::SUCCESS => 0,              // ERROR_SUCCESS
-        status::NOT_IMPLEMENTED => 1,      // ERROR_INVALID_FUNCTION
-        status::INVALID_HANDLE => 6,       // ERROR_INVALID_HANDLE
-        status::OBJECT_TYPE_MISMATCH => 6, // ERROR_INVALID_HANDLE
-        status::INVALID_PARAMETER => 87,   // ERROR_INVALID_PARAMETER
-        status::ACCESS_VIOLATION => 998,   // ERROR_NOACCESS
-        status::END_OF_FILE => 38,         // ERROR_HANDLE_EOF
-        _ => 317,                          // ERROR_MR_MID_NOT_FOUND
+        status::SUCCESS => 0,                   // ERROR_SUCCESS
+        status::TIMEOUT => 258,                 // WAIT_TIMEOUT
+        status::NO_MORE_FILES => 18,            // ERROR_NO_MORE_FILES
+        status::NOT_IMPLEMENTED => 1,           // ERROR_INVALID_FUNCTION
+        status::INVALID_INFO_CLASS => 87,       // ERROR_INVALID_PARAMETER
+        status::INVALID_HANDLE => 6,            // ERROR_INVALID_HANDLE
+        status::OBJECT_TYPE_MISMATCH => 6,      // ERROR_INVALID_HANDLE
+        status::INVALID_PARAMETER => 87,        // ERROR_INVALID_PARAMETER
+        status::ACCESS_VIOLATION => 998,        // ERROR_NOACCESS
+        status::END_OF_FILE => 38,              // ERROR_HANDLE_EOF
+        status::NO_MEMORY => 8,                 // ERROR_NOT_ENOUGH_MEMORY
+        status::ACCESS_DENIED => 5,             // ERROR_ACCESS_DENIED
+        status::BUFFER_TOO_SMALL => 122,        // ERROR_INSUFFICIENT_BUFFER
+        status::OBJECT_NAME_INVALID => 123,     // ERROR_INVALID_NAME
+        status::OBJECT_NAME_NOT_FOUND => 2,     // ERROR_FILE_NOT_FOUND
+        status::OBJECT_NAME_COLLISION => 183,   // ERROR_ALREADY_EXISTS
+        status::OBJECT_PATH_NOT_FOUND => 3,     // ERROR_PATH_NOT_FOUND
+        status::FILE_IS_A_DIRECTORY => 5,       // ERROR_ACCESS_DENIED
+        status::DIRECTORY_NOT_EMPTY => 145,     // ERROR_DIR_NOT_EMPTY
+        status::NOT_A_DIRECTORY => 267,         // ERROR_DIRECTORY
+        status::DLL_NOT_FOUND => 126,           // ERROR_MOD_NOT_FOUND
+        status::PROCEDURE_NOT_FOUND => 127,     // ERROR_PROC_NOT_FOUND
+        _ => 317,                               // ERROR_MR_MID_NOT_FOUND
     }
 }
 
+// -----| heap |-----
+
+use heap::Heap;
+
 #[no_mangle]
-pub extern "system" fn DllMain(_module: usize, _reason: u32, _reserved: usize) -> i32 {
+pub unsafe extern "system" fn RtlCreateHeap(_flags: u32, _base: usize, _reserve: usize, _commit: usize, _lock: usize, _params: usize) -> *mut Heap {
+    unsafe { Heap::create() }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn RtlDestroyHeap(heap: *mut Heap) -> *mut Heap {
+    if !heap.is_null() {
+        unsafe { Heap::destroy(heap) };
+    }
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn RtlAllocateHeap(heap: *mut Heap, flags: u32, size: usize) -> *mut u8 {
+    if heap.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { (*heap).alloc(size, flags) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn RtlFreeHeap(heap: *mut Heap, _flags: u32, p: *mut u8) -> u8 {
+    if p.is_null() {
+        return 1;
+    }
+    if heap.is_null() {
+        return 0;
+    }
+    unsafe { (*heap).free(p) as u8 }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn RtlReAllocateHeap(heap: *mut Heap, flags: u32, p: *mut u8, size: usize) -> *mut u8 {
+    if heap.is_null() {
+        return core::ptr::null_mut();
+    }
+    if p.is_null() {
+        return unsafe { (*heap).alloc(size, flags) };
+    }
+    unsafe { (*heap).realloc(p, size, flags) }
+}
+
+/// The size the block at `p` was allocated with, or (SIZE_T)-1.
+#[no_mangle]
+pub unsafe extern "system" fn RtlSizeHeap(_heap: *mut Heap, _flags: u32, p: *mut u8) -> usize {
+    unsafe { Heap::size(p) }.unwrap_or(usize::MAX)
+}
+
+#[no_mangle]
+pub extern "system" fn RtlValidateHeap(_heap: *mut Heap, _flags: u32, _p: *mut u8) -> u8 {
+    1
+}
+
+/// This thread's TEB.
+fn teb() -> *mut u8 {
+    let t: *mut u8;
+    unsafe { core::arch::asm!("mov {}, gs:[0x30]", out(reg) t, options(nostack, readonly, preserves_flags)) };
+    t
+}
+
+/// Process attach (ntdll initialises before every other DLL): create the
+/// process heap.
+#[no_mangle]
+pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) -> i32 {
+    if reason == 1 {
+        unsafe {
+            let peb = *(teb().add(layout::TEB_PEB) as *const *mut u8);
+            *(peb.add(layout::PEB_PROCESS_HEAP) as *mut *mut Heap) = Heap::create();
+        }
+    }
     1
 }
 

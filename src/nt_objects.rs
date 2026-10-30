@@ -295,6 +295,7 @@ pub enum KernelObjectRef {
     Semaphore(Arc<SemaphoreObject>),
     Section(Arc<SectionObject>),
     Console(Arc<crate::console::Console>),
+    File(Arc<crate::nt_file::FileObject>),
 }
 
 impl KernelObjectRef {
@@ -305,6 +306,7 @@ impl KernelObjectRef {
             Self::Semaphore(_) => ObjectType::Semaphore,
             Self::Section(_)   => ObjectType::Section,
             Self::Console(_)   => ObjectType::Console,
+            Self::File(_)      => ObjectType::File,
         }
     }
 }

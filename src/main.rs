@@ -62,6 +62,8 @@ pub mod hotplug;
 pub mod modules;
 pub mod console;
 pub mod nt_syscalls;
+pub mod kusd;
+pub mod nt_file;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;

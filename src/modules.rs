@@ -26,6 +26,9 @@
 //   * PEB.Ldr lists the modules (load, memory and initialisation order).
 //   * Sections get their own protection (read-only / writable, NX unless
 //     executable) once linking is done.
+//   * The Linker stays with the process (Process::linker) for LoadLibrary
+//     and GetProcAddress later (`load_at_runtime`, `proc_address`). A DLL
+//     that exists only as kernel built-ins gets a pseudo module handle.
 //
 // Regions (per process, so fixed addresses don't collide between processes):
 
@@ -51,6 +54,9 @@ const THUNK_REGION: u64 = INIT_ENTRY + INIT_REGION_SIZE;
 const UNRESOLVED_REGION: u64 = 0x5_0000_0000;
 /// LDR entries, strings, TLS blocks and the TLS pointer array (read-write, NX).
 const LOADER_DATA_REGION: u64 = 0x6_0000_0000;
+/// Pseudo module handles for DLLs that exist only as kernel built-ins
+/// (never mapped: GetProcAddress recognises them).
+const BUILTIN_HANDLE_BASE: u64 = 0x4_0000_0000;
 
 /// Syscall IDs `UNRESOLVED_SYSCALL_BASE + n` mean "unresolved import n was
 /// called" (`subsystem::WindowsSubsystem`).
@@ -194,6 +200,11 @@ pub struct Linker {
     tls_count: u32,
     overrides: UserModeOverrides,
     stats: Stats,
+    /// PEB.Ldr, and the modules initialised so far, in order.
+    ldr: u64,
+    initialized: Vec<usize>,
+    /// Pseudo handles handed out for built-in-only DLLs.
+    builtin_handles: Vec<String>,
 }
 
 #[derive(Default)]
@@ -289,6 +300,9 @@ impl Linker {
             tls_count: 0,
             overrides: UserModeOverrides { initterm: 0, initterm_e: 0 },
             stats: Stats::default(),
+            ldr: 0,
+            initialized: Vec::new(),
+            builtin_handles: Vec::new(),
         }
     }
 
@@ -807,6 +821,8 @@ impl Linker {
         self.bind_imports(mem, exe)?;
         self.setup_tls(mem, teb)?;
         let order = self.init_order();
+        self.ldr = ldr;
+        self.initialized = order.clone();
         self.write_ldr(mem, ldr, &order)?;
         self.write_startup(mem, &order, peb)?;
         self.protect_images(mem);
@@ -815,6 +831,90 @@ impl Linker {
         crate::serial_println!("[MODULES] imports: {} from modules, {} built-in, {} unresolved",
             self.stats.to_modules, self.stats.to_builtin, self.stats.unresolved);
         Ok(())
+    }
+
+    /// LoadLibrary: load `name` (a file name or path; the folder is ignored,
+    /// DLLs are found as at startup) into the running process. Returns its
+    /// base and the init calls (TLS callbacks, then DllMain, dependencies
+    /// first) for the caller to run in user mode.
+    pub fn load_at_runtime<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, name: &str) -> Result<(u64, Vec<(u64, u64)>), nt_abi::NtStatus> {
+        let file = name.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(name);
+        let n = normalize(file);
+        let first = self.modules.len();
+        let p = self.provider(mem, &n).map_err(|_| nt_abi::status::NO_MEMORY)?;
+        let Some(idx) = p.real else {
+            // Only the kernel's built-ins: a pseudo handle GetProcAddress knows.
+            let reg = crate::dll::DLL_REGISTRY.lock();
+            if !p.builtin.iter().any(|b| reg.get_dll(b).is_some()) {
+                return Err(nt_abi::status::DLL_NOT_FOUND);
+            }
+            drop(reg);
+            let i = match self.builtin_handles.iter().position(|b| *b == n) {
+                Some(i) => i,
+                None => {
+                    self.builtin_handles.push(n.clone());
+                    self.builtin_handles.len() - 1
+                }
+            };
+            return Ok((BUILTIN_HANDLE_BASE + i as u64 * 0x10000, Vec::new()));
+        };
+        if idx < first {
+            return Ok((self.modules[idx].base, Vec::new())); // already loaded
+        }
+        // The newly loaded modules, dependencies first.
+        fn visit(l: &Linker, i: usize, first: usize, seen: &mut [bool], out: &mut Vec<usize>) {
+            if i < first || seen[i - first] {
+                return;
+            }
+            seen[i - first] = true;
+            for &d in &l.modules[i].deps {
+                visit(l, d, first, seen, out);
+            }
+            out.push(i);
+        }
+        let mut seen = alloc::vec![false; self.modules.len() - first];
+        let mut order = Vec::new();
+        visit(self, idx, first, &mut seen, &mut order);
+        let mut inits = Vec::new();
+        for &i in &order {
+            let m = &self.modules[i];
+            if data_dir(m.base, DIR_TLS).0 != 0 {
+                crate::serial_println!("[MODULES] {}: static TLS in a DLL loaded at run time isn't set up", m.name);
+            }
+            if m.entry != 0 {
+                inits.push((m.entry, m.base));
+            }
+        }
+        self.initialized.extend_from_slice(&order);
+        let (ldr, init_order) = (self.ldr, self.initialized.clone());
+        self.write_ldr(mem, ldr, &init_order).map_err(|_| nt_abi::status::NO_MEMORY)?;
+        self.protect_images(mem);
+        crate::serial_println!("[MODULES] LoadLibrary {}: {} module(s) loaded, {} init call(s)", n, order.len(), inits.len());
+        Ok((self.modules[idx].base, inits))
+    }
+
+    /// GetProcAddress: `sym` exported by the module at `base` (forwarders
+    /// followed), or a built-in with that name. None if neither has it.
+    pub fn proc_address<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, base: u64, sym_name: Option<&str>, ordinal: u16) -> Option<u64> {
+        let sym = match sym_name {
+            Some(n) => Sym::Name(n),
+            None => Sym::Ordinal(ordinal),
+        };
+        let name = if base >= BUILTIN_HANDLE_BASE && base < BUILTIN_HANDLE_BASE + 0x1_0000_0000 {
+            self.builtin_handles.get(((base - BUILTIN_HANDLE_BASE) / 0x10000) as usize)?.clone()
+        } else {
+            let i = self.modules.iter().position(|m| m.base == base)?;
+            if let Ok(Some(addr)) = self.export_address(mem, i, sym, 0) {
+                return Some(addr);
+            }
+            self.modules[i].name.clone()
+        };
+        let mut builtin = alloc::vec![name.clone()];
+        if let Some(h) = api_set_host(&name) {
+            builtin.push(String::from(h));
+        }
+        let p = Provider { real: None, builtin, label: name };
+        self.builtin_address(mem, &p, sym).ok().flatten()
     }
 
     /// Every region the loader mapped, for the process's VAD (so VirtualAlloc

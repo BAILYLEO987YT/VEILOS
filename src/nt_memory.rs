@@ -299,14 +299,23 @@ impl VadSpace {
     // ----- Commit (map physical frames) -----
 
     fn commit_range(&mut self, base: u64, size: usize, protect: u32) -> Result<(), u64> {
+        use x86_64::structures::paging::Translate;
         let flags = nt_protect_to_page_flags(protect);
         let mut mapper = unsafe { memory::get_mapper() };
         let num_pages = size / 0x1000;
+        let phys_offset = memory::get_phys_mem_offset().as_u64();
 
         for i in 0..num_pages {
             let vaddr = VirtAddr::new(base + (i as u64 * 0x1000));
+            // Already committed: leave its contents alone.
+            if mapper.translate_addr(vaddr).is_some() {
+                continue;
+            }
             let page  = Page::<Size4KiB>::containing_address(vaddr);
             let frame = memory::allocate_frame().ok_or(STATUS_NO_MEMORY)?;
+            // Committed memory reads as zero; cleared through the physical
+            // map, since the page itself may be read-only.
+            unsafe { core::ptr::write_bytes((phys_offset + frame.start_address().as_u64()) as *mut u8, 0, 4096) };
             memory::map_page(page, frame, flags, &mut mapper, &mut GlobalFrameAllocator);
         }
 
@@ -358,9 +367,17 @@ impl VadSpace {
         for i in 0..num_pages {
             let vaddr = VirtAddr::new(base + (i as u64 * 0x1000));
             let page  = Page::<Size4KiB>::containing_address(vaddr);
-            // Unmap — ignore errors (page might not be mapped if partially committed).
-            if let Ok((_frame, flush)) = mapper.unmap(page) {
-                flush.flush();
+            // Unmap and free; pages never committed are skipped.
+            let _ = memory::unmap_and_free_page(page, &mut mapper);
+        }
+    }
+
+    /// Process exit: free every private allocation's memory. (Image and
+    /// loader regions belong to the loader's page list.)
+    pub fn release_all(&mut self) {
+        for e in core::mem::take(&mut self.entries) {
+            if e.vad_type == VadType::Private && e.state == VadState::Committed {
+                self.decommit_range(e.base, e.size);
             }
         }
     }

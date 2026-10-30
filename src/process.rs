@@ -68,6 +68,8 @@ pub struct Process {
     pub unresolved_imports: Mutex<Vec<(alloc::string::String, bool)>>,
     /// The console of a console-subsystem program (its std handles refer to it).
     pub console: Option<alloc::sync::Arc<crate::console::Console>>,
+    /// The module loader, kept for LoadLibrary / GetProcAddress.
+    pub linker: Mutex<Option<crate::modules::Linker>>,
 
     // -----| Lifecycle |-----
     pub exit_code: Mutex<Option<i32>>,
@@ -103,6 +105,7 @@ impl Process {
             nt_env:      Mutex::new(crate::loader::NtEnv::default()),
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             console:     None,
+            linker:      Mutex::new(None),
             exit_code:   Mutex::new(None),
         }
     }
@@ -172,6 +175,7 @@ impl ProcessManager {
             nt_env: Mutex::new(crate::loader::NtEnv::default()),
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             console: None,
+            linker: Mutex::new(None),
             exit_code: Mutex::new(None),
         });
         self.processes.push(kernel_process);
