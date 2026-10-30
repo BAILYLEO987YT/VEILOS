@@ -1,0 +1,123 @@
+
+== args ==
+argc=3
+argv[1]=[one]
+argv[2]=[two words]
+
+== integers ==
+[42] [-42] [3000000000] [    7] [7    |] [-0007] [+7] [ 7]
+[ff] [FF] [0xff] [010] [10] [0]
+[-9223372036854775808] [18446744073709551615] [1234567890123] [99] [-2] [-3] [65535]
+[005] [] [     005] [00a     |] [     1] [1     |] [0009]
+[000000001234ABCD]
+
+== floats ==
+[3.141590] [2.67] [    -1.500] [2.2       |] [+2] [3.] [-000003.14]
+[1.234568e+04] [1.235E-04] [5e+10] [5.e+10] [-1.0000e-300]
+[100000] [1e+06] [0.0001] [1e-05] [1E-10] [1.50000] [3.14] [0.3333333333]
+[0x1.0000000000000p+0] [-0X1.0000000000000P-1] [0x2.00p+0] [0x0.0000000000000p+0]
+[inf] [-inf] [nan] [inf] [ -0.0]
+[0.10000000000000000555] [0.1] [0.10000000000000001]
+[100000000000000000000.000000] [0] [0.1]
+
+== strings and chars ==
+[hello] [     right] [left      |] [tru] [x] [  y] [%] [wide] [Wide] [   ab]
+[(null)]
+swprintf: 12 wide narrow W|
+
+== snprintf ==
+snprintf -> 20 [0123456789abcde]
+snprintf(NULL) -> 7
+sprintf -> 5 [010.0]
+_snprintf -> -1 [abcd]
+sprintf_s -> 4 [fits]
+_snprintf_s -> -1 [this is far too]
+
+== scanf ==
+sscanf -> 7: 42 -17 255 350 1.25 [hello,] [world]
+sscanf %i -> 3: 26 15 9
+sscanf set -> 2: [abc] 123 consumed=6
+sscanf empty -> -1
+sscanf mismatch -> 0
+sscanf %3c -> 1 [xyz]
+sscanf_s -> 2 [token] 5
+swscanf -> 2 [wide] 77
+
+== conversions ==
+strtol: -123 2147483647 511
+end=[xyz]
+overflow: 2147483647 errno=34
+strtoul: 4294967295 4294967295
+strtoull: 18446744073709551615 strtoll: -42
+strtod: 1e-05 0.5 -inf 12 12
+end=[abc] atof=2500 atoi=-88 atol=123
+_itoa: ffffff01 -255 4000000000 1111111111111111111111111111111111111111111111111111111111111111
+wcstol: -16 _wtoi: 321
+_itow: 1234
+wcstombs -> 5 bytes: 68 65 6c 6c 6f
+
+== strings ==
+Hello, World len=12 cmp=-1,1,0 icmp=0 ncmp=0
+strchr=[o, World] strrchr=[orld] strstr=[World] spn=4 cspn=2 pbrk=[llo]
+tok=[a] tok=[b] tok=[c] 
+_strupr=[MIXED] _strlwr=[mixed] _strrev=[dexim]
+_strdup=[copy] memcmp=1 memchr=[me]
+strcpy_s too long -> 80 [abc]
+wcslen=4 wcscmp=0 _wcsicmp=0 wcschr=[de] wcsstr=[stack]
+strerror(2)=[No such file or directory] strerror(22)=[Invalid argument]
+
+== ctype ==
+61:1000010 5a:1000110 35:0100010 20:0010010 09:0010001 21:0001010 7f:0000001 
+toupper=Q tolower=q towupper=00e9
+
+== math ==
+1.414214 0.841471 0.540302 2.356194 2.718282
+2.302585 3.000000 1.414214 1.500000 5.000000
+-3 -2 -3 -2 3 1024
+frexp=0.75,6 modf=-0.75,-3 isnan=1 isinf=1 signbit=1 fpclassify(1)=-1
+abs=5 labs=6 llabs=7 div=3,2
+
+== qsort, bsearch, rand ==
+0 1 2 3 3 4 5 6 7 8 9 10 11 | found 7 at 8
+7584 19164 25795 22125 5828 
+
+== time ==
+gmtime: 2000-02-29 00:00:00 wday=2 yday=59
+strftime: 2000-02-29 00:00:00 Tue Feb 060 Tuesday February
+_mkgmtime: 1738368000 -> month 1 year 125
+asctime: Tue Feb 29 00:00:00 2000
+time() > 2020: 1
+
+== files ==
+fopen w: ok
+binary size: 26 (CRLF)
+read: [line one] ftell=10
+read: [line 2] ftell=18
+read: [third] ftell=25
+read: [X] ftell=26
+feof=1
+after rewind: l [line]
+lines after append: 4
+remove: 0, again: -1 errno=2
+fopen missing: NULL errno=2
+
+== environment ==
+getenv: [value one]
+getenv case: [value one]
+after unset: NULL
+PATH set: 1
+
+== setjmp ==
+setjmp returned 0 (stage 0)
+setjmp returned 7 (stage 1)
+
+== locale ==
+setlocale: C decimal_point=[.]
+
+== stderr ==
+
+== end ==
+exit code 3 follows
+atexit 2 (runs first)
+atexit 1 (runs last)
+exit 3

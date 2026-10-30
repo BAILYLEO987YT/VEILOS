@@ -1,0 +1,11 @@
+[package]
+name = "ucrtbase"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS ucrtbase.dll: the C runtime (msvcrt.dll and vcruntime140.dll forward to it)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libm = "0.2"

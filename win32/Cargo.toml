@@ -3,7 +3,7 @@
 # installs them into storage/system.
 [workspace]
 resolver = "2"
-members = ["nt_abi", "ntdll", "kernel32"]
+members = ["nt_abi", "ntdll", "kernel32", "ucrtbase"]
 
 [profile.dev]
 panic = "abort"
