@@ -941,6 +941,48 @@ pub fn dispatch_veilos_input(vid: u32, msg: u32, w_param: u64, l_param: u64) {
 
 pub static WIN32_USER: Mutex<Win32UserState> = Mutex::new(Win32UserState::new());
 
+// -----| ending an app whose window the user closed |-----
+//
+// Clicking the close button sends WM_CLOSE. A well-behaved app destroys its
+// window, leaves its message loop and exits. Some never exit (gui_test.exe
+// spins in `jmp $` after its loop): on Windows they linger invisibly until
+// Task Manager ends them. VEILOS ends such a process itself, like an automatic
+// "End task", once it has gone CLOSE_GRACE_MS with no windows left. An app
+// that keeps its window (it asked to save, or hid itself) is left alone.
+
+const CLOSE_GRACE_MS: u64 = 3000;
+
+/// (pid, deadline) of the app the user last closed.
+static CLOSE_WATCH: Mutex<Option<(u32, u64)>> = Mutex::new(None);
+
+/// The user closed one of `pid`'s windows.
+pub fn watch_close(pid: u32) {
+    let now = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    *CLOSE_WATCH.lock() = Some((pid, now + CLOSE_GRACE_MS));
+}
+
+/// Call often (the GUI loop does): end the watched app if it outlived its
+/// windows by CLOSE_GRACE_MS.
+pub fn check_close_watch() {
+    let Some((pid, deadline)) = *CLOSE_WATCH.lock() else { return };
+    let now = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    if now < deadline {
+        return;
+    }
+    *CLOSE_WATCH.lock() = None;
+    let Some(proc) = crate::process::PROCESSOR.lock().find(pid) else { return };
+    if proc.exit_code.lock().is_some() {
+        return; // already exiting
+    }
+    let has_window = WIN32_USER.try_lock().map_or(true, |s| s.windows.iter().any(|w| w.owning_pid == pid));
+    if has_window {
+        return; // it kept a window open: its choice
+    }
+    crate::serial_println!("[WIN32] pid {} still running {} ms after its last window closed: ending it", pid, CLOSE_GRACE_MS);
+    proc.terminate(0);
+    crate::loader::request_kill();
+}
+
 // =====================================================================
 // -----| NT Syscall Dispatcher |-----
 // =====================================================================

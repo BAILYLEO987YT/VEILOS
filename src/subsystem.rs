@@ -158,10 +158,41 @@ fn tpool_alloc() -> u64 {
     }
 }
 
+/// An OutputDebugString argument: ASCII, or UTF-16 if its second byte is 0.
+/// At most 256 characters; bytes outside the caller's mapped memory end it.
+fn read_debug_string(ptr: u64) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    if !crate::memory::user_ptr_ok(ptr, 2) {
+        return s;
+    }
+    let wide = unsafe { *((ptr + 1) as *const u8) } == 0;
+    let step = if wide { 2 } else { 1 };
+    for i in 0..256u64 {
+        let addr = ptr + i * step;
+        if !crate::memory::user_ptr_ok(addr, step as usize) {
+            break;
+        }
+        let c = if wide { (unsafe { core::ptr::read_unaligned(addr as *const u16) }) as u32 } else { (unsafe { *(addr as *const u8) }) as u32 };
+        if c == 0 {
+            break;
+        }
+        s.push(char::from_u32(c).unwrap_or('?'));
+    }
+    s
+}
+
 impl Subsystem for WindowsSubsystem {
     fn get_type(&self) -> SubsystemType { SubsystemType::WindowsNT }
 
     fn handle_syscall(&self, id: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+
+        // ---- An import nothing provides (modules.rs stub): log it once, return 0 ----
+        if (crate::modules::UNRESOLVED_SYSCALL_BASE..crate::modules::UNRESOLVED_SYSCALL_BASE + 0x0100_0000).contains(&id) {
+            if let Some(name) = crate::modules::unresolved_call(id) {
+                crate::serial_println!("[WIN32] called unresolved import {} (returns 0)", name);
+            }
+            return 0;
+        }
 
         // ---- Anti-Cheat compatibility layer (Phase 14) ----
         // Intercepts AC-specific syscalls before the standard NT dispatcher.
@@ -251,7 +282,7 @@ impl Subsystem for WindowsSubsystem {
             // --- Module & Process Management ---
             0x1004 => { 
                 if let Some(proc) = crate::process::PROCESSOR.lock().get_active() {
-                    proc.entry_point & !0xFFF
+                    proc.image_base // GetModuleHandle(NULL): the EXE's base
                 } else { 0 }
             }
             0x1005 => { println!("[KERNEL32] GetProcAddress"); 0 }
@@ -1739,7 +1770,12 @@ impl Subsystem for WindowsSubsystem {
             }
             0x112C => { 0x0409 }  // GetUserDefaultUILanguage → en-US
             0x112D => { 0 }       // DebugBreak / DebugBreakProcess → no-op
-            0x112E => { 0 }       // OutputDebugStringW/A → no-op (serial already logs)
+            0x112E => {
+                // OutputDebugStringA/W (one ID): the serial log is the debugger.
+                // A wide string shows up as a zero second byte.
+                crate::serial_println!("[WIN32] OutputDebugString: {}", read_debug_string(arg0));
+                0
+            }
             0x112F => {
                 // FindFirstFileW(lpFileName, lpFindFileData) → INVALID_HANDLE_VALUE
                 // Write empty WIN32_FIND_DATAW (592 bytes) so caller doesn't read garbage

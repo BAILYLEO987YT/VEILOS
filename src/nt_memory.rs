@@ -196,6 +196,18 @@ impl VadSpace {
         !self.entries.iter().any(|e| e.overlaps(base, size))
     }
 
+    /// Record an image or loader region mapped outside the VAD (modules.rs)
+    /// so VirtualAlloc never hands it out.
+    pub fn record_image(&mut self, base: u64, size: usize) {
+        self.entries.push(VadEntry {
+            base, size: align_up(size, 0x1000), state: VadState::Committed,
+            vad_type: VadType::Image,
+            protect: PAGE_EXECUTE_READ, alloc_protect: PAGE_EXECUTE_READ,
+            section: None, section_offset: 0,
+        });
+        self.entries.sort_by_key(|e| e.base);
+    }
+
     // ----- Address selection -----
 
     /// Find a free region of at least `size` bytes.

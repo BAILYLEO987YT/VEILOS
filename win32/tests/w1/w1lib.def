@@ -1,0 +1,8 @@
+LIBRARY w1lib
+EXPORTS
+    lib_add
+    lib_via_table
+    lib_counter DATA
+    lib_saw_dep DATA
+    lib_mul = w1dep.dep_mul
+    lib_ordinal_only @5 NONAME

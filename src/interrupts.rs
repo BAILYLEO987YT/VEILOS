@@ -907,6 +907,7 @@ impl core::future::Future for SleepFuture {
 extern "x86-interrupt" fn ap_timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     crate::smp::lapic_eoi();
     if stack_frame.code_segment & 0x3 == 3 {
+        crate::loader::kill_if_requested();
         crate::kthread::preempt_from_timer();
     }
 }
@@ -980,6 +981,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     let interrupted_user_mode = (stack_frame.code_segment & 0x3) == 3;
     if interrupted_user_mode {
         LAST_USER_MODE_TICK.store(tick, Ordering::Relaxed);
+        crate::loader::kill_if_requested();
         crate::kthread::preempt_from_timer();
     }
 }

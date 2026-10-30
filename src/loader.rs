@@ -1,4 +1,3 @@
-use crate::println;
 use crate::vfs::VFS;
 use crate::executable::PeFile;
 use crate::memory;
@@ -112,106 +111,14 @@ fn load_and_spawn_pe_inner(
     };
     pe.print_info();
 
-    // 3. Map Sections into Memory
-    
-    // Safety check: if the PE has a low image_base (like 4MB), it will collide and blindly overwrite
-    // the kernel's own physical or virtual space in a single-address-space monolithic table.
-    // So we artificially shove it high up in 64-bit space to keep it containerized.
-    let mut mapped_image_base = pe.image_base;
-    if mapped_image_base < 0x8000_0000 {
-        mapped_image_base |= 0x1_0000_0000;
-        crate::serial_println!("[LOADER] Relocated Low-Memory Image Base -> {:#X}", mapped_image_base);
-    }
-    
-    crate::serial_println!("[LOADER] Mapping {} sections to Virtual RAM...", pe.sections.len());
-
-    // ── Map the PE header page ────────────────────────────────────────────────
-    // The MSVC CRT startup reads the PE header at image_base (checksum, timestamp,
-    // module name) for __security_init_cookie entropy and PEB.ImageBaseAddress
-    // verification.  VEILOS only mapped sections, leaving the header page absent.
-    // Map one read-only user-accessible page at image_base and copy the raw header.
-    {
-        use x86_64::structures::paging::PageTableFlags;
-        let header_va = VirtAddr::new(mapped_image_base);
-        let header_page = Page::containing_address(header_va);
-        if let Some(frame) = memory::allocate_frame() {
-            memory::map_page(
-                header_page, frame,
-                PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE,
-                mapper, frame_allocator,
-            );
-            // Copy the first 4 KB of the PE file (DOS header + PE header + section table)
-            let copy_size = core::cmp::min(4096, data.len());
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    header_va.as_mut_ptr::<u8>(),
-                    copy_size,
-                );
-                // Zero any remainder of the page
-                if copy_size < 4096 {
-                    core::ptr::write_bytes(
-                        header_va.as_mut_ptr::<u8>().add(copy_size),
-                        0,
-                        4096 - copy_size,
-                    );
-                }
-            }
-            mapped_pages.push(mapped_image_base);
-            crate::serial_println!("[LOADER] PE header mapped at {:#X} ({} bytes)", mapped_image_base, copy_size);
-        } else {
-            crate::serial_println!("[LOADER] WARNING: could not allocate frame for PE header page");
-        }
-    }
-
-    for section in &pe.sections {
-        let v_addr = section.virtual_address as u64;
-        let p_data = section.pointer_to_raw_data as usize;
-        let raw_size = section.size_of_raw_data as usize;
-        let virt_size = section.virtual_size as usize;
-        
-        let section_base = mapped_image_base + v_addr;
-        
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if (section.characteristics & 0x80000000) != 0 { flags |= PageTableFlags::WRITABLE; }
-        
-        // Map one page at a time
-        let num_pages = (virt_size + 4095) / 4096;
-        for i in 0..num_pages {
-            let page_addr_u64 = section_base + (i as u64 * 4096);
-            let page_addr = VirtAddr::new(page_addr_u64);
-            let page = Page::containing_address(page_addr);
-            
-            let aligned_page_start = page.start_address().as_u64();
-            if !mapped_pages.contains(&aligned_page_start) {
-                let frame = memory::allocate_frame().ok_or("No frames left for PE loading")?;
-                memory::map_page(page, frame, flags | PageTableFlags::WRITABLE, mapper, frame_allocator);
-                mapped_pages.push(aligned_page_start);
-            }
-            
-            // If we have raw data for this page, copy it!
-            let offset_in_section = (i * 4096) as usize;
-            if offset_in_section < raw_size {
-                let to_copy = core::cmp::min(4096, raw_size - offset_in_section);
-                let src = &data[p_data + offset_in_section .. p_data + offset_in_section + to_copy];
-                
-                unsafe {
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), page_addr.as_mut_ptr::<u8>(), to_copy);
-                    // Zero out the rest of the page if needed
-                    if to_copy < 4096 {
-                        core::ptr::write_bytes(page_addr.as_mut_ptr::<u8>().add(to_copy), 0, 4096 - to_copy);
-                    }
-                }
-            }
-        }
-    }
-
-    // NOTE: IAT resolution and the read-only protection sweep used to happen
-    // HERE, before the NT environment existed.  That meant `_initterm` /
-    // `_initterm_e` were linked against addresses that had not been assigned
-    // yet (0 on the first launch, a dangling pointer into the previous
-    // process's TEB pool afterwards).  Both now run after the NT environment
-    // is built — see "3c" further down.
+    // 3. Map the EXE (headers + sections, relocated). Its DLLs are loaded and
+    //    every import bound once the NT environment exists (3c below).
+    let exe_entry_rva = pe.entry_point;
+    let mut linker = crate::modules::Linker::new(path);
+    let mapped_image_base = {
+        let mut mem = crate::modules::Mem { mapper: &mut *mapper, fa: &mut *frame_allocator, pages: &mut *mapped_pages };
+        linker.load_exe(&mut mem, path, &data, pe)?
+    };
 
     // 4. Set up Stack (Small 64KB stack for now)
     // To prevent overlapping processes from hitting PageAlreadyMapped over same execution runs
@@ -279,7 +186,9 @@ fn load_and_spawn_pe_inner(
     // 5. Create Process
     let pid = PROCESSOR.lock().alloc_pid();
     let mut process_inner = Process::new(pid, "WindowsApp", Box::new(WindowsSubsystem));
-    process_inner.entry_point = mapped_image_base + pe.entry_point;
+    // The startup routine runs TLS callbacks and DllMains, then jumps to the
+    // EXE's own entry point (modules::Linker::link).
+    process_inner.entry_point = crate::modules::INIT_ENTRY;
     process_inner.stack_top   = launch_rsp;  // launch RSP, not the raw top
     
     // Set up initial register state for User Mode execution
@@ -642,34 +551,26 @@ fn load_and_spawn_pe_inner(
     crate::serial_println!("[LOADER] TEB={:#X}  PEB={:#X}  Ldr={:#X}  KUSD=0x7FFE0000", teb_base, peb_base, ldr_base);
     crate::serial_println!("[LOADER] _initterm={:#X}  _initterm_e={:#X}", initterm_code_base, initterm_code_base + 0x40);
 
-    // ── 3b. Apply base relocations ───────────────────────────────────────────
-    // Must happen before the IAT is linked (IAT slots are written afterwards
-    // and must not be relocated) and while sections are still writable.
-    apply_base_relocations(&pe, &data, mapped_image_base);
-
-    // ── 3c. Resolve Imports (IAT) ────────────────────────────────────────────
-    // Runs HERE, not before the NT environment is built, so `_initterm` and
-    // `_initterm_e` are linked against this process's own trampoline page.
-    resolve_imports(&pe, &data, mapped_image_base, &env, mapper, frame_allocator, mapped_pages)?;
-
-    // ── 3d. Finalise memory protection ───────────────────────────────────────
-    // Read-only bounds must be applied after ALL copies (including the IAT
-    // patches above) or overlapping pages fault mid-write.
-    for section in &pe.sections {
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if (section.characteristics & 0x80000000) != 0 { flags |= PageTableFlags::WRITABLE; }
-        if !flags.contains(PageTableFlags::WRITABLE) {
-            let section_base = mapped_image_base + section.virtual_address as u64;
-            let num_pages = (section.virtual_size as usize + 4095) / 4096;
-            for i in 0..num_pages {
-                let page_addr = VirtAddr::new(section_base + (i as u64 * 4096));
-                let page = Page::containing_address(page_addr);
-                unsafe {
-                    let _ = mapper.update_flags(page, flags).map(|f| f.flush());
-                }
-            }
+    // ── 3c. Load DLLs and bind every import ─────────────────────────────────
+    // Runs HERE, after the NT environment is built: `_initterm`/`_initterm_e`
+    // link against this process's own trampoline page, and TLS and PEB.Ldr
+    // need the TEB and PEB. Also protects each section (read-only, NX).
+    linker.set_user_mode_overrides(crate::modules::UserModeOverrides {
+        initterm: env.initterm,
+        initterm_e: env.initterm_e,
+    });
+    {
+        let mut mem = crate::modules::Mem { mapper: &mut *mapper, fa: &mut *frame_allocator, pages: &mut *mapped_pages };
+        linker.link(&mut mem, teb_base, peb_base, ldr_base)?;
+    }
+    // VirtualAlloc must never hand out what the loader mapped.
+    {
+        let mut vad = process.vad.lock();
+        for (base, size) in linker.regions() {
+            vad.record_image(base, size);
         }
     }
+    *process.unresolved_imports.lock() = linker.unresolved.iter().map(|n| (n.clone(), false)).collect();
 
     // Everything that can fail has now succeeded — hand ownership of the page
     // list to the process so teardown (not rollback) reclaims it.
@@ -684,7 +585,7 @@ fn load_and_spawn_pe_inner(
     crate::serial_println!("[LOADER] Spawning Execution Fiber for Pid={}...", pid);
     crate::vnr::spawn_fiber(process_execution_task(process.clone(), teb_base));
 
-    crate::serial_println!("[LOADER] Successfully prepared Windows executable at {:#X}", mapped_image_base + pe.entry_point);
+    crate::serial_println!("[LOADER] Successfully prepared Windows executable at {:#X}", mapped_image_base + exe_entry_rva);
     Ok(process)
 }
 
@@ -916,6 +817,26 @@ pub fn has_exec_context() -> bool {
 /// that unwinds nothing, every spinlock held at this instant would stay
 /// locked forever — so we force-release the tracked ones first.  See
 /// `lock_guard`.
+/// Set when the running Windows process must be ended from outside
+/// (`request_kill`). One Windows process runs at a time, so any ring-3 code
+/// a timer interrupts belongs to it.
+static KILL_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// End the running Windows process the next time a timer interrupt finds it
+/// in user mode (within a tick). Its exit code must already be set.
+pub fn request_kill() {
+    KILL_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Timer ISRs call this when they interrupted ring 3: carries out a pending
+/// `request_kill` the way ExitProcess would. Returns if nothing is pending.
+pub fn kill_if_requested() {
+    if KILL_REQUESTED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        crate::interrupts::USER_PROCESS_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        unsafe { return_from_usermode() }
+    }
+}
+
 pub unsafe fn return_from_usermode() -> ! {
     let cpu_id = current_exec_cpu();
 
@@ -1144,435 +1065,4 @@ pub unsafe fn launch_into_usermode(entry: u64, stack_top: u64, teb_base: u64) {
     // cleared the flag.  Clearing again is harmless and documents intent.
     EXEC_CTX_VALID[cpu_id].store(false, core::sync::atomic::Ordering::Release);
     }
-}
-
-/// Apply the PE base relocation table to an image that was loaded somewhere
-/// other than its preferred `image_base`.
-///
-/// Without this, every absolute address baked into the image — vtables,
-/// jump tables, string pointers, the `__security_cookie` slot — still refers
-/// to the link-time base.  The loader has *always* rebased low-image-base
-/// EXEs (`image_base |= 0x1_0000_0000`) and loads every DLL at a synthetic
-/// address, so this was silently corrupting both.
-///
-/// `actual_base` is where the image really lives; the image must already be
-/// mapped WRITABLE when this is called (the protection sweep runs later).
-fn apply_base_relocations(pe: &PeFile, data: &[u8], actual_base: u64) -> usize {
-    const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
-    const IMAGE_REL_BASED_HIGHLOW:  u16 = 3;
-    const IMAGE_REL_BASED_DIR64:    u16 = 10;
-
-    let delta = actual_base.wrapping_sub(pe.image_base);
-    if delta == 0 { return 0; }
-
-    let (reloc_rva, reloc_size) = match pe.reloc_dir {
-        Some(r) => r,
-        None => {
-            crate::serial_println!(
-                "[LOADER] WARNING: image rebased by {:#X} but has NO .reloc table — \
-                 absolute addresses will be wrong", delta
-            );
-            return 0;
-        }
-    };
-
-    let mut file_off = match PeFile::rva_to_offset(&pe.sections, reloc_rva) {
-        Some(o) => o,
-        None => return 0,
-    };
-    let end = file_off + reloc_size as usize;
-    let mut fixups = 0usize;
-
-    while file_off + 8 <= end && file_off + 8 <= data.len() {
-        let page_rva   = unsafe { core::ptr::read_unaligned(data.as_ptr().add(file_off) as *const u32) };
-        let block_size = unsafe { core::ptr::read_unaligned(data.as_ptr().add(file_off + 4) as *const u32) } as usize;
-        if block_size < 8 || file_off + block_size > data.len() { break; }
-
-        let count = (block_size - 8) / 2;
-        for i in 0..count {
-            let ent_off = file_off + 8 + i * 2;
-            if ent_off + 2 > data.len() { break; }
-            let entry = unsafe { core::ptr::read_unaligned(data.as_ptr().add(ent_off) as *const u16) };
-            let kind   = entry >> 12;
-            let offset = (entry & 0x0FFF) as u32;
-            let target = actual_base + page_rva as u64 + offset as u64;
-
-            match kind {
-                IMAGE_REL_BASED_ABSOLUTE => {}  // padding entry, skip
-                IMAGE_REL_BASED_DIR64 => unsafe {
-                    let p = target as *mut u64;
-                    let v = core::ptr::read_unaligned(p);
-                    core::ptr::write_unaligned(p, v.wrapping_add(delta));
-                    fixups += 1;
-                },
-                IMAGE_REL_BASED_HIGHLOW => unsafe {
-                    let p = target as *mut u32;
-                    let v = core::ptr::read_unaligned(p);
-                    core::ptr::write_unaligned(p, v.wrapping_add(delta as u32));
-                    fixups += 1;
-                },
-                other => {
-                    crate::serial_println!("[LOADER] Unsupported relocation type {} at {:#X}", other, target);
-                }
-            }
-        }
-        file_off += block_size;
-    }
-
-    crate::serial_println!(
-        "[LOADER] Applied {} base relocations (delta {:#X})", fixups, delta
-    );
-    fixups
-}
-
-fn resolve_imports(
-    exe_pe: &PeFile,
-    exe_data: &[u8],
-    exe_mapped_base: u64,
-    env: &NtEnv,
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    mapped_pages: &mut alloc::vec::Vec<u64>,
-) -> Result<(), &'static str> {
-
-    // Allocate one shared "null stub" page.  Any import that has no real DLL
-    // AND no fake-DLL handler is redirected here instead of being left with
-    // its original on-disk RVA (which would be jumped to as a raw address).
-    //
-    // Map WRITABLE from the start so the kernel write below succeeds.
-    // On x86_64 pages are executable by default (NX bit not set here), so
-    // PRESENT | WRITABLE | USER_ACCESSIBLE = read/write/execute.
-    // The stub bytes:  xor rax, rax  (48 31 C0)  +  ret  (C3)
-    static NULL_STUB_BASE: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0x5_0000_0000);
-    let stub_base = NULL_STUB_BASE.fetch_add(0x1000, core::sync::atomic::Ordering::Relaxed);
-
-    let stub_page  = Page::containing_address(VirtAddr::new(stub_base));
-    let stub_frame = memory::allocate_frame().ok_or("No frame for null stub")?;
-    memory::map_page(
-        stub_page, stub_frame,
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
-        mapper, frame_allocator,
-    );
-    mapped_pages.push(stub_page.start_address().as_u64());
-    // Write stub directly — using write_volatile to prevent dead-store elimination.
-    unsafe {
-        let p = stub_base as *mut u8;
-        core::ptr::write_volatile(p.add(0), 0x48);
-        core::ptr::write_volatile(p.add(1), 0x31);
-        core::ptr::write_volatile(p.add(2), 0xC0);  // xor rax, rax
-        core::ptr::write_volatile(p.add(3), 0xC3);  // ret
-        let check = core::ptr::read(p as *const [u8; 4]);
-        crate::serial_println!("[LOADER] Null stub explicitly written. Verification read: {:02X} {:02X} {:02X} {:02X} at PhysFrame {:#X}", 
-            check[0], check[1], check[2], check[3], stub_frame.start_address().as_u64());
-    }
-    // IMMEDIATELY revoke write permissions to the stub page.
-    // If the OS or user-executable is secretly zeroing out `0x500000000` later on,
-    // this will trap the culprit red-handed with a Write Page Fault at 0x500000000!
-    unsafe {
-        mapper.update_flags(stub_page, PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
-            .expect("Failed to revoke write access to stub")
-            .flush();
-    }
-    crate::serial_println!("[LOADER] Null-return stub secured at {:#X}", stub_base);
-
-    for dll_info in &exe_pe.imports {
-        println!("[LOADER] Resolving Imports for: {}", dll_info.name);
-        
-        // 1. Load the DLL binary
-        // We look in /SYSTEM/ for the DLL.
-        let dll_path = alloc::format!("/SYSTEM/{}", dll_info.name);
-        let dll_data_opt = VFS.read_file(&dll_path);
-        
-        if let Ok(dll_data) = dll_data_opt {
-            // --- REAL DLL LOADING PATH ---
-            // A malformed DLL must NOT abort the whole EXE load — fall back to
-            // the internal handler / null-stub path instead.
-            let dll_pe = match PeFile::parse(&dll_data) {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::serial_println!(
-                        "[LOADER] {} failed to parse ({}) — falling back to kernel thunks",
-                        dll_info.name, e
-                    );
-                    link_fallback(exe_pe, exe_data, exe_mapped_base, dll_info, stub_base, env,
-                                  mapper, frame_allocator, mapped_pages)?;
-                    continue;
-                }
-            };
-            
-            static DLL_LOAD_ADDR: core::sync::atomic::AtomicU64 =
-                core::sync::atomic::AtomicU64::new(0x2_0000_0000);
-            let dll_base = DLL_LOAD_ADDR.fetch_add(0x1_0000_0000, core::sync::atomic::Ordering::Relaxed);
-            
-            crate::serial_println!("[LOADER] Mapping REAL DLL {} to {:#X}", dll_info.name, dll_base);
-            
-            for section in &dll_pe.sections {
-                let num_pages = (section.virtual_size as usize + 4095) / 4096;
-                for i in 0..num_pages {
-                    let page_addr = VirtAddr::new(dll_base + section.virtual_address as u64 + (i as u64 * 4096));
-                    let page = Page::containing_address(page_addr);
-                    let frame = memory::allocate_frame().ok_or("No frames for DLL")?;
-                    memory::map_page(page, frame, PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE, mapper, frame_allocator);
-                    mapped_pages.push(page.start_address().as_u64());
-                    
-                    let offset_in_section = i * 4096;
-                    if offset_in_section < section.size_of_raw_data as usize {
-                        let to_copy = core::cmp::min(4096, section.size_of_raw_data as usize - offset_in_section);
-                        let src = &dll_data[section.pointer_to_raw_data as usize + offset_in_section .. section.pointer_to_raw_data as usize + offset_in_section + to_copy];
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(src.as_ptr(), page_addr.as_mut_ptr::<u8>(), to_copy);
-                        }
-                    }
-                }
-            }
-            
-            // Rebase the DLL now that every section is resident and writable.
-            apply_base_relocations(&dll_pe, &dll_data, dll_base);
-
-            link_iat_from_eat(exe_pe, exe_data, exe_mapped_base, &dll_info.name, &dll_pe, dll_base, stub_base)?;
-        } else {
-            link_fallback(exe_pe, exe_data, exe_mapped_base, dll_info, stub_base, env,
-                          mapper, frame_allocator, mapped_pages)?;
-        }
-    }
-    Ok(())
-}
-
-/// Link a DLL's imports when no real on-disk DLL could be loaded: try the
-/// internal fake-DLL registry first, otherwise point every slot at the
-/// null-return stub.
-fn link_fallback(
-    exe_pe: &PeFile,
-    exe_data: &[u8],
-    exe_mapped_base: u64,
-    dll_info: &crate::executable::ImportedDll,
-    stub_base: u64,
-    env: &NtEnv,
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    mapped_pages: &mut alloc::vec::Vec<u64>,
-) -> Result<(), &'static str> {
-    crate::serial_println!("[LOADER] No real DLL for {}. Attempting kernel thunking...", dll_info.name);
-
-    if let Some(fake_dll) = crate::dll::DLL_REGISTRY.lock().get_dll(&dll_info.name) {
-        crate::serial_println!("[LOADER] Found INTERNAL handler for {}. Linking thunks...", dll_info.name);
-        link_iat_from_fake(exe_pe, exe_data, exe_mapped_base, dll_info, fake_dll, stub_base, env,
-                           mapper, frame_allocator, mapped_pages)?;
-    } else {
-        crate::serial_println!("[LOADER] No handler for {} — patching IAT with null stub (returns 0)", dll_info.name);
-        // Patch every import from this DLL to the null-return stub so the
-        // exe calls a valid address instead of jumping to a raw on-disk RVA.
-        let oft_rva = if dll_info.original_first_thunk != 0 { dll_info.original_first_thunk } else { dll_info.first_thunk };
-        let ft_rva  = dll_info.first_thunk;
-        if let Some(oft_off) = PeFile::rva_to_offset(&exe_pe.sections, oft_rva) {
-            let mut i = 0usize;
-            loop {
-                let thunk_offset = i * 8;
-                if oft_off + thunk_offset + 8 > exe_data.len() { break; }
-                let val = unsafe { core::ptr::read_unaligned(exe_data.as_ptr().add(oft_off + thunk_offset) as *const u64) };
-                if val == 0 { break; }
-                let ft_mem_addr = exe_mapped_base + ft_rva as u64 + thunk_offset as u64;
-                unsafe { *(ft_mem_addr as *mut u64) = stub_base; }
-                i += 1;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn link_iat_from_eat(
-    exe_pe: &PeFile,
-    exe_data: &[u8],
-    exe_mapped_base: u64,
-    dll_name: &str,
-    dll_pe: &PeFile,
-    dll_base: u64,
-    stub_base: u64,  // null-return stub for symbols not in the EAT
-) -> Result<(), &'static str> {
-    let mut resolved_count = 0;
-    let mut stubbed_count  = 0;
-    for dll_info in &exe_pe.imports {
-        if !dll_info.name.eq_ignore_ascii_case(dll_name) { continue; }
-
-        let oft_rva = if dll_info.original_first_thunk != 0 { dll_info.original_first_thunk } else { dll_info.first_thunk };
-        let ft_rva  = dll_info.first_thunk;
-
-        if let Some(oft_off) = PeFile::rva_to_offset(&exe_pe.sections, oft_rva) {
-            let mut i = 0;
-            loop {
-                let thunk_offset = i * 8;
-                if oft_off + thunk_offset + 8 > exe_data.len() { break; }
-                let val = unsafe { core::ptr::read_unaligned(exe_data.as_ptr().add(oft_off + thunk_offset) as *const u64) };
-                if val == 0 { break; }
-
-                let ft_mem_addr = exe_mapped_base + ft_rva as u64 + thunk_offset as u64;
-
-                if val & (1 << 63) == 0 {
-                    // Import by name.
-                    if let Some(name_entry_off) = PeFile::rva_to_offset(&exe_pe.sections, (val & 0x7FFFFFFF) as u32) {
-                        let mut name = alloc::string::String::new();
-                        let mut k = name_entry_off + 2;
-                        while k < exe_data.len() && exe_data[k] != 0 {
-                            name.push(exe_data[k] as char);
-                            k += 1;
-                        }
-                        if let Some(exp) = dll_pe.exports.iter().find(|e| e.name.as_deref() == Some(&name)) {
-                            // A forwarded export stores an ASCII string
-                            // ("NTDLL.RtlAllocHeap") inside the export
-                            // directory instead of code.  Jumping to it
-                            // executes the string as instructions.  We can't
-                            // chase forwarders yet, so stub them out.
-                            if dll_pe.export_dir_range.map_or(false, |(lo, hi)| exp.rva >= lo && exp.rva < hi) {
-                                crate::serial_println!(
-                                    "[LOADER] Forwarded export {}!{} → null stub (forwarders unsupported)",
-                                    dll_name, name
-                                );
-                                unsafe { *(ft_mem_addr as *mut u64) = stub_base; }
-                                stubbed_count += 1;
-                            } else {
-                                let func_addr = dll_base + exp.rva as u64;
-                                unsafe { *(ft_mem_addr as *mut u64) = func_addr; }
-                                resolved_count += 1;
-                            }
-                        } else {
-                            // Symbol exists in the EXE's import table but not in the
-                            // DLL's export table — patch to null stub so it doesn't crash.
-                            crate::serial_println!("[LOADER] EAT miss: {} in {} → null stub", name, dll_name);
-                            unsafe { *(ft_mem_addr as *mut u64) = stub_base; }
-                            stubbed_count += 1;
-                        }
-                    }
-                } else {
-                    // Import by ordinal.  The low 16 bits hold the ordinal;
-                    // match it against the DLL's export table before falling
-                    // back to the stub.
-                    let ordinal = (val & 0xFFFF) as u16;
-                    match dll_pe.exports.iter().find(|e| e.ordinal == ordinal) {
-                        Some(exp) if !dll_pe.export_dir_range
-                            .map_or(false, |(lo, hi)| exp.rva >= lo && exp.rva < hi) =>
-                        {
-                            unsafe { *(ft_mem_addr as *mut u64) = dll_base + exp.rva as u64; }
-                            resolved_count += 1;
-                        }
-                        _ => {
-                            crate::serial_println!("[LOADER] Ordinal import #{} from {} → null stub", ordinal, dll_name);
-                            unsafe { *(ft_mem_addr as *mut u64) = stub_base; }
-                            stubbed_count += 1;
-                        }
-                    }
-                }
-                i += 1;
-            }
-        }
-    }
-    crate::serial_println!("[LOADER] Linked {} from REAL DLL {} ({} stubbed)", resolved_count, dll_name, stubbed_count);
-    Ok(())
-}
-
-fn link_iat_from_fake(
-    exe_pe: &PeFile,
-    exe_data: &[u8],
-    exe_mapped_base: u64,
-    dll_info: &crate::executable::ImportedDll,
-    fake_dll: &crate::dll::FakeDll,
-    stub_base: u64,  // null-return stub for symbols not in fake_dll.symbols
-    env: &NtEnv,     // this process's own trampoline/data addresses
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    mapped_pages: &mut alloc::vec::Vec<u64>,
-) -> Result<(), &'static str> {
-    // 1. Create a Trampoline Page for this DLL's thunks
-    // Every thunk will be:  MOV RAX, ID; SYSCALL; RET (approx 16 bytes)
-    static THUNK_POOL_BASE: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0x3_0000_0000);
-    let pool_base = THUNK_POOL_BASE.fetch_add(0x1000, core::sync::atomic::Ordering::Relaxed);
-    
-    let page = Page::containing_address(VirtAddr::new(pool_base));
-    let frame = memory::allocate_frame().ok_or("No frames for thunks")?;
-    memory::map_page(page, frame, PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE, mapper, frame_allocator);
-    mapped_pages.push(page.start_address().as_u64());
-
-    let oft_rva = if dll_info.original_first_thunk != 0 { dll_info.original_first_thunk } else { dll_info.first_thunk };
-    let ft_rva = dll_info.first_thunk;
-    
-    let mut resolved_count: u64 = 0;
-    if let Some(oft_off) = PeFile::rva_to_offset(&exe_pe.sections, oft_rva) {
-        let mut i = 0;
-        loop {
-            let thunk_offset = i * 8;
-            if oft_off + thunk_offset + 8 > exe_data.len() { break; }
-            let val = unsafe { core::ptr::read_unaligned(exe_data.as_ptr().add(oft_off + thunk_offset) as *const u64) };
-            if val == 0 { break; }
-            
-            if val & (1 << 63) == 0 {
-                if let Some(name_entry_off) = PeFile::rva_to_offset(&exe_pe.sections, (val & 0x7FFFFFFF) as u32) {
-                    let mut name = alloc::string::String::new();
-                    let mut k = name_entry_off + 2;
-                    while k < exe_data.len() && exe_data[k] != 0 {
-                        name.push(exe_data[k] as char);
-                        k += 1;
-                    }
-                    
-                    let ft_mem_addr = exe_mapped_base + ft_rva as u64 + thunk_offset as u64;
-
-                    // ── Special user-mode overrides ──
-                    // These functions MUST NOT go through SYSCALL — they need to
-                    // execute in user-mode with access to user-mode pointers.
-                    let user_mode_addr = match name.as_str() {
-                        "_initterm"   if env.initterm   != 0 => Some(env.initterm),
-                        "_initterm_e" if env.initterm_e != 0 => Some(env.initterm_e),
-                        _ => None,
-                    };
-
-                    if let Some(addr) = user_mode_addr {
-                        crate::serial_println!("[LOADER] IAT override: {}!{} → user-mode {:#X}", dll_info.name, name, addr);
-                        unsafe { *(ft_mem_addr as *mut u64) = addr; }
-                        resolved_count += 1;
-                    } else if let Some(sym) = fake_dll.symbols.iter().find(|s| s.name == name) {
-                        // Build a syscall trampoline in the thunk pool:
-                        //   mov r10, rcx   (preserve Windows arg0 before SYSCALL clobbers RCX)
-                        //   mov rax, ID    (syscall number)
-                        //   syscall
-                        //   ret
-                        let tramp_addr = pool_base + (resolved_count * 16);
-                        unsafe {
-                            let p = tramp_addr as *mut u8;
-                            core::ptr::write_volatile(p.add(0),  0x49); // mov r10, rcx
-                            core::ptr::write_volatile(p.add(1),  0x89);
-                            core::ptr::write_volatile(p.add(2),  0xCA);
-                            core::ptr::write_volatile(p.add(3),  0x48); // mov rax, imm32
-                            core::ptr::write_volatile(p.add(4),  0xC7);
-                            core::ptr::write_volatile(p.add(5),  0xC0);
-                            let id = sym.syscall_id as u32;
-                            core::ptr::write_volatile(p.add(6), (id & 0xFF) as u8);
-                            core::ptr::write_volatile(p.add(7), ((id >> 8) & 0xFF) as u8);
-                            core::ptr::write_volatile(p.add(8), ((id >> 16) & 0xFF) as u8);
-                            core::ptr::write_volatile(p.add(9), ((id >> 24) & 0xFF) as u8);
-                            core::ptr::write_volatile(p.add(10), 0x0F); // syscall
-                            core::ptr::write_volatile(p.add(11), 0x05);
-                            core::ptr::write_volatile(p.add(12), 0xC3); // ret
-                        }
-                        unsafe { *(ft_mem_addr as *mut u64) = tramp_addr; }
-                        resolved_count += 1;
-                    } else {
-                        // Symbol not in our fake DLL registry — redirect to null stub
-                        // so the EXE calls a valid address that returns 0 instead of
-                        // jumping to the raw on-disk hint/name RVA.
-                        crate::serial_println!("[LOADER] Unresolved: {}!{} → null stub", dll_info.name, name);
-                        unsafe { *(ft_mem_addr as *mut u64) = stub_base; }
-                    }
-                }
-            }
-            i += 1;
-        }
-    }
-    
-    // Set to read-execute only after writing
-    unsafe {
-        let _ = mapper.update_flags(page, PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE).map(|f| f.flush());
-    }
-
-    crate::serial_println!("[LOADER] Created {} syscall-thunks for internal {}", resolved_count, dll_info.name);
-    Ok(())
 }

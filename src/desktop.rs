@@ -413,18 +413,15 @@ impl DesktopWindowManager {
             let hwnd = crate::loader::lock_guard::lock_tracked(&crate::win32_user::WIN32_USER)
                 .find_hwnd_by_veilos_id(id);
             if let Some(hwnd) = hwnd {
-                // Notify the app so it can do cleanup (save dialogs, etc.).
+                // WM_CLOSE only, as on Windows: the app decides (DefWindowProc
+                // destroys the window and its WM_DESTROY handler posts WM_QUIT,
+                // or it asks to save, or it hides to the tray). Forcing WM_QUIT
+                // as well used to end apps that meant to stay open.
+                let _ = hwnd;
                 crate::win32_user::dispatch_veilos_input(id, crate::win32_user::WM_CLOSE, 0, 0);
-                // Also post WM_QUIT so the app's GetMessage loop returns 0
-                // even if the WndProc doesn't call PostQuitMessage itself.
-                {
-                    let mut w32 = crate::loader::lock_guard::lock_tracked(&crate::win32_user::WIN32_USER);
-                    // Find the owning thread to post WM_QUIT to.
-                    if let Some(win) = w32.windows.iter().find(|w| w.hwnd == hwnd) {
-                        let tid = win.owning_tid;
-                        w32.post_quit(tid, 0);
-                    }
-                }
+                // If the app then has no windows but keeps running, it's ended
+                // (win32_user::check_close_watch).
+                crate::win32_user::watch_close(pid);
             } else {
                 // Non-Win32 window: just terminate the owning process.
                 if pid > 0 {

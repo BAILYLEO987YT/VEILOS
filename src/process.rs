@@ -63,6 +63,9 @@ pub struct Process {
     /// Per-process NT environment (TEB/PEB/_initterm trampolines).
     /// These used to be `static mut` globals shared by every process.
     pub nt_env: Mutex<crate::loader::NtEnv>,
+    /// "dll!name" of each import nothing provided (modules.rs), and whether
+    /// a call to it has been logged yet.
+    pub unresolved_imports: Mutex<Vec<(alloc::string::String, bool)>>,
 
     // -----| Lifecycle |-----
     pub exit_code: Mutex<Option<i32>>,
@@ -96,6 +99,7 @@ impl Process {
             registers:   Mutex::new(Registers::zeroed()),
             mapped_pages: Mutex::new(alloc::vec::Vec::new()),
             nt_env:      Mutex::new(crate::loader::NtEnv::default()),
+            unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             exit_code:   Mutex::new(None),
         }
     }
@@ -163,6 +167,7 @@ impl ProcessManager {
             registers: Mutex::new(Registers::zeroed()),
             mapped_pages: Mutex::new(alloc::vec::Vec::new()),
             nt_env: Mutex::new(crate::loader::NtEnv::default()),
+            unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             exit_code: Mutex::new(None),
         });
         self.processes.push(kernel_process);

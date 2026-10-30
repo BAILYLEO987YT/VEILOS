@@ -1,0 +1,5 @@
+; Imports nothing provides: a function and a data variable (msvcrt isn't on VEILOS).
+LIBRARY msvcrt
+EXPORTS
+    w1_missing_data DATA
+    w1_no_such_function

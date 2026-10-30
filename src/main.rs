@@ -59,6 +59,7 @@ pub mod address_space;
 pub mod block;
 pub mod hal;
 pub mod hotplug;
+pub mod modules;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;
@@ -761,6 +762,9 @@ async fn gui_refresh_task() {
 
         // Cards inserted into or removed from PCIe hot-plug slots.
         crate::hotplug::poll();
+
+        // An app the user closed that kept running without windows.
+        crate::win32_user::check_close_watch();
 
         // ---- frame-time diagnostics ----
         if ui_dirty {

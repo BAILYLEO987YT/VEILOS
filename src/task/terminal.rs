@@ -44,7 +44,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from("VEILOS SHELL - AVAILABLE COMMANDS:"));
             history.push(String::from(" FS:      LS [PATH]  CAT [FILE]  HEAD [FILE]  MKDIR [DIR]  RM [FILE]  PWD"));
             history.push(String::from(" PROC:    PS  KILL [PID]  CAPS [PID]"));
-            history.push(String::from(" HW:      DEVICES  DISPLAYS  SLOTS  WORKERS  GPUTEST"));
+            history.push(String::from(" HW:      DEVICES  DISPLAYS  SLOTS  WORKERS  GPUTEST  RUN"));
             history.push(String::from(" PKG:     PKG LIST  PKG INSTALL [NAME]  PKG REMOVE [NAME]"));
             history.push(String::from(" DEBUG:   TRACE [N]  PROFILE [START|STOP|REPORT]  DBG [ATTACH|BP] [PID/ADDR]"));
             history.push(String::from(" POLICY:  POLICY  POLICY SET [PROFILE] [PID]  MODE [SECURITY|PERFORMANCE]"));
@@ -618,6 +618,17 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(alloc::format!("workers: 64 chunks  1 CPU {} ms  all CPUs {} ms  speedup {}.{}x",
                 seq / 1000, par / 1000, seq / par.max(1), (seq * 10 / par.max(1)) % 10));
             history.push(alloc::format!("chunks run per CPU: {:?}", per_cpu));
+        }
+        "RUN" => {
+            // RUN <path>: start a Windows program (as double-clicking it does).
+            let Some(arg) = parts.get(1) else {
+                history.push(String::from("USAGE: RUN [PATH]  e.g. RUN /TESTS/W1TEST.EXE"));
+                return;
+            };
+            let path = arg.to_ascii_lowercase();
+            let name = String::from(path.rsplit('/').next().unwrap_or(&path));
+            history.push(alloc::format!("  starting {}", path));
+            crate::apps::open_file_absolute(&path, &name);
         }
         "SLOTS" => {
             // PCIe hot-plug slots (hotplug.rs).
