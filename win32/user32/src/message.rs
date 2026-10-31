@@ -117,7 +117,64 @@ pub fn call_proc(proc: usize, wnd_unicode: bool, hwnd: Hwnd, msg: u32, wp: u64, 
             }
             unsafe { f(hwnd, msg, wp, cs.as_mut_ptr() as i64) }
         }
+        _ if lp != 0 && string_in(hwnd, msg) => {
+            let mut conv = convert_str(lp as u64, unicode);
+            unsafe { f(hwnd, msg, wp, conv.as_mut_ptr() as i64) }
+        }
+        _ if lp != 0 && string_out(hwnd, msg) => {
+            // Into a big buffer of the procedure's kind (EM_GETLINE's first
+            // word is its size), then back without the NUL's change.
+            let cap = if msg == 0x00C4 { (unsafe { *(lp as *const u16) }) as usize } else { 4096 };
+            let mut buf = alloc::vec![0u8; cap * 4 + 8];
+            if msg == 0x00C4 {
+                buf[..2].copy_from_slice(&(cap as u16).to_le_bytes());
+            }
+            let r = unsafe { f(hwnd, msg, wp, buf.as_mut_ptr() as i64) };
+            if r < 0 {
+                return r;
+            }
+            let text: Vec<u16> = if wnd_unicode {
+                let p = buf.as_ptr() as *const u16;
+                (0..r as usize).map(|i| unsafe { *p.add(i) }).collect()
+            } else {
+                unsafe { crate::from_ansi(buf.as_ptr(), r as i32) }
+            };
+            let nul = msg != 0x00C4;
+            if unicode {
+                unsafe { core::ptr::copy_nonoverlapping(text.as_ptr(), lp as *mut u16, text.len()) };
+                if nul {
+                    unsafe { *(lp as *mut u16).add(text.len()) = 0 };
+                }
+                text.len() as i64
+            } else {
+                let a = crate::to_ansi(&text);
+                unsafe { core::ptr::copy_nonoverlapping(a.as_ptr(), lp as *mut u8, a.len()) };
+                if nul {
+                    unsafe { *(lp as *mut u8).add(a.len()) = 0 };
+                }
+                a.len() as i64
+            }
+        }
         _ => unsafe { f(hwnd, msg, wp, lp) },
+    }
+}
+
+/// Messages to list boxes, combo boxes and edits that pass a string in
+/// lParam (converted between ANSI and Unicode callers like WM_SETTEXT).
+fn string_in(hwnd: Hwnd, msg: u32) -> bool {
+    match msg {
+        0x0180 | 0x0181 | 0x018C | 0x018F | 0x01A2 | 0x0143 | 0x014A | 0x014C | 0x014D | 0x0158 => crate::controls::takes_strings(hwnd),
+        0x00C2 => true, // EM_REPLACESEL
+        _ => false,
+    }
+}
+
+/// ... and those that return one into lParam's buffer.
+fn string_out(hwnd: Hwnd, msg: u32) -> bool {
+    match msg {
+        0x0189 | 0x0148 => crate::controls::takes_strings(hwnd), // LB_GETTEXT, CB_GETLBTEXT
+        0x00C4 => true,                                           // EM_GETLINE
+        _ => false,
     }
 }
 
@@ -278,22 +335,45 @@ fn private(m: &Msg) -> bool {
 
 /// Input for a top-level window goes to the child under the mouse, or to
 /// the window with the keyboard focus.
+/// Input for a top-level window (mouse positions in its pixels) goes to
+/// the child under the mouse, as a non-client message over a window's
+/// non-client part (its scroll bars), or to the window with the keyboard
+/// focus.
 fn route(m: &mut Msg) {
     if (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&m.message) {
-        let s = state();
-        let target = if s.capture != 0 && s.root(s.capture) == m.hwnd { s.capture } else {
-            let (x, y) = ((m.lparam & 0xFFFF) as i16 as i32, ((m.lparam >> 16) & 0xFFFF) as i16 as i32);
-            crate::window::child_at(&s, m.hwnd, x, y)
-        };
-        if target != m.hwnd {
+        let (sx, sy) = ((m.lparam & 0xFFFF) as i16 as i32, ((m.lparam >> 16) & 0xFFFF) as i16 as i32);
+        let (target, cx, cy, inside) = {
+            let s = state();
+            let Some(root) = s.get(m.hwnd) else { return };
+            let i = root.inset();
+            let (rx, ry) = (sx - i[0], sy - i[1]);
+            let in_root = rx >= 0 && ry >= 0 && rx < root.client_w() && ry < root.client_h();
+            let target = if s.capture != 0 && s.root(s.capture) == m.hwnd {
+                s.capture
+            } else if in_root {
+                crate::window::child_at(&s, m.hwnd, rx, ry)
+            } else {
+                m.hwnd
+            };
             let (ox, oy) = s.client_origin(target);
-            let (x, y) = ((m.lparam & 0xFFFF) as i16 as i32 - ox, ((m.lparam >> 16) & 0xFFFF) as i16 as i32 - oy);
-            m.lparam = ((y as u16 as u64) << 16) | x as u16 as u64;
-            m.hwnd = target;
+            let (cx, cy) = (sx - ox, sy - oy);
+            let w = s.get(target).unwrap();
+            let inside = s.capture == target || (cx >= 0 && cy >= 0 && cx < w.client_w() && cy < w.client_h());
+            (target, cx, cy, inside)
+        };
+        m.hwnd = target;
+        if inside {
+            m.lparam = ((cy as u16 as u64) << 16) | cx as u16 as u64;
+        } else {
+            // WM_NC*: the hit-test code, and the screen position.
+            m.message -= 0x160;
+            m.wparam = crate::window::nc_hit(target, m.pt_x, m.pt_y);
+            m.lparam = ((m.pt_y as u16 as u64) << 16) | m.pt_x as u16 as u64;
         }
     } else if (WM_KEYDOWN..=0x0109).contains(&m.message) {
         let s = state();
-        if s.focus != 0 && s.root(s.focus) == m.hwnd {
+        let tid = unsafe { crate::GetCurrentThreadId() };
+        if s.get(s.focus).is_some_and(|w| w.tid == tid) {
             m.hwnd = s.focus;
         }
     }
@@ -351,6 +431,7 @@ fn next(out: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: bool, wait: bool)
 
 fn deliver(out: *mut Msg, mut m: Msg) -> bool {
     route(&mut m);
+    crate::keyboard::track(&m);
     if m.message == WM_TIMER {
         let s = state();
         if let Some(t) = s.timer_procs.iter().find(|t| t.0 == m.hwnd && t.1 == m.wparam) {
@@ -441,17 +522,6 @@ pub extern "system" fn DispatchMessageA(m: *const Msg) -> i64 {
     dispatch(m, false)
 }
 
-/// Dialogs and accelerators come with G3.
-#[no_mangle]
-pub extern "system" fn IsDialogMessageW(_dlg: Hwnd, _m: *const Msg) -> Bool {
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn IsDialogMessageA(_dlg: Hwnd, _m: *const Msg) -> Bool {
-    0
-}
-
 #[no_mangle]
 pub extern "system" fn TranslateAcceleratorW(_hwnd: Hwnd, _accel: u64, _m: *const Msg) -> i32 {
     0
@@ -522,7 +592,7 @@ pub fn def_window_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) ->
             if lp != 0 {
                 let r = lp as *mut [i32; 4];
                 if let Some(w) = state().get(hwnd) {
-                    let m = crate::window::frame_margins(w.style, w.ex_style, w.parent == 0);
+                    let m = crate::window::nc_margins(w.style, w.ex_style, w.parent == 0);
                     unsafe {
                         (*r)[0] += m[0];
                         (*r)[1] += m[1];
@@ -600,12 +670,38 @@ pub fn def_window_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) ->
             0
         }
         WM_ACTIVATE => {
+            // The focus comes to the window unless it's inside it already.
             if wp & 0xFFFF != 0 && wp >> 16 == 0 {
-                crate::window::SetFocus(hwnd);
+                let inside = {
+                    let s = state();
+                    let mut h = s.focus;
+                    loop {
+                        if h == hwnd {
+                            break true;
+                        }
+                        match s.get(h) {
+                            Some(w) if w.parent != 0 => h = w.parent,
+                            _ => break false,
+                        }
+                    }
+                };
+                if !inside {
+                    crate::window::SetFocus(hwnd);
+                }
             }
             0
         }
-        WM_NCHITTEST => 1,
+        0x0132..=0x0138 => crate::controls::default_ctl_color(wp, msg) as i64,
+        WM_NCHITTEST => {
+            let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            crate::window::nc_hit(hwnd, x, y) as i64
+        }
+        // A click on a standard scroll bar.
+        0x00A1 if wp == crate::scroll::HTVSCROLL || wp == crate::scroll::HTHSCROLL => {
+            let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            crate::scroll::nc_click(hwnd, wp == crate::scroll::HTVSCROLL, x, y);
+            0
+        }
         WM_MOUSEACTIVATE => 1,
         WM_NCACTIVATE => 1,
         0x0011 => 1, // WM_QUERYENDSESSION

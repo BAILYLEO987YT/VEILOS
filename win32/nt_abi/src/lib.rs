@@ -115,7 +115,7 @@ pub mod sys {
     pub const VEIL_USER_CREATE_WINDOW: u32 = BASE + 36;
     /// VEIL_USER_DESTROY_WINDOW(hwnd).
     pub const VEIL_USER_DESTROY_WINDOW: u32 = BASE + 37;
-    /// VEIL_USER_SHOW_WINDOW(hwnd, show: 0 hide, 1 show, 2 minimize, 3 maximize, 4 restore).
+    /// VEIL_USER_SHOW_WINDOW(hwnd, show: 0 hide, 1 show, 2 minimize, 3 maximize, 4 show without focus).
     pub const VEIL_USER_SHOW_WINDOW: u32 = BASE + 38;
     /// VEIL_USER_SET_TEXT(hwnd, title: *const u16).
     pub const VEIL_USER_SET_TEXT: u32 = BASE + 39;
@@ -132,7 +132,8 @@ pub mod sys {
     pub const VEIL_USER_GET_MESSAGE: u32 = BASE + 44;
     /// VEIL_USER_TIMER(hwnd, id, interval_ms (0: kill)).
     pub const VEIL_USER_TIMER: u32 = BASE + 45;
-    /// VEIL_USER_QUERY(what: 0 screen size, 1 cursor position, out: *mut [i32; 2]).
+    /// VEIL_USER_QUERY(what: 0 screen size, 1 cursor position, 2 | vk << 8 key
+    /// state [down, toggled], out: *mut [i32; 2]).
     pub const VEIL_USER_QUERY: u32 = BASE + 46;
     /// One past the last number in use.
     pub const END: u32 = BASE + 47;
@@ -181,7 +182,7 @@ pub struct ProcessParams {
 }
 
 /// VEIL_USER_CREATE_WINDOW's parameters: the window's title, screen
-/// position (of its frame) and client size.
+/// position (of its frame) and client size, and `WINDOW_*` flags.
 #[repr(C)]
 pub struct WindowParams {
     pub title: u64,
@@ -189,8 +190,14 @@ pub struct WindowParams {
     pub y: i32,
     pub client_w: u32,
     pub client_h: u32,
-    pub visible: u32,
+    pub flags: u32,
 }
+
+/// Shown when created.
+pub const WINDOW_VISIBLE: u32 = 1;
+/// No desktop frame (a popup: a menu, a drop-down list): its position is
+/// its client area's.
+pub const WINDOW_POPUP: u32 = 2;
 
 /// A window's client area: its origin on the screen and its size.
 #[repr(C)]

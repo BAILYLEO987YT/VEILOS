@@ -18,7 +18,8 @@ const DESKTOP: Hwnd = 0x0001_0000;
 /// move while big enough (a DC may still point at them), and are kept
 /// (leaked) when they must grow.
 pub fn ensure_surface(w: &mut Wnd) {
-    let (cw, ch) = (w.client_w().max(1) as usize, w.client_h().max(1) as usize);
+    let (sw, sh) = w.surface_size();
+    let (cw, ch) = (sw as usize, sh as usize);
     let rows = if w.stride == 0 { 0 } else { w.surface.len() / w.stride };
     if cw <= w.stride && ch <= rows {
         return;
@@ -36,7 +37,8 @@ pub fn present(root: Hwnd) {
     let mut s = state();
     let Some(w) = s.get_mut(root) else { return };
     let Some(d) = w.dirty.take() else { return };
-    let d = intersect(d, [0, 0, w.client_w(), w.client_h()]);
+    let (sw, sh) = w.surface_size();
+    let d = intersect(d, [0, 0, sw, sh]);
     if !w.kernel || empty(d) {
         return;
     }
@@ -71,12 +73,11 @@ fn make_dc(hwnd: Hwnd, clip: Option<[i32; 4]>, frame: bool) -> u64 {
     let (mut ox, mut oy) = s.client_origin(hwnd);
     let mut area = s.visible_clip(hwnd);
     if frame {
-        if let Some(w) = s.get(hwnd).filter(|w| !w.top_level()) {
+        if let Some(w) = s.get(hwnd) {
             ox -= w.margins[0];
             oy -= w.margins[1];
             area = [ox, oy, ox + w.w, oy + w.h];
-            if let Some(p) = s.get(w.parent) {
-                let _ = p;
+            if !w.top_level() {
                 area = intersect(area, s.visible_clip(w.parent));
             }
         }
@@ -85,7 +86,8 @@ fn make_dc(hwnd: Hwnd, clip: Option<[i32; 4]>, frame: bool) -> u64 {
         area = intersect(area, [c[0] + ox, c[1] + oy, c[2] + ox, c[3] + oy]);
     }
     let Some(r) = s.get_mut(root) else { return 0 };
-    let (ptr, w, h, stride) = (r.surface.as_mut_ptr(), r.client_w(), r.client_h(), r.stride);
+    let (w, h) = r.surface_size();
+    let (ptr, stride) = (r.surface.as_mut_ptr(), r.stride);
     if !empty(area) {
         r.dirty = Some(union(r.dirty, area));
     }
@@ -288,11 +290,14 @@ pub extern "system" fn BeginPaint(hwnd: Hwnd, ps: *mut u8) -> u64 {
         let Some(w) = s.get_mut(hwnd) else { return 0 };
         let u = w.update.take().unwrap_or([0; 4]);
         let e = core::mem::replace(&mut w.erase, false);
-        (u, e, !w.top_level() && w.margins != [0; 4])
+        // Non-client parts of its own to draw: a child's border, scroll
+        // bars, a popup's frame.
+        (u, e, if w.top_level() { w.inset() != [0; 4] } else { w.margins != [0; 4] })
     };
     if framed {
         send(hwnd, WM_NCPAINT, 1, 0);
     }
+    crate::keyboard::hide_caret_for_paint(hwnd);
     let hdc = make_dc(hwnd, Some(update), false);
     let not_erased = erase && send(hwnd, WM_ERASEBKGND, hdc, 0) == 0;
     if !ps.is_null() {
@@ -307,10 +312,11 @@ pub extern "system" fn BeginPaint(hwnd: Hwnd, ps: *mut u8) -> u64 {
 }
 
 #[no_mangle]
-pub extern "system" fn EndPaint(_hwnd: Hwnd, ps: *const u8) -> Bool {
+pub extern "system" fn EndPaint(hwnd: Hwnd, ps: *const u8) -> Bool {
     if !ps.is_null() {
         release(unsafe { *(ps as *const u64) });
     }
+    crate::keyboard::show_caret_after_paint(hwnd);
     1
 }
 
@@ -332,20 +338,33 @@ pub fn erase_background(hwnd: Hwnd, hdc: u64) -> bool {
 }
 
 /// WM_NCPAINT's DefWindowProc for a child window: its border.
+/// WM_NCPAINT's DefWindowProc: the borders it draws itself (a child's,
+/// or a popup's; the desktop frames other top-level windows) and the
+/// standard scroll bars.
 pub fn paint_frame(hwnd: Hwnd) {
-    let Some((w, h, style, ex)) = state().get(hwnd).filter(|w| !w.top_level()).map(|w| (w.w, w.h, w.style, w.ex_style)) else {
+    let Some((w, h, style, ex, own_border)) =
+        state().get(hwnd).map(|w| (w.w, w.h, w.style, w.ex_style, !w.top_level() || w.popup))
+    else {
         return;
     };
     let hdc = make_dc(hwnd, None, true);
-    let mut inset = 0;
-    if ex & crate::window::WS_EX_CLIENTEDGE != 0 {
-        frame(hdc, [0, 0, w, h], GetSysColorBrush(16));
-        frame(hdc, [1, 1, w - 1, h - 1], GetSysColorBrush(21));
-        inset = 2;
+    if own_border {
+        let mut inset = 0;
+        if ex & crate::window::WS_EX_CLIENTEDGE != 0 {
+            frame(hdc, [0, 0, w, h], GetSysColorBrush(16));
+            frame(hdc, [1, 1, w - 1, h - 1], GetSysColorBrush(21));
+            inset = 2;
+        }
+        if style & crate::window::WS_DLGFRAME != 0 && style & crate::window::WS_CHILD == 0 {
+            // A popup dialog's raised frame.
+            frame(hdc, [0, 0, w, h], GetSysColorBrush(21));
+            frame(hdc, [1, 1, w - 1, h - 1], GetSysColorBrush(20));
+            frame(hdc, [2, 2, w - 2, h - 2], GetSysColorBrush(15));
+        } else if style & crate::window::WS_BORDER != 0 {
+            frame(hdc, [inset, inset, w - inset, h - inset], GetSysColorBrush(6));
+        }
     }
-    if style & crate::window::WS_BORDER != 0 {
-        frame(hdc, [inset, inset, w - inset, h - inset], GetSysColorBrush(6));
-    }
+    crate::scroll::paint_bars(hwnd, hdc);
     release(hdc);
 }
 
@@ -808,32 +827,6 @@ pub extern "system" fn SetCursorPos(_x: i32, _y: i32) -> Bool {
 #[no_mangle]
 pub extern "system" fn ClipCursor(_r: *const [i32; 4]) -> Bool {
     1
-}
-
-/// Until dialogs (G3): the text goes to the debug log and the answer is
-/// the first button's (IDOK, or IDYES / IDABORT / IDRETRY for those sets).
-fn message_box(text: &[u16], caption: &[u16], kind: u32) -> i32 {
-    let mut line = alloc::string::String::from("MessageBox: ");
-    line.extend(char::decode_utf16(caption.iter().copied()).map(|c| c.unwrap_or('?')));
-    line.push_str(": ");
-    line.extend(char::decode_utf16(text.iter().copied()).map(|c| c.unwrap_or('?')));
-    crate::debug(&line);
-    match kind & 0xF {
-        2 => 3, // MB_ABORTRETRYIGNORE: IDABORT
-        3 | 4 => 6, // MB_YESNO(CANCEL): IDYES
-        5 => 4, // MB_RETRYCANCEL: IDRETRY
-        _ => 1,
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn MessageBoxW(_hwnd: Hwnd, text: *const u16, caption: *const u16, kind: u32) -> i32 {
-    message_box(&unsafe { crate::wstr(text) }, &unsafe { crate::wstr(caption) }, kind)
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn MessageBoxA(_hwnd: Hwnd, text: *const u8, caption: *const u8, kind: u32) -> i32 {
-    message_box(&unsafe { crate::from_ansi(text, -1) }, &unsafe { crate::from_ansi(caption, -1) }, kind)
 }
 
 #[no_mangle]

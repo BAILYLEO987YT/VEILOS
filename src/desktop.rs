@@ -109,6 +109,8 @@ pub struct DesktopWindow {
     pub owner_pid: u32,
     pub root:    Option<Box<dyn Widget>>,  // Widget tree root
     pub dirty:   bool,
+    /// No frame, title bar or taskbar button (a Windows program's popup).
+    pub frameless: bool,
 }
 
 impl DesktopWindow {
@@ -117,7 +119,7 @@ impl DesktopWindow {
         Self {
             id, title: String::from(title), rect, saved_rect: rect,
             state: WindowState::Normal, z_order: 0, resizable: true,
-            owner_pid: pid, root: None, dirty: true,
+            owner_pid: pid, root: None, dirty: true, frameless: false,
         }
     }
 
@@ -132,6 +134,12 @@ impl DesktopWindow {
         let p = t.palette;
         let title_h = t.titlebar_height;
         drop(t);
+
+        if self.frameless {
+            crate::nt_user::set_content_rect(self.id, self.rect.x, self.rect.y, self.rect.w, self.rect.h);
+            if let Some(ref root) = self.root { root.paint(r); }
+            return;
+        }
 
         // Shadow
         r.fill_rect(Rect::new(self.rect.x + 4, self.rect.y + 4, self.rect.w, self.rect.h),
@@ -173,6 +181,9 @@ impl DesktopWindow {
     }
 
     pub fn hit_test(&self, x: i32, y: i32) -> WindowHit {
+        if self.frameless {
+            return if self.rect.contains(x, y) { WindowHit::Content } else { WindowHit::None };
+        }
         if !self.rect.contains(x, y) {
             if self.resizable && self.state != WindowState::Minimized && self.state != WindowState::Maximized {
                 let rx = self.rect.x;
@@ -1167,10 +1178,11 @@ impl Panel {
 
     pub fn sync_windows(&mut self, wm: &DesktopWindowManager) {
         let mut needs_sync = false;
-        if self.taskbar_buttons.len() != wm.windows.len() {
+        let listed: Vec<&DesktopWindow> = wm.windows.iter().filter(|w| !w.frameless).collect();
+        if self.taskbar_buttons.len() != listed.len() {
             needs_sync = true;
         } else {
-            for (b, w) in self.taskbar_buttons.iter().zip(&wm.windows) {
+            for (b, w) in self.taskbar_buttons.iter().zip(listed.iter()) {
                 if b.window_id != w.id || b.active != (wm.focused_id == Some(w.id)) {
                     needs_sync = true;
                     break;
@@ -1180,7 +1192,7 @@ impl Panel {
         if !needs_sync { return; }
 
         self.taskbar_buttons.clear();
-        for win in &wm.windows {
+        for win in listed {
             self.taskbar_buttons.push(TaskbarButton {
                 window_id: win.id,
                 label:     win.title[..win.title.len().min(14)].to_uppercase(),
@@ -2708,13 +2720,9 @@ pub fn dispatch_raw_key(key: pc_keyboard::KeyCode) {
     match DesktopPhase::from_u8(DESKTOP_PHASE.load(Ordering::Acquire)) {
         DesktopPhase::Desktop => {
             let mut wm = DESKTOP_WM.lock();
-            if let Some(id) = wm.focused_id {
-                let vk = crate::nt_user::vk_for_key(key);
-                if vk != 0 && crate::nt_user::owns(id) {
-                    drop(wm);
-                    crate::nt_user::deliver_key(id, vk);
-                    return;
-                }
+            // A Windows program's window had the key itself (nt_user::key_event).
+            if wm.focused_id.is_some_and(crate::nt_user::owns) {
+                return;
             }
             let _ = wm.handle_arrow_navigation(key);
         }

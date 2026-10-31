@@ -67,6 +67,24 @@ pub fn frame_margins(style: u32, ex: u32, top_level: bool) -> [i32; 4] {
     [b, b + caption, b, b]
 }
 
+pub const WS_VSCROLL: u32 = 0x0020_0000;
+pub const WS_HSCROLL: u32 = 0x0010_0000;
+/// SM_CXVSCROLL / SM_CYHSCROLL.
+pub const SCROLL_SIZE: i32 = 17;
+
+/// The default non-client margins (WM_NCCALCSIZE's): the frame and the
+/// standard scroll bars.
+pub fn nc_margins(style: u32, ex: u32, top_level: bool) -> [i32; 4] {
+    let mut m = frame_margins(style, ex, top_level);
+    if style & WS_VSCROLL != 0 {
+        m[2] += SCROLL_SIZE;
+    }
+    if style & WS_HSCROLL != 0 {
+        m[3] += SCROLL_SIZE;
+    }
+    m
+}
+
 fn adjust(r: *mut [i32; 4], style: u32, menu: Bool, ex: u32) -> Bool {
     if r.is_null() {
         return 0;
@@ -100,16 +118,21 @@ pub extern "system" fn AdjustWindowRectExForDpi(r: *mut [i32; 4], style: u32, me
 
 static CASCADE: crate::dllrt::Lock<i32> = crate::dllrt::Lock::new(0);
 
-/// A kernel window's client rectangle on screen, as the kernel has it.
+/// A kernel window's pixels' rectangle on screen, as the kernel has it.
 fn kernel_place(hwnd: Hwnd) -> Option<WindowPlace> {
     let mut p = WindowPlace::default();
     (unsafe { crate::VeilUserGetPos(hwnd, &mut p) } == 0).then_some(p)
 }
 
-/// Move/size kernel window `hwnd` so its client area is at screen (cx, cy),
-/// `cw` x `ch`.
-fn kernel_set(hwnd: Hwnd, cx: i32, cy: i32, cw: i32, ch: i32, flags: u32) {
-    let p = WindowPlace { x: cx - DESK_BORDER, y: cy - DESK_TITLE, w: cw.max(1) as u32, h: ch.max(1) as u32 };
+/// Move/size kernel window `hwnd` to match its window rectangle (`flags`:
+/// 1 move, 2 size).
+fn kernel_sync(hwnd: Hwnd, flags: u32) {
+    let Some((x, y, popup, f, (sw, sh))) = state().get(hwnd).filter(|w| w.kernel).map(|w| (w.x, w.y, w.popup, w.frame(), w.surface_size())) else {
+        return;
+    };
+    // VEIL_USER_SET_POS takes the desktop frame's corner.
+    let (dx, dy) = if popup { (0, 0) } else { (DESK_BORDER, DESK_TITLE) };
+    let p = WindowPlace { x: x + f[0] - dx, y: y + f[1] - dy, w: sw as u32, h: sh as u32 };
     unsafe { crate::VeilUserSetPos(hwnd, &p, flags) };
 }
 
@@ -139,7 +162,7 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
     }
     let message_only = parent == HWND_MESSAGE;
     let (parent, owner) = if child { (parent, 0) } else { (0, if message_only { 0 } else { s.root(parent) }) };
-    let margins = frame_margins(style, ex, !child);
+    let margins = nc_margins(style, ex, !child);
     let (sw, sh) = crate::screen_size();
     let (mut x, mut y, mut w, mut h) = (x, y, w, h);
     if child {
@@ -171,15 +194,19 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
     // The kernel window (hidden until shown) gives a top-level window its
     // handle; a child's is ours.
     let kernel = !child && !message_only;
+    // A popup without a caption has no desktop frame.
+    let popup = kernel && style & WS_POPUP != 0 && style & WS_CAPTION != WS_CAPTION;
     let hwnd = if kernel {
         let title = Vec::from([0u16]);
+        let f = if popup { [0; 4] } else { frame_margins(style, ex, true) };
+        let (dx, dy) = if popup { (0, 0) } else { (DESK_BORDER, DESK_TITLE) };
         let params = WindowParams {
             title: title.as_ptr() as u64,
-            x: x + margins[0] - DESK_BORDER,
-            y: y + margins[1] - DESK_TITLE,
-            client_w: (w - margins[0] - margins[2]).max(1) as u32,
-            client_h: (h - margins[1] - margins[3]).max(1) as u32,
-            visible: 0,
+            x: x + f[0] - dx,
+            y: y + f[1] - dy,
+            client_w: (w - f[0] - f[2]).max(1) as u32,
+            client_h: (h - f[1] - f[3]).max(1) as u32,
+            flags: if popup { nt_abi::WINDOW_POPUP } else { 0 },
         };
         let mut hwnd = 0u64;
         if unsafe { crate::VeilUserCreateWindow(&params, &mut hwnd) } != 0 {
@@ -188,10 +215,10 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
         }
         // Where the desktop put it.
         if let Some(p) = kernel_place(hwnd) {
-            x = p.x - margins[0];
-            y = p.y - margins[1];
-            w = p.w as i32 + margins[0] + margins[2];
-            h = p.h as i32 + margins[1] + margins[3];
+            x = p.x - f[0];
+            y = p.y - f[1];
+            w = p.w as i32 + f[0] + f[2];
+            h = p.h as i32 + f[1] + f[3];
         }
         hwnd
     } else {
@@ -234,6 +261,8 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
             stride: 0,
             dirty: None,
             kernel,
+            popup,
+            scroll: [crate::ScrollBar { max: 100, ..Default::default() }; 2],
         });
         if kernel {
             let w = s.get_mut(hwnd).unwrap();
@@ -253,9 +282,7 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
                 wnd.h = h;
                 crate::paint::ensure_surface(wnd);
             }
-            if kernel {
-                kernel_set(hwnd, x + margins[0], y + margins[1], w - margins[0] - margins[2], h - margins[1] - margins[3], 2);
-            }
+            kernel_sync(hwnd, 2);
         }
     }
 
@@ -318,10 +345,9 @@ fn set_margins(hwnd: Hwnd, m: [i32; 4]) {
     }
     w.margins = m;
     if w.kernel {
-        let (cx, cy, cw, ch) = (w.x + m[0], w.y + m[1], w.client_w(), w.client_h());
         crate::paint::ensure_surface(w);
         drop(s);
-        kernel_set(hwnd, cx, cy, cw, ch, 3);
+        kernel_sync(hwnd, 3);
     }
 }
 
@@ -531,8 +557,8 @@ pub fn set_window_pos(hwnd: Hwnd, after: Hwnd, x: i32, y: i32, cx: i32, cy: i32,
     if kernel {
         let moved = out_flags & SWP_NOCLIENTMOVE == 0;
         let sized = out_flags & SWP_NOCLIENTSIZE == 0;
-        if moved || sized {
-            kernel_set(hwnd, nx + margins[0], ny + margins[1], new_cw, new_ch, (moved as u32) | (sized as u32) << 1);
+        if moved || sized || margins != old_margins {
+            kernel_sync(hwnd, (moved as u32) | ((sized || margins != old_margins) as u32) << 1);
         }
         if show {
             unsafe { crate::VeilUserShowWindow(hwnd, if flags & SWP_NOACTIVATE != 0 { 4 } else { 1 }) };
@@ -543,6 +569,20 @@ pub fn set_window_pos(hwnd: Hwnd, after: Hwnd, x: i32, y: i32, cx: i32, cy: i32,
     }
     if top && flags & SWP_NOACTIVATE == 0 && (show || (was_visible && !hide)) {
         activate(hwnd);
+    }
+    // A hidden window can't keep the keyboard focus.
+    if hide {
+        let focus_inside = {
+            let s = state();
+            let f = s.focus;
+            f != 0 && (f == hwnd || family(&s, hwnd).contains(&f))
+        };
+        if focus_inside {
+            SetFocus(0);
+        }
+        if state().active == hwnd {
+            state().active = 0;
+        }
     }
     // Repaint what changed.
     let changed = show || hide || out_flags & (SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE) != (SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE);
@@ -679,9 +719,9 @@ pub extern "system" fn ShowWindowAsync(hwnd: Hwnd, cmd: i32) -> Bool {
 /// The kernel says the desktop moved or resized top-level window `hwnd`.
 pub fn geometry_changed(hwnd: Hwnd) {
     let Some(p) = kernel_place(hwnd) else { return };
-    let Some(m) = state().get(hwnd).map(|w| w.margins) else { return };
-    let (x, y) = (p.x - m[0], p.y - m[1]);
-    let (w, h) = (p.w as i32 + m[0] + m[2], p.h as i32 + m[1] + m[3]);
+    let Some(f) = state().get(hwnd).map(|w| w.frame()) else { return };
+    let (x, y) = (p.x - f[0], p.y - f[1]);
+    let (w, h) = (p.w as i32 + f[0] + f[2], p.h as i32 + f[1] + f[3]);
     let Some(old) = state().get(hwnd).map(|w| (w.x, w.y, w.w, w.h)) else { return };
     if old == (x, y, w, h) {
         return;
@@ -1041,11 +1081,6 @@ pub unsafe extern "system" fn GetClassNameA(hwnd: Hwnd, out: *mut u8, cap: i32) 
 #[no_mangle]
 pub extern "system" fn GetDlgCtrlID(hwnd: Hwnd) -> i32 {
     state().get(hwnd).map_or(0, |w| w.id as i32)
-}
-
-#[no_mangle]
-pub extern "system" fn GetDlgItem(hwnd: Hwnd, id: i32) -> Hwnd {
-    state().windows.iter().find(|w| w.parent == hwnd && w.id as i32 == id).map_or(0, |w| w.hwnd)
 }
 
 // -----| window data |-----
@@ -1415,6 +1450,33 @@ pub extern "system" fn MapWindowPoints(from: Hwnd, to: Hwnd, pts: *mut [i32; 2],
         }
     }
     ((dy as u16 as i32) << 16) | dx as u16 as i32
+}
+
+/// WM_NCHITTEST's answer for screen (x, y): HTCLIENT, a scroll bar,
+/// HTBORDER or HTNOWHERE.
+pub fn nc_hit(hwnd: Hwnd, x: i32, y: i32) -> u64 {
+    let mut r = [0i32; 4];
+    if GetWindowRect(hwnd, &mut r) == 0 {
+        return 0;
+    }
+    let (wx, wy) = (x - r[0], y - r[1]);
+    if wx < 0 || wy < 0 || x >= r[2] || y >= r[3] {
+        return 0;
+    }
+    let bars = crate::scroll::bar_rects(hwnd);
+    let inside = |b: Option<[i32; 4]>| b.is_some_and(|b| wx >= b[0] && wx < b[2] && wy >= b[1] && wy < b[3]);
+    if inside(bars[1]) {
+        return crate::scroll::HTVSCROLL;
+    }
+    if inside(bars[0]) {
+        return crate::scroll::HTHSCROLL;
+    }
+    let Some(m) = state().get(hwnd).map(|w| w.margins) else { return 0 };
+    if wx >= m[0] && wy >= m[1] && wx < r[2] - r[0] - m[2] && wy < r[3] - r[1] - m[3] {
+        1 // HTCLIENT
+    } else {
+        18 // HTBORDER
+    }
 }
 
 /// The deepest visible, enabled child of `top` under its client point

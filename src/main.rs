@@ -534,6 +534,8 @@ async fn gui_refresh_task() {
                 }
 
                 if let Some(ev) = maybe_event {
+                    // A Windows program's window gets the key itself too.
+                    let program_key = crate::nt_user::key_event(ev.code, ev.state);
                     let key_name = match ev.code {
                         pc_keyboard::KeyCode::Escape => "ESC",
                         pc_keyboard::KeyCode::Return => "ENTER",
@@ -566,7 +568,7 @@ async fn gui_refresh_task() {
                             DecodedKey::Unicode(ch) => {
                                 crate::users::SESSION.lock().touch();
                                 // Intercept Ctrl+letter for clipboard / selection shortcuts.
-                                if CTRL_HELD.load(core::sync::atomic::Ordering::Relaxed) {
+                                if CTRL_HELD.load(core::sync::atomic::Ordering::Relaxed) && !program_key {
                                     let lower = ch.to_ascii_lowercase();
                                     match lower {
                                         'c' => { crate::clipboard::clipboard_copy(); continue; }

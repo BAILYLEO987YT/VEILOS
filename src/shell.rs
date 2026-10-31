@@ -377,7 +377,7 @@ pub fn pump(ms: u64) -> bool {
     if let Some(wm) = crate::desktop::DESKTOP_WM.try_lock() {
         focused = wm.focused_id.map(|f| f as i64).unwrap_or(0);
         let mut known = KNOWN_WINDOWS.lock();
-        for w in &wm.windows {
+        for w in wm.windows.iter().filter(|w| !w.frameless) {
             match known.iter_mut().find(|(id, _)| *id == w.id) {
                 None => opened.push((w.id, w.title.clone())),
                 Some((_, t)) if *t != w.title => {
@@ -388,7 +388,7 @@ pub fn pump(ms: u64) -> bool {
             }
         }
         for (id, _) in known.iter() {
-            if !wm.windows.iter().any(|w| w.id == *id) {
+            if !wm.windows.iter().any(|w| w.id == *id && !w.frameless) {
                 closed.push(*id);
             }
         }

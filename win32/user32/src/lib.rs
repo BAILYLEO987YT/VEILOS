@@ -17,16 +17,29 @@
 //!   paint.rs    pixels, DCs, invalidation and painting, DrawText, colors,
 //!               metrics
 //!   image.rs    bitmaps, icons and cursors (resources, files, standard ones)
+//!   scroll.rs   scroll bars: standard ones and the ScrollBar control
+//!   keyboard.rs key state, virtual keys, the caret
+//!   controls.rs the standard controls' shared parts; Button, Static
+//!   edit.rs     the Edit control
+//!   listbox.rs  ListBox, ComboBox (and its drop-down list)
+//!   dialog.rs   dialog templates, DefDlgProc, DialogBox, IsDialogMessage,
+//!               MessageBox
 
 #![no_std]
 
 extern crate alloc;
 
+mod controls;
+mod dialog;
 #[path = "../../dllrt.rs"]
 mod dllrt;
+mod edit;
 mod image;
+mod keyboard;
+mod listbox;
 mod message;
 mod paint;
+mod scroll;
 mod window;
 
 use alloc::vec::Vec;
@@ -58,7 +71,6 @@ unsafe extern "system" {
     pub(crate) fn VeilUserGetMessage(msg: *mut nt_abi::Msg, timeout: u32, flags: u32, hwnd: u64, min: u32, max: u32) -> i32;
     pub(crate) fn VeilUserTimer(hwnd: u64, id: u64, interval: u32) -> i32;
     pub(crate) fn VeilUserQuery(what: u32, out: *mut [i32; 2]) -> i32;
-    pub(crate) fn VeilDebugPrint(text: *const u8, len: usize) -> i32;
 }
 
 #[link(name = "gdi32", kind = "raw-dylib")]
@@ -78,6 +90,14 @@ unsafe extern "system" {
     pub(crate) fn SaveDC(hdc: u64) -> i32;
     pub(crate) fn RestoreDC(hdc: u64, n: i32) -> Bool;
     pub(crate) fn IntersectClipRect(hdc: u64, l: i32, t: i32, r: i32, b: i32) -> i32;
+    pub(crate) fn SetTextColor(hdc: u64, color: u32) -> u32;
+    pub(crate) fn SetBkColor(hdc: u64, color: u32) -> u32;
+    pub(crate) fn SetBkMode(hdc: u64, mode: i32) -> i32;
+    pub(crate) fn CreateCompatibleDC(hdc: u64) -> u64;
+    pub(crate) fn BitBlt(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i32, rop: u32) -> Bool;
+    pub(crate) fn GetObjectW(h: u64, size: i32, out: *mut u8) -> i32;
+    pub(crate) fn CreateFontW(h: i32, w: i32, esc: i32, orient: i32, weight: i32, italic: u32, underline: u32, strike: u32,
+                              charset: u32, out_prec: u32, clip_prec: u32, quality: u32, pitch: u32, face: *const u16) -> u64;
 }
 
 pub(crate) const ERROR_INVALID_WINDOW_HANDLE: u32 = 1400;
@@ -90,9 +110,6 @@ pub(crate) fn set_error(code: u32) {
     unsafe { SetLastError(code) };
 }
 
-pub(crate) fn debug(text: &str) {
-    unsafe { VeilDebugPrint(text.as_ptr(), text.len()) };
-}
 
 // -----| text |-----
 
@@ -239,6 +256,10 @@ pub(crate) struct Wnd {
     /// The kernel's window: a top-level window on the desktop (not a child,
     /// nor a message-only window).
     pub kernel: bool,
+    /// A kernel window without the desktop's frame (a popup).
+    pub popup: bool,
+    /// The standard scroll bars (WS_HSCROLL, WS_VSCROLL).
+    pub scroll: [ScrollBar; 2],
     /// A top-level window's client pixels (stride `stride`), and the part
     /// drawn since it was last presented.
     pub surface: Vec<u32>,
@@ -246,9 +267,40 @@ pub(crate) struct Wnd {
     pub dirty: Option<[i32; 4]>,
 }
 
+/// A scroll bar's SCROLLINFO, and whether its arrows are disabled.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ScrollBar {
+    pub min: i32,
+    pub max: i32,
+    pub page: u32,
+    pub pos: i32,
+    pub disabled: u32,
+}
+
 impl Wnd {
     pub fn top_level(&self) -> bool {
         self.parent == 0
+    }
+    /// The part of a kernel window's margins the desktop's frame stands
+    /// in for (Windows' border and caption); the rest of the non-client
+    /// area (scroll bars, the menu bar) is drawn in the window's pixels.
+    pub fn frame(&self) -> [i32; 4] {
+        if !self.kernel || self.popup {
+            return [0; 4];
+        }
+        let f = crate::window::frame_margins(self.style, self.ex_style, true);
+        [f[0].min(self.margins[0]), f[1].min(self.margins[1]), f[2].min(self.margins[2]), f[3].min(self.margins[3])]
+    }
+    /// Where the client area is inside the window's pixels: the non-client
+    /// parts drawn there (left, top, right, bottom).
+    pub fn inset(&self) -> [i32; 4] {
+        let f = self.frame();
+        [self.margins[0] - f[0], self.margins[1] - f[1], self.margins[2] - f[2], self.margins[3] - f[3]]
+    }
+    /// A kernel window's pixels: their size.
+    pub fn surface_size(&self) -> (i32, i32) {
+        let f = self.frame();
+        ((self.w - f[0] - f[2]).max(1), (self.h - f[1] - f[3]).max(1))
     }
     pub fn client_w(&self) -> i32 {
         (self.w - self.margins[0] - self.margins[2]).max(0)
@@ -307,12 +359,15 @@ impl State {
         0
     }
     /// Where `hwnd`'s client (0, 0) is in its top-level window's client area.
+    /// (In its top-level window's pixels, whose own client area may start
+    /// after an inset.)
     pub fn client_origin(&self, hwnd: Hwnd) -> (i32, i32) {
         let (mut x, mut y) = (0, 0);
         let mut h = hwnd;
         while let Some(w) = self.get(h) {
             if w.parent == 0 {
-                break;
+                let i = w.inset();
+                return (x + i[0], y + i[1]);
             }
             x += w.x + w.margins[0];
             y += w.y + w.margins[1];
@@ -325,12 +380,12 @@ impl State {
         let root = self.root(hwnd);
         let (ox, oy) = self.client_origin(hwnd);
         match self.get(root) {
-            Some(r) => (r.x + r.margins[0] + ox, r.y + r.margins[1] + oy),
+            Some(r) => (r.x + r.frame()[0] + ox, r.y + r.frame()[1] + oy),
             None => (ox, oy),
         }
     }
-    /// The part of `hwnd`'s client area its ancestors don't cut off, in
-    /// top-level client coordinates.
+    /// The part of `hwnd`'s client area its ancestors don't cut off, in its
+    /// top-level window's pixels.
     pub fn visible_clip(&self, hwnd: Hwnd) -> [i32; 4] {
         let (ox, oy) = self.client_origin(hwnd);
         let Some(w) = self.get(hwnd) else { return [0, 0, 0, 0] };
@@ -374,7 +429,10 @@ pub(crate) fn screen_size() -> (i32, i32) {
 }
 
 #[no_mangle]
-pub extern "system" fn DllMain(_module: usize, _reason: u32, _reserved: usize) -> i32 {
+pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) -> i32 {
+    if reason == 1 {
+        controls::register_classes();
+    }
     1
 }
 
