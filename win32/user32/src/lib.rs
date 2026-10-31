@@ -24,6 +24,8 @@
 //!   listbox.rs  ListBox, ComboBox (and its drop-down list)
 //!   dialog.rs   dialog templates, DefDlgProc, DialogBox, IsDialogMessage,
 //!               MessageBox
+//!   menu.rs     menus, the menu bar, popup menus and the menu loop, the
+//!               system menu, accelerators
 
 #![no_std]
 
@@ -37,6 +39,7 @@ mod edit;
 mod image;
 mod keyboard;
 mod listbox;
+mod menu;
 mod message;
 mod paint;
 mod scroll;
@@ -260,6 +263,8 @@ pub(crate) struct Wnd {
     pub popup: bool,
     /// The standard scroll bars (WS_HSCROLL, WS_VSCROLL).
     pub scroll: [ScrollBar; 2],
+    /// A top-level window's menu bar.
+    pub menu: u64,
     /// A top-level window's client pixels (stride `stride`), and the part
     /// drawn since it was last presented.
     pub surface: Vec<u32>,

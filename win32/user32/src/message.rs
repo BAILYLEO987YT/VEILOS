@@ -310,6 +310,9 @@ pub fn wake(tid: u32) {
 
 // -----| the queue |-----
 
+/// Alt went down with no other key since (for the menu bar).
+static ALT_ALONE: crate::dllrt::Lock<bool> = crate::dllrt::Lock::new(false);
+
 static LAST: crate::dllrt::Lock<(u32, i32, i32)> = crate::dllrt::Lock::new((0, 0, 0));
 
 fn kernel_get(m: &mut Msg, timeout: u32, flags: u32, hwnd: Hwnd, min: u32, max: u32) -> bool {
@@ -522,16 +525,6 @@ pub extern "system" fn DispatchMessageA(m: *const Msg) -> i64 {
     dispatch(m, false)
 }
 
-#[no_mangle]
-pub extern "system" fn TranslateAcceleratorW(_hwnd: Hwnd, _accel: u64, _m: *const Msg) -> i32 {
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn TranslateAcceleratorA(_hwnd: Hwnd, _accel: u64, _m: *const Msg) -> i32 {
-    0
-}
-
 // -----| timers |-----
 
 #[no_mangle]
@@ -592,7 +585,7 @@ pub fn def_window_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) ->
             if lp != 0 {
                 let r = lp as *mut [i32; 4];
                 if let Some(w) = state().get(hwnd) {
-                    let m = crate::window::nc_margins(w.style, w.ex_style, w.parent == 0);
+                    let m = crate::window::nc_margins(w.style, w.ex_style, w.parent == 0, w.parent == 0 && w.menu != 0);
                     unsafe {
                         (*r)[0] += m[0];
                         (*r)[1] += m[1];
@@ -665,6 +658,8 @@ pub fn def_window_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) ->
                 0xF120 => {
                     crate::window::ShowWindow(hwnd, 9);
                 }
+                // SC_KEYMENU: lParam the key.
+                0xF100 => crate::menu::key_menu(hwnd, lp as u16),
                 _ => {}
             }
             0
@@ -695,6 +690,51 @@ pub fn def_window_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) ->
         WM_NCHITTEST => {
             let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
             crate::window::nc_hit(hwnd, x, y) as i64
+        }
+        // A click on the menu bar.
+        0x00A1 if wp == 5 => {
+            let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            crate::menu::bar_click(hwnd, x, y);
+            0
+        }
+        // Alt+key: the menu with that mnemonic (Alt+Space: the system
+        // menu), from the top-level window.
+        0x0106 => {
+            let root = state().root(hwnd);
+            if wp == 0x0D {
+                return 0;
+            }
+            if root != 0 {
+                send(root, WM_SYSCOMMAND, 0xF100, wp as u16 as i64);
+            }
+            0
+        }
+        // Alt alone, F10: the menu bar from the keyboard; Alt+F4: close.
+        WM_SYSKEYDOWN => {
+            let mut alone = ALT_ALONE.lock();
+            if wp == 0x12 {
+                *alone = lp & (1 << 30) == 0 || *alone;
+            } else {
+                *alone = false;
+            }
+            drop(alone);
+            if wp == 0x73 && lp & (1 << 29) != 0 {
+                let root = state().root(hwnd);
+                send(root, WM_SYSCOMMAND, 0xF060, 0);
+            }
+            0
+        }
+        0x0105 => {
+            let alone = core::mem::replace(&mut *ALT_ALONE.lock(), false);
+            if (wp == 0x12 && alone) || wp == 0x79 {
+                let root = state().root(hwnd);
+                send(root, WM_SYSCOMMAND, 0xF100, 0);
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            *ALT_ALONE.lock() = false;
+            0
         }
         // A click on a standard scroll bar.
         0x00A1 if wp == crate::scroll::HTVSCROLL || wp == crate::scroll::HTHSCROLL => {

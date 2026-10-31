@@ -72,10 +72,13 @@ pub const WS_HSCROLL: u32 = 0x0010_0000;
 /// SM_CXVSCROLL / SM_CYHSCROLL.
 pub const SCROLL_SIZE: i32 = 17;
 
-/// The default non-client margins (WM_NCCALCSIZE's): the frame and the
-/// standard scroll bars.
-pub fn nc_margins(style: u32, ex: u32, top_level: bool) -> [i32; 4] {
+/// The default non-client margins (WM_NCCALCSIZE's): the frame, the menu
+/// bar and the standard scroll bars.
+pub fn nc_margins(style: u32, ex: u32, top_level: bool, menu: bool) -> [i32; 4] {
     let mut m = frame_margins(style, ex, top_level);
+    if menu && top_level {
+        m[1] += crate::menu::BAR_H;
+    }
     if style & WS_VSCROLL != 0 {
         m[2] += SCROLL_SIZE;
     }
@@ -162,7 +165,17 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
     }
     let message_only = parent == HWND_MESSAGE;
     let (parent, owner) = if child { (parent, 0) } else { (0, if message_only { 0 } else { s.root(parent) }) };
-    let margins = nc_margins(style, ex, !child);
+    // A top-level window's menu: given, or its class's (loading it takes
+    // only the menu table's lock).
+    let menu_bar = if child {
+        0
+    } else if menu != 0 {
+        menu
+    } else {
+        let c = &s.classes[ci];
+        if c.menu_name != 0 { crate::menu::LoadMenuW(c.instance, c.menu_name as *const u16) } else { 0 }
+    };
+    let margins = nc_margins(style, ex, !child, menu_bar != 0);
     let (sw, sh) = crate::screen_size();
     let (mut x, mut y, mut w, mut h) = (x, y, w, h);
     if child {
@@ -263,6 +276,7 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
             kernel,
             popup,
             scroll: [crate::ScrollBar { max: 100, ..Default::default() }; 2],
+            menu: menu_bar,
         });
         if kernel {
             let w = s.get_mut(hwnd).unwrap();
@@ -400,6 +414,7 @@ fn destroy_now(hwnd: Hwnd) {
     }
     s.timer_procs.retain(|t| !all.contains(&t.0));
     let kernel: Vec<Hwnd> = all.iter().copied().filter(|h| s.get(*h).is_some_and(|w| w.kernel)).collect();
+    let menus: Vec<(Hwnd, u64)> = all.iter().filter_map(|h| s.get(*h).map(|w| (w.hwnd, if w.parent == 0 { w.menu } else { 0 }))).collect();
     s.windows.retain(|w| !all.contains(&w.hwnd));
     let st = &mut *s;
     for f in [&mut st.focus, &mut st.active, &mut st.capture] {
@@ -413,6 +428,13 @@ fn destroy_now(hwnd: Hwnd) {
     }
     for h in kernel {
         unsafe { crate::VeilUserDestroyWindow(h) };
+    }
+    // The menu bar and system menu go with the window.
+    for (h, menu) in menus {
+        crate::menu::window_destroyed(h);
+        if menu != 0 {
+            crate::menu::DestroyMenu(menu);
+        }
     }
 }
 
@@ -1462,6 +1484,9 @@ pub fn nc_hit(hwnd: Hwnd, x: i32, y: i32) -> u64 {
     let (wx, wy) = (x - r[0], y - r[1]);
     if wx < 0 || wy < 0 || x >= r[2] || y >= r[3] {
         return 0;
+    }
+    if crate::menu::on_bar(hwnd, wx, wy) {
+        return 5; // HTMENU
     }
     let bars = crate::scroll::bar_rects(hwnd);
     let inside = |b: Option<[i32; 4]>| b.is_some_and(|b| wx >= b[0] && wx < b[2] && wy >= b[1] && wy < b[3]);

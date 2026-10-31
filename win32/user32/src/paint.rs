@@ -365,6 +365,7 @@ pub fn paint_frame(hwnd: Hwnd) {
         }
     }
     crate::scroll::paint_bars(hwnd, hdc);
+    crate::menu::paint_bar(hwnd, hdc);
     release(hdc);
 }
 

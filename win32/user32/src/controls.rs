@@ -215,7 +215,8 @@ pub fn draw_label(hdc: u64, text: &[u16], r: [i32; 4], flags: u32, enabled: bool
 /// The standard classes, registered when user32 loads.
 pub fn register_classes() {
     type P = unsafe extern "system" fn(Hwnd, u32, u64, i64) -> i64;
-    let classes: [(&str, P, u32, u64, i32); 7] = [
+    let classes: [(&str, P, u32, u64, i32); 8] = [
+        ("#32768", crate::menu::popup_proc, 0x0808, 0, 0),
         ("Button", button_proc, 0x0B, 0, 0),
         ("Static", static_proc, 0x08, 0, 0),
         ("Edit", crate::edit::edit_proc, 0x0B, 0, 0),

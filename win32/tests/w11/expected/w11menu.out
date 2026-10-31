@@ -1,0 +1,106 @@
+built menus
+0: id -1 "&Menu" state 0410
+  0: id 10 "&One" state 0000
+  1: id 11 "&Two" state 0008
+  2: id 0 "" state 0803
+  3: id 12 "T&hree" state 0001
+1: id 20 "&Item" state 0000
+CheckMenuItem was 0, EnableMenuItem was 1
+CheckMenuRadioItem 1
+item info id 11 state 0008 type 0200 "&Two"
+default item 9
+0: id -1 "&Menu" state 0510
+  0: id 9 "&Zero" state 1000
+  1: id 10 "&One" state 0000
+  2: id 11 "&Two" state 0208
+  3: id 0 "" state 0803
+  4: id 12 "T&hree" state 0000
+1: id 21 "&Renamed" state 0000
+DeleteMenu 1, RemoveMenu 1, count 5
+missing item state -1, IsMenu 1
+after DestroyMenu: IsMenu 0 0
+MENU resource
+0: id -1 "&File" state 0410
+  0: id 200 "&New	Ctrl+N" state 0000
+  1: id 201 "&Open..." state 0001
+  2: id 0 "" state 0803
+  3: id 202 "E&xit" state 0000
+1: id -1 "&View" state 0210
+  0: id 210 "&Toolbar" state 0008
+  1: id -1 "&Zoom" state 0210
+    0: id 220 "&In" state 0000
+    1: id 221 "&Out" state 0000
+2: id 230 "&Help" state 0000
+MENUEX resource
+0: id -1 "&Edit" state 0410
+  0: id 301 "&Undo" state 1000
+  1: id 0 "" state 0803
+  2: id 302 "&Left" state 0208
+  3: id 303 "&Right" state 0200
+radio item type 0200 state 0008 id 302
+window with a menu bar
+GetMenu is bar 1
+client 384x241
+  WM_SIZE 384,261
+without menu: client 384x261, GetMenu 0
+  WM_SIZE 384,241
+with menu: client 384x241
+system menu 7 items: f120 f010 f000 f020 f030 0000 f060
+close "&Close	Alt+F4"
+accelerators
+count 3, second 0 'a' 101
+TranslateAccelerator key 83 ctrl 0 -> 0
+  WM_COMMAND 100 source 1
+TranslateAccelerator key 83 ctrl 1 -> 1
+  WM_COMMAND 102 source 1
+TranslateAccelerator key 116 ctrl 0 -> 1
+  WM_COMMAND 101 source 1
+TranslateAccelerator char 97 ctrl 0 -> 1
+TranslateAccelerator char 98 ctrl 0 -> 0
+resource table 3: (09 78 200) (01 112 230) (00 120 202)
+  WM_INITMENU bar 1
+  WM_INITMENUPOPUP position 0 system 0
+  WM_UNINITMENUPOPUP
+TranslateAccelerator key 78 ctrl 1 -> 1
+  WM_INITMENU bar 1
+  WM_INITMENUPOPUP position 0 system 0
+  WM_COMMAND 200 source 1
+  WM_UNINITMENUPOPUP
+TranslateAccelerator key 78 ctrl 1 -> 1
+  WM_INITMENU bar 1
+  WM_COMMAND 230 source 1
+TranslateAccelerator key 112 ctrl 0 -> 1
+TranslateAccelerator key 78 ctrl 0 -> 0
+popup menu
+  WM_MENUSELECT item 40 flags 0080 menu 1
+  WM_MENUSELECT item 41 flags 0080 menu 1
+  WM_MENUSELECT item 0 flags ffff menu 0
+TrackPopupMenu returned 41
+  WM_ENTERMENULOOP popup 1
+  WM_INITMENU bar 0
+  WM_INITMENUPOPUP position 0 system 0
+  WM_MENUSELECT item 40 flags 0080 menu 1
+  WM_UNINITMENUPOPUP
+  WM_MENUSELECT item 0 flags ffff menu 0
+  WM_EXITMENULOOP popup 1
+TrackPopupMenu returned 1
+  WM_COMMAND 40 source 0
+  WM_ENTERMENULOOP popup 1
+  WM_INITMENU bar 0
+  WM_INITMENUPOPUP position 0 system 0
+  WM_UNINITMENUPOPUP
+  WM_MENUSELECT item 0 flags ffff menu 0
+  WM_EXITMENULOOP popup 1
+cancelled: returned 0
+menu bar from the keyboard
+  WM_SYSCOMMAND f100 key 102
+  WM_ENTERMENULOOP popup 0
+  WM_INITMENU bar 1
+  WM_MENUSELECT item 0 flags 0090 menu 1
+  WM_INITMENUPOPUP position 0 system 0
+  WM_MENUSELECT item 200 flags 0080 menu 1
+  WM_MENUSELECT item 201 flags 0081 menu 1
+  WM_UNINITMENUPOPUP
+  WM_MENUSELECT item 0 flags ffff menu 0
+  WM_EXITMENULOOP popup 0
+exit 0

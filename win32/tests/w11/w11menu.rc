@@ -1,0 +1,40 @@
+#include <windows.h>
+
+101 MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&New\tCtrl+N", 200
+        MENUITEM "&Open...", 201, GRAYED
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit", 202
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "&Toolbar", 210, CHECKED
+        POPUP "&Zoom"
+        BEGIN
+            MENUITEM "&In", 220
+            MENUITEM "&Out", 221
+        END
+    END
+    MENUITEM "&Help", 230
+END
+
+102 MENUEX
+BEGIN
+    POPUP "&Edit", 300, MFT_STRING, MFS_ENABLED
+    BEGIN
+        MENUITEM "&Undo", 301, MFT_STRING, MFS_DEFAULT
+        MENUITEM "", 0, MFT_SEPARATOR
+        MENUITEM "&Left", 302, MFT_RADIOCHECK, MFS_CHECKED
+        MENUITEM "&Right", 303, MFT_RADIOCHECK
+    END
+END
+
+103 ACCELERATORS
+BEGIN
+    "N", 200, VIRTKEY, CONTROL
+    VK_F1, 230, VIRTKEY
+    "x", 202, ASCII
+END

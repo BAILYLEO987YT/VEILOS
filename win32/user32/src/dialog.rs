@@ -843,9 +843,50 @@ pub extern "system" fn IsDialogMessageW(dlg: Hwnd, m: *const nt_abi::Msg) -> Boo
             _ => {}
         }
     }
+    // A mnemonic: Alt+key, or a plain key where the focus doesn't take
+    // characters.
+    if msg.message == 0x0106 || msg.message == 0x0102 {
+        let focus = crate::window::GetFocus();
+        let ctl = dlg_child(dlg, focus);
+        let code = if ctl != 0 { send(ctl, WM_GETDLGCODE, msg.wparam, m as i64) } else { 0 };
+        if msg.message == 0x0106 || code & (controls::DLGC_WANTCHARS | controls::DLGC_WANTALLKEYS) == 0 {
+            if mnemonic(dlg, msg.wparam as u16) {
+                return 1;
+            }
+        }
+    }
     crate::message::TranslateMessage(m);
     crate::message::DispatchMessageW(m);
     1
+}
+
+/// The control whose text marks `ch` with '&': a button is clicked, a
+/// label passes the focus to the control after it.
+fn mnemonic(dlg: Hwnd, ch: u16) -> bool {
+    let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
+    let cs = controls_of(dlg);
+    for (i, (h, st)) in cs.iter().enumerate() {
+        if !usable(*st) {
+            continue;
+        }
+        let t = controls::text(*h);
+        if !t.windows(2).any(|w| w[0] == b'&' as u16 && lower(w[1]) == lower(ch)) {
+            continue;
+        }
+        let code = send(*h, WM_GETDLGCODE, 0, 0);
+        if code & controls::DLGC_STATIC != 0 {
+            if let Some((next, _)) = cs[i + 1..].iter().find(|(_, s)| usable(*s) && s & WS_TABSTOP != 0) {
+                set_dlg_focus(dlg, *next);
+            }
+        } else if code & controls::DLGC_BUTTON != 0 {
+            crate::window::SetFocus(*h);
+            send(*h, 0x00F5, 0, 0);
+        } else {
+            set_dlg_focus(dlg, *h);
+        }
+        return true;
+    }
+    false
 }
 
 #[no_mangle]
