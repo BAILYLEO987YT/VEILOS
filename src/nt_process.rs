@@ -337,6 +337,13 @@ fn signalled(obj: &KernelObjectRef, take: bool) -> bool {
                 ev.signaled.load(Ordering::Acquire)
             }
         }
+        KernelObjectRef::Semaphore(s) => {
+            if take {
+                s.try_acquire()
+            } else {
+                s.count.load(Ordering::Acquire) > 0
+            }
+        }
         KernelObjectRef::Process(p) => p.ended.load(Ordering::Acquire),
         KernelObjectRef::Thread(t) => t.done.load(Ordering::Acquire),
         _ => true,

@@ -75,6 +75,33 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 }
             }
         }
+        sys::NT_CREATE_SEMAPHORE => {
+            let max = stack(4).unwrap_or(1) as u32 as i32;
+            let initial = a3 as u32 as i32;
+            if !ptr_ok(a0, 8) {
+                status::ACCESS_VIOLATION
+            } else if max <= 0 || initial < 0 || initial > max {
+                status::INVALID_PARAMETER
+            } else {
+                let sem = Arc::new(crate::nt_objects::SemaphoreObject::new(None, initial, max));
+                let h = proc.handles.lock().allocate_semaphore(sem, a1 as u32);
+                unsafe { *(a0 as *mut u64) = h as u64 };
+                status::SUCCESS
+            }
+        }
+        sys::NT_RELEASE_SEMAPHORE => match object(&proc, a0) {
+            Some(KernelObjectRef::Semaphore(sem)) => match sem.release(a1 as u32 as i32) {
+                Ok(prev) => {
+                    if ptr_ok(a2, 4) {
+                        unsafe { *(a2 as *mut i32) = prev };
+                    }
+                    status::SUCCESS
+                }
+                // STATUS_SEMAPHORE_LIMIT_EXCEEDED
+                Err(_) => 0xC000_0047u32 as i32,
+            },
+            _ => status::INVALID_HANDLE,
+        },
         sys::NT_QUERY_OBJECT => {
             if a1 as u32 != 4 || (a3 as u32) < 2 || !ptr_ok(a2, 2) {
                 status::INVALID_PARAMETER
@@ -116,6 +143,8 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::VEIL_USER_GET_MESSAGE => crate::nt_user::get_message(a0, a1, a2, a3),
         sys::VEIL_USER_TIMER => crate::nt_user::timer(a0, a1, a2),
         sys::VEIL_USER_QUERY => crate::nt_user::query(a0, a1),
+        sys::VEIL_CLIP_SET => crate::nt_user::clip_set(proc.pid as u32, a0, a1),
+        sys::VEIL_CLIP_GET => crate::nt_user::clip_get(proc.pid as u32, a0, a1, a2),
         sys::VEIL_LOAD_DLL => load_dll(&proc, a0, a1, a2, a3),
         sys::VEIL_GET_PROC_ADDRESS => get_proc_address(&proc, a0, a1, a2),
         _ => status::NOT_IMPLEMENTED,

@@ -254,6 +254,13 @@ pub fn draw_glyph(c: &crate::draw::Canvas, r: &Realized, gid: u16, x_q6: i32, ba
     }
 }
 
+/// Every face: (family, fixed pitch, weight, italic).
+pub fn families() -> Vec<(String, bool, i32, bool)> {
+    let mut lib = LIB.lock();
+    lib.load();
+    lib.faces.iter().zip(&lib.fixed).map(|(f, &fx)| (f.family.clone(), fx, f.weight as i32, f.italic)).collect()
+}
+
 /// The family name of a realized font's face.
 pub fn face_name(r: &Realized) -> String {
     LIB.lock().faces[r.face].family.clone()

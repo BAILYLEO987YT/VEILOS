@@ -135,8 +135,17 @@ pub mod sys {
     /// VEIL_USER_QUERY(what: 0 screen size, 1 cursor position, 2 | vk << 8 key
     /// state [down, toggled], out: *mut [i32; 2]).
     pub const VEIL_USER_QUERY: u32 = BASE + 46;
+    /// NtCreateSemaphore(handle_out*, access, attributes*, initial, maximum).
+    pub const NT_CREATE_SEMAPHORE: u32 = BASE + 47;
+    /// NtReleaseSemaphore(handle, count, previous*).
+    pub const NT_RELEASE_SEMAPHORE: u32 = BASE + 48;
+    /// VEIL_CLIP_SET(text: *const u16, chars): the clipboard's text.
+    pub const VEIL_CLIP_SET: u32 = BASE + 49;
+    /// VEIL_CLIP_GET(buf: *mut u16, cap, chars_out*, sequence_out*): the
+    /// clipboard's latest text (buf null: just its length and sequence).
+    pub const VEIL_CLIP_GET: u32 = BASE + 50;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 47;
+    pub const END: u32 = BASE + 51;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
@@ -198,6 +207,13 @@ pub const WINDOW_VISIBLE: u32 = 1;
 /// No desktop frame (a popup: a menu, a drop-down list): its position is
 /// its client area's.
 pub const WINDOW_POPUP: u32 = 2;
+/// Owned by another window (a dialog): no taskbar button.
+pub const WINDOW_OWNED: u32 = 4;
+
+/// In a WM_CHAR / WM_SYSCHAR the desktop typed (lParam bit 28, reserved on
+/// Windows): user32 delivers it only if its key-down was translated, as
+/// TranslateMessage would have made it, and clears the bit.
+pub const CHAR_TYPED: u64 = 1 << 28;
 
 /// A window's client area: its origin on the screen and its size.
 #[repr(C)]

@@ -111,6 +111,8 @@ pub struct DesktopWindow {
     pub dirty:   bool,
     /// No frame, title bar or taskbar button (a Windows program's popup).
     pub frameless: bool,
+    /// A taskbar button (not for frameless or owned windows).
+    pub taskbar: bool,
 }
 
 impl DesktopWindow {
@@ -119,7 +121,7 @@ impl DesktopWindow {
         Self {
             id, title: String::from(title), rect, saved_rect: rect,
             state: WindowState::Normal, z_order: 0, resizable: true,
-            owner_pid: pid, root: None, dirty: true, frameless: false,
+            owner_pid: pid, root: None, dirty: true, frameless: false, taskbar: true,
         }
     }
 
@@ -1178,7 +1180,7 @@ impl Panel {
 
     pub fn sync_windows(&mut self, wm: &DesktopWindowManager) {
         let mut needs_sync = false;
-        let listed: Vec<&DesktopWindow> = wm.windows.iter().filter(|w| !w.frameless).collect();
+        let listed: Vec<&DesktopWindow> = wm.windows.iter().filter(|w| !w.frameless && w.taskbar).collect();
         if self.taskbar_buttons.len() != listed.len() {
             needs_sync = true;
         } else {

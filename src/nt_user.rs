@@ -203,14 +203,14 @@ pub fn deliver(vid: u32, message: u32, wparam: u64, lparam: u64) -> bool {
         }
         WM_CHAR => {
             // A typed character (its key went as WM_KEYDOWN/UP): with Ctrl a
-            // control character, with Alt WM_SYSCHAR.
-            let mut ch = wparam as u32;
+            // control character, with Alt WM_SYSCHAR. Enter types CR.
+            let mut ch = if wparam == 0x0A { 0x0D } else { wparam as u32 };
             let (ctrl, alt) = (key_down(VK_CONTROL), key_down(VK_MENU));
             if ctrl && (0x40..0x80).contains(&ch) {
                 ch &= 0x1F;
             }
             let msg = if alt && !ctrl { WM_SYSCHAR } else { WM_CHAR };
-            post_to(win.tid, hwnd, msg, ch as u64, 1);
+            post_to(win.tid, hwnd, msg, ch as u64, 1 | nt_abi::CHAR_TYPED);
         }
         _ => post_to(win.tid, hwnd, message, wparam, lparam),
     }
@@ -482,6 +482,11 @@ pub fn create_window(pid: u32, params: u64, out: u64) -> NtStatus {
             }
             wm.focused_id = focused;
         }
+        if p.flags & nt_abi::WINDOW_OWNED != 0 {
+            if let Some(dw) = wm.windows.iter_mut().find(|w| w.id == vid) {
+                dw.taskbar = false;
+            }
+        }
         vid
     };
     let hwnd = NEXT_HWND.fetch_add(4, Ordering::Relaxed);
@@ -512,7 +517,7 @@ pub fn create_window(pid: u32, params: u64, out: u64) -> NtStatus {
     }
     WINDOWS.lock().push(win);
     unsafe { *(out as *mut u64) = hwnd as u64 };
-    crate::serial_println!("[USER] pid {} window {:#x} '{}' {}x{}", pid, hwnd, title, cw, ch);
+    crate::serial_println!("[USER] pid {} window {:#x} '{}' {}x{} flags {:#x}", pid, hwnd, title, cw, ch, p.flags);
     status::SUCCESS
 }
 
@@ -753,6 +758,39 @@ pub fn timer(hwnd: u64, id: u64, interval: u64) -> NtStatus {
         before != q.timers.len()
     });
     if interval == 0 && !found { status::INVALID_PARAMETER } else { status::SUCCESS }
+}
+
+/// VEIL_CLIP_SET(text*, chars): text a Windows program copied.
+pub fn clip_set(pid: u32, text: u64, chars: u64) -> NtStatus {
+    let n = (chars as usize).min(1 << 20);
+    if !ptr_ok(text, n * 2) {
+        return status::ACCESS_VIOLATION;
+    }
+    let units = unsafe { core::slice::from_raw_parts(text as *const u16, n) };
+    let s: String = char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or('\u{FFFD}')).collect();
+    crate::clipboard::CLIPBOARD.lock().copy_text(s, pid, false);
+    status::SUCCESS
+}
+
+/// VEIL_CLIP_GET(buf*, cap, chars_out*, seq_out*): the latest text.
+pub fn clip_get(pid: u32, buf: u64, cap: u64, chars_out: u64) -> NtStatus {
+    let seq_out = stack(4).unwrap_or(0);
+    let text = crate::clipboard::CLIPBOARD.lock().paste_text(pid).unwrap_or_default();
+    let units: Vec<u16> = text.encode_utf16().collect();
+    if ptr_ok(chars_out, 4) {
+        unsafe { *(chars_out as *mut u32) = units.len() as u32 };
+    }
+    if ptr_ok(seq_out, 4) {
+        unsafe { *(seq_out as *mut u32) = crate::clipboard::SEQUENCE.load(Ordering::Relaxed) };
+    }
+    if buf != 0 {
+        let n = units.len().min(cap as usize);
+        if !ptr_ok(buf, n * 2) {
+            return status::ACCESS_VIOLATION;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(units.as_ptr(), buf as *mut u16, n) };
+    }
+    status::SUCCESS
 }
 
 /// VEIL_USER_QUERY(what, out*).

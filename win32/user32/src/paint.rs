@@ -762,8 +762,28 @@ pub extern "system" fn GetSystemMetricsForDpi(index: i32, _dpi: u32) -> i32 {
     GetSystemMetrics(index)
 }
 
+/// A LOGFONTW of Segoe UI (Windows' interface font), `height` pixels.
+fn ui_font(out: *mut u8, height: i32, weight: i32) {
+    unsafe {
+        core::ptr::write_bytes(out, 0, 92);
+        *(out as *mut i32) = height;
+        *(out.add(16) as *mut i32) = weight;
+        *out.add(23) = 1; // DEFAULT_CHARSET
+        *out.add(26) = 5; // CLEARTYPE_QUALITY
+        for (i, c) in "Segoe UI".encode_utf16().enumerate() {
+            *(out.add(28 + 2 * i) as *mut u16) = c;
+        }
+    }
+}
+
 #[no_mangle]
-pub extern "system" fn SystemParametersInfoW(action: u32, _p: u32, out: *mut u8, _ini: u32) -> Bool {
+pub extern "system" fn SystemParametersInfoW(action: u32, p: u32, out: *mut u8, _ini: u32) -> Bool {
+    let put32 = |v: u32| {
+        if !out.is_null() {
+            unsafe { *(out as *mut u32) = v };
+        }
+        1
+    };
     match action {
         0x30 => {
             // SPI_GETWORKAREA: below the desktop's panel.
@@ -771,8 +791,141 @@ pub extern "system" fn SystemParametersInfoW(action: u32, _p: u32, out: *mut u8,
             unsafe { *(out as *mut [i32; 4]) = [0, 0, w, h] };
             1
         }
-        _ => 0,
+        // SPI_GETNONCLIENTMETRICS: Windows 10's sizes and fonts.
+        0x29 => {
+            if out.is_null() {
+                return 0;
+            }
+            let size = unsafe { *(out as *const u32) }.max(500) as usize;
+            unsafe { core::ptr::write_bytes(out.add(4), 0, size.min(504) - 4) };
+            let ints = [1, 17, 17, 22, 22];
+            for (i, v) in ints.iter().enumerate() {
+                unsafe { *(out.add(4 + i * 4) as *mut i32) = *v };
+            }
+            ui_font(unsafe { out.add(24) }, -12, 400); // caption font
+            unsafe {
+                *(out.add(116) as *mut i32) = 22;
+                *(out.add(120) as *mut i32) = 22;
+            }
+            ui_font(unsafe { out.add(124) }, -12, 400); // small caption
+            unsafe {
+                *(out.add(216) as *mut i32) = 19;
+                *(out.add(220) as *mut i32) = 19;
+            }
+            ui_font(unsafe { out.add(224) }, -12, 400); // menu
+            ui_font(unsafe { out.add(316) }, -12, 400); // status
+            ui_font(unsafe { out.add(408) }, -12, 400); // message
+            if size >= 504 {
+                unsafe { *(out.add(500) as *mut i32) = 4 }; // iPaddedBorderWidth
+            }
+            1
+        }
+        // SPI_GETICONTITLELOGFONT
+        0x1F => {
+            ui_font(out, -12, 400);
+            1
+        }
+        // SPI_GETWHEELSCROLLLINES, SPI_GETWHEELSCROLLCHARS
+        0x68 | 0x6C => put32(3),
+        // SPI_GETFONTSMOOTHING, SPI_GETKEYBOARDCUES, SPI_GETDRAGFULLWINDOWS
+        0x4A | 0x100A | 0x26 => put32(1),
+        // SPI_GETFLATMENU, SPI_GETSCREENREADER, SPI_GETMENUANIMATION,
+        // SPI_GETCLIENTAREAANIMATION, SPI_GETCLEARTYPE
+        0x1022 | 0x46 | 0x1002 | 0x1042 | 0x1048 => put32(0),
+        // SPI_GETHIGHCONTRAST: off.
+        0x42 => {
+            if !out.is_null() {
+                unsafe {
+                    *(out.add(4) as *mut u32) = 0;
+                    *(out.add(8) as *mut u64) = 0;
+                }
+            }
+            1
+        }
+        // SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED, SPI_GETMENUSHOWDELAY
+        0x16 => put32(1),
+        0x0A => put32(31),
+        0x6A => put32(400),
+        // SPI_GETFOCUSBORDERWIDTH/HEIGHT, SPI_GETCARETWIDTH
+        0x200E | 0x2010 | 0x2006 => put32(1),
+        _ => {
+            let _ = p;
+            0
+        }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn SystemParametersInfoForDpi(action: u32, p: u32, out: *mut u8, ini: u32, _dpi: u32) -> Bool {
+    SystemParametersInfoW(action, p, out, ini)
+}
+
+// -----| the monitor: one, the screen |-----
+
+const MONITOR: u64 = 0x0001_0001;
+
+#[no_mangle]
+pub extern "system" fn MonitorFromWindow(_hwnd: Hwnd, _flags: u32) -> u64 {
+    MONITOR
+}
+
+#[no_mangle]
+pub extern "system" fn MonitorFromPoint(_x: i64, _flags: u32) -> u64 {
+    MONITOR
+}
+
+#[no_mangle]
+pub extern "system" fn MonitorFromRect(_r: *const [i32; 4], _flags: u32) -> u64 {
+    MONITOR
+}
+
+/// MONITORINFO(EX): size, monitor and work rectangles, flags, (device).
+fn monitor_info(out: *mut u8, wide: bool) -> Bool {
+    if out.is_null() {
+        return 0;
+    }
+    let size = unsafe { *(out as *const u32) };
+    let (w, h) = crate::screen_size();
+    unsafe {
+        *(out.add(4) as *mut [i32; 4]) = [0, 0, w, h];
+        *(out.add(20) as *mut [i32; 4]) = [0, 0, w, h];
+        *(out.add(36) as *mut u32) = 1; // MONITORINFOF_PRIMARY
+    }
+    if size > 40 {
+        let name = "\\\\.\\DISPLAY1";
+        for (i, c) in name.encode_utf16().chain(core::iter::once(0)).enumerate() {
+            unsafe {
+                if wide {
+                    *(out.add(40 + i * 2) as *mut u16) = c;
+                } else {
+                    *out.add(40 + i) = c as u8;
+                }
+            }
+        }
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn GetMonitorInfoW(_mon: u64, out: *mut u8) -> Bool {
+    monitor_info(out, true)
+}
+
+#[no_mangle]
+pub extern "system" fn GetMonitorInfoA(_mon: u64, out: *mut u8) -> Bool {
+    monitor_info(out, false)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumDisplayMonitors(_hdc: u64, _clip: *const [i32; 4], proc: usize, lp: i64) -> Bool {
+    if proc == 0 {
+        return 0;
+    }
+    let (w, h) = crate::screen_size();
+    let r = [0, 0, w, h];
+    let f: unsafe extern "system" fn(u64, u64, *const [i32; 4], i64) -> Bool = unsafe { core::mem::transmute(proc) };
+    unsafe { f(MONITOR, 0, &r, lp) };
+    1
 }
 
 #[no_mangle]

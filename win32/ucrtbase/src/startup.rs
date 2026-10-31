@@ -906,3 +906,29 @@ pub unsafe extern "C" fn __std_type_info_name(t: *const u8, _list: usize) -> *co
 
 #[no_mangle]
 pub extern "C" fn __std_type_info_destroy_list(_list: usize) {}
+
+/// The command line after the program's name (what WinMain gets).
+#[no_mangle]
+pub unsafe extern "C" fn _get_wide_winmain_command_line() -> *const u16 {
+    let mut p = unsafe { GetCommandLineW() };
+    let quote = b'"' as u16;
+    unsafe {
+        if *p == quote {
+            p = p.add(1);
+            while *p != 0 && *p != quote {
+                p = p.add(1);
+            }
+            if *p == quote {
+                p = p.add(1);
+            }
+        } else {
+            while *p > b' ' as u16 {
+                p = p.add(1);
+            }
+        }
+        while *p == b' ' as u16 || *p == 9 {
+            p = p.add(1);
+        }
+    }
+    p
+}

@@ -501,9 +501,14 @@ async fn gui_refresh_task() {
                     Some(s) => s,
                     None    => break,
                 };
-                // Detect extended prefix (0xE0) for Super/arrow keys.
+                // Detect extended prefix (0xE0) for Super/arrow keys. The
+                // decoder needs it too, or End, the arrows and the other
+                // grey keys decode as their numeric-keypad twins.
                 if sc == 0xE0 {
                     EXTENDED_PREFIX.store(true, core::sync::atomic::Ordering::Relaxed);
+                    if let Some(kb) = KB.lock().as_mut() {
+                        let _ = kb.add_byte(sc);
+                    }
                     continue;
                 }
                 let extended = EXTENDED_PREFIX.swap(false, core::sync::atomic::Ordering::Relaxed);

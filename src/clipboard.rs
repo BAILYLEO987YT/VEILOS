@@ -148,6 +148,7 @@ impl ClipboardManager {
     }
 
     pub fn push(&mut self, entry: ClipboardEntry) {
+        SEQUENCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.history.insert(0, entry);
         while self.history.len() > self.max_history { self.history.pop(); }
     }
@@ -377,6 +378,9 @@ impl ClipboardManager {
 }
 
 pub static CLIPBOARD: Mutex<ClipboardManager> = Mutex::new(ClipboardManager::new());
+
+/// Counts the entries ever copied (GetClipboardSequenceNumber).
+pub static SEQUENCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
 // =====================================================================
 // -----| Public API — keyboard shortcuts |-----

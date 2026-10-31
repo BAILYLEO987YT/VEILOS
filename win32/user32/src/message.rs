@@ -243,6 +243,14 @@ pub extern "system" fn CallWindowProcA(proc: usize, hwnd: Hwnd, msg: u32, wp: u6
     call_proc(proc, false, hwnd, msg, wp, lp, false)
 }
 
+/// For comctl32's subclassing: call `proc` (taking Unicode messages if
+/// `proc_unicode`) with a message from a caller using Unicode strings or
+/// not, converting between them like CallWindowProc's thunks.
+#[no_mangle]
+pub extern "system" fn VeilCallProc(proc: usize, proc_unicode: Bool, hwnd: Hwnd, msg: u32, wp: u64, lp: i64, from_unicode: Bool) -> i64 {
+    call_proc(proc, proc_unicode != 0, hwnd, msg, wp, lp, from_unicode != 0)
+}
+
 #[no_mangle]
 pub extern "system" fn InSendMessage() -> Bool {
     0
@@ -401,6 +409,7 @@ fn next(out: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: bool, wait: bool)
     let mut m = Msg::default();
     loop {
         crate::paint::present_all();
+        run_win_events();
         // The kernel's private messages first, whatever the filter.
         while kernel_get(&mut m, 0, 1 | 2, 0, VEIL_WAKE, VEIL_GEOMETRY) {
             private(&m);
@@ -409,6 +418,9 @@ fn next(out: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: bool, wait: bool)
         // Posted messages and input.
         if kernel_get(&mut m, 0, flags | 2, hwnd, min, max) {
             if private(&m) {
+                continue;
+            }
+            if !typed(&mut m, remove) {
                 continue;
             }
             return deliver(out, m);
@@ -493,13 +505,43 @@ pub extern "system" fn GetMessagePos() -> u32 {
     (l.2 as u16 as u32) << 16 | l.1 as u16 as u32
 }
 
+/// Threads whose last key-down wasn't passed to TranslateMessage (a dialog
+/// or an accelerator took it).
+static UNTRANSLATED: crate::dllrt::Lock<Vec<u32>> = crate::dllrt::Lock::new(Vec::new());
+
+/// The desktop sends a key's character right after its key-down; as on
+/// Windows, the character only arrives if the key-down was translated
+/// (posted characters always do). False for a character to drop.
+fn typed(m: &mut Msg, remove: bool) -> bool {
+    let tid = unsafe { crate::GetCurrentThreadId() };
+    match m.message {
+        WM_KEYDOWN | WM_SYSKEYDOWN if remove => {
+            let mut u = UNTRANSLATED.lock();
+            if !u.contains(&tid) {
+                u.push(tid);
+            }
+            true
+        }
+        0x0102 | 0x0106 if m.lparam & nt_abi::CHAR_TYPED != 0 => {
+            m.lparam &= !nt_abi::CHAR_TYPED;
+            !(remove && UNTRANSLATED.lock().contains(&tid))
+        }
+        _ => true,
+    }
+}
+
 /// The desktop already sends WM_CHAR after each character's key-down.
 #[no_mangle]
 pub extern "system" fn TranslateMessage(m: *const Msg) -> Bool {
     if m.is_null() {
         return 0;
     }
-    matches!(unsafe { (*m).message }, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | 0x0105) as Bool
+    let message = unsafe { (*m).message };
+    if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        let tid = unsafe { crate::GetCurrentThreadId() };
+        UNTRANSLATED.lock().retain(|&t| t != tid);
+    }
+    matches!(message, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | 0x0105) as Bool
 }
 
 fn dispatch(m: *const Msg, unicode: bool) -> i64 {
@@ -523,6 +565,130 @@ pub extern "system" fn DispatchMessageW(m: *const Msg) -> i64 {
 #[no_mangle]
 pub extern "system" fn DispatchMessageA(m: *const Msg) -> i64 {
     dispatch(m, false)
+}
+
+// -----| WinEvent hooks |-----
+
+/// A WinEvent hook in this process: its handle, event range, procedure,
+/// the thread to run it on (the one that set it), and the thread filter.
+struct WinEventHook {
+    handle: u64,
+    min: u32,
+    max: u32,
+    proc: usize,
+    owner_tid: u32,
+    tid: u32,
+    flags: u32,
+}
+
+/// An event waiting for its hook's thread: (hook, event, hwnd, object,
+/// child, the thread that raised it).
+type Pending = (u64, u32, Hwnd, i32, i32, u32);
+
+static WIN_EVENT_HOOKS: crate::dllrt::Lock<Vec<WinEventHook>> = crate::dllrt::Lock::new(Vec::new());
+static WIN_EVENTS: crate::dllrt::Lock<Vec<Pending>> = crate::dllrt::Lock::new(Vec::new());
+static NEXT_HOOK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x0007_0001);
+
+const WINEVENT_SKIPOWNTHREAD: u32 = 0x1;
+const WINEVENT_SKIPOWNPROCESS: u32 = 0x2;
+
+/// Hooks see this process's events only (another process's hook would
+/// need its own copy of user32 to run in), all out of context: each runs
+/// on the thread that set it, when that thread next looks for a message.
+#[no_mangle]
+pub extern "system" fn SetWinEventHook(min: u32, max: u32, _module: u64, proc: usize, pid: u32, tid: u32, flags: u32) -> u64 {
+    let me = unsafe { crate::GetCurrentProcessId() };
+    if proc == 0 || min > max || (pid != 0 && pid != me) || flags & WINEVENT_SKIPOWNPROCESS != 0 {
+        // Nothing it could see: a handle all the same.
+        return if proc == 0 { 0 } else { NEXT_HOOK.fetch_add(1, core::sync::atomic::Ordering::Relaxed) };
+    }
+    let handle = NEXT_HOOK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let owner_tid = unsafe { crate::GetCurrentThreadId() };
+    WIN_EVENT_HOOKS.lock().push(WinEventHook { handle, min, max, proc, owner_tid, tid, flags });
+    handle
+}
+
+#[no_mangle]
+pub extern "system" fn UnhookWinEvent(hook: u64) -> Bool {
+    let mut hooks = WIN_EVENT_HOOKS.lock();
+    let before = hooks.len();
+    hooks.retain(|h| h.handle != hook);
+    WIN_EVENTS.lock().retain(|e| e.0 != hook);
+    (hooks.len() != before || hook != 0) as Bool
+}
+
+/// Queues `event` for the hooks that want it (a repeat of an event still
+/// waiting is dropped).
+pub(crate) fn win_event(event: u32, hwnd: Hwnd, object: i32, child: i32) {
+    let hooks = WIN_EVENT_HOOKS.lock();
+    if hooks.is_empty() {
+        return;
+    }
+    let tid = unsafe { crate::GetCurrentThreadId() };
+    let mut pending = WIN_EVENTS.lock();
+    for h in hooks.iter().filter(|h| (h.min..=h.max).contains(&event)) {
+        if (h.tid != 0 && h.tid != tid) || (h.flags & WINEVENT_SKIPOWNTHREAD != 0 && h.owner_tid == tid) {
+            continue;
+        }
+        let e = (h.handle, event, hwnd, object, child, tid);
+        if !pending.contains(&e) {
+            pending.push(e);
+        }
+    }
+}
+
+/// Runs this thread's waiting events.
+fn run_win_events() {
+    let tid = unsafe { crate::GetCurrentThreadId() };
+    loop {
+        let next = {
+            let hooks = WIN_EVENT_HOOKS.lock();
+            let mut pending = WIN_EVENTS.lock();
+            let at = pending.iter().position(|e| hooks.iter().any(|h| h.handle == e.0 && h.owner_tid == tid));
+            at.map(|i| {
+                let e = pending.remove(i);
+                (hooks.iter().find(|h| h.handle == e.0).map_or(0, |h| h.proc), e)
+            })
+        };
+        let Some((proc, (hook, event, hwnd, object, child, from))) = next else { return };
+        if proc == 0 {
+            continue;
+        }
+        let f: unsafe extern "system" fn(u64, u32, Hwnd, i32, i32, u32, u32) = unsafe { core::mem::transmute(proc) };
+        let time = LAST.lock().0;
+        unsafe { f(hook, event, hwnd, object, child, from, time) };
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn NotifyWinEvent(event: u32, hwnd: Hwnd, object: i32, child: i32) {
+    win_event(event, hwnd, object, child);
+}
+
+/// The desktop reports clicks, not movement: no WM_MOUSELEAVE / HOVER.
+#[no_mangle]
+pub extern "system" fn TrackMouseEvent(_tme: *mut u8) -> Bool {
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn SetWindowsHookExW(_kind: i32, _proc: usize, _module: u64, _tid: u32) -> u64 {
+    0x0007_0002
+}
+
+#[no_mangle]
+pub extern "system" fn SetWindowsHookExA(kind: i32, proc: usize, module: u64, tid: u32) -> u64 {
+    SetWindowsHookExW(kind, proc, module, tid)
+}
+
+#[no_mangle]
+pub extern "system" fn UnhookWindowsHookEx(_hook: u64) -> Bool {
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn CallNextHookEx(_hook: u64, _code: i32, _wp: u64, _lp: i64) -> i64 {
+    0
 }
 
 // -----| timers |-----

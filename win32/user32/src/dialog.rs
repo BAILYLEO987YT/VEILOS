@@ -930,9 +930,14 @@ fn mb_template(text: &[u16], caption: &[u16], kind: u32) -> Vec<u8> {
     let hdc = unsafe { crate::CreateCompatibleDC(0) };
     let old = unsafe { crate::SelectObject(hdc, font) };
     let (sw, _) = crate::screen_size();
-    let mut r = [0, 0, sw * 2 / 3, 0];
+    // Its own width when that fits, else wrapped at the limit.
     let mut t = text.to_vec();
-    unsafe { crate::paint::DrawTextW(hdc, t.as_mut_ptr(), t.len() as i32, &mut r, 0x410 | 0x800) };
+    let mut r = [0, 0, 0, 0];
+    unsafe { crate::paint::DrawTextW(hdc, t.as_mut_ptr(), t.len() as i32, &mut r, 0x400 | 0x800) };
+    if r[2] > sw * 2 / 3 {
+        r = [0, 0, sw * 2 / 3, 0];
+        unsafe { crate::paint::DrawTextW(hdc, t.as_mut_ptr(), t.len() as i32, &mut r, 0x410 | 0x800) };
+    }
     unsafe {
         crate::SelectObject(hdc, old);
         crate::DeleteDC(hdc);

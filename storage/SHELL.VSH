@@ -475,6 +475,7 @@ var MenuShutdown: element.button = {
 //
 //  The runtime exposes two system events for this:
 //      window_opened(id, title)
+//      window_title_changed(id, title)
 //      window_closed(id)
 //
 //  Handlers for these events live in Section 7. Every button
@@ -533,6 +534,25 @@ on_event window_opened(id, title) {
     // provides `window_id` and `window_title` as injectable
     // values for this specific event; the WindowButton
     // definition reads them by name.
+    var btn: element_ref = add element.button(
+        WindowButton,
+        parent:      window_list_ref,
+        id:          "win_" + id,
+        window_id:    id,
+        window_title: title,
+    );
+    window_refs.append(btn);
+}
+
+on_event window_title_changed(id, title) {
+    // A button's label is fixed when it is published: replace it.
+    for ref in window_refs {
+        if (ref[window_id] == id) {
+            destroy(ref);
+            window_refs.remove(ref);
+            break;
+        }
+    }
     var btn: element_ref = add element.button(
         WindowButton,
         parent:      window_list_ref,

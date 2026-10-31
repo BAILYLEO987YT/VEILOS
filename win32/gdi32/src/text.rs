@@ -401,6 +401,140 @@ pub extern "system" fn GetTextFaceA(hdc: Handle, n: i32, out: *mut u8) -> i32 {
     k as i32 - 1
 }
 
+// -----| enumerating fonts |-----
+
+/// Call `proc(ENUMLOGFONTEXW*, NEWTEXTMETRICEXW*, FontType, lParam)` for
+/// each family (or each face of `family`): the installed TrueType faces,
+/// then the bitmap "System". Stops when it returns 0; that's the result.
+fn enumerate(family: Option<alloc::vec::Vec<u16>>, proc: usize, lp: i64, wide: bool) -> i32 {
+    if proc == 0 {
+        return 0;
+    }
+    let f: unsafe extern "system" fn(*const u8, *const u8, u32, i64) -> i32 = unsafe { core::mem::transmute(proc) };
+    let mut faces = ttf::families();
+    faces.push((alloc::string::String::from("System"), false, 400, false));
+    let lower = |s: &str| s.chars().map(|c| c.to_ascii_lowercase()).collect::<alloc::string::String>();
+    let want = family.map(|w| lower(&alloc::string::String::from_utf16_lossy(&w)));
+    let mut last = 1;
+    let mut seen: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for (name, fixed, weight, italic) in faces {
+        if want.as_ref().is_some_and(|w| *w != lower(&name)) {
+            continue;
+        }
+        // One call per family unless a family was asked for.
+        if want.is_none() && seen.contains(&lower(&name)) {
+            continue;
+        }
+        seen.push(lower(&name));
+        let tt = name != "System";
+        // ENUMLOGFONTEXW: LOGFONTW, full name, style, script (A: bytes).
+        let mut lf = [0u8; 420];
+        lf[0..4].copy_from_slice(&(if tt { -16i32 } else { 16 }).to_le_bytes());
+        lf[16..20].copy_from_slice(&weight.to_le_bytes());
+        lf[20] = italic as u8;
+        lf[27] = if fixed { 0x31 } else { 0x22 };
+        let style = match (weight >= 600, italic) {
+            (false, false) => "Regular",
+            (true, false) => "Bold",
+            (false, true) => "Italic",
+            (true, true) => "Bold Italic",
+        };
+        let put = |buf: &mut [u8], at: usize, s: &str, w: bool| {
+            for (i, c) in s.encode_utf16().enumerate() {
+                if w {
+                    buf[at + 2 * i..at + 2 * i + 2].copy_from_slice(&c.to_le_bytes());
+                } else {
+                    buf[at + i] = c as u8;
+                }
+            }
+        };
+        let (face_at, full_at, style_at, script_at) = if wide { (28, 92, 220, 284) } else { (28, 60, 124, 156) };
+        put(&mut lf, face_at, &name, wide);
+        put(&mut lf, full_at, &name, wide);
+        put(&mut lf, style_at, style, wide);
+        put(&mut lf, script_at, "Western", wide);
+        // NEWTEXTMETRICEXW: the metrics at 16 pixels.
+        let mut tm = [0u8; 120];
+        let longs = [16i32, 12, 4, 0, 0, 8, 8, weight, 0, 96, 96];
+        for (i, v) in longs.iter().enumerate() {
+            tm[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let kind = if tt { 4 } else { 0 }; // TRUETYPE_FONTTYPE
+        last = unsafe { f(lf.as_ptr(), tm.as_ptr(), kind, lp) };
+        if last == 0 {
+            break;
+        }
+    }
+    last
+}
+
+fn family_arg(p: *const u8, wide: bool, at_logfont: bool) -> Option<alloc::vec::Vec<u16>> {
+    if p.is_null() {
+        return None;
+    }
+    let p = if at_logfont { unsafe { p.add(28) } } else { p };
+    let v: alloc::vec::Vec<u16> = if wide {
+        (0..32).map(|i| unsafe { *(p as *const u16).add(i) }).take_while(|&c| c != 0).collect()
+    } else {
+        (0..32).map(|i| unsafe { *p.add(i) } as u16).take_while(|&c| c != 0).collect()
+    };
+    (!v.is_empty()).then_some(v)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumFontFamiliesExW(_hdc: Handle, lf: *const u8, proc: usize, lp: i64, _flags: u32) -> i32 {
+    enumerate(family_arg(lf, true, true), proc, lp, true)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumFontFamiliesExA(_hdc: Handle, lf: *const u8, proc: usize, lp: i64, _flags: u32) -> i32 {
+    enumerate(family_arg(lf, false, true), proc, lp, false)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumFontFamiliesW(_hdc: Handle, family: *const u8, proc: usize, lp: i64) -> i32 {
+    enumerate(family_arg(family, true, false), proc, lp, true)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumFontFamiliesA(_hdc: Handle, family: *const u8, proc: usize, lp: i64) -> i32 {
+    enumerate(family_arg(family, false, false), proc, lp, false)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumFontsW(_hdc: Handle, face: *const u8, proc: usize, lp: i64) -> i32 {
+    enumerate(family_arg(face, true, false), proc, lp, true)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumFontsA(_hdc: Handle, face: *const u8, proc: usize, lp: i64) -> i32 {
+    enumerate(family_arg(face, false, false), proc, lp, false)
+}
+
+/// Fonts can't be added at run time yet.
+#[no_mangle]
+pub extern "system" fn AddFontResourceExW(_name: *const u16, _flags: u32, _r: usize) -> i32 {
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn RemoveFontResourceExW(_name: *const u16, _flags: u32, _r: usize) -> Bool {
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn GetTextCharset(_hdc: Handle) -> i32 {
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn GetTextCharsetInfo(_hdc: Handle, sig: *mut u8, _flags: u32) -> i32 {
+    if !sig.is_null() {
+        unsafe { core::ptr::write_bytes(sig, 0, 24) };
+    }
+    0
+}
+
 /// Advance widths of characters `first..=last`.
 fn char_widths(hdc: Handle, first: u32, last: u32, out: *mut i32, abc: bool) -> Bool {
     let mut t = crate::table();

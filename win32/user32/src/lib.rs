@@ -26,11 +26,14 @@
 //!               MessageBox
 //!   menu.rs     menus, the menu bar, popup menus and the menu loop, the
 //!               system menu, accelerators
+//!   clipboard.rs registered names, window properties, the clipboard
+//!   text.rs     character helpers, wsprintf
 
 #![no_std]
 
 extern crate alloc;
 
+mod clipboard;
 mod controls;
 mod dialog;
 #[path = "../../dllrt.rs"]
@@ -43,6 +46,7 @@ mod menu;
 mod message;
 mod paint;
 mod scroll;
+mod text;
 mod window;
 
 use alloc::vec::Vec;

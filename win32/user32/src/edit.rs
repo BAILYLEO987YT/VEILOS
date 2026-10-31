@@ -26,6 +26,16 @@ const EN_CHANGE: u32 = 0x0300;
 const EN_UPDATE: u32 = 0x0400;
 const EN_MAXTEXT: u32 = 0x0501;
 
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn LocalAlloc(flags: u32, size: usize) -> u64;
+    fn LocalReAlloc(h: u64, size: usize, flags: u32) -> u64;
+    fn LocalFree(p: u64) -> u64;
+    fn LocalLock(h: u64) -> *mut u16;
+    fn LocalUnlock(h: u64) -> i32;
+    fn LocalSize(h: u64) -> usize;
+}
+
 const CR: u16 = 13;
 const LF: u16 = 10;
 
@@ -40,6 +50,13 @@ pub struct Edit {
     /// Scrolled: pixels (single-line) and the first visible line.
     pub scroll_x: i32,
     pub top: usize,
+    /// EM_GETHANDLE's block (LocalAlloc'd), and the text before the last
+    /// change (EM_UNDO).
+    pub local: u64,
+    pub undo: Option<(Vec<u16>, usize, usize)>,
+    /// EM_SETEXTENDEDSTYLE's flags and EM_SETENDOFLINE's line ending.
+    pub ex_style: u32,
+    pub eol: u32,
 }
 
 fn get<R>(hwnd: Hwnd, f: impl FnOnce(&mut Edit) -> R) -> Option<R> {
@@ -141,6 +158,26 @@ fn lines(hwnd: Hwnd, t: &[u16], hdc: u64) -> Vec<(usize, usize)> {
     out
 }
 
+/// The lines between line breaks (no wrapping): Windows 10's "file lines".
+fn file_lines(t: &[u16]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    loop {
+        let mut end = start;
+        while end < t.len() && t[end] != CR && t[end] != LF {
+            end += 1;
+        }
+        out.push((start, end));
+        if end >= t.len() {
+            return out;
+        }
+        start = if t[end] == CR && end + 1 < t.len() && t[end + 1] == LF { end + 2 } else { end + 1 };
+    }
+}
+
+const EC_ENDOFLINE_CRLF: u32 = 1;
+const LMEM_MOVEABLE: u32 = 0x2;
+
 fn line_of(ls: &[(usize, usize)], i: usize) -> usize {
     ls.iter().rposition(|l| l.0 <= i).unwrap_or(0)
 }
@@ -177,6 +214,7 @@ fn replace_sel(hwnd: Hwnd, ins: &[u16], user: bool) -> bool {
     let mut n = t[..a].to_vec();
     n.extend_from_slice(ins);
     n.extend_from_slice(&t[b..]);
+    get(hwnd, |e| e.undo = Some((t.clone(), a, b)));
     set_text_raw(hwnd, n);
     let at = a + ins.len();
     get(hwnd, |e| {
@@ -426,7 +464,7 @@ pub unsafe extern "system" fn edit_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) 
             // WM_NCCREATE
             controls::border_to_edge(hwnd);
             let password = if style & ES_PASSWORD != 0 && !multi { b'*' as u16 } else { 0 };
-            controls::add(hwnd, Kind::Edit(Edit { anchor: 0, caret: 0, limit: 0x7FFF_FFFE, modified: false, password, focused: false, scroll_x: 0, top: 0 }));
+            controls::add(hwnd, Kind::Edit(Edit { anchor: 0, caret: 0, limit: 0x7FFF_FFFE, modified: false, password, focused: false, scroll_x: 0, top: 0, local: 0, undo: None, ex_style: 0, eol: EC_ENDOFLINE_CRLF }));
             def_window_proc(hwnd, msg, wp, lp, true)
         }
         0x000F => {
@@ -656,8 +694,6 @@ pub unsafe extern "system" fn edit_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) 
             get(hwnd, |e| e.limit = if wp == 0 { 0x7FFF_FFFE } else { wp as usize });
             0
         }
-        // EM_CANUNDO, EM_UNDO, EM_EMPTYUNDOBUFFER: no undo yet
-        0x00C6 | 0x00C7 | 0x00CD => 0,
         // EM_LINEFROMCHAR
         0x00C9 => {
             let dc = measure_dc(hwnd);
@@ -703,13 +739,170 @@ pub unsafe extern "system" fn edit_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) 
             release_dc(hwnd, dc);
             ((line as i64) << 16) | i as i64
         }
-        // WM_CUT and WM_CLEAR delete the selection (the clipboard comes later).
-        0x0300 | 0x0303 => {
-            if style & ES_READONLY == 0 {
-                replace_sel(hwnd, &[], false);
+        // WM_CUT, WM_COPY (not from a password field), WM_PASTE, WM_CLEAR
+        0x0300 | 0x0301 => {
+            let (a, b) = sel(hwnd);
+            let password = get(hwnd, |e| e.password).unwrap_or(0);
+            if a < b && password == 0 {
+                crate::clipboard::copy_text(hwnd, &text(hwnd)[a..b]);
+            }
+            if msg == 0x0300 && style & ES_READONLY == 0 {
+                replace_sel(hwnd, &[], true);
             }
             0
         }
+        0x0302 => {
+            if style & ES_READONLY == 0 {
+                let mut t = crate::clipboard::paste_text();
+                if !multi {
+                    // One line only: to the first line break.
+                    if let Some(i) = t.iter().position(|&c| c == CR || c == LF) {
+                        t.truncate(i);
+                    }
+                }
+                replace_sel(hwnd, &t, true);
+            }
+            0
+        }
+        0x0303 => {
+            if style & ES_READONLY == 0 {
+                replace_sel(hwnd, &[], true);
+            }
+            0
+        }
+        // EM_UNDO / WM_UNDO: back to the text before the last change.
+        0x00C7 | 0x0304 => {
+            let Some((old, a, b)) = get(hwnd, |e| e.undo.take()).flatten() else { return 0 };
+            let now = text(hwnd);
+            set_text_raw(hwnd, old);
+            get(hwnd, |e| {
+                e.anchor = a;
+                e.caret = b;
+                e.modified = true;
+                e.undo = Some((now, a, a));
+            });
+            changed(hwnd);
+            1
+        }
+        0x00C6 => get(hwnd, |e| e.undo.is_some() as i64).unwrap_or(0),
+        0x00CD => {
+            get(hwnd, |e| e.undo = None);
+            0
+        }
+        // EM_GETHANDLE: the text in the edit's moveable block (the same
+        // handle each time; programs grow it and hand it back).
+        0x00BD => {
+            let t = text(hwnd);
+            let size = (t.len() + 1) * 2;
+            let old = get(hwnd, |e| e.local).unwrap_or(0);
+            let h = if old != 0 && unsafe { LocalReAlloc(old, size, LMEM_MOVEABLE) } != 0 { old } else { unsafe { LocalAlloc(LMEM_MOVEABLE, size) } };
+            let p = if h != 0 { unsafe { LocalLock(h) } } else { core::ptr::null_mut() };
+            if !p.is_null() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(t.as_ptr(), p, t.len());
+                    *p.add(t.len()) = 0;
+                    LocalUnlock(h);
+                }
+            }
+            get(hwnd, |e| e.local = h);
+            h as i64
+        }
+        // EM_SETHANDLE: the text from a block the edit now owns.
+        0x00BC => {
+            let p = wp;
+            // Up to the NUL, within the block.
+            let mut t = Vec::new();
+            let data = if p == 0 { core::ptr::null_mut() } else { unsafe { LocalLock(p) } };
+            if !data.is_null() {
+                let n = unsafe { LocalSize(p) } / 2;
+                let s = unsafe { core::slice::from_raw_parts(data, n) };
+                t = s[..s.iter().position(|&c| c == 0).unwrap_or(n)].to_vec();
+                unsafe { LocalUnlock(p) };
+            }
+            let old = get(hwnd, |e| core::mem::replace(&mut e.local, p)).unwrap_or(0);
+            if old != 0 && old != p {
+                unsafe { LocalFree(old) };
+            }
+            set_text_raw(hwnd, t);
+            get(hwnd, |e| {
+                e.anchor = 0;
+                e.caret = 0;
+                e.modified = false;
+                e.undo = None;
+                e.top = 0;
+                e.scroll_x = 0;
+            });
+            scroll_to_caret(hwnd);
+            crate::paint::invalidate(hwnd, None, true);
+            0
+        }
+        // EM_SETEXTENDEDSTYLE (wp the mask, 0 for all), EM_GETEXTENDEDSTYLE
+        0x150A => {
+            let mask = if wp == 0 { u32::MAX } else { wp as u32 };
+            get(hwnd, |e| e.ex_style = (e.ex_style & !mask) | (lp as u32 & mask));
+            0
+        }
+        0x150B => get(hwnd, |e| e.ex_style as i64).unwrap_or(0),
+        // EM_SETENDOFLINE, EM_GETENDOFLINE (0 detect, 1 CRLF, 2 CR, 3 LF)
+        0x150C => {
+            get(hwnd, |e| e.eol = if wp == 0 { EC_ENDOFLINE_CRLF } else { wp as u32 });
+            0
+        }
+        0x150D => get(hwnd, |e| e.eol as i64).unwrap_or(EC_ENDOFLINE_CRLF as i64),
+        // EM_ENABLESEARCHWEB, EM_SEARCHWEB: no web search.
+        0x150E | 0x150F => 0,
+        // EM_SETCARETINDEX, EM_GETCARETINDEX
+        0x1511 => {
+            let n = text(hwnd).len();
+            move_caret(hwnd, (wp as usize).min(n), false);
+            1
+        }
+        0x1512 => get(hwnd, |e| e.caret as i64).unwrap_or(0),
+        // EM_FILELINEFROMCHAR, EM_FILELINEINDEX, EM_FILELINELENGTH: lines
+        // between line breaks, whatever the wrapping (-1: the caret's).
+        0x1513 | 0x1514 | 0x1515 => {
+            let t = text(hwnd);
+            let ls = file_lines(&t);
+            let caret = get(hwnd, |e| e.caret).unwrap_or(0);
+            let at = |i: usize| line_of(&ls, i.min(t.len()));
+            match msg {
+                0x1513 => at(if wp as i64 == -1 { caret } else { wp as usize }) as i64,
+                0x1514 => {
+                    let line = if wp as i64 == -1 { at(caret) } else { wp as usize };
+                    ls.get(line).map_or(-1, |l| l.0 as i64)
+                }
+                _ => {
+                    let l = ls[at(if wp as i64 == -1 { caret } else { wp as usize })];
+                    (l.1 - l.0) as i64
+                }
+            }
+        }
+        // EM_GETFILELINE: line `wp` into a buffer whose first word is its size.
+        0x1516 => {
+            if lp == 0 {
+                return 0;
+            }
+            let t = text(hwnd);
+            let Some(&(s, e)) = file_lines(&t).get(wp as usize) else { return 0 };
+            let cap = unsafe { *(lp as *const u16) } as usize;
+            let n = (e - s).min(cap);
+            unsafe { core::ptr::copy_nonoverlapping(t[s..].as_ptr(), lp as *mut u16, n) };
+            n as i64
+        }
+        // EM_GETFILELINECOUNT
+        0x1517 => file_lines(&text(hwnd)).len() as i64,
+        // EM_GETZOOM (always 1:1), EM_SETZOOM (no zooming yet)
+        0x04E0 => {
+            for p in [wp, lp as u64] {
+                if p != 0 {
+                    unsafe { *(p as *mut i32) = 1 };
+                }
+            }
+            1
+        }
+        0x04E1 => 0,
+        // EM_FMTLINES, EM_SETTABSTOPS: accepted.
+        0x00C8 | 0x00CB => 1,
         _ => def_window_proc(hwnd, msg, wp, lp, true),
     }
 }

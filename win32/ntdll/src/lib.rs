@@ -64,6 +64,10 @@ syscall_stubs! {
     VeilCreatePipe, ZwVeilCreatePipe => sys::VEIL_CREATE_PIPE;
     NtSetInformationObject, ZwSetInformationObject => sys::NT_SET_INFORMATION_OBJECT;
     NtQueryObject, ZwQueryObject => sys::NT_QUERY_OBJECT;
+    NtCreateSemaphore, ZwCreateSemaphore => sys::NT_CREATE_SEMAPHORE;
+    NtReleaseSemaphore, ZwReleaseSemaphore => sys::NT_RELEASE_SEMAPHORE;
+    VeilClipSet, ZwVeilClipSet => sys::VEIL_CLIP_SET;
+    VeilClipGet, ZwVeilClipGet => sys::VEIL_CLIP_GET;
     VeilUserCreateWindow, ZwVeilUserCreateWindow => sys::VEIL_USER_CREATE_WINDOW;
     VeilUserDestroyWindow, ZwVeilUserDestroyWindow => sys::VEIL_USER_DESTROY_WINDOW;
     VeilUserShowWindow, ZwVeilUserShowWindow => sys::VEIL_USER_SHOW_WINDOW;

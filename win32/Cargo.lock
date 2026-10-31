@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "comctl32"
+version = "0.1.0"
+
+[[package]]
+name = "comdlg32"
+version = "0.1.0"
+
+[[package]]
 name = "gdi32"
 version = "0.1.0"
 
@@ -29,6 +37,10 @@ version = "0.1.0"
 dependencies = [
  "nt_abi",
 ]
+
+[[package]]
+name = "shell32"
+version = "0.1.0"
 
 [[package]]
 name = "simd-adler32"

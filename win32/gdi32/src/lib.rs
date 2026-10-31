@@ -130,6 +130,9 @@ pub(crate) struct DcState {
     pos: (i32, i32),
     viewport: (i32, i32),
     window: (i32, i32),
+    map_mode: i32,
+    viewport_ext: (i32, i32),
+    window_ext: (i32, i32),
     dc_brush: u32,
     dc_pen: u32,
     /// IntersectClipRect, in device coordinates.
@@ -380,10 +383,33 @@ impl Table {
 impl Dc {
     /// Logical to device coordinates.
     fn dev(&self, x: i32, y: i32) -> (i32, i32) {
-        (
-            x - self.s.window.0 + self.s.viewport.0 + self.origin.0,
-            y - self.s.window.1 + self.s.viewport.1 + self.origin.1,
-        )
+        let (sx, sy) = self.scale(x - self.s.window.0, y - self.s.window.1);
+        (sx + self.s.viewport.0 + self.origin.0, sy + self.s.viewport.1 + self.origin.1)
+    }
+
+    /// Logical extent to device extent (MM_ISOTROPIC / MM_ANISOTROPIC).
+    fn scale(&self, x: i32, y: i32) -> (i32, i32) {
+        if !matches!(self.s.map_mode, 7 | 8) {
+            return (x, y);
+        }
+        let (vx, vy) = self.s.viewport_ext;
+        let (wx, wy) = self.s.window_ext;
+        let f = |v: i32, n: i32, d: i32| if d == 0 { v } else { (v as i64 * n as i64 / d as i64) as i32 };
+        (f(x, vx, wx), f(y, vy, wy))
+    }
+
+    /// Device to logical coordinates.
+    fn logical(&self, x: i32, y: i32) -> (i32, i32) {
+        let (dx, dy) = (x - self.s.viewport.0 - self.origin.0, y - self.s.viewport.1 - self.origin.1);
+        let (ux, uy) = if matches!(self.s.map_mode, 7 | 8) {
+            let (vx, vy) = self.s.viewport_ext;
+            let (wx, wy) = self.s.window_ext;
+            let f = |v: i32, n: i32, d: i32| if d == 0 { v } else { (v as i64 * n as i64 / d as i64) as i32 };
+            (f(dx, wx, vx), f(dy, wy, vy))
+        } else {
+            (dx, dy)
+        };
+        (ux + self.s.window.0, uy + self.s.window.1)
     }
 }
 
@@ -406,6 +432,9 @@ fn new_state() -> DcState {
         fill_mode: 1,
         pos: (0, 0),
         viewport: (0, 0),
+        map_mode: 1,
+        viewport_ext: (1, 1),
+        window_ext: (1, 1),
         window: (0, 0),
         dc_brush: 0xFF_FFFF,
         dc_pen: 0,
@@ -829,15 +858,165 @@ dc_field!(SetPolyFillMode, GetPolyFillMode, fill_mode, 0);
 dc_field!(SetDCBrushColor, GetDCBrushColor, dc_brush, CLR_INVALID);
 dc_field!(SetDCPenColor, GetDCPenColor, dc_pen, CLR_INVALID);
 
-/// Only MM_TEXT.
+/// MM_TEXT, MM_ISOTROPIC and MM_ANISOTROPIC scale as on Windows; the
+/// fixed metric modes draw 1:1 like MM_TEXT.
 #[no_mangle]
-pub extern "system" fn SetMapMode(_hdc: Handle, _mode: i32) -> i32 {
+pub extern "system" fn SetMapMode(hdc: Handle, mode: i32) -> i32 {
+    match TABLE.lock().dc(hdc) {
+        Some(dc) if (1..=8).contains(&mode) => core::mem::replace(&mut dc.s.map_mode, mode),
+        _ => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn GetMapMode(hdc: Handle) -> i32 {
+    TABLE.lock().dc(hdc).map_or(0, |dc| dc.s.map_mode)
+}
+
+fn extent(hdc: Handle, v: Option<(i32, i32)>, viewport: bool, old: *mut i32) -> Bool {
+    match TABLE.lock().dc(hdc) {
+        Some(dc) => {
+            let slot = if viewport { &mut dc.s.viewport_ext } else { &mut dc.s.window_ext };
+            point_out(old, *slot);
+            // Extents only change in the scaling modes.
+            if let Some(v) = v.filter(|_| matches!(dc.s.map_mode, 7 | 8)) {
+                if v.0 == 0 || v.1 == 0 {
+                    return 0;
+                }
+                *slot = v;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn SetViewportExtEx(hdc: Handle, x: i32, y: i32, old: *mut i32) -> Bool {
+    extent(hdc, Some((x, y)), true, old)
+}
+
+#[no_mangle]
+pub extern "system" fn SetWindowExtEx(hdc: Handle, x: i32, y: i32, old: *mut i32) -> Bool {
+    extent(hdc, Some((x, y)), false, old)
+}
+
+#[no_mangle]
+pub extern "system" fn GetViewportExtEx(hdc: Handle, out: *mut i32) -> Bool {
+    extent(hdc, None, true, out)
+}
+
+#[no_mangle]
+pub extern "system" fn GetWindowExtEx(hdc: Handle, out: *mut i32) -> Bool {
+    extent(hdc, None, false, out)
+}
+
+unsafe fn convert(hdc: Handle, pts: *mut i32, n: i32, to_device: bool) -> Bool {
+    let mut t = TABLE.lock();
+    let Some(dc) = t.dc(hdc) else { return 0 };
+    let (ox, oy) = dc.origin;
+    for i in 0..n.max(0) as usize {
+        unsafe {
+            let (x, y) = (*pts.add(2 * i), *pts.add(2 * i + 1));
+            // Without the DC's own origin in its target (programs see the
+            // window's coordinates).
+            let (a, b) = if to_device {
+                let (a, b) = dc.dev(x, y);
+                (a - ox, b - oy)
+            } else {
+                dc.logical(x + ox, y + oy)
+            };
+            *pts.add(2 * i) = a;
+            *pts.add(2 * i + 1) = b;
+        }
+    }
     1
 }
 
 #[no_mangle]
-pub extern "system" fn GetMapMode(_hdc: Handle) -> i32 {
-    1
+pub unsafe extern "system" fn LPtoDP(hdc: Handle, pts: *mut i32, n: i32) -> Bool {
+    unsafe { convert(hdc, pts, n, true) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn DPtoLP(hdc: Handle, pts: *mut i32, n: i32) -> Bool {
+    unsafe { convert(hdc, pts, n, false) }
+}
+
+// -----| devices and printing (there are no printers yet) |-----
+
+/// The display (a screen DC); printers aren't there.
+#[no_mangle]
+pub unsafe extern "system" fn CreateDCW(driver: *const u16, _device: *const u16, _output: *const u16, _mode: *const u8) -> Handle {
+    let is_display = !driver.is_null() && {
+        let s: alloc::vec::Vec<u16> = (0..8).map(|i| unsafe { *driver.add(i) }).take_while(|&c| c != 0).collect();
+        s.iter().map(|&c| if (0x61..=0x7A).contains(&c) { c - 32 } else { c }).eq("DISPLAY".encode_utf16())
+    };
+    if !is_display {
+        return 0;
+    }
+    let (w, h) = screen_size();
+    VeilGdiCreateDC(core::ptr::null_mut(), w, h, w as usize, 0, 0, core::ptr::null())
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn CreateDCA(driver: *const u8, _device: *const u8, _output: *const u8, _mode: *const u8) -> Handle {
+    if driver.is_null() {
+        return 0;
+    }
+    let d: alloc::vec::Vec<u16> = (0..8).map(|i| unsafe { *driver.add(i) } as u16).take_while(|&c| c != 0).chain(core::iter::once(0)).collect();
+    unsafe { CreateDCW(d.as_ptr(), core::ptr::null(), core::ptr::null(), core::ptr::null()) }
+}
+
+#[no_mangle]
+pub extern "system" fn CreateICW(driver: *const u16, device: *const u16, output: *const u16, mode: *const u8) -> Handle {
+    unsafe { CreateDCW(driver, device, output, mode) }
+}
+
+/// SP_ERROR: printing fails (no printer DC can exist).
+#[no_mangle]
+pub extern "system" fn StartDocW(_hdc: Handle, _doc: *const u8) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn StartDocA(_hdc: Handle, _doc: *const u8) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn EndDoc(_hdc: Handle) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn AbortDoc(_hdc: Handle) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn StartPage(_hdc: Handle) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn EndPage(_hdc: Handle) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn SetAbortProc(_hdc: Handle, _proc: usize) -> i32 {
+    -1
+}
+
+#[no_mangle]
+pub extern "system" fn Escape(_hdc: Handle, _code: i32, _n: i32, _in: *const u8, _out: *mut u8) -> i32 {
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn ExtEscape(_hdc: Handle, _code: i32, _n: i32, _in: *const u8, _m: i32, _out: *mut u8) -> i32 {
+    0
 }
 
 #[no_mangle]

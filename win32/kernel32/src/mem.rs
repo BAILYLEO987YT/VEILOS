@@ -113,37 +113,206 @@ pub extern "system" fn HeapSetInformation(_heap: Handle, _class: u32, _info: usi
     1
 }
 
-// Local and Global memory: fixed blocks from the process heap (handles are
-// pointers, so GMEM_MOVEABLE blocks behave as fixed ones).
+// Local and Global memory, from the process heap. A fixed block's handle
+// is its address. A moveable block's handle is an entry in this table
+// holding its address (so `*(void**)h` is the data, as on Windows) and a
+// lock count; the handle stays the same when the block is reallocated.
+
+const LMEM_MOVEABLE: u32 = 0x2;
+const LMEM_MODIFY: u32 = 0x80;
+const LMEM_DISCARDED: u32 = 0x4000;
+const ERROR_NOT_LOCKED: u32 = 158;
+const ERROR_INVALID_HANDLE: u32 = 6;
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct Moveable {
+    data: *mut u8,
+    locks: u32,
+    used: bool,
+}
+
+const FREE: Moveable = Moveable { data: core::ptr::null_mut(), locks: 0, used: false };
+const MOVEABLE_SLOTS: usize = 4096;
+static mut MOVEABLE: [Moveable; MOVEABLE_SLOTS] = [FREE; MOVEABLE_SLOTS];
+static MOVEABLE_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn moveable<R>(f: impl FnOnce(&mut [Moveable; MOVEABLE_SLOTS]) -> R) -> R {
+    use core::sync::atomic::Ordering;
+    while MOVEABLE_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let r = f(unsafe { &mut *core::ptr::addr_of_mut!(MOVEABLE) });
+    MOVEABLE_LOCK.store(false, Ordering::Release);
+    r
+}
+
+/// The table entry `h` names, if it's a moveable block's handle.
+fn slot_of(h: *mut u8) -> Option<usize> {
+    let base = core::ptr::addr_of!(MOVEABLE) as usize;
+    let at = (h as usize).wrapping_sub(base);
+    let size = core::mem::size_of::<Moveable>();
+    (at < MOVEABLE_SLOTS * size && at % size == 0).then_some(at / size)
+}
+
+fn heap_flags(flags: u32) -> u32 {
+    if flags & LMEM_ZEROINIT != 0 { HEAP_ZERO_MEMORY } else { 0 }
+}
 
 #[no_mangle]
 pub extern "system" fn LocalAlloc(flags: u32, size: usize) -> *mut u8 {
-    HeapAlloc(GetProcessHeap(), if flags & LMEM_ZEROINIT != 0 { HEAP_ZERO_MEMORY } else { 0 }, size)
+    if flags & LMEM_MOVEABLE == 0 {
+        return HeapAlloc(GetProcessHeap(), heap_flags(flags), size);
+    }
+    // Size 0: a discarded block (no data until reallocated).
+    let data = if size == 0 { core::ptr::null_mut() } else { HeapAlloc(GetProcessHeap(), heap_flags(flags), size) };
+    if size != 0 && data.is_null() {
+        return core::ptr::null_mut();
+    }
+    let h = moveable(|t| {
+        let i = t.iter().position(|m| !m.used)?;
+        t[i] = Moveable { data, locks: 0, used: true };
+        Some(&mut t[i] as *mut Moveable as *mut u8)
+    });
+    match h {
+        Some(h) => h,
+        None => {
+            if !data.is_null() {
+                HeapFree(GetProcessHeap(), 0, data);
+            }
+            crate::SetLastError(8);
+            core::ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]
-pub extern "system" fn LocalFree(p: *mut u8) -> *mut u8 {
-    if p.is_null() || HeapFree(GetProcessHeap(), 0, p) != 0 { core::ptr::null_mut() } else { p }
+pub extern "system" fn LocalFree(h: *mut u8) -> *mut u8 {
+    if h.is_null() {
+        return h;
+    }
+    if let Some(i) = slot_of(h) {
+        let data = moveable(|t| {
+            let m = t[i];
+            t[i] = FREE;
+            m.used.then_some(m.data)
+        });
+        return match data {
+            Some(d) => {
+                if !d.is_null() {
+                    HeapFree(GetProcessHeap(), 0, d);
+                }
+                core::ptr::null_mut()
+            }
+            None => {
+                crate::SetLastError(ERROR_INVALID_HANDLE);
+                h
+            }
+        };
+    }
+    if HeapFree(GetProcessHeap(), 0, h) != 0 { core::ptr::null_mut() } else { h }
 }
 
 #[no_mangle]
-pub extern "system" fn LocalReAlloc(p: *mut u8, size: usize, flags: u32) -> *mut u8 {
-    HeapReAlloc(GetProcessHeap(), if flags & LMEM_ZEROINIT != 0 { HEAP_ZERO_MEMORY } else { 0 }, p, size)
+pub extern "system" fn LocalReAlloc(h: *mut u8, size: usize, flags: u32) -> *mut u8 {
+    let Some(i) = slot_of(h) else {
+        return HeapReAlloc(GetProcessHeap(), heap_flags(flags), h, size);
+    };
+    if flags & LMEM_MODIFY != 0 {
+        return h;
+    }
+    let old = moveable(|t| t[i].used.then_some(t[i].data));
+    let Some(old) = old else {
+        crate::SetLastError(ERROR_INVALID_HANDLE);
+        return core::ptr::null_mut();
+    };
+    let data = match (old.is_null(), size) {
+        (_, 0) => {
+            if !old.is_null() {
+                HeapFree(GetProcessHeap(), 0, old);
+            }
+            core::ptr::null_mut()
+        }
+        (true, _) => HeapAlloc(GetProcessHeap(), heap_flags(flags), size),
+        (false, _) => HeapReAlloc(GetProcessHeap(), heap_flags(flags), old, size),
+    };
+    if size != 0 && data.is_null() {
+        return core::ptr::null_mut();
+    }
+    moveable(|t| t[i].data = data);
+    h
 }
 
 #[no_mangle]
-pub extern "system" fn LocalSize(p: *mut u8) -> usize {
-    HeapSize(GetProcessHeap(), 0, p)
+pub extern "system" fn LocalSize(h: *mut u8) -> usize {
+    match slot_of(h) {
+        Some(i) => {
+            let d = moveable(|t| t[i].data);
+            if d.is_null() { 0 } else { HeapSize(GetProcessHeap(), 0, d) }
+        }
+        None => HeapSize(GetProcessHeap(), 0, h),
+    }
 }
 
 #[no_mangle]
-pub extern "system" fn LocalLock(p: *mut u8) -> *mut u8 {
-    p
+pub extern "system" fn LocalLock(h: *mut u8) -> *mut u8 {
+    match slot_of(h) {
+        Some(i) => moveable(|t| {
+            if t[i].used && !t[i].data.is_null() {
+                t[i].locks += 1;
+                t[i].data
+            } else {
+                core::ptr::null_mut()
+            }
+        }),
+        None => h,
+    }
 }
 
+/// Nonzero while still locked; 0 when the last lock goes (or for a fixed
+/// block, which was never locked).
 #[no_mangle]
-pub extern "system" fn LocalUnlock(_p: *mut u8) -> Bool {
-    1
+pub extern "system" fn LocalUnlock(h: *mut u8) -> Bool {
+    let Some(i) = slot_of(h) else {
+        crate::SetLastError(ERROR_NOT_LOCKED);
+        return 0;
+    };
+    let left = moveable(|t| {
+        if t[i].locks == 0 {
+            return None;
+        }
+        t[i].locks -= 1;
+        Some(t[i].locks)
+    });
+    match left {
+        Some(0) => {
+            crate::SetLastError(0);
+            0
+        }
+        Some(_) => 1,
+        None => {
+            crate::SetLastError(ERROR_NOT_LOCKED);
+            0
+        }
+    }
+}
+
+/// The handle of the block whose data is at `p` (a fixed block's is `p`).
+#[no_mangle]
+pub extern "system" fn LocalHandle(p: *mut u8) -> *mut u8 {
+    if p.is_null() {
+        return p;
+    }
+    moveable(|t| t.iter_mut().find(|m| m.used && m.data == p).map(|m| m as *mut Moveable as *mut u8)).unwrap_or(p)
+}
+
+/// The lock count, and LMEM_DISCARDED for a moveable block without data.
+#[no_mangle]
+pub extern "system" fn LocalFlags(h: *mut u8) -> u32 {
+    match slot_of(h) {
+        Some(i) => moveable(|t| t[i].locks.min(0xFF) | if t[i].data.is_null() { LMEM_DISCARDED } else { 0 }),
+        None => 0,
+    }
 }
 
 #[no_mangle]
@@ -168,12 +337,22 @@ pub extern "system" fn GlobalSize(p: *mut u8) -> usize {
 
 #[no_mangle]
 pub extern "system" fn GlobalLock(p: *mut u8) -> *mut u8 {
-    p
+    LocalLock(p)
 }
 
 #[no_mangle]
-pub extern "system" fn GlobalUnlock(_p: *mut u8) -> Bool {
-    1
+pub extern "system" fn GlobalUnlock(p: *mut u8) -> Bool {
+    LocalUnlock(p)
+}
+
+#[no_mangle]
+pub extern "system" fn GlobalHandle(p: *mut u8) -> *mut u8 {
+    LocalHandle(p)
+}
+
+#[no_mangle]
+pub extern "system" fn GlobalFlags(p: *mut u8) -> u32 {
+    LocalFlags(p)
 }
 
 /// SYSTEM_INFO (48 bytes).

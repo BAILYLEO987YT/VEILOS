@@ -1,0 +1,8 @@
+[package]
+name = "comctl32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS comctl32.dll: the common controls, image lists and subclassing"
+
+[lib]
+crate-type = ["cdylib"]

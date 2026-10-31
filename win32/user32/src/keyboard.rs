@@ -2,6 +2,7 @@
 //! messages it has read), the live state (GetAsyncKeyState, the kernel's),
 //! virtual-key translations, and the caret.
 
+use alloc::vec::Vec;
 use nt_abi::Msg;
 
 use crate::dllrt::Lock;
@@ -169,6 +170,41 @@ pub extern "system" fn VkKeyScanA(ch: u8) -> i16 {
     VkKeyScanW(ch as u16)
 }
 
+/// US English.
+#[no_mangle]
+pub extern "system" fn GetKeyboardLayout(_tid: u32) -> u64 {
+    0x0409_0409
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn GetKeyboardLayoutList(n: i32, out: *mut u64) -> i32 {
+    if n > 0 && !out.is_null() {
+        unsafe { *out = 0x0409_0409 };
+    }
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn GetKeyboardLayoutNameW(out: *mut u16) -> Bool {
+    let name: Vec<u16> = "00000409\0".encode_utf16().collect();
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, 9) };
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn ActivateKeyboardLayout(_hkl: u64, _flags: u32) -> u64 {
+    0x0409_0409
+}
+
+#[no_mangle]
+pub extern "system" fn GetKeyboardType(which: i32) -> i32 {
+    match which {
+        0 => 4,  // enhanced 101/102-key
+        2 => 12, // function keys
+        _ => 0,
+    }
+}
+
 // -----| the caret |-----
 
 struct Caret {
@@ -213,12 +249,30 @@ pub extern "system" fn CreateCaret(hwnd: Hwnd, _bitmap: u64, w: i32, h: i32) -> 
         return 0;
     }
     *CARET.lock() = Some(Caret { hwnd, w: if w == 0 { 1 } else { w }, h: if h == 0 { 16 } else { h }, x: 0, y: 0, shown: 0, drawn: false });
+    caret_event(EVENT_OBJECT_CREATE);
     1
+}
+
+const EVENT_OBJECT_CREATE: u32 = 0x8000;
+const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+const EVENT_OBJECT_SHOW: u32 = 0x8002;
+const EVENT_OBJECT_HIDE: u32 = 0x8003;
+const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+const OBJID_CARET: i32 = -8;
+
+/// Tells WinEvent hooks about the caret (accessibility tools, and programs
+/// like Notepad that follow it).
+fn caret_event(event: u32) {
+    let hwnd = CARET.lock().as_ref().map_or(0, |c| c.hwnd);
+    if hwnd != 0 {
+        crate::message::win_event(event, hwnd, OBJID_CARET, 0);
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn DestroyCaret() -> Bool {
     redraw(false);
+    caret_event(EVENT_OBJECT_DESTROY);
     CARET.lock().take().is_some() as Bool
 }
 
@@ -228,6 +282,7 @@ pub extern "system" fn ShowCaret(hwnd: Hwnd) -> Bool {
         c.shown = (c.shown + 1).min(1);
     }
     update();
+    caret_event(EVENT_OBJECT_SHOW);
     1
 }
 
@@ -237,6 +292,7 @@ pub extern "system" fn HideCaret(hwnd: Hwnd) -> Bool {
         c.shown -= 1;
     }
     update();
+    caret_event(EVENT_OBJECT_HIDE);
     1
 }
 
@@ -248,6 +304,7 @@ pub extern "system" fn SetCaretPos(x: i32, y: i32) -> Bool {
         c.y = y;
     }
     update();
+    caret_event(EVENT_OBJECT_LOCATIONCHANGE);
     1
 }
 

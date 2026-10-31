@@ -215,7 +215,9 @@ struct Stats {
 }
 
 /// The DLL that implements an API-set contract, if `name` is one. VEILOS's
-/// own DLLs host the contracts real Windows puts in kernelbase/ucrtbase.
+/// own DLLs host the contracts real Windows puts in kernelbase/ucrtbase;
+/// kernel32 also hosts those of shlwapi, shcore and combase (COM, WinRT)
+/// until those DLLs exist.
 pub fn api_set_host(name: &str) -> Option<&'static str> {
     let n = name;
     if !(n.starts_with("api-ms-win-") || n.starts_with("ext-ms-win-")) {
@@ -223,18 +225,22 @@ pub fn api_set_host(name: &str) -> Option<&'static str> {
     }
     Some(if n.starts_with("api-ms-win-crt-") {
         "ucrtbase.dll"
-    } else if n.starts_with("api-ms-win-core-shlwapi-") {
-        "shlwapi.dll"
-    } else if n.starts_with("api-ms-win-shcore-") {
-        "shcore.dll"
-    } else if n.starts_with("api-ms-win-core-winrt-") {
-        "combase.dll"
     } else if n.starts_with("ext-ms-win-") {
         // Optional extensions (branding, shell helpers): not provided yet.
         return None;
     } else {
         "kernel32.dll"
     })
+}
+
+/// The name behind an API-set ordinal: some contracts export functions by
+/// ordinal only, and the host DLL's ordinals are its own.
+fn api_set_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
+    let n = dll.to_ascii_lowercase();
+    match ordinal {
+        170 if n.starts_with("api-ms-win-shcore-path-l1-1-") => Some("PathIsNetworkPathW"),
+        _ => None,
+    }
 }
 
 /// Lower-case, with ".dll" added when there's no extension.
@@ -462,7 +468,10 @@ impl Linker {
                 }
                 let name_buf;
                 let sym = if entry & (1 << 63) != 0 {
-                    Sym::Ordinal(entry as u16)
+                    match api_set_ordinal(&dll, entry as u16) {
+                        Some(n) => Sym::Name(n),
+                        None => Sym::Ordinal(entry as u16),
+                    }
                 } else {
                     name_buf = read_cstr(base + (entry & 0x7FFF_FFFF) + 2);
                     Sym::Name(&name_buf)
@@ -477,6 +486,11 @@ impl Linker {
 
     /// The address an import of `sym` from `p` binds to.
     fn resolve<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, p: &Provider, sym: Sym, depth: u32) -> Result<u64, &'static str> {
+        // An unknown API-set ordinal would land on whatever the host DLL
+        // numbers that way.
+        if matches!(sym, Sym::Ordinal(_)) && api_set_host(&p.label).is_some() {
+            return self.unresolved_stub(mem, &p.label, sym);
+        }
         if let Some(m) = p.real {
             if let Some(addr) = self.export_address(mem, m, sym, depth)? {
                 self.stats.to_modules += 1;
@@ -494,7 +508,11 @@ impl Linker {
     fn export_address<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, m: usize, sym: Sym, depth: u32) -> Result<Option<u64>, &'static str> {
         let module = &self.modules[m];
         let rva = match sym {
-            Sym::Name(n) => module.exports.get(n).copied(),
+            // ucrtbase's "_o_" entry points (api-ms-win-crt-private) are its
+            // ordinary functions under another name.
+            Sym::Name(n) => module.exports.get(n).copied().or_else(|| {
+                n.strip_prefix("_o_").filter(|_| module.name == "ucrtbase.dll").and_then(|plain| module.exports.get(plain).copied())
+            }),
             Sym::Ordinal(o) => module.pe.exports.iter().find(|e| e.ordinal == o).map(|e| e.rva),
         };
         let Some(rva) = rva else { return Ok(None) };

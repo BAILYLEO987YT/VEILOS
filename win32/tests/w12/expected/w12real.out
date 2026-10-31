@@ -1,0 +1,78 @@
+InitCommonControlsEx: 1
+message: in range 1, same name same id 1, other differs 1
+format: in range 1, same 1, name length 15
+format name: "VeilTest Format"
+predefined format name: 0
+props: set 1, get 42, missing 0
+props: by atom then name 7
+props: removed 42, after 0
+CharUpperW: "HELLO, WORLD 123"
+CharLowerBuffW: 5
+after: "hello, WORLD 123"
+CharUpperW single: Q
+CharNextW: 1 2, CharPrevW at start 0
+IsCharAlphaW a 1 1 0, IsCharAlphaNumericW 1 1, IsCharUpperW A 1 a 0, IsCharLowerW a 1
+wsprintfW: 87
+wsprintfW: "[-42] [    7] [7    ] [00042] [ff] [FF] [0000BEEF] [4000000000] [str] [Z] [%] [-100000]"
+wsprintfA: 34 "abc|a  |  b|xy|12|0x1f|narrow|wide"
+moveable: handle is not the data 1, data zeroed 1, flags 1
+unlock: 0, error 0, flags 0
+realloc: same handle 1, size 5000, contents "kept", LocalHandle 1
+free: 1
+fixed: lock is the handle 1, unlock 0, error 158, LocalHandle 1
+zero-size moveable: flags 0x4000, lock 1
+revived: 1, size 8
+MulDiv: 15 -8 8 4 -1 4
+mapping: 1 1, view "hello mapping"
+written back: "Jello mapping"
+FindNLSString: 6 len 5
+ignoring case: 6 len 5
+with case: -1
+from end: 4
+IsTextUnicode signature: 1 0x8
+reverse signature: 0 0x80
+CommandLineToArgvW: 4
+  argv[0]: "prog.exe"
+  argv[1]: "one"
+  argv[2]: "two words"
+  argv[3]: "three\q" ""
+GetFileTitleW: 0
+title: "file.txt"
+too small: 9
+folder: 0
+FindMimeFromData txt: 0
+  mime: "text/plain"
+status bar: 1
+parts: set 1, count 3: 100 250 -1
+part 1: length 11, get 0xb
+part 1: "Ln 1, Col 1"
+part 2 type: 0x100
+part 1 spans 102..250
+borders: 0 2 2
+image list: 1, count 0
+added at 0 then 3, count 6
+icon size 16x16
+remove: 1, count 5
+set count: 9
+bk color: 0xffffffff then 0x30201
+cleared: 0
+EM_SETHANDLE: grew in place 1, text length 26
+EM_GETHANDLE again: same 1
+lines 4, file lines 4
+caret 15, file line of caret 1, its start 12, its length 6
+line 3 starts at 22
+EM_GETFILELINE 1: 6
+  line: "second"
+EM_SETCARETINDEX 22: selection 22..22
+end of line: 1
+hook: 1
+events: before the message loop 0, after 1 (object -4, child 5)
+unhooked 1, events 1
+FindTextW: 1, visible 1
+find box: "start"
+reports: 2
+  flags 0x1000d: "needle"
+  flags 0x10045: "needle"
+dialog gone: 1
+CommDlgExtendedError: 0
+exit 0

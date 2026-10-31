@@ -1,0 +1,8 @@
+[package]
+name = "comdlg32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS comdlg32.dll: the common dialogs: open and save, find and replace, fonts"
+
+[lib]
+crate-type = ["cdylib"]

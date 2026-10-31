@@ -1,0 +1,8 @@
+[package]
+name = "shell32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS shell32.dll: the shell basics: About box, drag and drop, folders, ShellExecute"
+
+[lib]
+crate-type = ["cdylib"]

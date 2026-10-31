@@ -231,6 +231,25 @@ extern "C" fn deliver(fx: &[u8; 512], t: &mut Trap) {
         unsafe { crate::loader::return_from_usermode() }
     }
     crate::serial_println!("[EXCEPTION] pid {} {:#010x} at {:#x} -> dispatcher", pid, code, address);
+    let top = if crate::memory::user_ptr_ok(t.rsp, 8) { unsafe { *(t.rsp as *const u64) } } else { 0 };
+    crate::serial_println!(
+        "[EXCEPTION]   data {:#x} rsp {:#x} [rsp] {:#x} rax {:#x} rcx {:#x} rdx {:#x} r8 {:#x} r11 {:#x}",
+        params[1], t.rsp, top, t.rax, t.rcx, t.rdx, t.r8, t.r11
+    );
+    // Likely return addresses (in an image) further up the stack.
+    {
+        let mut trail = alloc::string::String::new();
+        for i in 1..2048 {
+            if !crate::memory::user_ptr_ok(t.rsp + i * 8, 8) {
+                break;
+            }
+            let v = unsafe { *((t.rsp + i * 8) as *const u64) };
+            if (0x1_4000_0000..0x1_5000_0000).contains(&v) || (0x2_0000_0000..0x3_0000_0000).contains(&v) {
+                trail.push_str(&alloc::format!(" {:#x}", v));
+            }
+        }
+        crate::serial_println!("[EXCEPTION]   stack:{}", trail);
+    }
 
     unsafe {
         core::ptr::write_bytes(base as *mut u8, 0, FRAME_SIZE as usize);

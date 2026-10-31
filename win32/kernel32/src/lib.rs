@@ -15,14 +15,19 @@
 
 #![no_std]
 
+mod atom;
+mod com;
 mod env;
 mod exception;
 mod file;
 mod locale;
+mod mapping;
 mod mem;
 mod module;
+mod pool;
 mod process;
 mod resource;
+mod support;
 mod system;
 mod sync;
 mod time;
@@ -310,6 +315,8 @@ pub extern "system" fn SetConsoleOutputCP(_cp: u32) -> Bool {
 
 #[no_mangle]
 pub extern "system" fn CloseHandle(handle: Handle) -> Bool {
+    // A file mapping lets go of its file (and contents) too.
+    mapping::closed(handle);
     check(unsafe { NtClose(handle) })
 }
 

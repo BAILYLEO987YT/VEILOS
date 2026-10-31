@@ -219,7 +219,7 @@ unsafe fn create(ex: u32, class: Name, name: u64, style: u32, x: i32, y: i32, w:
             y: y + f[1] - dy,
             client_w: (w - f[0] - f[2]).max(1) as u32,
             client_h: (h - f[1] - f[3]).max(1) as u32,
-            flags: if popup { nt_abi::WINDOW_POPUP } else { 0 },
+            flags: if popup { nt_abi::WINDOW_POPUP } else { 0 } | if owner != 0 { nt_abi::WINDOW_OWNED } else { 0 },
         };
         let mut hwnd = 0u64;
         if unsafe { crate::VeilUserCreateWindow(&params, &mut hwnd) } != 0 {
@@ -432,6 +432,7 @@ fn destroy_now(hwnd: Hwnd) {
     // The menu bar and system menu go with the window.
     for (h, menu) in menus {
         crate::menu::window_destroyed(h);
+        crate::clipboard::window_destroyed(h);
         if menu != 0 {
             crate::menu::DestroyMenu(menu);
         }
@@ -872,6 +873,12 @@ pub extern "system" fn IsWindowEnabled(hwnd: Hwnd) -> Bool {
 #[no_mangle]
 pub extern "system" fn IsWindow(hwnd: Hwnd) -> Bool {
     state().get(hwnd).is_some() as Bool
+}
+
+/// The window's procedure takes Unicode messages.
+#[no_mangle]
+pub extern "system" fn IsWindowUnicode(hwnd: Hwnd) -> Bool {
+    state().get(hwnd).is_some_and(|w| w.unicode) as Bool
 }
 
 #[no_mangle]
