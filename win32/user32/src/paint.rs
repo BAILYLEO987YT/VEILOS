@@ -398,96 +398,281 @@ const DT_CENTER: u32 = 0x1;
 const DT_RIGHT: u32 = 0x2;
 const DT_VCENTER: u32 = 0x4;
 const DT_BOTTOM: u32 = 0x8;
+const DT_WORDBREAK: u32 = 0x10;
 const DT_SINGLELINE: u32 = 0x20;
+const DT_EXPANDTABS: u32 = 0x40;
+const DT_TABSTOP: u32 = 0x80;
+const DT_NOCLIP: u32 = 0x100;
+const DT_EXTERNALLEADING: u32 = 0x200;
 const DT_CALCRECT: u32 = 0x400;
 const DT_NOPREFIX: u32 = 0x800;
+const DT_PATH_ELLIPSIS: u32 = 0x4000;
+const DT_END_ELLIPSIS: u32 = 0x8000;
+const DT_MODIFYSTRING: u32 = 0x10000;
+const DT_WORD_ELLIPSIS: u32 = 0x40000;
+const DT_HIDEPREFIX: u32 = 0x10_0000;
+const DT_PREFIXONLY: u32 = 0x20_0000;
 
-/// DrawText's lines, alignment, prefixes and DT_CALCRECT; word wrapping
-/// and ellipses come with G2.
-fn draw_text(hdc: u64, text: &[u16], r: *mut [i32; 4], flags: u32) -> i32 {
-    let Some(rect) = rect_arg(r) else { return 0 };
-    let cleaned: Vec<u16> = if flags & DT_NOPREFIX != 0 {
-        text.to_vec()
-    } else {
-        // "&x" shows x ("&&" shows "&").
-        let mut v = Vec::new();
-        let mut i = 0;
-        while i < text.len() {
-            if text[i] == b'&' as u16 && i + 1 < text.len() {
+const SPACE: u16 = b' ' as u16;
+
+fn width(hdc: u64, s: &[u16]) -> i32 {
+    let mut sz = [0i32; 2];
+    unsafe { crate::GetTextExtentPoint32W(hdc, s.as_ptr(), s.len() as i32, &mut sz) };
+    sz[0]
+}
+
+/// A line of DrawText's output: its text, and the index in it of the
+/// character a '&' prefix underlines.
+struct Line {
+    text: Vec<u16>,
+    mnemonic: Option<usize>,
+}
+
+/// Remove '&' prefixes ("&&" is a '&'), noting what the last one marks.
+fn strip_prefixes(text: &[u16]) -> (Vec<u16>, Option<usize>) {
+    let mut out = Vec::with_capacity(text.len());
+    let mut mark = None;
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] == b'&' as u16 && i + 1 < text.len() {
+            i += 1;
+            if text[i] != b'&' as u16 {
+                mark = Some(out.len());
+            }
+        }
+        out.push(text[i]);
+        i += 1;
+    }
+    (out, mark)
+}
+
+/// Tabs to spaces, up to every `stop`th column.
+fn expand_tabs(text: &[u16], stop: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(text.len());
+    for &c in text {
+        if c == b'\t' as u16 {
+            let n = stop - out.len() % stop;
+            out.extend(core::iter::repeat_n(SPACE, n));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Break `text` into lines no wider than `max`, at spaces (a word longer
+/// than a line stays whole).
+fn wrap(hdc: u64, text: &[u16], max: i32) -> Vec<Vec<u16>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        // The longest run of whole words from `start` that fits.
+        let mut end = start;
+        let mut i = start;
+        loop {
+            while i < text.len() && text[i] != SPACE {
                 i += 1;
             }
-            v.push(text[i]);
+            if end > start && width(hdc, &text[start..i]) > max {
+                break;
+            }
+            end = i;
+            if i >= text.len() {
+                break;
+            }
             i += 1;
         }
-        v
-    };
-    let lines: Vec<&[u16]> = if flags & DT_SINGLELINE != 0 {
-        alloc::vec![&cleaned[..]]
+        let mut line_end = end;
+        while line_end > start && text[line_end - 1] == SPACE {
+            line_end -= 1;
+        }
+        lines.push(text[start..line_end].to_vec());
+        start = end;
+        while start < text.len() && text[start] == SPACE {
+            start += 1;
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    lines
+}
+
+/// `text` shortened with "..." to fit `max`: at the end, at a word end,
+/// or (`path`) keeping the part after the last backslash.
+fn ellipsize(hdc: u64, text: &[u16], max: i32, path: bool, word: bool) -> Vec<u16> {
+    if width(hdc, text) <= max {
+        return text.to_vec();
+    }
+    let dots: Vec<u16> = "...".encode_utf16().collect();
+    if path {
+        if let Some(slash) = text.iter().rposition(|&c| c == b'\\' as u16) {
+            let tail = &text[slash..];
+            for keep in (0..slash).rev() {
+                let candidate: Vec<u16> = text[..keep].iter().chain(&dots).chain(tail).copied().collect();
+                if width(hdc, &candidate) <= max {
+                    return candidate;
+                }
+            }
+            let candidate: Vec<u16> = dots.iter().chain(tail).copied().collect();
+            return candidate;
+        }
+    }
+    for keep in (0..text.len()).rev() {
+        if word && keep > 0 && text[keep] != SPACE && text[keep - 1] != SPACE {
+            continue;
+        }
+        let mut head = text[..keep].to_vec();
+        while head.last() == Some(&SPACE) {
+            head.pop();
+        }
+        head.extend_from_slice(&dots);
+        if width(hdc, &head) <= max {
+            return head;
+        }
+    }
+    dots
+}
+
+/// DrawText: lines, word breaks, tabs, ellipses, '&' prefixes, alignment,
+/// clipping and DT_CALCRECT. The height, and the shortened text for
+/// DT_MODIFYSTRING.
+fn draw_text(hdc: u64, text: &[u16], r: *mut [i32; 4], flags: u32) -> (i32, Option<Vec<u16>>) {
+    let Some(rect) = rect_arg(r) else { return (0, None) };
+    let max_w = rect[2] - rect[0];
+    let mut tm = [0u8; 60];
+    unsafe { crate::GetTextMetricsW(hdc, tm.as_mut_ptr()) };
+    let tm_height = i32::from_le_bytes(tm[0..4].try_into().unwrap());
+    let tm_ascent = i32::from_le_bytes(tm[4..8].try_into().unwrap());
+    let ext_leading = i32::from_le_bytes(tm[16..20].try_into().unwrap());
+    let line_h = tm_height + if flags & DT_EXTERNALLEADING != 0 { ext_leading } else { 0 };
+
+    let tabbed = if flags & DT_EXPANDTABS != 0 {
+        let stop = if flags & DT_TABSTOP != 0 { ((flags >> 8) & 0xFF).max(1) as usize } else { 8 };
+        expand_tabs(text, stop)
     } else {
-        cleaned.split(|&c| c == b'\n' as u16).map(|l| l.strip_suffix(&[b'\r' as u16]).unwrap_or(l)).collect()
+        text.to_vec()
     };
-    let mut size = [0i32; 2];
-    unsafe { crate::GetTextExtentPoint32W(hdc, [b'X' as u16].as_ptr(), 1, &mut size) };
-    let line_h = size[1];
+    let prefixes = flags & DT_NOPREFIX == 0;
+    let raw_lines: Vec<&[u16]> = if flags & DT_SINGLELINE != 0 {
+        alloc::vec![&tabbed[..]]
+    } else {
+        tabbed.split(|&c| c == b'\n' as u16).map(|l| l.strip_suffix(&[b'\r' as u16]).unwrap_or(l)).collect()
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for raw in raw_lines {
+        let raw: Vec<u16> = if flags & DT_SINGLELINE != 0 { raw.iter().copied().filter(|&c| c != 13 && c != 10).collect() } else { raw.to_vec() };
+        let (clean, mark) = if prefixes { strip_prefixes(&raw) } else { (raw, None) };
+        if flags & DT_WORDBREAK != 0 && flags & DT_SINGLELINE == 0 && max_w > 0 {
+            // The mnemonic stays with the line that holds it.
+            let mut pos = 0;
+            for piece in wrap(hdc, &clean, max_w) {
+                let at = clean[pos..].windows(piece.len().max(1)).position(|w| w == &piece[..]).map_or(pos, |p| p + pos);
+                let m = mark.filter(|&m| m >= at && m < at + piece.len()).map(|m| m - at);
+                pos = at + piece.len();
+                lines.push(Line { text: piece, mnemonic: m });
+            }
+        } else {
+            lines.push(Line { text: clean, mnemonic: mark });
+        }
+    }
+    let mut modified = None;
+    if flags & (DT_END_ELLIPSIS | DT_PATH_ELLIPSIS | DT_WORD_ELLIPSIS) != 0 {
+        for line in lines.iter_mut() {
+            let short = ellipsize(hdc, &line.text, max_w, flags & DT_PATH_ELLIPSIS != 0, flags & DT_WORD_ELLIPSIS != 0);
+            if short != line.text {
+                line.text = short;
+                line.mnemonic = line.mnemonic.filter(|&m| m + 3 < line.text.len());
+                if flags & DT_MODIFYSTRING != 0 {
+                    modified = Some(line.text.clone());
+                }
+            }
+        }
+    }
+    let widths: Vec<i32> = lines.iter().map(|l| width(hdc, &l.text)).collect();
     let total_h = line_h * lines.len() as i32;
-    let widths: Vec<i32> = lines
-        .iter()
-        .map(|l| {
-            let mut sz = [0i32; 2];
-            unsafe { crate::GetTextExtentPoint32W(hdc, l.as_ptr(), l.len() as i32, &mut sz) };
-            sz[0]
-        })
-        .collect();
     if flags & DT_CALCRECT != 0 {
         let w = widths.iter().copied().max().unwrap_or(0);
         unsafe {
-            (*r)[2] = rect[0] + w;
+            if flags & DT_WORDBREAK == 0 || w > max_w || max_w <= 0 {
+                (*r)[2] = rect[0] + w;
+            }
             (*r)[3] = rect[1] + total_h;
         }
-        return total_h;
+        return (total_h, modified);
     }
     let mut y = rect[1];
-    if flags & DT_SINGLELINE != 0 {
-        if flags & DT_VCENTER != 0 {
-            y = rect[1] + (rect[3] - rect[1] - line_h) / 2;
-        } else if flags & DT_BOTTOM != 0 {
-            y = rect[3] - line_h;
+    let mut ret = total_h;
+    if flags & DT_SINGLELINE != 0 && flags & (DT_VCENTER | DT_BOTTOM) != 0 {
+        y = if flags & DT_VCENTER != 0 { rect[1] + (rect[3] - rect[1] - line_h) / 2 } else { rect[3] - line_h };
+        ret = y - rect[1] + line_h;
+    }
+    let clip = flags & DT_NOCLIP == 0;
+    if clip {
+        unsafe {
+            crate::SaveDC(hdc);
+            crate::IntersectClipRect(hdc, rect[0], rect[1], rect[2], rect[3]);
         }
     }
     let old_align = unsafe { crate::SetTextAlign(hdc, 0) };
+    let underline = prefixes && flags & DT_HIDEPREFIX == 0;
     for (line, w) in lines.iter().zip(&widths) {
         let x = if flags & DT_CENTER != 0 {
-            rect[0] + (rect[2] - rect[0] - w) / 2
+            rect[0] + (max_w - w) / 2
         } else if flags & DT_RIGHT != 0 {
             rect[2] - w
         } else {
             rect[0]
         };
-        unsafe { crate::TextOutW(hdc, x, y, line.as_ptr(), line.len() as i32) };
+        if flags & DT_PREFIXONLY == 0 {
+            unsafe { crate::TextOutW(hdc, x, y, line.text.as_ptr(), line.text.len() as i32) };
+        }
+        if let (true, Some(m)) = (underline, line.mnemonic) {
+            let ux = x + width(hdc, &line.text[..m]);
+            let uw = width(hdc, &line.text[m..m + 1]);
+            let brush = unsafe { crate::CreateSolidBrush(crate::GetTextColor(hdc)) };
+            let u = [ux, y + tm_ascent + 1, ux + uw, y + tm_ascent + 2];
+            FillRect(hdc, &u, brush);
+            unsafe { crate::DeleteObject(brush) };
+        }
         y += line_h;
     }
     unsafe { crate::SetTextAlign(hdc, old_align) };
-    total_h
+    if clip {
+        unsafe { crate::RestoreDC(hdc, -1) };
+    }
+    (ret, modified)
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn DrawTextW(hdc: u64, s: *const u16, n: i32, r: *mut [i32; 4], flags: u32) -> i32 {
+pub unsafe extern "system" fn DrawTextW(hdc: u64, s: *mut u16, n: i32, r: *mut [i32; 4], flags: u32) -> i32 {
     let text = if n < 0 { unsafe { crate::wstr(s) } } else { unsafe { core::slice::from_raw_parts(s, n as usize) }.to_vec() };
-    draw_text(hdc, &text, r, flags)
+    let (h, modified) = draw_text(hdc, &text, r, flags);
+    if let Some(m) = modified {
+        // The buffer has room for the text plus four characters.
+        unsafe { crate::copy_out(&m, s, text.len() + 5) };
+    }
+    h
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn DrawTextA(hdc: u64, s: *const u8, n: i32, r: *mut [i32; 4], flags: u32) -> i32 {
-    draw_text(hdc, &unsafe { crate::from_ansi(s, n) }, r, flags)
+pub unsafe extern "system" fn DrawTextA(hdc: u64, s: *mut u8, n: i32, r: *mut [i32; 4], flags: u32) -> i32 {
+    let text = unsafe { crate::from_ansi(s, n) };
+    let len = if n < 0 { (0..).take_while(|&i| unsafe { *s.add(i) } != 0).count() } else { n as usize };
+    let (h, modified) = draw_text(hdc, &text, r, flags);
+    if let Some(m) = modified {
+        unsafe { crate::copy_out(&crate::to_ansi(&m), s, len + 5) };
+    }
+    h
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn DrawTextExW(hdc: u64, s: *const u16, n: i32, r: *mut [i32; 4], flags: u32, _p: usize) -> i32 {
+pub unsafe extern "system" fn DrawTextExW(hdc: u64, s: *mut u16, n: i32, r: *mut [i32; 4], flags: u32, _p: usize) -> i32 {
     unsafe { DrawTextW(hdc, s, n, r, flags) }
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn DrawTextExA(hdc: u64, s: *const u8, n: i32, r: *mut [i32; 4], flags: u32, _p: usize) -> i32 {
+pub unsafe extern "system" fn DrawTextExA(hdc: u64, s: *mut u8, n: i32, r: *mut [i32; 4], flags: u32, _p: usize) -> i32 {
     unsafe { DrawTextA(hdc, s, n, r, flags) }
 }
 
@@ -605,67 +790,7 @@ pub extern "system" fn SetThreadDpiAwarenessContext(_ctx: i64) -> i64 {
     -1
 }
 
-// -----| cursors, icons, message boxes (resources and dialogs: G2, G3) |-----
-
-/// Stand-in handles: the standard cursor or icon asked for.
-#[no_mangle]
-pub extern "system" fn LoadCursorW(_instance: u64, name: u64) -> u64 {
-    0x0001_0000 | (name & 0xFFFF)
-}
-
-#[no_mangle]
-pub extern "system" fn LoadCursorA(instance: u64, name: u64) -> u64 {
-    LoadCursorW(instance, name)
-}
-
-#[no_mangle]
-pub extern "system" fn LoadIconW(_instance: u64, name: u64) -> u64 {
-    0x0002_0000 | (name & 0xFFFF)
-}
-
-#[no_mangle]
-pub extern "system" fn LoadIconA(instance: u64, name: u64) -> u64 {
-    LoadIconW(instance, name)
-}
-
-#[no_mangle]
-pub extern "system" fn LoadImageW(_instance: u64, name: u64, kind: u32, _w: i32, _h: i32, _flags: u32) -> u64 {
-    0x0003_0000 | (kind as u64) << 12 | (name & 0xFFF)
-}
-
-#[no_mangle]
-pub extern "system" fn LoadImageA(instance: u64, name: u64, kind: u32, w: i32, h: i32, flags: u32) -> u64 {
-    LoadImageW(instance, name, kind, w, h, flags)
-}
-
-#[no_mangle]
-pub extern "system" fn DestroyIcon(_h: u64) -> Bool {
-    1
-}
-
-#[no_mangle]
-pub extern "system" fn DestroyCursor(_h: u64) -> Bool {
-    1
-}
-
-static CURSOR: crate::dllrt::Lock<(u64, i32)> = crate::dllrt::Lock::new((0x0001_7F00, 0));
-
-#[no_mangle]
-pub extern "system" fn SetCursor(c: u64) -> u64 {
-    core::mem::replace(&mut CURSOR.lock().0, c)
-}
-
-#[no_mangle]
-pub extern "system" fn GetCursor() -> u64 {
-    CURSOR.lock().0
-}
-
-#[no_mangle]
-pub extern "system" fn ShowCursor(show: Bool) -> i32 {
-    let mut c = CURSOR.lock();
-    c.1 += if show != 0 { 1 } else { -1 };
-    c.1
-}
+// -----| the pointer, message boxes (dialogs: G3) |-----
 
 #[no_mangle]
 pub extern "system" fn GetCursorPos(out: *mut [i32; 2]) -> Bool {

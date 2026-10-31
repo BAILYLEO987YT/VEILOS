@@ -14,7 +14,9 @@
 //!   lib.rs      classes, the window table, text and character sets
 //!   window.rs   creating, destroying, showing, moving; window data
 //!   message.rs  the queue, sending and dispatching, timers, DefWindowProc
-//!   paint.rs    pixels, DCs, invalidation and painting, colors, metrics
+//!   paint.rs    pixels, DCs, invalidation and painting, DrawText, colors,
+//!               metrics
+//!   image.rs    bitmaps, icons and cursors (resources, files, standard ones)
 
 #![no_std]
 
@@ -22,6 +24,7 @@ extern crate alloc;
 
 #[path = "../../dllrt.rs"]
 mod dllrt;
+mod image;
 mod message;
 mod paint;
 mod window;
@@ -69,6 +72,12 @@ unsafe extern "system" {
     pub(crate) fn TextOutW(hdc: u64, x: i32, y: i32, s: *const u16, n: i32) -> Bool;
     pub(crate) fn GetTextExtentPoint32W(hdc: u64, s: *const u16, n: i32, out: *mut [i32; 2]) -> Bool;
     pub(crate) fn SetTextAlign(hdc: u64, align: u32) -> u32;
+    pub(crate) fn GetTextMetricsW(hdc: u64, out: *mut u8) -> Bool;
+    pub(crate) fn GetTextColor(hdc: u64) -> u32;
+    pub(crate) fn DeleteObject(h: u64) -> Bool;
+    pub(crate) fn SaveDC(hdc: u64) -> i32;
+    pub(crate) fn RestoreDC(hdc: u64, n: i32) -> Bool;
+    pub(crate) fn IntersectClipRect(hdc: u64, l: i32, t: i32, r: i32, b: i32) -> i32;
 }
 
 pub(crate) const ERROR_INVALID_WINDOW_HANDLE: u32 = 1400;

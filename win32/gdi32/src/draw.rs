@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 #[derive(Clone, Copy)]
 pub struct Canvas {
     pub ptr: *mut u32,
-    pub stride: usize,
+    /// Pixels from one row to the next (negative for bottom-up bits).
+    pub stride: isize,
     /// Drawable area, device pixels, exclusive right/bottom.
     pub x0: i32,
     pub y0: i32,
@@ -27,17 +28,22 @@ pub fn colorref(p: u32) -> u32 {
 }
 
 impl Canvas {
+    /// Pixel (x, y), which must be inside.
+    pub fn at(&self, x: i32, y: i32) -> *mut u32 {
+        unsafe { self.ptr.offset(y as isize * self.stride + x as isize) }
+    }
+
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
     }
 
     pub fn get(&self, x: i32, y: i32) -> Option<u32> {
-        self.contains(x, y).then(|| unsafe { *self.ptr.add(y as usize * self.stride + x as usize) } & 0x00FF_FFFF)
+        self.contains(x, y).then(|| unsafe { *self.at(x, y) } & 0x00FF_FFFF)
     }
 
     pub fn put(&self, x: i32, y: i32, p: u32, rop2: u32) {
         if self.contains(x, y) {
-            let at = unsafe { self.ptr.add(y as usize * self.stride + x as usize) };
+            let at = self.at(x, y);
             unsafe { *at = mix2(rop2, p, *at) };
         }
     }
@@ -50,7 +56,7 @@ impl Canvas {
             return;
         }
         for y in y0..y1 {
-            let row = unsafe { core::slice::from_raw_parts_mut(self.ptr.add(y as usize * self.stride + x0 as usize), (x1 - x0) as usize) };
+            let row = unsafe { core::slice::from_raw_parts_mut(self.at(x0, y), (x1 - x0) as usize) };
             if rop2 == R2_COPYPEN {
                 row.fill(p);
             } else {
@@ -105,6 +111,25 @@ pub fn mix3(code: u8, p: u32, s: u32, d: u32) -> u32 {
             r & 0x00FF_FFFF
         }
     }
+}
+
+/// The pixels a stretched copy covers from `origin` with signed `size`, as
+/// [lo, hi): a negative size runs back from `origin` (which it includes),
+/// mirroring, as GDI does.
+pub fn span(origin: i32, size: i32) -> (i32, i32) {
+    if size >= 0 { (origin, origin + size) } else { (origin + size + 1, origin + 1) }
+}
+
+/// Steps from `origin` to `p` in `size`'s direction.
+pub fn step(origin: i32, size: i32, p: i32) -> i32 {
+    if size >= 0 { p - origin } else { origin - p }
+}
+
+/// The source pixel for destination step `i` of `dsize`, from `origin`
+/// along `ssize`.
+pub fn source(origin: i32, ssize: i32, dsize: i32, i: i32) -> i32 {
+    let k = i * ssize.abs() / dsize.abs().max(1);
+    if ssize >= 0 { origin + k } else { origin - k }
 }
 
 /// A line from (x0, y0) towards (x1, y1), the last point not drawn, `w`

@@ -24,4 +24,10 @@ for dll in msvcrt vcruntime140 vcruntime140_1; do
         /DEF:target/forwarders/$dll.def target/forwarders/empty.obj /OUT:target/forwarders/$dll.dll
     cp target/forwarders/$dll.dll "../storage/system/$dll.dll"
 done
+
+# msimg32.dll: AlphaBlend and TransparentBlt live in gdi32, as on Windows.
+printf 'LIBRARY msimg32.dll\nEXPORTS\n    AlphaBlend=gdi32.GdiAlphaBlend\n    TransparentBlt=gdi32.GdiTransparentBlt\n' > target/forwarders/msimg32.def
+"$LLVM/lld-link.exe" /nologo /DLL /NOENTRY /NODEFAULTLIB /MACHINE:X64 \
+    /DEF:target/forwarders/msimg32.def target/forwarders/empty.obj /OUT:target/forwarders/msimg32.dll
+cp target/forwarders/msimg32.dll ../storage/system/msimg32.dll
 echo "installed: $(ls ../storage/system | tr '\n' ' ')"

@@ -1,12 +1,13 @@
-//! Text in the built-in 8x16 font (font_data.rs, from Cascadia Mono), drawn
-//! at a whole-number scale picked from the selected font's height. Every
-//! font is this font until G2 brings TrueType.
+//! Text: TrueType faces (ttf.rs) for the fonts programs create, and the
+//! built-in 8x16 bitmap font (font_data.rs, from Cascadia Mono) for the
+//! stock "System" fonts, drawn at a whole-number scale from the height.
 
 use alloc::vec::Vec;
 
-use crate::draw::pixel;
+use crate::draw::{pixel, Canvas, R2_COPYPEN};
 use crate::font_data::GLYPHS;
-use crate::{Bool, Handle};
+use crate::ttf::{self, Realized};
+use crate::{Bool, Handle, Obj, Table};
 
 const CELL_W: i32 = 8;
 const CELL_H: i32 = 16;
@@ -21,6 +22,58 @@ const TA_BASELINE: u32 = 24;
 const ETO_OPAQUE: u32 = 2;
 const ETO_CLIPPED: u32 = 4;
 
+/// How a DC's font draws.
+#[derive(Clone)]
+enum Face {
+    /// The bitmap font at this scale, with underline/strike-out.
+    Bitmap { scale: i32, underline: bool, strike: bool },
+    TrueType(Realized),
+}
+
+impl Face {
+    fn ascent(&self) -> i32 {
+        match self {
+            Face::Bitmap { scale, .. } => ASCENT * scale,
+            Face::TrueType(r) => r.ascent,
+        }
+    }
+    fn height(&self) -> i32 {
+        match self {
+            Face::Bitmap { scale, .. } => CELL_H * scale,
+            Face::TrueType(r) => r.ascent + r.descent,
+        }
+    }
+    /// Where a strike-out line goes, above the baseline.
+    fn strike_rise(&self) -> i32 {
+        match self {
+            Face::Bitmap { scale, .. } => 4 * scale,
+            Face::TrueType(r) => (r.x_height / 2).max(1),
+        }
+    }
+    fn lines(&self) -> (bool, bool) {
+        match self {
+            Face::Bitmap { underline, strike, .. } => (*underline, *strike),
+            Face::TrueType(r) => (r.underline, r.strike),
+        }
+    }
+}
+
+/// The DC's font, realized (once per font object).
+fn face(t: &mut Table, hdc: Handle) -> Face {
+    let Some(f) = t.dc(hdc).map(|dc| dc.s.font) else { return Face::Bitmap { scale: 1, underline: false, strike: false } };
+    let Some(Obj::Font(font)) = t.get(f) else { return Face::Bitmap { scale: 1, underline: false, strike: false } };
+    if font.tt.is_none() {
+        font.tt = Some(ttf::realize(&font.log));
+    }
+    match font.tt.as_ref().unwrap() {
+        Some(r) => Face::TrueType(r.clone()),
+        None => {
+            let h = i32::from_le_bytes(font.log[0..4].try_into().unwrap()).abs();
+            Face::Bitmap { scale: if h == 0 { 1 } else { ((h + 8) / 16).clamp(1, 8) }, underline: font.log[21] != 0, strike: font.log[22] != 0 }
+        }
+    }
+}
+
 fn glyph(c: u16) -> &'static [u8; 16] {
     let i = match c {
         0x20..=0x7E => c as usize - 0x20,
@@ -30,18 +83,33 @@ fn glyph(c: u16) -> &'static [u8; 16] {
     &GLYPHS[i]
 }
 
-/// Draw `text` with its cells' top-left at device (x, y); `advances`
-/// (device pixels) if the caller gave its own spacing.
+/// Each character's x (q6 pixels from the start) and the total advance.
+fn layout(face: &Face, text: &[u16], advances: Option<&[i32]>) -> (Vec<(u16, i32)>, i32) {
+    match face {
+        Face::TrueType(r) => ttf::layout(r, text, advances),
+        Face::Bitmap { scale, .. } => {
+            let mut x = 0;
+            let mut out = Vec::with_capacity(text.len());
+            for (i, &ch) in text.iter().enumerate() {
+                out.push((ch, x * 64));
+                x += advances.and_then(|a| a.get(i).copied()).unwrap_or(CELL_W * scale);
+            }
+            (out, x * 64)
+        }
+    }
+}
+
+/// Draw `text` at logical (x, y) by the DC's text alignment.
 fn draw(hdc: Handle, x: i32, y: i32, text: &[u16], opts: u32, rect: Option<[i32; 4]>, advances: Option<&[i32]>) -> Bool {
     let mut t = crate::table();
-    if !crate::is_dc(&mut t, hdc) {
+    if !t.is_dc(hdc) {
         return 0;
     }
-    let scale = crate::font_scale(&mut t, hdc);
+    let face = face(&mut t, hdc);
     let (fg, bg, mode, align, cp) = crate::dc_text_state(&mut t, hdc).unwrap();
-    let advance = |i: usize| advances.and_then(|a| a.get(i).copied()).unwrap_or(CELL_W * scale);
-    let width: i32 = (0..text.len()).map(advance).sum();
-    let height = CELL_H * scale;
+    let (glyphs, total_q6) = layout(&face, text, advances);
+    let width = ttf::px(total_q6);
+    let height = face.height();
     // The reference point: the current position, or (x, y).
     let (rx, ry) = if align & TA_UPDATECP != 0 { cp } else { (x, y) };
     let (dx, dy) = crate::to_device(&mut t, hdc, rx, ry);
@@ -51,7 +119,7 @@ fn draw(hdc: Handle, x: i32, y: i32, text: &[u16], opts: u32, rect: Option<[i32;
         _ => dx,
     };
     let top = match align & TA_BASELINE {
-        TA_BASELINE => dy - ASCENT * scale,
+        TA_BASELINE => dy - face.ascent(),
         TA_BOTTOM => dy - height,
         _ => dy,
     };
@@ -59,7 +127,7 @@ fn draw(hdc: Handle, x: i32, y: i32, text: &[u16], opts: u32, rect: Option<[i32;
         let nx = if align & TA_CENTER == TA_RIGHT { rx - width } else { rx + width };
         crate::set_pos(&mut t, hdc, (nx, ry));
     }
-    let Some(mut c) = crate::canvas(&mut t, hdc) else { return 1 };
+    let Some(mut c) = t.canvas(hdc) else { return 1 };
     let rect = rect.map(|r| {
         let (x0, y0) = crate::to_device(&mut t, hdc, r[0], r[1]);
         let (x1, y1) = crate::to_device(&mut t, hdc, r[2], r[3]);
@@ -67,7 +135,7 @@ fn draw(hdc: Handle, x: i32, y: i32, text: &[u16], opts: u32, rect: Option<[i32;
     });
     if let Some((x0, y0, x1, y1)) = rect {
         if opts & ETO_OPAQUE != 0 {
-            c.fill(x0, y0, x1, y1, pixel(bg), crate::draw::R2_COPYPEN);
+            c.fill(x0, y0, x1, y1, pixel(bg), R2_COPYPEN);
         }
         if opts & ETO_CLIPPED != 0 {
             c.x0 = c.x0.max(x0);
@@ -77,27 +145,41 @@ fn draw(hdc: Handle, x: i32, y: i32, text: &[u16], opts: u32, rect: Option<[i32;
         }
     }
     let (fg, bg) = (pixel(fg), pixel(bg));
-    let mut pen_x = left;
-    for (i, &ch) in text.iter().enumerate() {
-        let g = glyph(ch);
-        let adv = advance(i);
-        if mode == 2 {
-            c.fill(pen_x, top, pen_x + adv, top + height, bg, crate::draw::R2_COPYPEN);
-        }
-        for (row, bits) in g.iter().enumerate() {
-            if *bits == 0 {
-                continue;
-            }
-            for col in 0..8 {
-                if bits & (0x80 >> col) != 0 {
-                    let (px, py) = (pen_x + col * scale, top + row as i32 * scale);
-                    c.fill(px, py, px + scale, py + scale, fg, crate::draw::R2_COPYPEN);
-                }
-            }
-        }
-        pen_x += adv;
+    if mode == 2 {
+        c.fill(left, top, left + width, top + height, bg, R2_COPYPEN);
     }
+    let baseline = top + face.ascent();
+    for &(g, x_q6) in &glyphs {
+        match &face {
+            Face::TrueType(r) => ttf::draw_glyph(&c, r, g, left * 64 + x_q6, baseline, fg),
+            Face::Bitmap { scale, .. } => bitmap_glyph(&c, g, left + x_q6 / 64, top, *scale, fg),
+        }
+    }
+    let (underline, strike) = face.lines();
+    let thick = (height / 16).max(1);
+    if underline {
+        c.fill(left, baseline + thick, left + width, baseline + 2 * thick, fg, R2_COPYPEN);
+    }
+    if strike {
+        let mid = baseline - face.strike_rise();
+        c.fill(left, mid, left + width, mid + thick, fg, R2_COPYPEN);
+    }
+    t.done(hdc);
     1
+}
+
+fn bitmap_glyph(c: &Canvas, ch: u16, x: i32, top: i32, scale: i32, fg: u32) {
+    for (row, bits) in glyph(ch).iter().enumerate() {
+        if *bits == 0 {
+            continue;
+        }
+        for col in 0..8 {
+            if bits & (0x80 >> col) != 0 {
+                let (px, py) = (x + col * scale, top + row as i32 * scale);
+                c.fill(px, py, px + scale, py + scale, fg, R2_COPYPEN);
+            }
+        }
+    }
 }
 
 unsafe fn wide(s: *const u16, n: i32) -> Vec<u16> {
@@ -107,12 +189,16 @@ unsafe fn wide(s: *const u16, n: i32) -> Vec<u16> {
     unsafe { core::slice::from_raw_parts(s, n as usize) }.to_vec()
 }
 
-/// ANSI text as Latin-1 (the code page is 1252 in name).
+/// ANSI text (UTF-8, VEILOS's ANSI code page) as UTF-16.
 unsafe fn ansi(s: *const u8, n: i32) -> Vec<u16> {
     if s.is_null() || n <= 0 {
         return Vec::new();
     }
-    unsafe { core::slice::from_raw_parts(s, n as usize) }.iter().map(|&b| b as u16).collect()
+    let bytes = unsafe { core::slice::from_raw_parts(s, n as usize) };
+    match core::str::from_utf8(bytes) {
+        Ok(text) => text.encode_utf16().collect(),
+        Err(_) => bytes.iter().map(|&b| b as u16).collect(),
+    }
 }
 
 #[no_mangle]
@@ -141,87 +227,116 @@ pub unsafe extern "system" fn ExtTextOutA(hdc: Handle, x: i32, y: i32, opts: u32
     unsafe { ext(hdc, x, y, opts, rect, &ansi(s, n as i32), dx) }
 }
 
-fn extent(hdc: Handle, n: i32, out: *mut [i32; 2]) -> Bool {
+/// Width and height of `text`; an empty string measures 0 x 0, as on
+/// Windows.
+fn extent(hdc: Handle, text: &[u16], out: *mut [i32; 2]) -> Bool {
     let mut t = crate::table();
-    if !crate::is_dc(&mut t, hdc) || out.is_null() {
+    if !t.is_dc(hdc) || out.is_null() {
         return 0;
     }
-    let scale = crate::font_scale(&mut t, hdc);
-    // An empty string measures 0 x 0, as on Windows.
-    let n = n.max(0);
-    unsafe { *out = [n * CELL_W * scale, if n == 0 { 0 } else { CELL_H * scale }] };
+    let face = face(&mut t, hdc);
+    let (_, total) = layout(&face, text, None);
+    unsafe { *out = if text.is_empty() { [0, 0] } else { [ttf::px(total), face.height()] } };
     1
 }
 
 #[no_mangle]
-pub extern "system" fn GetTextExtentPoint32W(hdc: Handle, _s: *const u16, n: i32, out: *mut [i32; 2]) -> Bool {
-    extent(hdc, n, out)
+pub unsafe extern "system" fn GetTextExtentPoint32W(hdc: Handle, s: *const u16, n: i32, out: *mut [i32; 2]) -> Bool {
+    extent(hdc, &unsafe { wide(s, n) }, out)
 }
 
 #[no_mangle]
-pub extern "system" fn GetTextExtentPoint32A(hdc: Handle, _s: *const u8, n: i32, out: *mut [i32; 2]) -> Bool {
-    extent(hdc, n, out)
+pub unsafe extern "system" fn GetTextExtentPoint32A(hdc: Handle, s: *const u8, n: i32, out: *mut [i32; 2]) -> Bool {
+    extent(hdc, &unsafe { ansi(s, n) }, out)
 }
 
 #[no_mangle]
-pub extern "system" fn GetTextExtentPointW(hdc: Handle, _s: *const u16, n: i32, out: *mut [i32; 2]) -> Bool {
-    extent(hdc, n, out)
+pub unsafe extern "system" fn GetTextExtentPointW(hdc: Handle, s: *const u16, n: i32, out: *mut [i32; 2]) -> Bool {
+    extent(hdc, &unsafe { wide(s, n) }, out)
 }
 
 #[no_mangle]
-pub extern "system" fn GetTextExtentPointA(hdc: Handle, _s: *const u8, n: i32, out: *mut [i32; 2]) -> Bool {
-    extent(hdc, n, out)
+pub unsafe extern "system" fn GetTextExtentPointA(hdc: Handle, s: *const u8, n: i32, out: *mut [i32; 2]) -> Bool {
+    extent(hdc, &unsafe { ansi(s, n) }, out)
 }
 
-/// How many of `n` characters fit in `max` pixels, and each one's end.
-#[no_mangle]
-pub extern "system" fn GetTextExtentExPointW(hdc: Handle, _s: *const u16, n: i32, max: i32, fit: *mut i32, dx: *mut i32, size: *mut [i32; 2]) -> Bool {
+/// How many characters fit in `max` pixels, and where each one ends.
+fn extent_ex(hdc: Handle, text: &[u16], max: i32, fit: *mut i32, dx: *mut i32, size: *mut [i32; 2]) -> Bool {
     let mut t = crate::table();
-    if !crate::is_dc(&mut t, hdc) {
+    if !t.is_dc(hdc) {
         return 0;
     }
-    let w = CELL_W * crate::font_scale(&mut t, hdc);
+    let face = face(&mut t, hdc);
     drop(t);
-    let n = n.max(0);
+    let (glyphs, total) = layout(&face, text, None);
+    let ends: Vec<i32> = (0..glyphs.len()).map(|i| ttf::px(glyphs.get(i + 1).map_or(total, |g| g.1))).collect();
     if !fit.is_null() {
-        unsafe { *fit = (max / w).min(n) };
+        unsafe { *fit = ends.iter().take_while(|&&e| e <= max).count() as i32 };
     }
     if !dx.is_null() {
-        for i in 0..n as usize {
-            unsafe { *dx.add(i) = (i as i32 + 1) * w };
+        for (i, e) in ends.iter().enumerate() {
+            unsafe { *dx.add(i) = *e };
         }
     }
     if !size.is_null() {
-        extent(hdc, n, size);
+        extent(hdc, text, size);
     }
     1
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn GetTextExtentExPointW(hdc: Handle, s: *const u16, n: i32, max: i32, fit: *mut i32, dx: *mut i32, size: *mut [i32; 2]) -> Bool {
+    extent_ex(hdc, &unsafe { wide(s, n) }, max, fit, dx, size)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn GetTextExtentExPointA(hdc: Handle, s: *const u8, n: i32, max: i32, fit: *mut i32, dx: *mut i32, size: *mut [i32; 2]) -> Bool {
+    extent_ex(hdc, &unsafe { ansi(s, n) }, max, fit, dx, size)
 }
 
 /// TEXTMETRICW (`wide`) or TEXTMETRICA.
 fn metrics(hdc: Handle, out: *mut u8, wide: bool) -> Bool {
     let mut t = crate::table();
-    if !crate::is_dc(&mut t, hdc) || out.is_null() {
+    if !t.is_dc(hdc) || out.is_null() {
         return 0;
     }
-    let s = crate::font_scale(&mut t, hdc);
-    let longs = [CELL_H * s, ASCENT * s, (CELL_H - ASCENT) * s, 0, 0, CELL_W * s, CELL_W * s, 400, 0, 96, 96];
+    let face = face(&mut t, hdc);
+    // Height, ascent, descent, internal and external leading, average and
+    // maximum width, weight, overhang, digitized aspect; then first, last,
+    // default and break characters; italic, underlined, struck out, pitch
+    // and family, charset.
+    let (longs, chars, flags): ([i32; 11], [u16; 4], [u8; 5]) = match &face {
+        Face::Bitmap { scale: s, underline, strike } => (
+            [CELL_H * s, ASCENT * s, (CELL_H - ASCENT) * s, 0, 0, CELL_W * s, CELL_W * s, 400, 0, 96, 96],
+            [0x20, 0xFF, 0x3F, 0x20],
+            [0, *underline as u8, *strike as u8, 0x30, 0],
+        ),
+        Face::TrueType(r) => {
+            let height = r.ascent + r.descent;
+            // TMPF_FIXED_PITCH set means variable pitch; TMPF_VECTOR, TMPF_TRUETYPE.
+            let pitch = (!r.fixed) as u8 | 2 | 4 | r.family;
+            (
+                [height, r.ascent, r.descent, (height - r.em_px).max(0), r.line_gap, r.avg_w, r.max_w, r.weight, 0, 96, 96],
+                [0x20, 0xFFFC, 0x1F, 0x20],
+                [r.italic as u8 * 255, r.underline as u8, r.strike as u8, pitch, 0],
+            )
+        }
+    };
     for (i, v) in longs.iter().enumerate() {
         unsafe { *(out.add(i * 4) as *mut i32) = *v };
     }
-    // First, last, default and break characters, then italic, underlined,
-    // struck out, pitch and family (fixed pitch, FF_MODERN), charset.
     let rest_at = if wide {
-        for (i, c) in [0x20u16, 0xFF, 0x3F, 0x20].iter().enumerate() {
+        for (i, c) in chars.iter().enumerate() {
             unsafe { *(out.add(44 + i * 2) as *mut u16) = *c };
         }
         52
     } else {
-        for (i, c) in [0x20u8, 0xFF, 0x3F, 0x20].iter().enumerate() {
-            unsafe { *out.add(44 + i) = *c };
+        for (i, c) in chars.iter().enumerate() {
+            unsafe { *out.add(44 + i) = (*c).min(0xFF) as u8 };
         }
         48
     };
-    for (i, b) in [0u8, 0, 0, 0x30, 0].iter().enumerate() {
+    for (i, b) in flags.iter().enumerate() {
         unsafe { *out.add(rest_at + i) = *b };
     }
     1
@@ -237,45 +352,106 @@ pub extern "system" fn GetTextMetricsA(hdc: Handle, out: *mut u8) -> Bool {
     metrics(hdc, out, false)
 }
 
-#[no_mangle]
-pub extern "system" fn GetTextFaceW(_hdc: Handle, n: i32, out: *mut u16) -> i32 {
-    let face: Vec<u16> = "System".encode_utf16().chain(core::iter::once(0)).collect();
-    if out.is_null() {
-        return face.len() as i32;
+/// The face name the program asked for (what it would get on Windows),
+/// or the face drawing it if it asked for none.
+fn face_name(hdc: Handle) -> Vec<u16> {
+    let mut t = crate::table();
+    let Some(f) = t.dc(hdc).map(|dc| dc.s.font) else { return Vec::new() };
+    let asked: Vec<u16> = match t.get(f) {
+        Some(Obj::Font(font)) => (0..32).map(|i| u16::from_le_bytes([font.log[28 + 2 * i], font.log[29 + 2 * i]])).take_while(|&c| c != 0).collect(),
+        _ => Vec::new(),
+    };
+    if !asked.is_empty() {
+        return asked;
     }
-    let k = (n.max(0) as usize).min(face.len());
+    match face(&mut t, hdc) {
+        Face::TrueType(r) => ttf::face_name(&r).encode_utf16().collect(),
+        Face::Bitmap { .. } => "System".encode_utf16().collect(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn GetTextFaceW(hdc: Handle, n: i32, out: *mut u16) -> i32 {
+    let mut name = face_name(hdc);
+    name.push(0);
+    if out.is_null() {
+        return name.len() as i32;
+    }
+    let k = (n.max(0) as usize).min(name.len());
     if k == 0 {
         return 0;
     }
-    unsafe { core::ptr::copy_nonoverlapping(face.as_ptr(), out, k) };
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, k) };
     unsafe { *out.add(k - 1) = 0 };
     k as i32 - 1
 }
 
 #[no_mangle]
-pub extern "system" fn GetTextFaceA(_hdc: Handle, n: i32, out: *mut u8) -> i32 {
-    let face = b"System\0";
+pub extern "system" fn GetTextFaceA(hdc: Handle, n: i32, out: *mut u8) -> i32 {
+    let name: Vec<u8> = alloc::string::String::from_utf16_lossy(&face_name(hdc)).into_bytes().into_iter().chain(core::iter::once(0)).collect();
     if out.is_null() {
-        return face.len() as i32;
+        return name.len() as i32;
     }
-    let k = (n.max(0) as usize).min(face.len());
+    let k = (n.max(0) as usize).min(name.len());
     if k == 0 {
         return 0;
     }
-    unsafe { core::ptr::copy_nonoverlapping(face.as_ptr(), out, k) };
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, k) };
     unsafe { *out.add(k - 1) = 0 };
     k as i32 - 1
+}
+
+/// Advance widths of characters `first..=last`.
+fn char_widths(hdc: Handle, first: u32, last: u32, out: *mut i32, abc: bool) -> Bool {
+    let mut t = crate::table();
+    if !t.is_dc(hdc) || out.is_null() || last < first || last - first > 0x10000 {
+        return 0;
+    }
+    let face = face(&mut t, hdc);
+    drop(t);
+    for (i, ch) in (first..=last).enumerate() {
+        let (_, w) = layout(&face, &[ch as u16], None);
+        let w = ttf::px(w);
+        unsafe {
+            if abc {
+                // ABC { A, B, C }: no overhangs.
+                *out.add(i * 3) = 0;
+                *(out.add(i * 3 + 1) as *mut u32) = w as u32;
+                *out.add(i * 3 + 2) = 0;
+            } else {
+                *out.add(i) = w;
+            }
+        }
+    }
+    1
 }
 
 #[no_mangle]
 pub extern "system" fn GetCharWidth32W(hdc: Handle, first: u32, last: u32, out: *mut i32) -> Bool {
-    let mut t = crate::table();
-    if !crate::is_dc(&mut t, hdc) || out.is_null() || last < first {
-        return 0;
-    }
-    let w = CELL_W * crate::font_scale(&mut t, hdc);
-    for i in 0..=(last - first) as usize {
-        unsafe { *out.add(i) = w };
-    }
-    1
+    char_widths(hdc, first, last, out, false)
+}
+
+#[no_mangle]
+pub extern "system" fn GetCharWidth32A(hdc: Handle, first: u32, last: u32, out: *mut i32) -> Bool {
+    char_widths(hdc, first, last, out, false)
+}
+
+#[no_mangle]
+pub extern "system" fn GetCharWidthW(hdc: Handle, first: u32, last: u32, out: *mut i32) -> Bool {
+    char_widths(hdc, first, last, out, false)
+}
+
+#[no_mangle]
+pub extern "system" fn GetCharWidthA(hdc: Handle, first: u32, last: u32, out: *mut i32) -> Bool {
+    char_widths(hdc, first, last, out, false)
+}
+
+#[no_mangle]
+pub extern "system" fn GetCharABCWidthsW(hdc: Handle, first: u32, last: u32, out: *mut i32) -> Bool {
+    char_widths(hdc, first, last, out, true)
+}
+
+#[no_mangle]
+pub extern "system" fn GetCharABCWidthsA(hdc: Handle, first: u32, last: u32, out: *mut i32) -> Bool {
+    char_widths(hdc, first, last, out, true)
 }

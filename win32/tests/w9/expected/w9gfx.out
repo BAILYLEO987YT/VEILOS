@@ -1,0 +1,43 @@
+dib32 bottom-left 332211 top-left 000000
+dib32 SetPixel top-right -> bits[15] 00010203
+DIBSECTION 32 4x4 bpp 32 bits ok 1 biHeight 4 size 64
+dib8 SetPixel near-red -> index 1, GetPixel 0000ff
+dib8 FillRect green -> indices 2 2, row 0 0
+dib8 bits written -> GetPixel ff0000
+color table 4: ff0000
+dib24 (1,0) 102030
+dib24 SetPixel (2,1) -> cc bb aa
+dib16 565 -> f800 07ff
+blt from dib32: 0000ff ffffff ff0000 00ff00
+StretchDIBits 2: 0000ff 808080 ff0000 00ff00
+mirrored 808080 808080
+SetDIBitsToDevice 2: 010203 040506 000000
+GetDIBits query 1: 8x8 bpp 32 compression 3 size 256
+GetDIBits 24 top-down 8: 00 00 ff | 80 80 80
+CreateDIBitmap pixel 563412
+AlphaBlend per-pixel: 80ff7f7f 00ffffff
+AlphaBlend constant: 7f7f7f
+TransparentBlt: ffffff ff0000
+palette entries 3, nearest to dark red 1, to blue 2
+LoadBitmap 8x8 bpp 32: (2,3) 806040 (7,0) 8000e0
+LoadImage DIB section: 1 bpp 24
+LoadIcon: icon 1, color 32x32, mask 32x32 bpp 1
+DrawIconEx: opaque 0000ff clear ffffff half ff7f7f
+LoadImage 16x16 icon: 16x16
+IDI_APPLICATION 1: 32x32
+IDI_ERROR twice same 1
+IDC_ARROW: icon 0
+arial: height = ascent + descent 1, height >= 20 1, weight 700, TrueType 1, variable 1
+face "Arial"
+iiii narrower than WWWW 1, extent height = tmHeight 1, char width W = extent 1
+fit in width of abc: 3
+LOGFONT -20 700 "Arial"
+courier: fixed 1, iiii = WWWW 1
+CALCRECT single line: height 1, width = extent 1
+wrap to aaa bbb: lines 2
+wrap to aaa: lines 3
+two lines: 2
+prefix: width = extent of File 1
+ellipsis: ends with ... 1, fits 1, shorter 1
+vcenter returns 1
+exit 0

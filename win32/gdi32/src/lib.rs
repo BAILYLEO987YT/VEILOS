@@ -8,17 +8,24 @@
 //!
 //!   lib.rs      objects, DCs and their state, the exports
 //!   draw.rs     pixels: lines, rectangles, ellipses, polygons, raster ops
-//!   text.rs     text in the built-in 8x16 font
+//!   dib.rs      DIBs and DIB sections, palettes, alpha and transparent blits
+//!   text.rs     text: TrueType fonts (ttf.rs) and the built-in 8x16 font
 
 #![no_std]
 
 extern crate alloc;
 
+mod dib;
 #[path = "../../dllrt.rs"]
 mod dllrt;
 mod draw;
+#[path = "../../../src/font.rs"]
+#[allow(dead_code)]
+mod font;
 mod font_data;
+mod render2d;
 mod text;
+mod ttf;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -64,16 +71,49 @@ pub(crate) struct Brush {
 pub(crate) struct Font {
     /// LOGFONTW, as given.
     pub log: [u8; 92],
+    /// The TrueType face and size it draws with (None inside: the bitmap
+    /// font), once first used.
+    pub tt: Option<Option<ttf::Realized>>,
 }
 
 pub(crate) struct Bitmap {
-    w: i32,
-    h: i32,
-    bpp: u16,
-    /// Top-down 0x00RRGGBB.
-    bits: Vec<u32>,
+    pub w: i32,
+    pub h: i32,
+    pub bpp: u16,
+    /// Top-down 0x00RRGGBB (unused for a 32bpp DIB section, drawn in place).
+    pub bits: Vec<u32>,
     /// The memory DC it's selected into.
-    dc: Handle,
+    pub dc: Handle,
+    pub dib: Option<Box<dib::Section>>,
+}
+
+impl Bitmap {
+    /// The pixels GDI draws on (read from a DIB section's bits if they're
+    /// in another format): first pixel of the top row, and the stride.
+    pub fn pixels(&mut self) -> (*mut u32, isize) {
+        match self.dib.as_ref() {
+            Some(sec) if sec.fmt.direct() => {
+                let f = &sec.fmt;
+                let row = f.row(sec.ptr(), 0) as *mut u32;
+                let stride = (f.stride / 4) as isize;
+                (row, if f.bottom_up { -stride } else { stride })
+            }
+            Some(sec) => {
+                sec.read_into(&mut self.bits);
+                (self.bits.as_mut_ptr(), self.w as isize)
+            }
+            None => (self.bits.as_mut_ptr(), self.w as isize),
+        }
+    }
+
+    /// GDI drew on the pixels: write them back to a DIB section's bits.
+    pub fn written(&mut self) {
+        if let Some(sec) = self.dib.as_mut() {
+            if !sec.fmt.direct() {
+                sec.write_from(&self.bits);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -111,6 +151,7 @@ pub(crate) struct Dc {
     bounds: (i32, i32, i32, i32),
     s: DcState,
     saved: Vec<DcState>,
+    palette: Handle,
 }
 
 pub(crate) enum Obj {
@@ -118,7 +159,8 @@ pub(crate) enum Obj {
     Brush(Brush),
     Font(Font),
     Bitmap(Bitmap),
-    Palette,
+    /// Colors as pixels.
+    Palette(Vec<u32>),
     Dc(Box<Dc>),
 }
 
@@ -129,7 +171,7 @@ impl Obj {
             Obj::Brush(_) => OBJ_BRUSH,
             Obj::Font(_) => OBJ_FONT,
             Obj::Bitmap(_) => OBJ_BITMAP,
-            Obj::Palette => OBJ_PAL,
+            Obj::Palette(_) => OBJ_PAL,
             Obj::Dc(_) => OBJ_DC,
         }
     }
@@ -164,15 +206,15 @@ fn slot_of(h: Handle) -> Option<(u32, usize)> {
 fn stock(n: u32) -> Option<Obj> {
     let pen = |color| Some(Obj::Pen(Pen { style: 0, width: 1, color }));
     let brush = |style, color| Some(Obj::Brush(Brush { style, color, hatch: 0 }));
-    let font = |pitch: u8| {
+    let font = |pitch: u8, height: i32, face: &str| {
         let mut log = [0u8; 92];
-        log[0..4].copy_from_slice(&16i32.to_le_bytes());
+        log[0..4].copy_from_slice(&height.to_le_bytes());
         log[16..20].copy_from_slice(&400i32.to_le_bytes());
         log[27] = pitch;
-        for (i, c) in "System".encode_utf16().enumerate() {
+        for (i, c) in face.encode_utf16().enumerate() {
             log[28 + 2 * i..30 + 2 * i].copy_from_slice(&c.to_le_bytes());
         }
-        Some(Obj::Font(Font { log }))
+        Some(Obj::Font(Font { log, tt: None }))
     };
     match n {
         0 => brush(0, 0xFF_FFFF),
@@ -184,12 +226,14 @@ fn stock(n: u32) -> Option<Obj> {
         6 => pen(0xFF_FFFF),
         7 => pen(0),
         8 => Some(Obj::Pen(Pen { style: 5, width: 1, color: 0 })),
-        10 | 11 | 16 => font(0x31),
-        12 | 13 | 14 | 17 => font(0x22),
-        15 => Some(Obj::Palette),
+        10 | 11 | 16 => font(0x31, 16, "System"),
+        13 | 14 => font(0x22, 16, "System"),
+        // ANSI_VAR_FONT and DEFAULT_GUI_FONT: Windows' "MS Shell Dlg", 8 points.
+        12 | 17 => font(0x22, -11, "MS Shell Dlg"),
+        15 => Some(Obj::Palette(dib::stock_palette())),
         18 => brush(0, 0xFF_FFFF),
         19 => pen(0),
-        21 => Some(Obj::Bitmap(Bitmap { w: 1, h: 1, bpp: 1, bits: alloc::vec![0], dc: 0 })),
+        21 => Some(Obj::Bitmap(Bitmap { w: 1, h: 1, bpp: 1, bits: alloc::vec![0], dc: 0, dib: None })),
         _ => None,
     }
 }
@@ -214,7 +258,7 @@ impl Table {
         }
     }
 
-    fn add(&mut self, obj: Obj) -> Handle {
+    pub(crate) fn add(&mut self, obj: Obj) -> Handle {
         self.init();
         let kind = obj.kind();
         let slot = match self.slots.iter().skip(STOCK_COUNT as usize).position(|s| s.is_none()) {
@@ -230,14 +274,14 @@ impl Table {
 
     /// The object behind `h`, if `h` is a live handle of its type (memory
     /// DCs are handed out as OBJ_DC handles too).
-    fn get(&mut self, h: Handle) -> Option<&mut Obj> {
+    pub(crate) fn get(&mut self, h: Handle) -> Option<&mut Obj> {
         self.init();
         let (kind, slot) = slot_of(h)?;
         let obj = self.slots.get_mut(slot)?.as_mut()?;
         (obj.kind() == kind).then_some(obj)
     }
 
-    fn dc(&mut self, h: Handle) -> Option<&mut Dc> {
+    pub(crate) fn dc(&mut self, h: Handle) -> Option<&mut Dc> {
         match self.get(h)? {
             Obj::Dc(dc) => Some(dc),
             _ => None,
@@ -266,21 +310,25 @@ impl Table {
     }
 
     /// The DC's brush as a pixel, None for a null brush.
-    fn dc_brush(&mut self, hdc: Handle) -> Option<u32> {
+    pub(crate) fn dc_brush(&mut self, hdc: Handle) -> Option<u32> {
         let s = self.dc(hdc)?.s.clone();
         let b = if s.brush == handle(OBJ_BRUSH, DC_BRUSH) { Brush { style: 0, color: s.dc_brush, hatch: 0 } } else { self.brush(s.brush) };
         (b.style != 1).then_some(pixel(b.color))
     }
 
-    /// The pixels `hdc` draws on, clipped.
-    fn canvas(&mut self, hdc: Handle) -> Option<Canvas> {
+    /// The pixels `hdc` draws on, clipped. After drawing on them, call
+    /// `done`.
+    pub(crate) fn canvas(&mut self, hdc: Handle) -> Option<Canvas> {
         let dc = self.dc(hdc)?;
         let (bx0, by0, bx1, by1) = dc.bounds;
         let clip = dc.s.clip;
         let (ptr, w, h, stride) = match dc.target {
-            Target::Surface { ptr, w, h, stride } => (ptr as *mut u32, w, h, stride),
+            Target::Surface { ptr, w, h, stride } => (ptr as *mut u32, w, h, stride as isize),
             Target::Bitmap(b) => match self.get(b) {
-                Some(Obj::Bitmap(bm)) => (bm.bits.as_mut_ptr(), bm.w, bm.h, bm.w as usize),
+                Some(Obj::Bitmap(bm)) => {
+                    let (p, s) = bm.pixels();
+                    (p, bm.w, bm.h, s)
+                }
                 _ => return None,
             },
         };
@@ -295,6 +343,37 @@ impl Table {
             c.y1 = c.y1.min(y1);
         }
         Some(c)
+    }
+}
+
+impl Table {
+    /// The bitmap selected into memory DC `hdc`.
+    pub(crate) fn selected_bitmap(&mut self, hdc: Handle) -> Option<Handle> {
+        match self.dc(hdc)?.target {
+            Target::Bitmap(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// `hdc` was drawn on.
+    pub(crate) fn done(&mut self, hdc: Handle) {
+        if let Some(b) = self.selected_bitmap(hdc) {
+            if let Some(Obj::Bitmap(bm)) = self.get(b) {
+                bm.written();
+            }
+        }
+    }
+
+    pub(crate) fn is_dc(&mut self, hdc: Handle) -> bool {
+        self.dc(hdc).is_some()
+    }
+
+    /// Select palette `pal` into `hdc`; the old one.
+    pub(crate) fn dc_palette(&mut self, hdc: Handle, pal: Handle) -> Handle {
+        match self.dc(hdc) {
+            Some(dc) => core::mem::replace(&mut dc.palette, pal),
+            None => 0,
+        }
     }
 }
 
@@ -352,6 +431,7 @@ pub extern "system" fn VeilGdiCreateDC(pixels: *mut u32, w: i32, h: i32, stride:
         bounds,
         s: new_state(),
         saved: Vec::new(),
+        palette: handle(OBJ_PAL, DEFAULT_PALETTE),
     };
     TABLE.lock().add(Obj::Dc(Box::new(dc)))
 }
@@ -413,7 +493,7 @@ pub extern "system" fn CreateBitmap(w: i32, h: i32, _planes: u32, bpp: u32, bits
     if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
         return 0;
     }
-    let mut bm = Bitmap { w, h, bpp: bpp.max(1) as u16, bits: alloc::vec![0; (w * h) as usize], dc: 0 };
+    let mut bm = Bitmap { w, h, bpp: bpp.max(1) as u16, bits: alloc::vec![0; (w * h) as usize], dc: 0, dib: None };
     if !bits.is_null() {
         // Rows are word-aligned, top-down.
         let row = ((w as usize * bpp as usize + 15) / 16) * 2;
@@ -456,6 +536,7 @@ pub extern "system" fn CreateCompatibleDC(_hdc: Handle) -> Handle {
         bounds: (0, 0, i32::MAX, i32::MAX),
         s: new_state(),
         saved: Vec::new(),
+        palette: handle(OBJ_PAL, DEFAULT_PALETTE),
     };
     TABLE.lock().add(Obj::Dc(Box::new(dc)))
 }
@@ -541,7 +622,7 @@ pub extern "system" fn GetCurrentObject(hdc: Handle, kind: u32) -> Handle {
         OBJ_PEN => dc.s.pen,
         OBJ_BRUSH => dc.s.brush,
         OBJ_FONT => dc.s.font,
-        OBJ_PAL => handle(OBJ_PAL, DEFAULT_PALETTE),
+        OBJ_PAL => dc.palette,
         OBJ_BITMAP => match dc.target {
             Target::Bitmap(b) => b,
             _ => handle(OBJ_BITMAP, STOCK_BITMAP),
@@ -564,6 +645,32 @@ fn get_object(h: Handle, size: i32, out: *mut u8, wide: bool) -> i32 {
     let mut t = TABLE.lock();
     let mut buf = [0u8; 92];
     let n = match t.get(h) {
+        Some(Obj::Bitmap(bm)) if size >= 104 && bm.dib.is_some() => {
+            // DIBSECTION: BITMAP, then BITMAPINFOHEADER, masks, section, offset.
+            let sec = bm.dib.as_ref().unwrap();
+            let f = &sec.fmt;
+            let mut d = [0u8; 104];
+            d[4..8].copy_from_slice(&f.w.to_le_bytes());
+            d[8..12].copy_from_slice(&f.h.to_le_bytes());
+            d[12..16].copy_from_slice(&(f.stride as u32).to_le_bytes());
+            d[16..18].copy_from_slice(&1u16.to_le_bytes());
+            d[18..20].copy_from_slice(&f.bpp.to_le_bytes());
+            d[24..32].copy_from_slice(&(sec.ptr() as u64).to_le_bytes());
+            d[32..36].copy_from_slice(&40u32.to_le_bytes());
+            d[36..40].copy_from_slice(&f.w.to_le_bytes());
+            d[40..44].copy_from_slice(&(if f.bottom_up { f.h } else { -f.h }).to_le_bytes());
+            d[44..46].copy_from_slice(&1u16.to_le_bytes());
+            d[46..48].copy_from_slice(&f.bpp.to_le_bytes());
+            d[52..56].copy_from_slice(&(f.size() as u32).to_le_bytes());
+            d[64..68].copy_from_slice(&(f.palette.len() as u32).to_le_bytes());
+            for (i, m) in f.masks.iter().enumerate() {
+                d[72 + i * 4..76 + i * 4].copy_from_slice(&m.to_le_bytes());
+            }
+            if !out.is_null() {
+                unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), out, 104) };
+            }
+            return 104;
+        }
         Some(Obj::Bitmap(bm)) => {
             buf[4..8].copy_from_slice(&bm.w.to_le_bytes());
             buf[8..12].copy_from_slice(&bm.h.to_le_bytes());
@@ -571,6 +678,9 @@ fn get_object(h: Handle, size: i32, out: *mut u8, wide: bool) -> i32 {
             buf[12..16].copy_from_slice(&row.to_le_bytes());
             buf[16..18].copy_from_slice(&1u16.to_le_bytes());
             buf[18..20].copy_from_slice(&bm.bpp.to_le_bytes());
+            if let Some(sec) = bm.dib.as_ref() {
+                buf[24..32].copy_from_slice(&(sec.ptr() as u64).to_le_bytes());
+            }
             32
         }
         Some(Obj::Pen(p)) => {
@@ -600,8 +710,8 @@ fn get_object(h: Handle, size: i32, out: *mut u8, wide: bool) -> i32 {
                 60
             }
         }
-        Some(Obj::Palette) => {
-            buf[0..2].copy_from_slice(&20u16.to_le_bytes());
+        Some(Obj::Palette(colors)) => {
+            buf[0..2].copy_from_slice(&(colors.len() as u16).to_le_bytes());
             2
         }
         _ => return 0,
@@ -633,7 +743,7 @@ pub unsafe extern "system" fn CreateFontIndirectW(lf: *const u8) -> Handle {
     }
     let mut log = [0u8; 92];
     unsafe { core::ptr::copy_nonoverlapping(lf, log.as_mut_ptr(), 92) };
-    TABLE.lock().add(Obj::Font(Font { log }))
+    TABLE.lock().add(Obj::Font(Font { log, tt: None }))
 }
 
 #[no_mangle]
@@ -690,18 +800,6 @@ pub unsafe extern "system" fn CreateFontA(h: i32, w: i32, esc: i32, orient: i32,
         }
     }
     unsafe { CreateFontIndirectW(log.as_ptr()) }
-}
-
-/// The scale the DC's font draws the 8x16 glyphs at.
-pub(crate) fn font_scale(t: &mut Table, hdc: Handle) -> i32 {
-    let Some(f) = t.dc(hdc).map(|dc| dc.s.font) else { return 1 };
-    match t.get(f) {
-        Some(Obj::Font(font)) => {
-            let h = i32::from_le_bytes(font.log[0..4].try_into().unwrap()).abs();
-            if h == 0 { 1 } else { ((h + 8) / 16).clamp(1, 8) }
-        }
-        _ => 1,
-    }
 }
 
 // -----| DC state |-----
@@ -938,6 +1036,7 @@ fn with_dc(hdc: Handle, f: impl FnOnce(&mut Table, Canvas)) -> Bool {
     }
     if let Some(c) = t.canvas(hdc) {
         f(&mut t, c);
+        t.done(hdc);
     }
     1
 }
@@ -969,6 +1068,7 @@ pub extern "system" fn LineTo(hdc: Handle, x: i32, y: i32) -> Bool {
         let (x0, y0) = dev(&mut t, hdc, from.0, from.1);
         let (x1, y1) = dev(&mut t, hdc, x, y);
         draw::line(&c, x0, y0, x1, y1, w, p, rop2(&mut t, hdc));
+        t.done(hdc);
     }
     t.dc(hdc).unwrap().s.pos = (x, y);
     1
@@ -1092,7 +1192,7 @@ pub extern "system" fn PatBlt(hdc: Handle, x: i32, y: i32, w: i32, h: i32, rop: 
         let (x0, x1, y0, y1) = (x0.max(c.x0), x1.min(c.x1), y0.max(c.y0), y1.min(c.y1));
         for yy in y0..y1 {
             for xx in x0..x1 {
-                let at = unsafe { c.ptr.add(yy as usize * c.stride + xx as usize) };
+                let at = c.at(xx, yy);
                 unsafe { *at = draw::mix3(code, pat, 0, *at) };
             }
         }
@@ -1121,38 +1221,46 @@ fn blt(dst: Handle, dx: i32, dy: i32, dw: i32, dh: i32, src: Handle, sx: i32, sy
     let (x0, y0) = dev(&mut t, dst, dx, dy);
     let (sx0, sy0) = if uses_src { dev(&mut t, src, sx, sy) } else { (0, 0) };
     let pat = t.dc_brush(dst).unwrap_or(0);
-    let (dw, dh) = (dw.abs(), dh.abs());
     if dw == 0 || dh == 0 {
         return 1;
     }
-    let (sw, sh) = (sw.abs().max(1), sh.abs().max(1));
-    // Overlapping copies within one target go through a snapshot.
+    let (sw, sh) = (if sw == 0 { 1 } else { sw }, if sh == 0 { 1 } else { sh });
+    // Overlapping copies within one target go through a snapshot of the
+    // source rectangle.
+    let ((sxa, sxb), (sya, syb)) = (draw::span(sx0, sw), draw::span(sy0, sh));
     let snapshot: Option<Vec<u32>> = src_canvas.filter(|s| s.ptr == c.ptr).map(|s| {
-        let mut v = Vec::with_capacity((sw * sh) as usize);
-        for y in 0..sh {
-            for x in 0..sw {
-                v.push(s.get(sx0 + x, sy0 + y).unwrap_or(0));
+        let mut v = Vec::with_capacity(((sxb - sxa) * (syb - sya)) as usize);
+        for y in sya..syb {
+            for x in sxa..sxb {
+                v.push(s.get(x, y).unwrap_or(0));
             }
         }
         v
     });
-    for y in y0.max(c.y0)..(y0 + dh).min(c.y1) {
-        let ry = (y - y0) * sh / dh;
-        for x in x0.max(c.x0)..(x0 + dw).min(c.x1) {
-            let rx = (x - x0) * sw / dw;
+    let ((xa, xb), (ya, yb)) = (draw::span(x0, dw), draw::span(y0, dh));
+    for y in ya.max(c.y0)..yb.min(c.y1) {
+        let ry = draw::source(sy0, sh, dh, draw::step(y0, dh, y));
+        for x in xa.max(c.x0)..xb.min(c.x1) {
+            let rx = draw::source(sx0, sw, dw, draw::step(x0, dw, x));
             let s = match (&snapshot, &src_canvas) {
-                (Some(v), _) => v[(ry * sw + rx) as usize],
-                (None, Some(s)) => match s.get(sx0 + rx, sy0 + ry) {
+                (Some(v), _) => {
+                    if rx < sxa || rx >= sxb || ry < sya || ry >= syb {
+                        continue;
+                    }
+                    v[((ry - sya) * (sxb - sxa) + rx - sxa) as usize]
+                }
+                (None, Some(s)) => match s.get(rx, ry) {
                     Some(p) => p,
                     // Outside the source: left alone.
                     None => continue,
                 },
                 _ => 0,
             };
-            let at = unsafe { c.ptr.add(y as usize * c.stride + x as usize) };
+            let at = c.at(x, y);
             unsafe { *at = draw::mix3(code, pat, s, *at) };
         }
     }
+    t.done(dst);
     1
 }
 
@@ -1185,14 +1293,7 @@ pub(crate) fn set_pos(t: &mut Table, hdc: Handle, pos: (i32, i32)) {
     }
 }
 
-pub(crate) fn canvas(t: &mut Table, hdc: Handle) -> Option<Canvas> {
-    t.canvas(hdc)
-}
 
 pub(crate) fn to_device(t: &mut Table, hdc: Handle, x: i32, y: i32) -> (i32, i32) {
     dev(t, hdc, x, y)
-}
-
-pub(crate) fn is_dc(t: &mut Table, hdc: Handle) -> bool {
-    t.dc(hdc).is_some()
 }

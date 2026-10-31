@@ -9,3 +9,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nt_abi = { path = "../nt_abi" }
+zune-png = { version = "0.5.2", default-features = false }
