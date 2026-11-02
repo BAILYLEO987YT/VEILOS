@@ -1134,6 +1134,86 @@ pub extern "system" fn RestoreDC(hdc: Handle, n: i32) -> Bool {
 
 /// Clipping: the DC's own rectangle and one intersected rectangle (regions
 /// come later).
+/// A pattern brush paints as the bitmap's first pixel (brushes have no
+/// patterns yet).
+#[no_mangle]
+pub extern "system" fn CreatePatternBrush(bitmap: Handle) -> Handle {
+    let mut px = [0u32; 1];
+    let color = if unsafe { crate::dib::GetBitmapBits(bitmap, 4, px.as_mut_ptr() as *mut u8) } == 4 {
+        // 0x00RRGGBB in the bitmap, COLORREF is 0x00BBGGRR.
+        let v = px[0];
+        ((v & 0xFF) << 16) | (v & 0xFF00) | ((v >> 16) & 0xFF)
+    } else {
+        0x00C0_C0C0
+    };
+    CreateSolidBrush(color)
+}
+
+#[no_mangle]
+pub extern "system" fn UnrealizeObject(_h: Handle) -> i32 {
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn GetLayout(_hdc: Handle) -> u32 {
+    0
+}
+
+/// `*cs`: CHARSETINFO { charset, code page, FONTSIGNATURE }. From a charset
+/// (TCI_SRCCHARSET, 1) or a code page (TCI_SRCCODEPAGE, 2).
+#[no_mangle]
+pub unsafe extern "system" fn TranslateCharsetInfo(src: *const u32, cs: *mut u32, flags: u32) -> i32 {
+    const PAIRS: [(u32, u32); 6] = [(0, 1252), (204, 1251), (238, 1250), (161, 1253), (162, 1254), (128, 932)];
+    if cs.is_null() {
+        return 0;
+    }
+    let key = src as usize as u32;
+    let hit = match flags {
+        1 => PAIRS.iter().find(|p| p.0 == key),
+        2 => PAIRS.iter().find(|p| p.1 == key),
+        _ => None,
+    };
+    let Some(p) = hit else { return 0 };
+    unsafe {
+        core::ptr::write_bytes(cs, 0, 8);
+        *cs = p.0;
+        *cs.add(1) = p.1;
+    }
+    1
+}
+
+/// A hole in the clip isn't representable (it's one rectangle): only the
+/// cases that leave a rectangle cut it; others keep it.
+#[no_mangle]
+pub extern "system" fn ExcludeClipRect(hdc: Handle, l: i32, t: i32, r: i32, b: i32) -> i32 {
+    match TABLE.lock().dc(hdc) {
+        Some(dc) => {
+            let (x0, y0) = dc.dev(l, t);
+            let (x1, y1) = dc.dev(r, b);
+            if let Some(mut c) = dc.s.clip {
+                if x0 <= c.0 && x1 >= c.2 {
+                    if y0 <= c.1 && y1 > c.1 {
+                        c.1 = y1;
+                    } else if y1 >= c.3 && y0 < c.3 {
+                        c.3 = y0;
+                    }
+                } else if y0 <= c.1 && y1 >= c.3 {
+                    if x0 <= c.0 && x1 > c.0 {
+                        c.0 = x1;
+                    } else if x1 >= c.2 && x0 < c.2 {
+                        c.2 = x0;
+                    }
+                }
+                dc.s.clip = Some(c);
+                if c.0 >= c.2 || c.1 >= c.3 { 1 } else { 2 }
+            } else {
+                2
+            }
+        }
+        None => 0,
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn IntersectClipRect(hdc: Handle, l: i32, t: i32, r: i32, b: i32) -> i32 {
     match TABLE.lock().dc(hdc) {

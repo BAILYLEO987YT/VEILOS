@@ -7,6 +7,14 @@
 //!   imagelist.rs  image lists
 //!   status.rs     the status bar
 //!   controls.rs   progress bar, trackbar, up-down control, tooltips
+//!   dpa.rs        dynamic pointer and structure arrays, small helpers
+//!   header.rs     the header control
+//!   listview.rs   the list view
+//!   treeview.rs   the tree view
+//!   toolbar.rs    the toolbar
+//!   tabs.rs       the tab control
+//!   propsheet.rs  property sheets and wizards
+//!   labeledit.rs  in-place label editing for list and tree views
 
 #![no_std]
 // build.rs gives some exports their Windows ordinals; the linker then sees
@@ -18,8 +26,16 @@ extern crate alloc;
 mod controls;
 #[path = "../../dllrt.rs"]
 mod dllrt;
+mod dpa;
+mod header;
 mod imagelist;
+mod labeledit;
+mod listview;
+mod propsheet;
 mod status;
+mod tabs;
+mod toolbar;
+mod treeview;
 
 use alloc::vec::Vec;
 use dllrt::Lock;
@@ -61,6 +77,35 @@ unsafe extern "system" {
                                   parent: Hwnd, menu: u64, inst: u64, param: u64) -> Hwnd;
     pub(crate) fn TrackMouseEvent(tme: *mut u8) -> Bool;
     pub(crate) fn VeilCallProc(proc: usize, proc_unicode: Bool, hwnd: Hwnd, msg: u32, wp: u64, lp: i64, from_unicode: Bool) -> i64;
+    pub(crate) fn DestroyWindow(hwnd: Hwnd) -> Bool;
+    pub(crate) fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
+    pub(crate) fn EnableWindow(hwnd: Hwnd, on: Bool) -> Bool;
+    pub(crate) fn IsWindowVisible(hwnd: Hwnd) -> Bool;
+    pub(crate) fn GetKeyState(vk: i32) -> i16;
+    pub(crate) fn SetScrollInfo(hwnd: Hwnd, bar: i32, si: *const u32, redraw: Bool) -> i32;
+    pub(crate) fn GetScrollInfo(hwnd: Hwnd, bar: i32, si: *mut u32) -> Bool;
+    pub(crate) fn ShowScrollBar(hwnd: Hwnd, bar: i32, show: Bool) -> Bool;
+    pub(crate) fn DrawFocusRect(hdc: u64, r: *const [i32; 4]) -> Bool;
+    pub(crate) fn IsDialogMessageW(hwnd: Hwnd, msg: *const u8) -> Bool;
+    pub(crate) fn PostMessageW(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -> Bool;
+    pub(crate) fn GetDlgItem(hwnd: Hwnd, id: i32) -> Hwnd;
+    pub(crate) fn EndDialog(hwnd: Hwnd, r: i64) -> Bool;
+    pub(crate) fn MapDialogRect(hwnd: Hwnd, r: *mut [i32; 4]) -> Bool;
+    pub(crate) fn CreateDialogIndirectParamW(inst: u64, t: *const u8, parent: Hwnd, proc: usize, param: i64) -> Hwnd;
+    pub(crate) fn CreateDialogIndirectParamA(inst: u64, t: *const u8, parent: Hwnd, proc: usize, param: i64) -> Hwnd;
+    pub(crate) fn DialogBoxIndirectParamW(inst: u64, t: *const u8, parent: Hwnd, proc: usize, param: i64) -> i64;
+    pub(crate) fn MessageBoxW(hwnd: Hwnd, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    pub(crate) fn LoadStringW(inst: u64, id: u32, buf: *mut u16, cap: i32) -> i32;
+}
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn MultiByteToWideChar(cp: u32, flags: u32, s: *const u8, n: i32, out: *mut u16, cap: i32) -> i32;
+    fn WideCharToMultiByte(cp: u32, flags: u32, s: *const u16, n: i32, out: *mut u8, cap: i32, def: usize, used: usize) -> i32;
+    pub(crate) fn FindResourceW(inst: u64, name: *const u16, kind: *const u16) -> u64;
+    pub(crate) fn LoadResource(inst: u64, res: u64) -> u64;
+    pub(crate) fn LockResource(h: u64) -> *const u8;
+    pub(crate) fn SizeofResource(inst: u64, res: u64) -> u32;
 }
 
 #[link(name = "gdi32", kind = "raw-dylib")]
@@ -79,6 +124,144 @@ unsafe extern "system" {
     pub(crate) fn CreateBitmap(w: i32, h: i32, planes: u32, bpp: u32, bits: *const u8) -> u64;
     pub(crate) fn GdiAlphaBlend(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i32, sw: i32, sh: i32, blend: u32) -> Bool;
     pub(crate) fn CreateSolidBrush(color: u32) -> u64;
+    pub(crate) fn GetTextExtentPoint32W(hdc: u64, s: *const u16, n: i32, size: *mut [i32; 2]) -> Bool;
+}
+
+// -----| strings, for the controls' A and W messages |-----
+
+pub(crate) fn wstr(p: *const u16) -> Vec<u16> {
+    if p.is_null() {
+        return Vec::new();
+    }
+    (0..).map(|i| unsafe { *p.add(i) }).take_while(|&c| c != 0).collect()
+}
+
+/// An ANSI string as UTF-16.
+pub(crate) fn astr(p: *const u8) -> Vec<u16> {
+    if p.is_null() {
+        return Vec::new();
+    }
+    let n = unsafe { MultiByteToWideChar(0, 0, p, -1, core::ptr::null_mut(), 0) };
+    if n <= 1 {
+        return Vec::new();
+    }
+    let mut v = alloc::vec![0u16; n as usize];
+    unsafe { MultiByteToWideChar(0, 0, p, -1, v.as_mut_ptr(), n) };
+    v.truncate(n as usize - 1);
+    v
+}
+
+/// A string argument in either character set.
+pub(crate) fn text_arg(p: u64, unicode: bool) -> Vec<u16> {
+    if unicode { wstr(p as *const u16) } else { astr(p as *const u8) }
+}
+
+/// Copy `s` to a caller's buffer of `cap` characters with its NUL, cut to
+/// fit. The characters copied (without the NUL).
+pub(crate) fn put_text(dst: u64, cap: i32, s: &[u16], unicode: bool) -> usize {
+    if dst == 0 || cap <= 0 {
+        return 0;
+    }
+    if unicode {
+        let n = s.len().min(cap as usize - 1);
+        unsafe {
+            core::ptr::copy_nonoverlapping(s.as_ptr(), dst as *mut u16, n);
+            *(dst as *mut u16).add(n) = 0;
+        }
+        n
+    } else {
+        let n = unsafe { WideCharToMultiByte(0, 0, s.as_ptr(), s.len() as i32, dst as *mut u8, cap - 1, 0, 0) }.max(0) as usize;
+        unsafe { *(dst as *mut u8).add(n) = 0 };
+        n
+    }
+}
+
+pub(crate) fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(core::iter::once(0)).collect()
+}
+
+/// Whether notifications to this control's parent are Unicode
+/// (WM_NOTIFYFORMAT).
+pub(crate) fn parent_unicode(hwnd: Hwnd) -> bool {
+    let parent = unsafe { GetParent(hwnd) };
+    unsafe { SendMessageW(parent, 0x0055, hwnd, 3) != 1 }
+}
+
+pub(crate) fn lower(c: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }
+}
+
+/// A stable sort by a comparison that may not be a proper order (it's the
+/// program's callback, so it mustn't be able to panic the sort).
+pub(crate) fn merge_sort<T: Clone>(v: &mut Vec<T>, cmp: &mut dyn FnMut(&T, &T) -> i32) {
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    let mut right = v.split_off(n / 2);
+    merge_sort(v, cmp);
+    merge_sort(&mut right, cmp);
+    let left = core::mem::take(v);
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() && j < right.len() {
+        if cmp(&left[i], &right[j]) <= 0 {
+            v.push(left[i].clone());
+            i += 1;
+        } else {
+            v.push(right[j].clone());
+            j += 1;
+        }
+    }
+    v.extend_from_slice(&left[i..]);
+    v.extend_from_slice(&right[j..]);
+}
+
+/// Width and height of `s` in the DC's font.
+pub(crate) fn text_size(hdc: u64, s: &[u16]) -> (i32, i32) {
+    let mut sz = [0i32; 2];
+    unsafe { GetTextExtentPoint32W(hdc, s.as_ptr(), s.len() as i32, &mut sz) };
+    (sz[0], sz[1])
+}
+
+pub(crate) fn font_height(hwnd: Hwnd, font: u64) -> i32 {
+    let hdc = unsafe { GetDC(hwnd) };
+    let old = unsafe { SelectObject(hdc, font_or_default(font)) };
+    let mut tm = [0u8; 60];
+    unsafe { GetTextMetricsW(hdc, tm.as_mut_ptr()) };
+    unsafe {
+        SelectObject(hdc, old);
+        ReleaseDC(hwnd, hdc);
+    }
+    i32::from_le_bytes(tm[0..4].try_into().unwrap())
+}
+
+/// A vertical or horizontal scroll bar: range to `content`, page `page`.
+pub(crate) fn set_scroll(hwnd: Hwnd, bar: i32, content: i32, page: i32, pos: i32) {
+    let need = content > page;
+    unsafe { ShowScrollBar(hwnd, bar, need as Bool) };
+    if need {
+        let si = [28u32, 7, 0, (content - 1).max(0) as u32, page.max(0) as u32, pos.max(0) as u32, 0];
+        unsafe { SetScrollInfo(hwnd, bar, si.as_ptr(), 1) };
+    }
+}
+
+/// The position a WM_HSCROLL / WM_VSCROLL asks for, given line and page sizes.
+pub(crate) fn scroll_target(hwnd: Hwnd, bar: i32, wp: u64, line: i32, page: i32, pos: i32, max: i32) -> i32 {
+    let target = match (wp & 0xFFFF) as u32 {
+        0 => pos - line,
+        1 => pos + line,
+        2 => pos - page,
+        3 => pos + page,
+        4 | 5 => {
+            let mut si = [28u32, 0x10, 0, 0, 0, 0, 0];
+            unsafe { GetScrollInfo(hwnd, bar, si.as_mut_ptr()) };
+            si[6] as i32
+        }
+        6 => 0,
+        7 => max,
+        _ => pos,
+    };
+    target.clamp(0, max.max(0))
 }
 
 pub(crate) const WM_NOTIFY: u32 = 0x004E;
@@ -122,6 +305,11 @@ pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) ->
     if reason == 1 {
         status::register_class();
         controls::register_classes();
+        header::register_class();
+        listview::register_class();
+        treeview::register_class();
+        toolbar::register_class();
+        tabs::register_class();
     }
     1
 }

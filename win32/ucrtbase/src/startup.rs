@@ -932,3 +932,42 @@ pub unsafe extern "C" fn _get_wide_winmain_command_line() -> *const u16 {
     }
     p
 }
+
+/// Whether `c` starts a double-byte character: the C locale has none.
+#[no_mangle]
+pub extern "C" fn _ismbblead(_c: u32) -> i32 {
+    0
+}
+
+/// After a stack overflow exception: nothing to restore, the guard page isn't
+/// consumed here.
+#[no_mangle]
+pub extern "C" fn _resetstkoflw() -> i32 {
+    1
+}
+
+/// `_o__get_narrow_winmain_command_line`'s plain name; see the wide one.
+#[no_mangle]
+pub unsafe extern "C" fn _get_narrow_winmain_command_line() -> *mut u8 {
+    let mut p = unsafe { crate::GetCommandLineA() };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        // Past the program's name, then the spaces.
+        let quoted = *p == b'"';
+        if quoted {
+            p = p.add(1);
+        }
+        while *p != 0 && (quoted && *p != b'"' || !quoted && *p > b' ') {
+            p = p.add(1);
+        }
+        if quoted && *p == b'"' {
+            p = p.add(1);
+        }
+        while *p != 0 && *p <= b' ' {
+            p = p.add(1);
+        }
+    }
+    p
+}

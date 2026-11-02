@@ -1,0 +1,298 @@
+InitCommonControlsEx: 1
+--- list view
+view 1, extended 0
+insert column 0 1 2
+header: 1, items 3
+column 1: width 60 fmt 16385 sub 0 order 1
+  text: "Size"
+width of column 2: 80
+  LVN_INSERTITEM item 0 sub 0 new 0 old 0 changed 0 param 0
+insert: 0
+  LVN_INSERTITEM item 1 sub 0 new 0 old 0 changed 0 param 0
+insert: 1
+  LVN_INSERTITEM item 2 sub 0 new 0 old 0 changed 0 param 0
+insert: 2
+  LVN_INSERTITEM item 3 sub 0 new 0 old 0 changed 0 param 0
+insert: 3
+items 4: [gamma p10 s0 i0] [alpha p20 s0 i1] [delta p30 s0 i2] [beta p40 s0 i3]
+cell 0.1 length 4
+  text: "1024"
+callback cell length 5
+  text: "cb0.2"
+cut to fit: length 2
+  text: "10"
+select 1:
+  LVN_ITEMCHANGING item 1 sub 0 new 3 old 0 changed 8 param 20
+  LVN_ITEMCHANGED item 1 sub 0 new 3 old 0 changed 8 param 20
+select 3 too:
+  LVN_ITEMCHANGING item 3 sub 0 new 2 old 0 changed 8 param 40
+  LVN_ITEMCHANGED item 3 sub 0 new 2 old 0 changed 8 param 40
+selected 2, focus 1, first 1, next 3, none after -1
+state of 1: 3, of 0: 0
+deselect all:
+  LVN_ITEMCHANGING item 1 sub 0 new 0 old 2 changed 8 param 20
+  LVN_ITEMCHANGED item 1 sub 0 new 0 old 2 changed 8 param 20
+  LVN_ITEMCHANGING item 3 sub 0 new 0 old 2 changed 8 param 40
+  LVN_ITEMCHANGED item 3 sub 0 new 0 old 2 changed 8 param 40
+find "DELTA" 2, partial "be" 3, param 30 2, after its own place -1, wrapping 0
+sorted by param, descending: items 4: [beta p40 s0 i3] [delta p30 s0 i2] [alpha p20 s1 i1] [gamma p10 s0 i0]
+  LVN_ITEMCHANGING item 1 sub 0 new 0 old 0 changed 8 param 30
+  LVN_DELETEITEM item 1 sub 0 new 0 old 0 changed 0 param 30
+delete 1: 1
+delete 9: 0
+items 3: [beta p40 s0 i3] [alpha p20 s1 i1] [gamma p10 s0 i0]
+delete column 1: 1, header items 3
+  LVN_DELETEALLITEMS item -1 sub 0 new 0 old 0 changed 0 param 0
+  LVN_DELETEITEM item 2 sub 0 new 0 old 0 changed 0 param 10
+  LVN_DELETEITEM item 1 sub 0 new 0 old 0 changed 0 param 20
+  LVN_DELETEITEM item 0 sub 0 new 0 old 0 changed 0 param 40
+delete all: 1
+items 0:
+extended: was 0, now 0x21
+set view list: 1, view 1, style low bits 1
+single selection: count 1, is 2
+row 0 spans x 0..150, rows stack 1
+subitem 1 spans x 100..150, same row 1
+subitem hit: 1 item 1 sub 1
+past the columns: -1 flags 0x1
+owner data: count 1000
+  500: "cb500.0"
+selected 2, first 7, next 9
+--- header
+insert 0 1 0
+count 3
+  0: width 30 param 33 order 0 spans 0..30 text: "Zero"
+  1: width 50 param 11 order 1 spans 30..80 text: "One"
+  2: width 70 param 22 order 2 spans 80..150 text: "Two"
+set order 1
+item 0 now spans 70..100, order 0 is item 2
+hit at x 5: 2 item 2
+delete 1, then 3 items
+--- tree view
+empty: count 0, root 0, caret 0
+count 10
+  a p1 children 1 state 0
+    a0 p10 children 0 state 0
+    a1 p11 children 1 state 0
+      a11 p111 children 0 state 0
+    a15 p15 children 0 state 0
+    a2 p12 children 0 state 0
+  b p2 children 1 state 0
+    abc p21 children 0 state 0
+    Mid p22 children 0 state 0
+    zed p23 children 0 state 0
+relatives of a1: parent 1, prev 10, next 15, child 111
+root's parent 0, null child is the root 1
+visible: first 1, next of a 2, last 2
+rect of hidden a1: 0
+expand a:
+  TVN_ITEMEXPANDING action 2 old 0 new 1
+  TVN_ITEMEXPANDED action 2 old 0 new 1
+  = 1
+expand a again:
+  = 1
+collapse a:
+  = 1
+expand a after once:
+  = 1
+toggle b:
+  TVN_ITEMEXPANDING action 2 old 0 new 2
+  TVN_ITEMEXPANDED action 2 old 0 new 2
+  = 1
+state of a: 60
+visible after a: 10, then 11
+rect of a1: 1
+select a2:
+  TVN_SELCHANGING action 0 old 0 new 12
+  TVN_SELCHANGED action 0 old 0 new 12
+  = 1
+caret 12
+select a2 again:
+  = 1
+select hidden a11:
+  TVN_SELCHANGING action 0 old 12 new 111
+  TVN_ITEMEXPANDING action 2 old 0 new 11
+  TVN_ITEMEXPANDED action 2 old 0 new 11
+  TVN_SELCHANGED action 0 old 12 new 111
+  = 1
+state of a1 (opened for it): 60
+collapse a1, which holds the selection:
+  = 1
+caret 11
+delete selected a1 (with a11):
+  TVN_DELETEITEM action 0 old 111 new 0
+  TVN_DELETEITEM action 0 old 11 new 0
+  TVN_SELCHANGING action 0 old 0 new 15
+  TVN_SELCHANGED action 0 old 0 new 15
+  = 1
+caret 15
+set: 1
+  a0 p10 children 0 state 0
+  tv99 p99 children 1 state 2
+  a2 p12 children 0 state 0
+sort children of a by name: 1
+  a0 p10 children 0 state 0
+  a2 p12 children 0 state 0
+  tv99 p99 children 1 state 2
+sort by callback: 1
+  tv99 p99 children 1 state 2
+  a2 p12 children 0 state 0
+  a0 p10 children 0 state 0
+indent is positive 1
+indent 30
+height was positive 1, now 24
+hit right of the first row: 1 flags 0x20
+hit below the rows: 0 flags 0x1
+delete all:
+  TVN_DELETEITEM action 0 old 99 new 0
+  TVN_DELETEITEM action 0 old 12 new 0
+  TVN_DELETEITEM action 0 old 10 new 0
+  TVN_DELETEITEM action 0 old 1 new 0
+  TVN_SELCHANGING action 0 old 0 new 2
+  TVN_SELCHANGED action 0 old 0 new 2
+  TVN_DELETEITEM action 0 old 21 new 0
+  TVN_DELETEITEM action 0 old 22 new 0
+  TVN_DELETEITEM action 0 old 23 new 0
+  TVN_DELETEITEM action 0 old 2 new 0
+  = 1
+count 0
+--- tabs
+empty: count 0, selection -1
+insert 0, selection 0, insert 1, insert 0, selection 1
+  0 param 3 text: "Zero"
+  1 param 1 text: "First"
+  2 param 2 text: "Second"
+set selection 2 (no notifications): was 1
+set focus 0 (user's way):
+  TCN_SELCHANGING
+  TCN_SELCHANGE
+selection 0, focus 0
+set selection out of range: -1
+tabs side by side 1, same row 1
+hit: 1 flags 0x6, beyond -1 flags 0x1
+page inside the control 1, and back again 1
+delete selected 0: 1, selection 0, count 3
+delete all: 1, count 2
+--- toolbar
+strings at 0, 2
+add: 1, count 0
+index of 102: 3, of 999: -1
+button 2: bitmap 1 id 101 state 4 style 2 string 1
+text of 101: 4: "Save"
+states: enabled 4, checked 103 1, checked 101 0, hidden 0, missing -1
+state of 100 0, 101 5, is enabled 0
+set state 4
+info of 102: index 3 command 102 image 2 state 4 style 6
+set info: 1, index of 202 -1
+text of 202: 7: "Renamed"
+buttons left to right 1
+hit test 2
+hidden 8
+insert: 1, index of 300 -1
+delete: 1, count 6
+extended 0x1
+a click on 300:
+  WM_COMMAND id 300 code 0
+--- property sheets
+  callback PSCB_INITIALIZED
+  page 1 WM_INITDIALOG
+  page 1 PSN_SETACTIVE lparam 0
+tab control 1, buttons OK 1 Cancel 1 Apply 1
+apply enabled 0
+current page 1, index 0
+page 1 hwnd known 0
+after PSM_CHANGED apply enabled 1
+go to page 1:
+  page 1 PSN_KILLACTIVE lparam 0
+  page 2 WM_INITDIALOG
+  page 2 PSN_SETACTIVE lparam 0
+  = 1
+current page 2, visible 1
+page 2 refuses to leave:
+  page 2 PSN_KILLACTIVE lparam 0
+  = 0
+still page 2
+apply:
+  page 2 PSN_KILLACTIVE lparam 0
+  page 1 PSN_APPLY lparam 0
+  page 2 PSN_APPLY lparam 0
+  page 2 PSN_SETACTIVE lparam 0
+apply enabled 0
+OK:
+  page 2 PSN_KILLACTIVE lparam 0
+  page 1 PSN_APPLY lparam 1
+  page 2 PSN_APPLY lparam 1
+PropertySheet returned 1
+  callback PSCB_INITIALIZED
+  page 1 WM_INITDIALOG
+  page 1 PSN_SETACTIVE lparam 0
+cancel:
+  page 1 PSN_QUERYCANCEL lparam 0
+  page 1 PSN_RESET lparam 0
+cancelled: returned 0
+handles:
+made 1 1
+  callback PSCB_INITIALIZED
+  page 1 WM_INITDIALOG
+  page 1 PSN_SETACTIVE lparam 0
+wizard buttons: back 1 (1) next 1 (1) finish 1, no tabs 0
+next:
+page 1, back enabled 1
+back:
+page 1
+next:
+finish:
+  page 1 PSN_WIZNEXT lparam 0
+  page 1 PSN_KILLACTIVE lparam 0
+  page 2 WM_INITDIALOG
+  page 2 PSN_SETACTIVE lparam 0
+  page 2 PSN_WIZBACK lparam 0
+  page 2 PSN_KILLACTIVE lparam 0
+  page 1 PSN_SETACTIVE lparam 0
+  page 1 PSN_WIZNEXT lparam 0
+  page 1 PSN_KILLACTIVE lparam 0
+  page 2 PSN_SETACTIVE lparam 0
+  page 2 PSN_WIZFINISH lparam 0
+wizard returned 1
+--- arrays
+insert 0 2 1 0
+get 30 40 10, past the end 0
+index of 20: 2, of 7: -1
+sorted: 10 20 30 40
+search sorted 30: 2, missing 25: -1, where 25 goes: 2
+set 6: 1
+deleted 10, then at 0: 10
+sum 150
+clone keeps 20, original 0
+dsa insert 0 1
+get 1: 9, ptr 1, past the end 1
+set 1, delete 1, now first 1
+after delete all, first is null 1
+Str_SetPtr 1 : "text"
+clear 1, null 0
+--- rich edit
+msftedit loaded 1
+created 1
+text: "Hello rich world"
+exsetsel 10
+exgetsel 6..10, type 5
+sel text 4: "rich"
+range 5: "Hello"
+find 11 at 11..16, matching case -1
+length 16
+gettextex 16: "Hello rich world"
+settextex 1
+text: "Replaced"
+stream out 8 "Replaced" error 0
+stream in 13: "From a stream"
+--- edges
+DrawEdge 1, unchanged 2..14
+adjusted 1 to 4 4 12 12
+left only: 1 0 16 16
+DrawFrameControl 1
+deferred 1
+before the end 3 x 4
+end 1
+after 30 x 40
+notify format of a Unicode window: 2
+exit 0

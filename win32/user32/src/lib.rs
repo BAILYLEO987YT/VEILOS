@@ -398,9 +398,17 @@ impl State {
     pub fn visible_clip(&self, hwnd: Hwnd) -> [i32; 4] {
         let (ox, oy) = self.client_origin(hwnd);
         let Some(w) = self.get(hwnd) else { return [0, 0, 0, 0] };
+        // A hidden child, or one inside a hidden child, can't draw. (A hidden
+        // top-level window may: its pixels aren't on the screen yet.)
+        if w.parent != 0 && !w.visible {
+            return [0, 0, 0, 0];
+        }
         let mut r = [ox, oy, ox + w.client_w(), oy + w.client_h()];
         let mut h = w.parent;
         while let Some(p) = self.get(h) {
+            if p.parent != 0 && !p.visible {
+                return [0, 0, 0, 0];
+            }
             let (px, py) = self.client_origin(h);
             r = intersect(r, [px, py, px + p.client_w(), py + p.client_h()]);
             h = p.parent;

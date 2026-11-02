@@ -517,7 +517,7 @@ pub extern "system" fn EndDialog(dlg: Hwnd, result: i64) -> Bool {
 /// Messages whose answer is the dialog procedure's return value itself,
 /// not DWLP_MSGRESULT.
 fn direct_answer(msg: u32) -> bool {
-    matches!(msg, 0x0132..=0x0138 | 0x0039 | 0x002E | 0x002F | 0x0037 | WM_INITDIALOG | 0x004E)
+    matches!(msg, 0x0132..=0x0138 | 0x0039 | 0x002E | 0x002F | 0x0037 | WM_INITDIALOG)
 }
 
 pub fn def_dlg_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) -> i64 {

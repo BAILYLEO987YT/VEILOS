@@ -18,6 +18,7 @@
 mod atom;
 mod com;
 mod env;
+mod legacy;
 mod exception;
 mod file;
 mod locale;

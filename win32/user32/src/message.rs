@@ -567,6 +567,42 @@ pub extern "system" fn DispatchMessageA(m: *const Msg) -> i64 {
     dispatch(m, false)
 }
 
+/// Input (or an object) to wake for: wait in small steps, looking at both.
+#[no_mangle]
+pub unsafe extern "system" fn MsgWaitForMultipleObjectsEx(n: u32, handles: *const u64, ms: u32, _mask: u32, flags: u32) -> u32 {
+    const WAIT_TIMEOUT: u32 = 258;
+    let wait_all = (flags & 1 != 0) as Bool; // MWMO_WAITALL
+    let start = unsafe { GetTickCount() };
+    loop {
+        let mut m = Msg::default();
+        if next(&mut m, 0, 0, 0, false, false) {
+            return n;
+        }
+        if n > 0 {
+            let r = unsafe { WaitForMultipleObjects(n, handles, wait_all, 0) };
+            if r != WAIT_TIMEOUT {
+                return r;
+            }
+        }
+        if ms != u32::MAX && unsafe { GetTickCount() }.wrapping_sub(start) >= ms {
+            return WAIT_TIMEOUT;
+        }
+        unsafe { Sleep(5) };
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn MsgWaitForMultipleObjects(n: u32, handles: *const u64, all: Bool, ms: u32, mask: u32) -> u32 {
+    unsafe { MsgWaitForMultipleObjectsEx(n, handles, ms, mask, all as u32 & 1) }
+}
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn GetTickCount() -> u32;
+    fn Sleep(ms: u32);
+    fn WaitForMultipleObjects(n: u32, handles: *const u64, all: Bool, ms: u32) -> u32;
+}
+
 // -----| WinEvent hooks |-----
 
 /// A WinEvent hook in this process: its handle, event range, procedure,
@@ -784,6 +820,8 @@ pub fn def_window_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) ->
             0
         }
         WM_ERASEBKGND => crate::paint::erase_background(hwnd, wp) as i64,
+        // WM_NOTIFYFORMAT, NF_QUERY: NFR_UNICODE or NFR_ANSI, as the window is.
+        0x0055 if lp == 3 => if crate::window::IsWindowUnicode(hwnd) != 0 { 2 } else { 1 },
         WM_PAINT => {
             let mut ps = [0u8; 72];
             crate::paint::BeginPaint(hwnd, ps.as_mut_ptr());

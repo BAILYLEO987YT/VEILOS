@@ -37,6 +37,10 @@ pub fn present(root: Hwnd) {
     let mut s = state();
     let Some(w) = s.get_mut(root) else { return };
     let Some(d) = w.dirty.take() else { return };
+    // A DC still out can go on drawing: what it covers stays due.
+    for dc in DCS.lock().iter().filter(|dc| dc.1 == root) {
+        w.dirty = Some(union(w.dirty, dc.2));
+    }
     let (sw, sh) = w.surface_size();
     let d = intersect(d, [0, 0, sw, sh]);
     if !w.kernel || empty(d) {
@@ -57,8 +61,9 @@ pub fn present_all() {
 
 // -----| DCs |-----
 
-/// DCs handed out by GetDC/BeginPaint: (hdc, top-level window).
-static DCS: crate::dllrt::Lock<Vec<(u64, Hwnd)>> = crate::dllrt::Lock::new(Vec::new());
+/// DCs handed out by GetDC/BeginPaint: (hdc, top-level window, what it can
+/// draw on).
+static DCS: crate::dllrt::Lock<Vec<(u64, Hwnd, [i32; 4])>> = crate::dllrt::Lock::new(Vec::new());
 
 /// A DC on `hwnd`'s client area, drawing only inside `clip` (client
 /// coordinates, None: all of it); `frame`: on the whole window rectangle
@@ -78,7 +83,7 @@ fn make_dc(hwnd: Hwnd, clip: Option<[i32; 4]>, frame: bool) -> u64 {
             oy -= w.margins[1];
             area = [ox, oy, ox + w.w, oy + w.h];
             if !w.top_level() {
-                area = intersect(area, s.visible_clip(w.parent));
+                area = if w.visible { intersect(area, s.visible_clip(w.parent)) } else { [0, 0, 0, 0] };
             }
         }
     }
@@ -93,18 +98,23 @@ fn make_dc(hwnd: Hwnd, clip: Option<[i32; 4]>, frame: bool) -> u64 {
     }
     drop(s);
     let hdc = unsafe { crate::VeilGdiCreateDC(ptr, w, h, stride, ox, oy, &area) };
-    DCS.lock().push((hdc, root));
+    DCS.lock().push((hdc, root, area));
     hdc
 }
 
 fn release(hdc: u64) -> bool {
-    let root = {
+    let (root, others) = {
         let mut dcs = DCS.lock();
         let Some(i) = dcs.iter().position(|d| d.0 == hdc) else { return false };
-        dcs.swap_remove(i).1
+        let root = dcs.swap_remove(i).1;
+        (root, dcs.iter().any(|d| d.1 == root))
     };
     unsafe { crate::DeleteDC(hdc) };
-    present(root);
+    // Not in the middle of another DC's drawing (a paint measuring text
+    // through GetDC, say): that one presents when it's done.
+    if !others {
+        present(root);
+    }
     true
 }
 

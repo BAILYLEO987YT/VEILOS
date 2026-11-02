@@ -174,6 +174,152 @@ pub fn edge(hdc: u64, r: [i32; 4], sunken: bool) {
     fill(hdc, [r[2] - 2, r[1] + 1, r[2] - 1, r[3] - 1], inner_br);
 }
 
+const BF_LEFT: u32 = 0x1;
+const BF_TOP: u32 = 0x2;
+const BF_RIGHT: u32 = 0x4;
+const BF_BOTTOM: u32 = 0x8;
+const BF_MIDDLE: u32 = 0x800;
+const BF_ADJUST: u32 = 0x2000;
+const BF_FLAT: u32 = 0x4000;
+const BF_MONO: u32 = 0x8000;
+
+/// One pair of borders: top/left and bottom/right colours.
+fn edge_ring(hdc: u64, r: &mut [i32; 4], flags: u32, tl: i32, br: i32) {
+    let (tl, br) = (crate::paint::GetSysColorBrush(tl), crate::paint::GetSysColorBrush(br));
+    if flags & BF_TOP != 0 {
+        crate::paint::FillRect(hdc, &[r[0], r[1], r[2], r[1] + 1], tl);
+        r[1] += 1;
+    }
+    if flags & BF_LEFT != 0 {
+        crate::paint::FillRect(hdc, &[r[0], r[1], r[0] + 1, r[3]], tl);
+        r[0] += 1;
+    }
+    if flags & BF_BOTTOM != 0 {
+        crate::paint::FillRect(hdc, &[r[0], r[3] - 1, r[2], r[3]], br);
+        r[3] -= 1;
+    }
+    if flags & BF_RIGHT != 0 {
+        crate::paint::FillRect(hdc, &[r[2] - 1, r[1], r[2], r[3]], br);
+        r[2] -= 1;
+    }
+}
+
+/// `edge`: BDR_RAISEDOUTER 1, BDR_SUNKENOUTER 2, BDR_RAISEDINNER 4,
+/// BDR_SUNKENINNER 8.
+#[no_mangle]
+pub unsafe extern "system" fn DrawEdge(hdc: u64, r: *mut [i32; 4], edge: u32, flags: u32) -> Bool {
+    if r.is_null() {
+        return 0;
+    }
+    let mut c = unsafe { *r };
+    if flags & BF_FLAT != 0 || flags & BF_MONO != 0 {
+        let color = if flags & BF_MONO != 0 { 8 } else { 16 };
+        edge_ring(hdc, &mut c, flags, color, color);
+        if edge & 0xC != 0 {
+            edge_ring(hdc, &mut c, flags, 15, 15);
+        }
+    } else {
+        // The outer ring, then the inner.
+        match edge & 3 {
+            1 => edge_ring(hdc, &mut c, flags, 22, 21),
+            2 => edge_ring(hdc, &mut c, flags, 16, 20),
+            _ => {}
+        }
+        match edge & 0xC {
+            4 => edge_ring(hdc, &mut c, flags, 20, 16),
+            8 => edge_ring(hdc, &mut c, flags, 21, 22),
+            _ => {}
+        }
+    }
+    if flags & BF_MIDDLE != 0 {
+        crate::paint::FillRect(hdc, &c, crate::paint::GetSysColorBrush(15));
+    }
+    if flags & BF_ADJUST != 0 {
+        unsafe { *r = c };
+    }
+    1
+}
+
+/// `kind`: DFC_CAPTION 1, DFC_MENU 2, DFC_SCROLL 3, DFC_BUTTON 4.
+#[no_mangle]
+pub unsafe extern "system" fn DrawFrameControl(hdc: u64, r: *mut [i32; 4], kind: u32, state: u32) -> Bool {
+    if r.is_null() {
+        return 0;
+    }
+    let mut c = unsafe { *r };
+    let ink = crate::paint::GetSysColorBrush(if state & 0x100 != 0 { 17 } else { 18 });
+    let pushed = state & 0x200 != 0;
+    let checked = state & 0x400 != 0;
+    let (cx, cy) = ((c[0] + c[2]) / 2, (c[1] + c[3]) / 2);
+    match (kind, state & 0xFF) {
+        // DFCS_BUTTONCHECK, DFCS_BUTTON3STATE: a box.
+        (4, 0) | (4, 8) => {
+            let b = [c[0], c[1], c[0] + 13, c[1] + 13];
+            crate::paint::FillRect(hdc, &b, crate::paint::GetSysColorBrush(5));
+            let mut e = b;
+            edge_ring(hdc, &mut e, 0xF, 16, 16);
+            if checked {
+                crate::paint::FillRect(hdc, &[b[0] + 3, b[1] + 3, b[2] - 3, b[3] - 3], ink);
+            }
+        }
+        // DFCS_BUTTONRADIO
+        (4, 4) => {
+            let b = [c[0] + 1, c[1] + 1, c[0] + 12, c[1] + 12];
+            crate::paint::FillRect(hdc, &b, crate::paint::GetSysColorBrush(5));
+            let mut e = b;
+            edge_ring(hdc, &mut e, 0xF, 16, 16);
+            if checked {
+                crate::paint::FillRect(hdc, &[b[0] + 3, b[1] + 3, b[2] - 3, b[3] - 3], ink);
+            }
+        }
+        _ => {
+            // A button face, with what it shows.
+            crate::paint::FillRect(hdc, &c, crate::paint::GetSysColorBrush(15));
+            if pushed {
+                edge_ring(hdc, &mut c, 0xF, 16, 20);
+            } else {
+                edge_ring(hdc, &mut c, 0xF, 20, 16);
+            }
+            let tri = |down: Option<bool>, right: Option<bool>| {
+                for k in 0..4 {
+                    let a = if let Some(d) = down {
+                        let y = if d { cy - 2 + k } else { cy + 1 - k };
+                        [cx - 3 + k, y, cx + 4 - k, y + 1]
+                    } else {
+                        let x = if right == Some(true) { cx - 2 + k } else { cx + 1 - k };
+                        [x, cy - 3 + k, x + 1, cy + 4 - k]
+                    };
+                    crate::paint::FillRect(hdc, &a, ink);
+                }
+            };
+            match (kind, state & 0xFF) {
+                (3, 0) => tri(Some(false), None),
+                (3, 1) | (3, 5) => tri(Some(true), None),
+                (3, 2) => tri(None, Some(false)),
+                (3, 3) => tri(None, Some(true)),
+                // DFCS_CAPTIONCLOSE: a cross.
+                (1, 0) => {
+                    for k in -3..4 {
+                        crate::paint::FillRect(hdc, &[cx + k, cy + k, cx + k + 1, cy + k + 1], ink);
+                        crate::paint::FillRect(hdc, &[cx + k, cy - k, cx + k + 1, cy - k + 1], ink);
+                    }
+                }
+                (1, 1) => {
+                    crate::paint::FillRect(hdc, &[cx - 3, cy + 2, cx + 3, cy + 4], ink);
+                }
+                (1, 2) | (1, 3) => {
+                    crate::paint::FillRect(hdc, &[cx - 4, cy - 4, cx + 4, cy - 2], ink);
+                    crate::paint::FillRect(hdc, &[cx - 4, cy + 3, cx + 4, cy + 4], ink);
+                    crate::paint::FillRect(hdc, &[cx - 4, cy - 4, cx - 3, cy + 4], ink);
+                    crate::paint::FillRect(hdc, &[cx + 3, cy - 4, cx + 4, cy + 4], ink);
+                }
+                _ => {}
+            }
+        }
+    }
+    1
+}
+
 /// A dotted focus rectangle (DrawFocusRect).
 #[no_mangle]
 pub extern "system" fn DrawFocusRect(hdc: u64, r: *const [i32; 4]) -> Bool {

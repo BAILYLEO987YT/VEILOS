@@ -630,6 +630,106 @@ pub fn set_window_pos(hwnd: Hwnd, after: Hwnd, x: i32, y: i32, cx: i32, cy: i32,
     1
 }
 
+// -----| deferred positions, scrolling |-----
+
+/// BeginDeferWindowPos's handle: the moves to make.
+type Deferred = Vec<(Hwnd, Hwnd, i32, i32, i32, i32, u32)>;
+
+#[no_mangle]
+pub extern "system" fn BeginDeferWindowPos(_n: i32) -> u64 {
+    alloc::boxed::Box::into_raw(alloc::boxed::Box::new(Deferred::new())) as u64
+}
+
+#[no_mangle]
+pub extern "system" fn DeferWindowPos(h: u64, hwnd: Hwnd, after: Hwnd, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> u64 {
+    if h == 0 {
+        return 0;
+    }
+    unsafe { (*(h as *mut Deferred)).push((hwnd, after, x, y, cx, cy, flags)) };
+    h
+}
+
+#[no_mangle]
+pub extern "system" fn EndDeferWindowPos(h: u64) -> Bool {
+    if h == 0 {
+        return 0;
+    }
+    let list = unsafe { alloc::boxed::Box::from_raw(h as *mut Deferred) };
+    for (hwnd, after, x, y, cx, cy, flags) in list.iter().copied() {
+        SetWindowPos(hwnd, after, x, y, cx, cy, flags);
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn GetLastActivePopup(hwnd: Hwnd) -> Hwnd {
+    hwnd
+}
+
+/// Left-to-right.
+#[no_mangle]
+pub unsafe extern "system" fn GetProcessDefaultLayout(out: *mut u32) -> Bool {
+    if out.is_null() {
+        return 0;
+    }
+    unsafe { *out = 0 };
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn SetProcessDefaultLayout(_layout: u32) -> Bool {
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn DrawAnimatedRects(_hwnd: Hwnd, _anim: i32, _from: *const [i32; 4], _to: *const [i32; 4]) -> Bool {
+    1
+}
+
+/// Children move with the scroll if asked; the pixels aren't moved, the
+/// whole client area paints again instead (programs paint from their
+/// positions either way).
+#[no_mangle]
+pub unsafe extern "system" fn ScrollWindowEx(hwnd: Hwnd, dx: i32, dy: i32, _scroll: *const [i32; 4], _clip: *const [i32; 4], _rgn: u64,
+                                             update: *mut [i32; 4], flags: u32) -> i32 {
+    const SW_SCROLLCHILDREN: u32 = 1;
+    if flags & SW_SCROLLCHILDREN != 0 {
+        scroll_children(hwnd, dx, dy);
+    }
+    let mut c = [0i32; 4];
+    GetClientRect(hwnd, &mut c);
+    if !update.is_null() {
+        unsafe { *update = c };
+    }
+    // SW_INVALIDATE, SW_ERASE
+    if flags & 6 != 0 {
+        crate::paint::invalidate(hwnd, None, flags & 4 != 0);
+    }
+    2 // SIMPLEREGION
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ScrollWindow(hwnd: Hwnd, dx: i32, dy: i32, scroll: *const [i32; 4], _clip: *const [i32; 4]) -> Bool {
+    if scroll.is_null() {
+        scroll_children(hwnd, dx, dy);
+    }
+    crate::paint::invalidate(hwnd, None, true);
+    1
+}
+
+fn scroll_children(hwnd: Hwnd, dx: i32, dy: i32) {
+    let mut child = GetWindow(hwnd, 5); // GW_CHILD
+    while child != 0 {
+        let mut r = [0i32; 4];
+        GetWindowRect(child, &mut r);
+        let mut pts = [[r[0], r[1]]];
+        MapWindowPoints(0, hwnd, pts.as_mut_ptr(), 1);
+        // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        SetWindowPos(child, 0, pts[0][0] + dx, pts[0][1] + dy, 0, 0, 0x1 | 0x4 | 0x10);
+        child = GetWindow(child, 2); // GW_HWNDNEXT
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn SetWindowPos(hwnd: Hwnd, after: Hwnd, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> Bool {
     set_window_pos(hwnd, after, x, y, cx, cy, flags)

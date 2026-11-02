@@ -68,6 +68,7 @@ unsafe extern "system" {
     fn GetFileSizeEx(h: Handle, size: *mut i64) -> i32;
     fn ExitProcess(code: u32) -> !;
     fn GetCommandLineW() -> *const u16;
+    pub(crate) fn GetCommandLineA() -> *mut u8;
     fn GetEnvironmentStringsW() -> *mut u16;
     fn FreeEnvironmentStringsW(p: *mut u16) -> i32;
     fn SetEnvironmentVariableW(name: *const u16, value: *const u16) -> i32;

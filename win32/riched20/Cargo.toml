@@ -1,0 +1,8 @@
+[package]
+name = "riched20"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS riched20.dll (also msftedit.dll): rich edit controls as plain edit controls"
+
+[lib]
+crate-type = ["cdylib"]
