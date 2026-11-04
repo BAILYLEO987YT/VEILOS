@@ -41,7 +41,9 @@ use x86_64::VirtAddr;
 
 use crate::executable::PeFile;
 use crate::memory;
-use crate::vfs::VFS;
+use alloc::sync::Arc;
+use crate::nt_demand::Sec;
+use crate::nt_file::SharedFile;
 
 /// DLL images, bump-allocated, 64 KiB aligned.
 const DLL_REGION: u64 = 0x2_0000_0000;
@@ -172,7 +174,6 @@ struct Module {
     entry: u64,
     is_exe: bool,
     pe: PeFile,
-    exports: BTreeMap<String, u32>,
     deps: Vec<usize>,
     tls_index: Option<u32>,
     tls_callbacks: Vec<u64>,
@@ -252,6 +253,78 @@ fn normalize(name: &str) -> String {
     n
 }
 
+/// The first bytes of an image, exactly up to the end of its headers: parsing
+/// them gives sections and directories, and nothing that needs the rest.
+pub fn read_headers(file: &SharedFile) -> Result<Vec<u8>, &'static str> {
+    let mut first = alloc::vec![0u8; 4096];
+    let n = file.read_at(0, &mut first).map_err(|_| "can't read the image")?;
+    first.truncate(n);
+    let pe = first.get(0x3C..0x40).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or("image too small")? as usize;
+    let at = pe + 24 + 60;
+    let size = first.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or("truncated PE header")? as usize;
+    if size > 1 << 20 {
+        return Err("PE headers too large");
+    }
+    let mut headers = alloc::vec![0u8; size];
+    let n = file.read_at(0, &mut headers).map_err(|_| "can't read the image")?;
+    headers.truncate(n);
+    Ok(headers)
+}
+
+/// IMAGE_IMPORT_DESCRIPTORs of the image at `base`.
+fn read_imports(base: u64, dir: u32) -> Vec<crate::executable::ImportedDll> {
+    let mut out = Vec::new();
+    if dir == 0 {
+        return out;
+    }
+    let mut at = base + dir as u64;
+    loop {
+        let (oft, name, ft) = (read_u32(at), read_u32(at + 12), read_u32(at + 16));
+        if name == 0 && ft == 0 {
+            return out;
+        }
+        out.push(crate::executable::ImportedDll { name: read_cstr(base + name as u64), original_first_thunk: oft, first_thunk: ft });
+        at += 20;
+    }
+}
+
+/// An export's RVA by name: export names are sorted, so a binary search touches
+/// only a few pages of even a very large table.
+fn export_by_name(base: u64, dir: u32, name: &str) -> Option<u32> {
+    if dir == 0 {
+        return None;
+    }
+    let d = base + dir as u64;
+    let (functions, names, ordinals) = (read_u32(d + 28), read_u32(d + 32), read_u32(d + 36));
+    let (mut lo, mut hi) = (0u64, read_u32(d + 24) as u64);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let candidate = read_cstr(base + read_u32(base + names as u64 + mid * 4) as u64);
+        match candidate.as_str().cmp(name) {
+            core::cmp::Ordering::Equal => {
+                let ord = unsafe { core::ptr::read_unaligned((base + ordinals as u64 + mid * 2) as *const u16) } as u64;
+                return Some(read_u32(base + functions as u64 + ord * 4));
+            }
+            core::cmp::Ordering::Less => lo = mid + 1,
+            core::cmp::Ordering::Greater => hi = mid,
+        }
+    }
+    None
+}
+
+fn export_by_ordinal(base: u64, dir: u32, ordinal: u16) -> Option<u32> {
+    if dir == 0 {
+        return None;
+    }
+    let d = base + dir as u64;
+    let (ord_base, count, functions) = (read_u32(d + 16), read_u32(d + 20), read_u32(d + 28));
+    let i = (ordinal as u32).checked_sub(ord_base)?;
+    if i >= count {
+        return None;
+    }
+    Some(read_u32(base + functions as u64 + i as u64 * 4)).filter(|&rva| rva != 0)
+}
+
 fn read_u32(addr: u64) -> u32 {
     unsafe { core::ptr::read_unaligned(addr as *const u32) }
 }
@@ -320,41 +393,34 @@ impl Linker {
 
     /// Map an image's headers and sections at `base` (writable for now) and
     /// apply its relocations. Returns SizeOfImage.
-    fn map_image<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(mem: &mut Mem<M, F>, data: &[u8], pe: &PeFile, base: u64) -> Result<u64, &'static str> {
-        if data.len() < 0x40 {
-            return Err("image too small");
-        }
-        let opt = read_u32(data.as_ptr() as u64 + 0x3C) as usize + 24;
-        if opt + 64 > data.len() {
-            return Err("truncated PE header");
-        }
-        let size_of_image = u32::from_le_bytes(data[opt + 56..opt + 60].try_into().unwrap()) as u64;
-        let size_of_headers = u32::from_le_bytes(data[opt + 60..opt + 64].try_into().unwrap()) as usize;
-        mem.map_zeroed(base, size_of_image.div_ceil(4096), RW)?;
-        let hdr = size_of_headers.min(data.len()).min(size_of_image as usize);
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, hdr) };
-        for s in &pe.sections {
-            let raw = (s.size_of_raw_data as usize).min(if s.virtual_size != 0 { s.virtual_size as usize } else { usize::MAX });
-            let start = s.pointer_to_raw_data as usize;
-            let raw = raw.min(data.len().saturating_sub(start));
-            if raw == 0 || s.virtual_address as u64 + raw as u64 > size_of_image {
-                continue;
-            }
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(start), (base + s.virtual_address as u64) as *mut u8, raw) };
-        }
-        apply_base_relocations(pe, data, base);
+    fn map_image(file: &Arc<SharedFile>, headers: &[u8], pe: &mut PeFile, base: u64) -> Result<u64, &'static str> {
+        let opt = u32::from_le_bytes(headers.get(0x3C..0x40).ok_or("image too small")?.try_into().unwrap()) as usize + 24;
+        let field = |at: usize| headers.get(opt + at..opt + at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or("truncated PE header");
+        let size_of_image = field(56)? as u64;
+        let size_of_headers = field(60)?;
+        let sections = pe.sections.iter().map(|s| Sec {
+            va: s.virtual_address,
+            vsize: s.virtual_size,
+            raw_ptr: s.pointer_to_raw_data,
+            raw_size: s.size_of_raw_data,
+            chars: s.characteristics,
+        }).collect();
+        // Only pages that get touched are read from the file (nt_demand.rs).
+        crate::nt_demand::add_image(base, size_of_image, file.clone(), size_of_headers, sections, base.wrapping_sub(pe.image_base), pe.reloc_dir);
+        // The import table is in the image; reading it brings in those pages.
+        pe.imports = read_imports(base, pe.import_dir);
         Ok(size_of_image)
     }
 
     /// Map the EXE. Low preferred bases are moved up out of the kernel's
     /// shared low 4 GiB.
-    pub fn load_exe<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, path: &str, data: &[u8], pe: PeFile) -> Result<u64, &'static str> {
+    pub fn load_exe(&mut self, path: &str, file: &Arc<SharedFile>, headers: &[u8], mut pe: PeFile) -> Result<u64, &'static str> {
         let mut base = pe.image_base;
         if base < 0x1_0000_0000 {
             base |= 0x1_0000_0000;
             crate::serial_println!("[MODULES] low image base {:#x} moved to {:#x}", pe.image_base, base);
         }
-        let size = Self::map_image(mem, data, &pe, base)?;
+        let size = Self::map_image(file, headers, &mut pe, base)?;
         let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
         let entry = if pe.entry_point != 0 { base + pe.entry_point } else { 0 };
         self.push_module(name, String::from(path), base, size, entry, true, pe);
@@ -362,24 +428,20 @@ impl Linker {
     }
 
     fn push_module(&mut self, name: String, path: String, base: u64, size: u64, entry: u64, is_exe: bool, pe: PeFile) -> usize {
-        let mut exports = BTreeMap::new();
-        for e in &pe.exports {
-            if let Some(n) = &e.name {
-                exports.insert(n.clone(), e.rva);
-            }
-        }
-        crate::serial_println!("[MODULES] {} mapped at {:#x} ({} KiB, {} exports)", name, base, size / 1024, exports.len());
-        self.modules.push(Module { name, path, base, size, entry, is_exe, pe, exports, deps: Vec::new(), tls_index: None, tls_callbacks: Vec::new() });
+        crate::serial_println!("[MODULES] {} at {:#x} ({} KiB)", name, base, size / 1024);
+        self.modules.push(Module { name, path, base, size, entry, is_exe, pe, deps: Vec::new(), tls_index: None, tls_callbacks: Vec::new() });
         self.modules.len() - 1
     }
 
     /// The DLL file for `name`: /SYSTEM first, then the EXE's folder.
-    fn find_dll_file(&self, name: &str) -> Option<(String, Vec<u8>)> {
+    fn find_dll_file(&self, name: &str) -> Option<(String, Arc<SharedFile>, Vec<u8>)> {
         let dirs = ["/SYSTEM", self.exe_dir.as_str()];
         for dir in dirs {
             let path = if dir.ends_with('/') { format!("{}{}", dir, name) } else { format!("{}/{}", dir, name) };
-            if let Ok(data) = VFS.read_file(&path) {
-                return Some((path, data));
+            if let Ok(file) = crate::nt_file::open_mapped(&path) {
+                if let Ok(headers) = read_headers(&file) {
+                    return Some((path, file, headers));
+                }
             }
         }
         None
@@ -390,8 +452,8 @@ impl Linker {
         if let Some(i) = self.modules.iter().position(|m| m.name == name) {
             return Ok(Some(i));
         }
-        let Some((path, data)) = self.find_dll_file(name) else { return Ok(None) };
-        let pe = match PeFile::parse(&data) {
+        let Some((path, file, data)) = self.find_dll_file(name) else { return Ok(None) };
+        let mut pe = match PeFile::parse(&data) {
             Ok(pe) => pe,
             Err(e) => {
                 crate::serial_println!("[MODULES] {}: not a usable PE ({}), using built-ins", path, e);
@@ -418,7 +480,7 @@ impl Linker {
             self.dll_next = b + size;
             b
         };
-        Self::map_image(mem, &data, &pe, base)?;
+        Self::map_image(&file, &data, &mut pe, base)?;
         let entry = if pe.entry_point != 0 { base + pe.entry_point } else { 0 };
         let idx = self.push_module(String::from(name), path, base, size, entry, false, pe);
         // Registered before its imports bind, so an import cycle ends here.
@@ -510,10 +572,10 @@ impl Linker {
         let rva = match sym {
             // ucrtbase's "_o_" entry points (api-ms-win-crt-private) are its
             // ordinary functions under another name.
-            Sym::Name(n) => module.exports.get(n).copied().or_else(|| {
-                n.strip_prefix("_o_").filter(|_| module.name == "ucrtbase.dll").and_then(|plain| module.exports.get(plain).copied())
+            Sym::Name(n) => export_by_name(module.base, module.pe.export_dir, n).or_else(|| {
+                n.strip_prefix("_o_").filter(|_| module.name == "ucrtbase.dll").and_then(|plain| export_by_name(module.base, module.pe.export_dir, plain))
             }),
-            Sym::Ordinal(o) => module.pe.exports.iter().find(|e| e.ordinal == o).map(|e| e.rva),
+            Sym::Ordinal(o) => export_by_ordinal(module.base, module.pe.export_dir, o),
         };
         let Some(rva) = rva else { return Ok(None) };
         let base = module.base;
@@ -792,6 +854,8 @@ impl Linker {
     /// Final page protection for every module: headers read-only; each section
     /// read-only or writable, executable only if it is code.
     fn protect_images<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&self, mem: &mut Mem<M, F>) {
+        // What isn't in yet takes its real protection when it comes in.
+        crate::nt_demand::images_linked();
         for m in &self.modules {
             let pages = m.size.div_ceil(4096) as usize;
             // Per page: (writable, executable); pages no section covers stay read-only, NX.

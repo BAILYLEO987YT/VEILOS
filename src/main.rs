@@ -68,6 +68,8 @@ pub mod nt_exception;
 pub mod nt_process;
 pub mod nt_user;
 pub mod nt_registry;
+pub mod nt_demand;
+pub mod nt_ipc;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;

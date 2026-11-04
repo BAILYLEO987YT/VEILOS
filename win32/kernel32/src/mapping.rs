@@ -148,6 +148,21 @@ pub unsafe extern "system" fn MapViewOfFileEx(h: Handle, access: u32, hi: u32, l
         crate::SetLastError(if access & FILE_MAP_WRITE != 0 && !m.writable { 5 } else { ERROR_INVALID_PARAMETER });
         return 0;
     }
+    // A file view nobody writes back comes in from the file as it's touched,
+    // however large the file. A view of a read-only mapping can only be that.
+    if m.file != 0 && !m.writable {
+        const FILE_MAP_COPY: u32 = 1;
+        const FILE_MAP_EXECUTE: u32 = 0x20;
+        let aligned = offset & !0xFFF;
+        let size = (if bytes != 0 { bytes as u64 } else { m.size - offset }) + (offset - aligned);
+        let flags = (access & FILE_MAP_COPY != 0) as u64 | ((access & FILE_MAP_EXECUTE != 0) as u64) << 1;
+        let mut at = 0u64;
+        if unsafe { crate::VeilMapView(m.file, aligned, size, &mut at, flags) } != 0 {
+            crate::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
+        }
+        return (at + (offset - aligned)) as usize;
+    }
     let Some(base) = contents(i) else {
         crate::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
@@ -198,6 +213,9 @@ pub extern "system" fn FlushViewOfFile(addr: usize, _bytes: usize) -> Bool {
 
 #[no_mangle]
 pub extern "system" fn UnmapViewOfFile(addr: usize) -> Bool {
+    if unsafe { crate::VeilUnmapView(addr as u64) } == 0 {
+        return 1;
+    }
     let Some(i) = holding(addr) else {
         crate::SetLastError(487); // ERROR_INVALID_ADDRESS
         return 0;

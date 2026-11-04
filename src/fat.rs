@@ -22,7 +22,7 @@
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use spin::Mutex;
 
-use crate::vfs::{BlockDevice, DirEntry, FileSystem, FileType, VfsError};
+use crate::vfs::{BlockDevice, DirEntry, FileState, FileSystem, FileType, Stat, VfsError};
 
 const SECTOR: usize = 512;
 const ENTRY: usize = 32;
@@ -61,6 +61,7 @@ struct Item {
     attr: u8,
     cluster: u32,
     size: u32,
+    mtime: i64,
     /// First slot belonging to this entry (its first LFN slot, if any).
     first_slot: usize,
     /// Slot of the short entry.
@@ -95,6 +96,10 @@ pub struct FatFileSystem {
     /// Valid clusters are 2 ..= cluster_count + 1.
     cluster_count: u32,
     fs_info_sector: u32,
+    /// QEMU's fat:rw: folder disk. It stops QEMU with an assertion when it sees
+    /// two entries for one file, as a rename does for a moment, so here a file
+    /// moves by copying and a folder can't move.
+    vvfat: bool,
     state: Mutex<State>,
 }
 
@@ -175,6 +180,7 @@ pub fn detect(device: &dyn BlockDevice) -> Option<(Box<dyn FileSystem>, &'static
         first_data_sector,
         cluster_count,
         fs_info_sector,
+        vvfat: b[43..54] == *b"QEMU VVFAT " || b[71..82] == *b"QEMU VVFAT ",
         state: Mutex::new(State { next_free: 2, fsinfo_invalidated: false }),
     };
     Some((Box::new(fs), name))
@@ -572,7 +578,316 @@ impl FatFileSystem {
     }
 }
 
+// -----| open files |-----
+
+impl FatFileSystem {
+    fn load_chain(&self, dev: &dyn BlockDevice, f: &mut FileState) -> Result<(), VfsError> {
+        if !f.chain_loaded {
+            f.chain = if f.first != 0 { self.chain(dev, f.first)? } else { Vec::new() };
+            f.chain_loaded = true;
+        }
+        Ok(())
+    }
+
+    /// Clusters from `off` on: (sector, bytes available in consecutive
+    /// clusters, limited to `want`).
+    fn extent(&self, f: &FileState, off: u64, want: usize) -> Option<(u64, usize)> {
+        let cb = self.cluster_bytes() as u64;
+        let mut k = (off / cb) as usize;
+        let first = *f.chain.get(k)?;
+        let inside = off % cb;
+        let mut run = cb - inside;
+        while (run as usize) < want && f.chain.get(k + 1) == Some(&(f.chain[k] + 1)) {
+            k += 1;
+            run += cb;
+        }
+        Some((self.cluster_lba(first) + inside / SECTOR as u64, (run as usize).min(want)))
+    }
+
+    /// Clusters and directory entry for a file `size` bytes long. The entry
+    /// goes before the data: see `write_file`.
+    fn resize(&self, dev: &dyn BlockDevice, f: &mut FileState, size: u64) -> Result<(), VfsError> {
+        if size > u32::MAX as u64 {
+            return Err(VfsError::WriteError);
+        }
+        self.load_chain(dev, f)?;
+        let need = (size as usize).div_ceil(self.cluster_bytes());
+        if need > f.chain.len() {
+            let extra = self.alloc_chain(dev, &mut self.state.lock(), need - f.chain.len())?;
+            match f.chain.last() {
+                Some(&last) => self.fat_set(dev, last, extra[0])?,
+                None => f.first = extra[0],
+            }
+            f.chain.extend(extra);
+        }
+        let old_chain = need < f.chain.len();
+        let freed = f.chain.get(need).copied();
+        if old_chain {
+            f.chain.truncate(need);
+            if need == 0 {
+                f.first = 0;
+            }
+        }
+        f.size = size;
+        self.write_entry(dev, f, None)?;
+        if let Some(c) = freed {
+            if let Some(&last) = f.chain.last() {
+                self.fat_set(dev, last, self.eoc())?;
+            }
+            self.free_chain(dev, c)?;
+        }
+        Ok(())
+    }
+
+    /// The directory entry as `f` has it; its time from `mtime`, or now.
+    fn write_entry(&self, dev: &dyn BlockDevice, f: &mut FileState, mtime: Option<i64>) -> Result<(), VfsError> {
+        let (date, time) = mtime.map_or_else(fat_now, filetime_to_fat);
+        f.mtime = fat_to_filetime(date, time);
+        let mut s = self.read_sector(dev, f.entry_lba)?;
+        let e = &mut s[f.entry_off..f.entry_off + ENTRY];
+        e[11] |= ATTR_ARCHIVE;
+        e[20..22].copy_from_slice(&((f.first >> 16) as u16).to_le_bytes());
+        e[26..28].copy_from_slice(&(f.first as u16).to_le_bytes());
+        e[28..32].copy_from_slice(&(f.size as u32).to_le_bytes());
+        e[22..24].copy_from_slice(&time.to_le_bytes());
+        e[24..26].copy_from_slice(&date.to_le_bytes());
+        e[18..20].copy_from_slice(&date.to_le_bytes());
+        self.write_sector(dev, f.entry_lba, &s)
+    }
+
+    /// Write inside the clusters the file already has.
+    fn write_inside(&self, dev: &dyn BlockDevice, f: &FileState, mut off: u64, mut data: &[u8]) -> Result<(), VfsError> {
+        while !data.is_empty() {
+            let (lba, run) = self.extent(f, off, data.len()).ok_or(VfsError::WriteError)?;
+            let inside = off as usize % SECTOR;
+            if inside != 0 || run < SECTOR {
+                let n = run.min(SECTOR - inside);
+                let mut s = self.read_sector(dev, lba)?;
+                s[inside..inside + n].copy_from_slice(&data[..n]);
+                self.write_sector(dev, lba, &s)?;
+                off += n as u64;
+                data = &data[n..];
+            } else {
+                let sectors = run / SECTOR;
+                if !dev.write_sectors(lba, sectors as u32, data.as_ptr() as u64) {
+                    return Err(VfsError::WriteError);
+                }
+                off += (sectors * SECTOR) as u64;
+                data = &data[sectors * SECTOR..];
+            }
+        }
+        Ok(())
+    }
+
+    /// Zeros from `from` to `to`, in clusters the file already has.
+    fn zero_inside(&self, dev: &dyn BlockDevice, f: &FileState, mut from: u64, to: u64) -> Result<(), VfsError> {
+        let zeros = vec![0u8; self.cluster_bytes()];
+        while from < to {
+            let n = (zeros.len() as u64).min(to - from) as usize;
+            self.write_inside(dev, f, from, &zeros[..n])?;
+            from += n as u64;
+        }
+        Ok(())
+    }
+}
+
+/// A FAT date and time as a FILETIME (100 ns since 1601).
+fn fat_to_filetime(date: u16, time: u16) -> i64 {
+    let (y, m, d) = ((date >> 9) as i64 + 1980, ((date >> 5) & 15) as i64, (date & 31) as i64);
+    if m == 0 || d == 0 {
+        return 0;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + ((time >> 11) as i64) * 3600 + (((time >> 5) & 63) as i64) * 60 + ((time & 31) as i64) * 2;
+    (secs + 11_644_473_600) * 10_000_000
+}
+
+fn filetime_to_fat(ft: i64) -> (u16, u16) {
+    let secs = ft / 10_000_000 - 11_644_473_600;
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    // civil_from_days.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    if y < 1980 {
+        return ((1 << 5) | 1, 0);
+    }
+    (
+        (((y - 1980).min(127) as u16) << 9) | ((m as u16) << 5) | d as u16,
+        (((rem / 3600) as u16) << 11) | ((((rem % 3600) / 60) as u16) << 5) | ((rem % 60 / 2) as u16),
+    )
+}
+
 impl FileSystem for FatFileSystem {
+    fn stat(&self, dev: &dyn BlockDevice, path: &str) -> Option<Stat> {
+        let _guard = self.state.lock();
+        if path.trim_end_matches('/').is_empty() {
+            return Some(Stat { is_dir: true, size: 0, mtime: 0 });
+        }
+        let (dir, name) = self.resolve_parent(dev, path).ok()?;
+        let it = self.lookup(dev, dir, name).ok()??;
+        Some(Stat { is_dir: it.is_dir(), size: it.size as u64, mtime: it.mtime })
+    }
+
+    fn open_file(&self, dev: &dyn BlockDevice, path: &str) -> Result<FileState, VfsError> {
+        let _guard = self.state.lock();
+        let (dir, name) = self.resolve_parent(dev, path).map_err(|_| VfsError::FileNotFound)?;
+        let item = self.lookup(dev, dir, name)?.ok_or(VfsError::FileNotFound)?;
+        if item.is_dir() {
+            return Err(VfsError::IsDirectory);
+        }
+        let lbas = self.dir_sectors(dev, dir)?;
+        Ok(FileState {
+            path: String::from(path),
+            size: item.size as u64,
+            mtime: item.mtime,
+            first: item.cluster,
+            entry_lba: lbas[item.slot / ENTRIES_PER_SECTOR],
+            entry_off: item.slot % ENTRIES_PER_SECTOR * ENTRY,
+            ..FileState::default()
+        })
+    }
+
+    fn read_at(&self, dev: &dyn BlockDevice, f: &mut FileState, off: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+        if off >= f.size || buf.is_empty() {
+            return Ok(0);
+        }
+        self.load_chain(dev, f)?;
+        let total = buf.len().min((f.size - off) as usize);
+        let mut done = 0;
+        while done < total {
+            let at = off + done as u64;
+            let (lba, run) = self.extent(f, at, total - done).ok_or(VfsError::ReadError)?;
+            let inside = at as usize % SECTOR;
+            if inside != 0 || run < SECTOR {
+                let n = run.min(SECTOR - inside);
+                let s = self.read_sector(dev, lba)?;
+                buf[done..done + n].copy_from_slice(&s[inside..inside + n]);
+                done += n;
+            } else {
+                let sectors = run / SECTOR;
+                if !dev.read_sectors(lba, sectors as u32, buf[done..].as_mut_ptr() as u64) {
+                    return Err(VfsError::ReadError);
+                }
+                done += sectors * SECTOR;
+            }
+        }
+        Ok(total)
+    }
+
+    fn write_at(&self, dev: &dyn BlockDevice, f: &mut FileState, off: u64, data: &[u8]) -> Result<(), VfsError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = off + data.len() as u64;
+        let old = f.size;
+        if end > old {
+            self.resize(dev, f, end)?;
+            if off > old {
+                self.zero_inside(dev, f, old, off)?;
+            }
+        } else {
+            self.load_chain(dev, f)?;
+        }
+        f.dirty = true;
+        self.write_inside(dev, f, off, data)
+    }
+
+    fn set_len(&self, dev: &dyn BlockDevice, f: &mut FileState, len: u64) -> Result<(), VfsError> {
+        let old = f.size;
+        if len != old {
+            self.resize(dev, f, len)?;
+            if len > old {
+                self.zero_inside(dev, f, old, len)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sync(&self, dev: &dyn BlockDevice, f: &mut FileState) -> Result<(), VfsError> {
+        if f.dirty {
+            f.dirty = false;
+            self.write_entry(dev, f, None)?;
+        }
+        Ok(())
+    }
+
+    fn set_mtime(&self, dev: &dyn BlockDevice, f: &mut FileState, mtime: i64) -> Result<(), VfsError> {
+        f.dirty = false;
+        self.write_entry(dev, f, Some(mtime))
+    }
+
+    fn rename(&self, dev: &dyn BlockDevice, from: &str, to: &str) -> Result<(), VfsError> {
+        if self.vvfat {
+            if self.stat(dev, from).is_none_or(|s| s.is_dir) {
+                return Err(VfsError::WriteError);
+            }
+            // Only the case changes: the host folder ignores case too, and QEMU
+            // stops if it can't delete what it then sees as gone. The name stays.
+            if from.eq_ignore_ascii_case(to) {
+                return Ok(());
+            }
+            let data = self.read_file(dev, from)?;
+            self.write_file(dev, to, &data)?;
+            return self.delete_file(dev, from);
+        }
+        let mut st = self.state.lock();
+        let (from_dir, from_name) = self.resolve_parent(dev, from)?;
+        let item = self.lookup(dev, from_dir, from_name)?.ok_or(VfsError::FileNotFound)?;
+        let (to_dir, to_name) = self.resolve_parent(dev, to)?;
+        // Only a change of case may find itself there.
+        let same_entry = to_dir == from_dir && to_name.eq_ignore_ascii_case(&item.name);
+        if !same_entry && self.lookup(dev, to_dir, to_name)?.is_some() {
+            return Err(VfsError::WriteError);
+        }
+        // A directory can't go inside itself.
+        if item.is_dir() && to.len() > from.len() && to[..from.len()].eq_ignore_ascii_case(from) && to.as_bytes()[from.len()] == b'/' {
+            return Err(VfsError::WriteError);
+        }
+        // Moved in two steps, so a failure in the middle leaves the data named.
+        if same_entry {
+            self.remove_entry(dev, from_dir, &item)?;
+            self.create_entry(dev, &mut st, to_dir, to_name, item.attr, item.cluster, item.size)?;
+        } else {
+            self.create_entry(dev, &mut st, to_dir, to_name, item.attr, item.cluster, item.size)?;
+            self.remove_entry(dev, from_dir, &item)?;
+        }
+        // The time goes with it.
+        if let Some(moved) = self.lookup(dev, to_dir, to_name)? {
+            let (date, time) = filetime_to_fat(item.mtime);
+            self.update_entry(dev, to_dir, &moved, |e| {
+                e[22..24].copy_from_slice(&time.to_le_bytes());
+                e[24..26].copy_from_slice(&date.to_le_bytes());
+            })?;
+        }
+        // A directory's ".." names its parent.
+        if item.is_dir() && to_dir != from_dir {
+            let parent = match to_dir {
+                Dir::Chain(p) if p != self.root_cluster || self.fat_type != FatType::Fat32 => p,
+                _ => 0,
+            };
+            let lba = self.cluster_lba(item.cluster);
+            let mut s = self.read_sector(dev, lba)?;
+            s[ENTRY + 20..ENTRY + 22].copy_from_slice(&((parent >> 16) as u16).to_le_bytes());
+            s[ENTRY + 26..ENTRY + 28].copy_from_slice(&(parent as u16).to_le_bytes());
+            self.write_sector(dev, lba, &s)?;
+        }
+        Ok(())
+    }
+
     fn read_file(&self, dev: &dyn BlockDevice, path: &str) -> Result<Vec<u8>, VfsError> {
         let _guard = self.state.lock();
         let (dir, name) = self.resolve_parent(dev, path).map_err(|_| VfsError::FileNotFound)?;
@@ -595,6 +910,7 @@ impl FileSystem for FatFileSystem {
                 name: it.name,
                 size: it.size as u64,
                 cluster: it.cluster,
+                mtime: it.mtime,
             })
             .collect())
     }
@@ -781,6 +1097,7 @@ fn parse_dir(raw: &[u8]) -> Vec<Item> {
             attr,
             cluster: (le16(e, 26) as u32) | ((le16(e, 20) as u32) << 16),
             size: le32(e, 28),
+            mtime: fat_to_filetime(le16(e, 24), le16(e, 22)),
             first_slot,
             slot: i,
         });

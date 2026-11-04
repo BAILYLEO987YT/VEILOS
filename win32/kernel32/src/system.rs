@@ -425,6 +425,8 @@ pub unsafe extern "system" fn CopyFileExW(from: *const u16, to: *const u16, _pro
 }
 
 const MOVEFILE_REPLACE_EXISTING: u32 = 1;
+const MOVEFILE_COPY_ALLOWED: u32 = 2;
+const STATUS_NOT_SAME_DEVICE: NtStatus = 0xC000_00D4u32 as NtStatus;
 
 /// No rename in the file system yet: a file moves by copy and delete.
 #[no_mangle]
@@ -433,17 +435,19 @@ pub unsafe extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flag
     if attrs == u32::MAX {
         return 0;
     }
-    if attrs & 0x10 != 0 {
-        crate::SetLastError(ERROR_ACCESS_DENIED); // directories can't move yet
-        return 0;
-    }
     if to.is_null() {
         return unsafe { crate::file::DeleteFileW(from) };
     }
-    if unsafe { CopyFileW(from, to, (flags & MOVEFILE_REPLACE_EXISTING == 0) as Bool) } == 0 {
-        return 0;
+    let replace = flags & MOVEFILE_REPLACE_EXISTING != 0;
+    let s = crate::file::rename_path(unsafe { wstr(from) }, unsafe { wstr(to) }, replace);
+    // Between volumes a file is copied, if the caller allows it.
+    if s == STATUS_NOT_SAME_DEVICE && attrs & 0x10 == 0 && flags & MOVEFILE_COPY_ALLOWED != 0 {
+        if unsafe { CopyFileW(from, to, !replace as Bool) } == 0 {
+            return 0;
+        }
+        return unsafe { crate::file::DeleteFileW(from) };
     }
-    unsafe { crate::file::DeleteFileW(from) }
+    check(s)
 }
 
 #[no_mangle]
@@ -480,20 +484,61 @@ pub extern "system" fn CreateSymbolicLinkW(_link: *const u16, _target: *const u1
     0
 }
 
-/// File times aren't kept yet: accepted.
+/// One time is kept per file: the last write.
 #[no_mangle]
-pub extern "system" fn SetFileTime(_h: Handle, _c: *const u64, _a: *const u64, _w: *const u64) -> Bool {
-    1
+pub unsafe extern "system" fn SetFileTime(h: Handle, _c: *const u64, _a: *const u64, w: *const u64) -> Bool {
+    let mut basic = [0u8; 40];
+    if !w.is_null() {
+        basic[16..24].copy_from_slice(&unsafe { *w }.to_le_bytes());
+    }
+    let mut iosb = nt_abi::IoStatusBlock::default();
+    check(unsafe { crate::NtSetInformationFile(h, &mut iosb, basic.as_ptr(), 40, 4) })
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn GetFileTime(_h: Handle, c: *mut u64, a: *mut u64, w: *mut u64) -> Bool {
-    for p in [c, a, w] {
+pub unsafe extern "system" fn GetFileTime(h: Handle, c: *mut u64, a: *mut u64, w: *mut u64) -> Bool {
+    let mut basic = [0u8; 40];
+    let mut iosb = nt_abi::IoStatusBlock::default();
+    let r = check(unsafe { crate::NtQueryInformationFile(h, &mut iosb, basic.as_mut_ptr(), 40, 4) });
+    if r == 0 {
+        return 0;
+    }
+    for (p, at) in [(c, 0usize), (a, 8), (w, 16)] {
         if !p.is_null() {
-            unsafe { *p = 0 };
+            unsafe { *p = u64::from_le_bytes(basic[at..at + 8].try_into().unwrap()) };
         }
     }
     1
+}
+
+/// FILE_INFO_BY_HANDLE_CLASS: basic (0), rename (3 and 22), disposition (4 and
+/// 21), end of file (6). The Ex forms start with flags where the plain ones
+/// start with a boolean.
+#[no_mangle]
+pub unsafe extern "system" fn SetFileInformationByHandle(h: Handle, class: u32, info: *const u8, size: u32) -> Bool {
+    let mut iosb = nt_abi::IoStatusBlock::default();
+    let set = |class: u32, p: *const u8, n: u32, iosb: &mut nt_abi::IoStatusBlock| check(unsafe { crate::NtSetInformationFile(h, iosb, p, n, class) });
+    match class {
+        0 => set(4, info, size, &mut iosb),
+        3 | 22 => {
+            // Flag 1 is FILE_RENAME_FLAG_REPLACE_IF_EXISTS, in the same place.
+            let replace = unsafe { *info } & 1;
+            let bytes = unsafe { core::ptr::read_unaligned(info.add(16) as *const u32) } as usize;
+            let name = unsafe { core::slice::from_raw_parts(info.add(20) as *const u16, bytes / 2) };
+            let s = crate::file::rename_handle(h, name, replace != 0);
+            check(s)
+        }
+        4 | 21 => {
+            // Flag 1 is FILE_DISPOSITION_FLAG_DELETE, in the same place.
+            let on = (unsafe { *info } & 1) as u8;
+            set(13, &on, 1, &mut iosb)
+        }
+        6 => set(20, info, 8, &mut iosb),
+        _ => {
+            crate::SetLastError(ERROR_NOT_SUPPORTED);
+            0
+        }
+    }
 }
 
 /// FILE_INFO_BY_HANDLE_CLASS: FileBasicInfo (0) and FileStandardInfo (1),
@@ -638,18 +683,22 @@ mod alloc_free {
 
 // -----| mutexes (on auto-reset events) and semaphores |-----
 //
-// A mutex is an auto-reset event: signalled = free. Waiting takes it,
-// ReleaseMutex frees it. (No owner tracking or recursion yet.)
+// Owned per thread, and recursive: the kernel keeps the count.
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateMutexExW(_sa: usize, _name: *const u16, flags: u32, access: u32) -> Handle {
+pub unsafe extern "system" fn CreateMutexExW(_sa: usize, name: *const u16, flags: u32, access: u32) -> Handle {
+    if let Some(found) = crate::named_existing(name, crate::KIND_MUTEX) {
+        return found;
+    }
     let mut h: Handle = 0;
+    let _ = access;
     let owned = flags & 1 != 0; // CREATE_MUTEX_INITIAL_OWNER
-    let s = unsafe { crate::NtCreateEvent(&mut h, access | 0x1F0003, core::ptr::null(), 1, (!owned) as u8) };
+    let s = unsafe { crate::VeilMutex(0, owned as u64, &mut h as *mut Handle as u64) };
     if s != status::SUCCESS {
         fail(s);
         return 0;
     }
+    crate::name_new(h, name, crate::KIND_MUTEX);
     h
 }
 
@@ -659,26 +708,28 @@ pub unsafe extern "system" fn CreateMutexW(sa: usize, owned: Bool, name: *const 
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateMutexA(sa: usize, owned: Bool, _name: *const u8) -> Handle {
-    unsafe { CreateMutexExW(sa, core::ptr::null(), (owned != 0) as u32, 0) }
+pub unsafe extern "system" fn CreateMutexA(sa: usize, owned: Bool, name: *const u8) -> Handle {
+    if name.is_null() {
+        return unsafe { CreateMutexExW(sa, core::ptr::null(), (owned != 0) as u32, 0) };
+    }
+    let w = unsafe { crate::util::widen(name) };
+    unsafe { CreateMutexExW(sa, w.as_ptr(), (owned != 0) as u32, 0) }
 }
 
 #[no_mangle]
 pub extern "system" fn ReleaseMutex(h: Handle) -> Bool {
-    check(unsafe { crate::NtSetEvent(h, core::ptr::null_mut()) })
-}
-
-/// Named objects aren't kept: opening one finds nothing.
-#[no_mangle]
-pub extern "system" fn OpenMutexW(_access: u32, _inherit: Bool, _name: *const u16) -> Handle {
-    crate::SetLastError(ERROR_FILE_NOT_FOUND);
-    0
+    check(unsafe { crate::VeilMutex(1, h, 0) })
 }
 
 #[no_mangle]
-pub extern "system" fn OpenSemaphoreW(_access: u32, _inherit: Bool, _name: *const u16) -> Handle {
-    crate::SetLastError(ERROR_FILE_NOT_FOUND);
-    0
+pub unsafe extern "system" fn OpenMutexW(_access: u32, _inherit: Bool, name: *const u16) -> Handle {
+    crate::open_named(name, crate::KIND_MUTEX)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn OpenMutexA(access: u32, inherit: Bool, name: *const u8) -> Handle {
+    let w = unsafe { crate::util::widen(name) };
+    unsafe { OpenMutexW(access, inherit, w.as_ptr()) }
 }
 
 // -----| delay-loaded imports |-----

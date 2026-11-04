@@ -344,6 +344,14 @@ fn signalled(obj: &KernelObjectRef, take: bool) -> bool {
                 s.count.load(Ordering::Acquire) > 0
             }
         }
+        KernelObjectRef::Mutex(m) => {
+            let me = crate::nt_objects::MutexObject::current_owner();
+            if take {
+                m.try_acquire(me)
+            } else {
+                !m.is_locked() || m.owner() == me
+            }
+        }
         KernelObjectRef::Process(p) => p.ended.load(Ordering::Acquire),
         KernelObjectRef::Thread(t) => t.done.load(Ordering::Acquire),
         _ => true,
@@ -505,7 +513,30 @@ pub struct PipeEnd {
     pub write: bool,
 }
 
+/// A pipe with no ends yet.
+pub fn new_pipe(capacity: u64) -> Arc<Pipe> {
+    Arc::new(Pipe {
+        data: Mutex::new(VecDeque::new()),
+        readers: AtomicUsize::new(0),
+        writers: AtomicUsize::new(0),
+        capacity: (capacity as u32 as usize).clamp(4096, 1 << 20),
+    })
+}
+
+/// Bytes waiting to be read.
+pub fn pipe_available(pipe: &Pipe) -> usize {
+    pipe.data.lock().len()
+}
+
 impl PipeEnd {
+    pub fn reader(pipe: Arc<Pipe>) -> Arc<Self> {
+        Arc::new(Self::new(pipe, false))
+    }
+
+    pub fn writer(pipe: Arc<Pipe>) -> Arc<Self> {
+        Arc::new(Self::new(pipe, true))
+    }
+
     fn new(pipe: Arc<Pipe>, write: bool) -> Self {
         let n = if write { &pipe.writers } else { &pipe.readers };
         n.fetch_add(1, Ordering::AcqRel);
@@ -525,12 +556,7 @@ pub fn create_pipe(proc: &Process, read_out: u64, write_out: u64, size: u64) -> 
     if !ptr_ok(read_out, 8) || !ptr_ok(write_out, 8) {
         return status::ACCESS_VIOLATION;
     }
-    let pipe = Arc::new(Pipe {
-        data: Mutex::new(VecDeque::new()),
-        readers: AtomicUsize::new(0),
-        writers: AtomicUsize::new(0),
-        capacity: (size as u32 as usize).clamp(4096, 1 << 20),
-    });
+    let pipe = new_pipe(size);
     let mut handles = proc.handles.lock();
     let r = handles.allocate_ref(KernelObjectRef::Pipe(Arc::new(PipeEnd::new(pipe.clone(), false))), 0x0012_019F, 0);
     let w = handles.allocate_ref(KernelObjectRef::Pipe(Arc::new(PipeEnd::new(pipe, true))), 0x0012_019F, 0);
@@ -717,6 +743,7 @@ pub fn query_volume(proc: &Arc<Process>, h: u64, iosb: u64, out: u64, length: u6
         return status::BUFFER_TOO_SMALL;
     }
     let device: u32 = match object(proc, h) {
+        Some(KernelObjectRef::Duplex(_)) => 0x11,  // FILE_DEVICE_NAMED_PIPE
         Some(KernelObjectRef::File(_)) => 0x07,    // FILE_DEVICE_DISK
         Some(KernelObjectRef::Console(_)) => 0x50, // FILE_DEVICE_CONSOLE
         Some(KernelObjectRef::Pipe(_)) => 0x11,    // FILE_DEVICE_NAMED_PIPE

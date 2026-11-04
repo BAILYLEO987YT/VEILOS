@@ -667,6 +667,13 @@ pub(crate) extern "x86-interrupt" fn page_fault_handler(
 
     let faulting_addr = Cr2::read();
     let in_user_mode = (stack_frame.code_segment & 0x3) == 3;
+    // The kernel touching a page of an image or view that isn't in yet.
+    if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && faulting_addr.as_u64() < 0x0000_8000_0000_0000
+        && crate::nt_demand::fault_in(faulting_addr.as_u64())
+    {
+        return;
+    }
     // See user_recoverable_handler! in this file: a syscall handler runs at
     // CPL=0 even while it's dereferencing a pointer a user-mode Win32 app
     // passed in. The OLD code treated every CPL=0 page fault as an

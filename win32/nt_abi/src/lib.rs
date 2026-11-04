@@ -29,6 +29,7 @@ pub mod status {
     pub const OBJECT_NAME_INVALID: NtStatus = 0xC000_0033u32 as i32;
     pub const OBJECT_NAME_NOT_FOUND: NtStatus = 0xC000_0034u32 as i32;
     pub const OBJECT_NAME_COLLISION: NtStatus = 0xC000_0035u32 as i32;
+    pub const DISK_FULL: NtStatus = 0xC000_007Fu32 as i32;
     pub const OBJECT_PATH_NOT_FOUND: NtStatus = 0xC000_003Au32 as i32;
     pub const FILE_IS_A_DIRECTORY: NtStatus = 0xC000_00BAu32 as i32;
     pub const DIRECTORY_NOT_EMPTY: NtStatus = 0xC000_0101u32 as i32;
@@ -146,8 +147,25 @@ pub mod sys {
     pub const VEIL_CLIP_GET: u32 = BASE + 50;
     /// VEIL_REG(call: *mut reg::RegCall): the registry; returns a Win32 error.
     pub const VEIL_REG: u32 = BASE + 51;
+    /// VEIL_MAP_VIEW(file, offset, size, out*, flags): a view of a file brought
+    /// in as it's touched. Flags: 1 private copy, writable; 2 executable.
+    pub const VEIL_MAP_VIEW: u32 = BASE + 52;
+    /// VEIL_UNMAP_VIEW(addr).
+    pub const VEIL_UNMAP_VIEW: u32 = BASE + 53;
+    /// VEIL_NAME_OBJECT(handle, name*, kind). Kinds: 1 event, 2 mutex, 3 semaphore.
+    pub const VEIL_NAME_OBJECT: u32 = BASE + 54;
+    /// VEIL_OPEN_NAMED(name*, kind, out*).
+    pub const VEIL_OPEN_NAMED: u32 = BASE + 55;
+    /// VEIL_WAIT_ADDRESS(addr, compare*, size, ms).
+    pub const VEIL_WAIT_ADDRESS: u32 = BASE + 56;
+    /// VEIL_WAKE_ADDRESS(addr).
+    pub const VEIL_WAKE_ADDRESS: u32 = BASE + 57;
+    /// VEIL_PIPE(op, a, b, c): named pipes (src/nt_ipc.rs).
+    pub const VEIL_PIPE: u32 = BASE + 58;
+    /// VEIL_MUTEX(op, a, b): create (owned, out*) or release (handle).
+    pub const VEIL_MUTEX: u32 = BASE + 59;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 52;
+    pub const END: u32 = BASE + 60;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
@@ -366,6 +384,7 @@ pub mod file {
     pub const DIRECTORY_INFORMATION: u32 = 1;
     pub const BASIC_INFORMATION: u32 = 4;
     pub const STANDARD_INFORMATION: u32 = 5;
+    pub const RENAME_INFORMATION: u32 = 10;
     pub const DISPOSITION_INFORMATION: u32 = 13;
     pub const POSITION_INFORMATION: u32 = 14;
     pub const ALLOCATION_INFORMATION: u32 = 19;

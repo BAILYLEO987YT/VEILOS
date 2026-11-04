@@ -252,6 +252,7 @@ impl ExFatFileSystem {
                     size:      file_size,
                     cluster:   first_cluster,
                     file_type: if is_dir { FileType::Directory } else { FileType::File },
+                    mtime:     0,
                 });
             }
 

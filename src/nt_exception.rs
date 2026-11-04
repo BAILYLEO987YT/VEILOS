@@ -213,6 +213,10 @@ fn describe(t: &Trap, fx: &[u8; 512]) -> (u32, u64, [u64; 2], u32) {
 /// Send the fault in `t` to the process's KiUserExceptionDispatcher by
 /// rewriting the interrupt frame. Ends the process if it can't take it.
 extern "C" fn deliver(fx: &[u8; 512], t: &mut Trap) {
+    // A page of an image or view not read from its file yet: try again.
+    if t.vector == 14 && t.error & 1 == 0 && crate::nt_demand::fault_in(x86_64::registers::control::Cr2::read_raw()) {
+        return;
+    }
     let proc = crate::process::PROCESSOR.lock().get_active();
     let dispatcher = proc.as_ref().map_or(0, |p| p.exception_dispatcher.load(Ordering::Acquire));
     let (code, address, params, nparams) = describe(t, fx);

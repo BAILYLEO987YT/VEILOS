@@ -1,0 +1,89 @@
+mkdir: 1 err 0
+--- partial reads and writes
+size 1228800
+at 0: 1 n=12 00000000 02000000
+at 4: 1 n=12 01000000 03000000
+at 4092: 1 n=12 ff030000 01040000
+at 4097: 1 n=12 04000001 04000003
+at 65536: 1 n=12 00400000 02400000
+at 1048572: 1 n=12 ffff0300 01000400
+at 1228796: 1 n=4 ffaf0400 00000000
+around the boundary: 00 00 ff 03 41 42 43 44 45 46 47 48 00 00 02 04
+size 1228800
+past the end: 1 n=0
+--- growing and truncating
+size 200003
+start reads zero: 1
+middle reads zero: 1
+set end: 1 err 0
+size 10
+set end: 1 err 0
+size 100
+regrown reads zero: 1
+empty: 1 err 0
+size 0
+w16tmp\sparse.bin: 5 bytes "again"
+--- two handles to one file
+b sees size 6
+b reads "from a"
+a sees size 12
+positions 6 12
+w16tmp\two.txt: 12 bytes "from a and b"
+after truncate a sees 0
+--- rename
+plain: 1 err 0
+w16tmp\a.txt: missing, err 2
+w16tmp\b.txt: 6 bytes "file a"
+onto existing, no flag: 0 err 183
+w16tmp\b.txt: 6 bytes "file a"
+onto existing, replace: 1 err 0
+w16tmp\b.txt: 6 bytes "file c"
+w16tmp\c.txt: missing, err 2
+missing source: 0 err 2
+missing folder: 0 err 3
+case only: 1 err 0
+found as B.TXT
+mkdir: 1 err 0
+into a folder: 1 err 0
+w16tmp\sub\moved with spaces and a long name.txt: 6 bytes "file c"
+folder: 1 err 0
+w16tmp\renamed\moved with spaces and a long name.txt: 6 bytes "file c"
+mkdir: 1 err 0
+folder into folder: 1 err 0
+w16tmp\outer\inner\moved with spaces and a long name.txt: 6 bytes "file c"
+w16tmp\outer\inner\..\inner\moved with spaces and a long name.txt: 6 bytes "file c"
+w16tmp\outer\inner\new.txt: 19 bytes "made after the move"
+folder into itself: 0 err 5
+open file: 1 err 0
+w16tmp\open.txt: missing, err 2
+w16tmp\moved.txt: 12 bytes "before after"
+onto an open file: 0 err 5
+w16tmp\q.txt: 1 bytes "q"
+--- deleting
+delete while open: 1 err 0
+through the handle: "doomed"
+open again: 0 err 2
+after close: 1 err 2
+delete on close, open: 1
+delete on close, closed: 0
+disposition: 1 err 0
+after: 0
+mkdir: 1 err 0
+full folder: 0 err 145
+emptied folder: 1 err 0
+--- rename by handle
+rename info: 1 err 0
+w16tmp\h1.txt: missing, err 2
+w16tmp\h2.txt: 9 bytes "by handle"
+--- times
+set: 1 err 0
+get: 1 err 0
+by handle 2020-06-15 12:00
+attributes: 1 err 0
+by path 2020-06-15 12:00 size 1
+in a listing 2020-06-15 12:00
+after rename 2020-06-15
+after a write, later than 2020: 1
+gone: 1
+done
+exit 5

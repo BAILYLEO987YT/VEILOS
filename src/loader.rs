@@ -1,4 +1,3 @@
-use crate::vfs::VFS;
 use crate::executable::PeFile;
 use crate::memory;
 use crate::process::{Process, PROCESSOR};
@@ -127,6 +126,9 @@ pub fn load_and_spawn_pe_with(
                 let _ = memory::unmap_and_free_page(page, &mut mapper);
             }
         }
+        if result.is_err() {
+            crate::nt_demand::release_active();
+        }
         result
     });
 
@@ -146,10 +148,8 @@ fn load_and_spawn_pe_inner(
     crate::serial_println!("\n[LOADER] >>> LOADING WINDOWS EXECUTABLE: {}", path);
 
     // 1. Read binary data from VFS
-    let data = match VFS.read_file(path) {
-        Ok(d) => d,
-        Err(_) => return Err("Failed to read PE file from VFS"),
-    };
+    let file = crate::nt_file::open_mapped(path).map_err(|_| "Failed to read PE file from VFS")?;
+    let data = crate::modules::read_headers(&file)?;
 
     // 2. Parse PE Headers
     let pe = match PeFile::parse(&data) {
@@ -170,8 +170,7 @@ fn load_and_spawn_pe_inner(
     let exe_entry_rva = pe.entry_point;
     let mut linker = crate::modules::Linker::new(path);
     let mapped_image_base = {
-        let mut mem = crate::modules::Mem { mapper: &mut *mapper, fa: &mut *frame_allocator, pages: &mut *mapped_pages };
-        linker.load_exe(&mut mem, path, &data, pe)?
+        linker.load_exe(path, &file, &data, pe)?
     };
 
     // 4. Set up Stack (Small 64KB stack for now)
@@ -812,6 +811,7 @@ pub fn on_process_exit(process: &Arc<Process>) {
 
 /// Unmap every page the process owns and return the frames to the allocator.
 pub fn release_process_memory(process: &Arc<Process>) {
+    crate::nt_demand::release_active();
     let pages: alloc::vec::Vec<u64> = {
         let mut owned = match process.mapped_pages.try_lock() {
             Some(g) => g,

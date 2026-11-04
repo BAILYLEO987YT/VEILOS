@@ -118,6 +118,39 @@ fn open(name: &[u16], access: u32, disposition: u32, options: u32) -> Result<(Ha
     })
 }
 
+/// FILE_RENAME_INFORMATION on an open handle: `to` as a DOS path.
+pub fn rename_handle(h: Handle, to: &[u16], replace: bool) -> NtStatus {
+    let full = full_path(to);
+    let mut nt = WBuf::new();
+    nt.push_str("\\??\\");
+    nt.extend(full.as_slice());
+    // ReplaceIfExists at 0, RootDirectory at 8, FileNameLength at 16, FileName at 20.
+    let mut info = [0u8; 20 + 2 * 520];
+    let bytes = nt.len * 2;
+    if 20 + bytes > info.len() {
+        return status::OBJECT_NAME_INVALID;
+    }
+    info[0] = replace as u8;
+    info[16..20].copy_from_slice(&(bytes as u32).to_le_bytes());
+    for (i, u) in nt.as_slice().iter().enumerate() {
+        info[20 + i * 2..22 + i * 2].copy_from_slice(&u.to_le_bytes());
+    }
+    let mut iosb = IoStatusBlock::default();
+    unsafe { crate::NtSetInformationFile(h, &mut iosb, info.as_ptr(), (20 + bytes) as u32, nf::RENAME_INFORMATION) }
+}
+
+/// Move what's at `from` (a file or directory) to `to`.
+pub fn rename_path(from: &[u16], to: &[u16], replace: bool) -> NtStatus {
+    match open(from, nf::DELETE, nf::OPEN, 0) {
+        Ok((h, _)) => {
+            let s = rename_handle(h, to, replace);
+            unsafe { crate::NtClose(h) };
+            s
+        }
+        Err(s) => s,
+    }
+}
+
 /// `name` is the ASCII string `s`, ignoring case.
 fn is_ascii_name(name: &[u16], s: &str) -> bool {
     name.len() == s.len() && name.iter().zip(s.bytes()).all(|(&u, b)| u < 0x80 && (u as u8).eq_ignore_ascii_case(&b))
@@ -139,6 +172,9 @@ pub unsafe extern "system" fn CreateFileW(name: *const u16, access: u32, _share:
     let name = unsafe { wstr(name) };
     if let Some(which) = console_name(name) {
         return crate::GetStdHandle(which);
+    }
+    if crate::fiber::pipe_name(name) {
+        return crate::fiber::pipe_client(name.as_ptr());
     }
     let disposition = match creation {
         1 => nf::CREATE,       // CREATE_NEW

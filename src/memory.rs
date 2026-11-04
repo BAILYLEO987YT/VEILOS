@@ -182,7 +182,8 @@ pub fn user_ptr_ok(ptr: u64, len: usize) -> bool {
 
     let mut addr = ptr & !0xFFF;
     while addr < end {
-        if !page_is_user_accessible(addr, offset) { return false; }
+        // Not there yet may mean not read from its file yet.
+        if !page_is_user_accessible(addr, offset) && !crate::nt_demand::fault_in(addr) { return false; }
         addr += 4096;
     }
     true

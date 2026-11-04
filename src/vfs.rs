@@ -26,6 +26,36 @@ pub struct DirEntry {
     pub size: u64,
     pub cluster: u32, // Internal handle, filesystem-specific
     pub file_type: FileType,
+    /// Last write, as a FILETIME (0: not known).
+    pub mtime: i64,
+}
+
+/// What's at a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// An open file as its filesystem keeps it. A filesystem with real partial I/O
+/// (FAT) uses the location fields; the default methods keep the whole file in
+/// `whole` and write it back on `sync`.
+#[derive(Default)]
+pub struct FileState {
+    pub path: String,
+    pub size: u64,
+    pub mtime: i64,
+    /// First cluster, and the clusters in order once `chain_loaded`.
+    pub first: u32,
+    pub chain: Vec<u32>,
+    pub chain_loaded: bool,
+    /// Where the directory entry is.
+    pub entry_lba: u64,
+    pub entry_off: usize,
+    pub whole: Option<Vec<u8>>,
+    /// Written since the last `sync`.
+    pub dirty: bool,
 }
 
 // -----| traits |-----
@@ -56,6 +86,78 @@ pub trait FileSystem: Send + Sync {
         let _ = (device, path);
         Err(VfsError::WriteError)
     }
+    /// What's at `path`. The default looks through its parent's listing.
+    fn stat(&self, device: &dyn BlockDevice, path: &str) -> Option<Stat> {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Some(Stat { is_dir: true, size: 0, mtime: 0 });
+        }
+        let (dir, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        let listing = self.list_dir(device, if dir.is_empty() { "/" } else { dir }).ok()?;
+        listing.into_iter().find(|e| e.name.eq_ignore_ascii_case(name)).map(|e| Stat {
+            is_dir: e.file_type == FileType::Directory,
+            size: e.size,
+            mtime: e.mtime,
+        })
+    }
+    /// Open a file for `read_at` and `write_at`.
+    fn open_file(&self, device: &dyn BlockDevice, path: &str) -> Result<FileState, VfsError> {
+        let whole = self.read_file(device, path)?;
+        Ok(FileState { path: String::from(path), size: whole.len() as u64, whole: Some(whole), ..FileState::default() })
+    }
+    /// Read at `off`: the bytes read, 0 at or past the end.
+    fn read_at(&self, device: &dyn BlockDevice, f: &mut FileState, off: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+        let _ = device;
+        let whole = f.whole.as_ref().ok_or(VfsError::ReadError)?;
+        let start = (off as usize).min(whole.len());
+        let n = buf.len().min(whole.len() - start);
+        buf[..n].copy_from_slice(&whole[start..start + n]);
+        Ok(n)
+    }
+    /// Write at `off`, growing the file if needed. A gap reads as zeros.
+    fn write_at(&self, device: &dyn BlockDevice, f: &mut FileState, off: u64, data: &[u8]) -> Result<(), VfsError> {
+        let _ = device;
+        let whole = f.whole.as_mut().ok_or(VfsError::WriteError)?;
+        let end = off as usize + data.len();
+        if whole.len() < end {
+            whole.resize(end, 0);
+        }
+        whole[off as usize..end].copy_from_slice(data);
+        f.size = whole.len() as u64;
+        f.dirty = true;
+        Ok(())
+    }
+    fn set_len(&self, device: &dyn BlockDevice, f: &mut FileState, len: u64) -> Result<(), VfsError> {
+        let _ = device;
+        let whole = f.whole.as_mut().ok_or(VfsError::WriteError)?;
+        whole.resize(len as usize, 0);
+        f.size = len;
+        f.dirty = true;
+        Ok(())
+    }
+    /// Everything written so far on the disk.
+    fn sync(&self, device: &dyn BlockDevice, f: &mut FileState) -> Result<(), VfsError> {
+        if !f.dirty {
+            return Ok(());
+        }
+        f.dirty = false;
+        match &f.whole {
+            Some(whole) => self.write_file(device, &f.path, whole),
+            None => Ok(()),
+        }
+    }
+    /// Set the last-write time. Filesystems that can't keep it ignore this.
+    fn set_mtime(&self, device: &dyn BlockDevice, f: &mut FileState, mtime: i64) -> Result<(), VfsError> {
+        let _ = device;
+        f.mtime = mtime;
+        Ok(())
+    }
+    /// Move a file or directory; `to` must not exist. The default copies a file.
+    fn rename(&self, device: &dyn BlockDevice, from: &str, to: &str) -> Result<(), VfsError> {
+        let data = self.read_file(device, from)?;
+        self.write_file(device, to, &data)?;
+        self.delete_file(device, from)
+    }
 }
 
 // -----| vfs manager |-----
@@ -64,6 +166,44 @@ pub struct MountedFileSystem {
     pub path: String,
     pub fs: Box<dyn FileSystem>,
     pub device: Box<dyn BlockDevice>,
+}
+
+/// An open file. Reads and writes reach the disk without passing through a
+/// copy of the whole file, unless its filesystem works that way.
+pub struct VfsFile {
+    mount: Arc<MountedFileSystem>,
+    state: spin::Mutex<FileState>,
+}
+
+impl VfsFile {
+    pub fn len(&self) -> u64 {
+        self.state.lock().size
+    }
+    pub fn mtime(&self) -> i64 {
+        self.state.lock().mtime
+    }
+    pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+        self.mount.fs.read_at(&*self.mount.device, &mut self.state.lock(), off, buf)
+    }
+    pub fn write_at(&self, off: u64, data: &[u8]) -> Result<(), VfsError> {
+        self.mount.fs.write_at(&*self.mount.device, &mut self.state.lock(), off, data)
+    }
+    pub fn set_len(&self, len: u64) -> Result<(), VfsError> {
+        self.mount.fs.set_len(&*self.mount.device, &mut self.state.lock(), len)
+    }
+    pub fn sync(&self) -> Result<(), VfsError> {
+        self.mount.fs.sync(&*self.mount.device, &mut self.state.lock())
+    }
+    pub fn set_mtime(&self, mtime: i64) -> Result<(), VfsError> {
+        self.mount.fs.set_mtime(&*self.mount.device, &mut self.state.lock(), mtime)
+    }
+    /// The file now lives at the volume path of VFS path `path`: look it up
+    /// again, as its directory entry has moved.
+    pub fn moved(&self, path: &str) -> Result<(), VfsError> {
+        let rel = VfsManager::strip_mount_prefix(path, &self.mount.path);
+        *self.state.lock() = self.mount.fs.open_file(&*self.mount.device, rel)?;
+        Ok(())
+    }
 }
 
 /// The mount table.
@@ -149,7 +289,7 @@ impl VfsManager {
     pub fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
         let listed = self.resolve(path).map(|(m, rel)| m.fs.list_dir(&*m.device, &rel));
         let children = self.mount_children(path);
-        let as_dir = |name: String| DirEntry { name, size: 0, cluster: 0, file_type: FileType::Directory };
+        let as_dir = |name: String| DirEntry { name, size: 0, cluster: 0, file_type: FileType::Directory, mtime: 0 };
         match listed {
             Some(Ok(mut entries)) => {
                 for name in children {
@@ -181,6 +321,34 @@ impl VfsManager {
             }
         }
         names
+    }
+
+    /// What's at `path`; a mount point counts as a directory.
+    pub fn stat(&self, path: &str) -> Option<Stat> {
+        if let Some(s) = self.resolve(path).and_then(|(m, rel)| m.fs.stat(&*m.device, &rel)) {
+            return Some(s);
+        }
+        let trimmed = path.trim_end_matches('/');
+        let (dir, name) = trimmed.rsplit_once('/')?;
+        let dir = if dir.is_empty() { "/" } else { dir };
+        self.mount_children(dir).iter().any(|c| c.eq_ignore_ascii_case(name)).then_some(Stat { is_dir: true, size: 0, mtime: 0 })
+    }
+
+    pub fn open(&self, path: &str) -> Result<VfsFile, VfsError> {
+        let (mount, rel) = self.resolve(path).ok_or(VfsError::FileNotFound)?;
+        let state = mount.fs.open_file(&*mount.device, &rel)?;
+        Ok(VfsFile { mount, state: spin::Mutex::new(state) })
+    }
+
+    /// Move a file or directory within one volume; `to` must not exist.
+    /// GenericError means the two paths are on different volumes.
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
+        let (m, f) = self.resolve(from).ok_or(VfsError::FileNotFound)?;
+        let (n, t) = self.resolve(to).ok_or(VfsError::FileNotFound)?;
+        if !Arc::ptr_eq(&m, &n) {
+            return Err(VfsError::GenericError);
+        }
+        m.fs.rename(&*m.device, &f, &t)
     }
 
     /// Create or overwrite a file at `path`. Routes to the mounted filesystem

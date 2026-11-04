@@ -146,6 +146,14 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::VEIL_CLIP_SET => crate::nt_user::clip_set(proc.pid as u32, a0, a1),
         sys::VEIL_CLIP_GET => crate::nt_user::clip_get(proc.pid as u32, a0, a1, a2),
         sys::VEIL_REG => crate::nt_registry::call(proc.pid as u32, a0),
+        sys::VEIL_MAP_VIEW => map_view(&proc, a0, a1, a2, a3),
+        sys::VEIL_NAME_OBJECT => crate::nt_ipc::name_object(&proc, a0, a1, a2),
+        sys::VEIL_OPEN_NAMED => crate::nt_ipc::open_named(&proc, a0, a1, a2),
+        sys::VEIL_WAIT_ADDRESS => crate::nt_ipc::wait_address(a0, a1, a2, a3),
+        sys::VEIL_WAKE_ADDRESS => crate::nt_ipc::wake_address(a0),
+        sys::VEIL_PIPE => crate::nt_ipc::pipe_call(&proc, a0, a1, a2, a3),
+        sys::VEIL_MUTEX => crate::nt_ipc::mutex_call(&proc, a0, a1, a2),
+        sys::VEIL_UNMAP_VIEW => unmap_view(&proc, a0),
         sys::VEIL_LOAD_DLL => load_dll(&proc, a0, a1, a2, a3),
         sys::VEIL_GET_PROC_ADDRESS => get_proc_address(&proc, a0, a1, a2),
         _ => status::NOT_IMPLEMENTED,
@@ -213,6 +221,11 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
     match object(proc, handle) {
         Some(KernelObjectRef::File(f)) if writing => crate::nt_file::write(&f, iosb, buffer, length, offset),
         Some(KernelObjectRef::File(f)) => crate::nt_file::read(&f, iosb, buffer, length, offset),
+        Some(KernelObjectRef::Duplex(end)) => {
+            let (s, n) = end.io(buffer, length, writing);
+            unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: s as u32 as u64, information: n as u64 } };
+            s
+        }
         Some(KernelObjectRef::Pipe(end)) => {
             let (s, n) = crate::nt_process::pipe_io(&end, buffer, length, writing);
             unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: s as u32 as u64, information: n as u64 } };
@@ -345,12 +358,42 @@ fn free_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64, free_type: u64)
 
 /// NtProtectVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
 /// NewProtect, OldProtect*).
+/// VEIL_MAP_VIEW(file, offset, size, flags | out*): flags on the stack.
+fn map_view(proc: &Process, file: u64, offset: u64, size: u64, out: u64) -> NtStatus {
+    let flags = stack(4).unwrap_or(0);
+    if !ptr_ok(out, 8) || size == 0 || offset & 0xFFF != 0 {
+        return if ptr_ok(out, 8) { status::INVALID_PARAMETER } else { status::ACCESS_VIOLATION };
+    }
+    let shared = match proc.handles.lock().get_ref(file as u32) {
+        Some(KernelObjectRef::File(f)) => f.shared(),
+        _ => None,
+    };
+    let Some(shared) = shared else { return status::INVALID_HANDLE };
+    let Some(base) = proc.vad.lock().reserve_view(size as usize) else { return status::NO_MEMORY };
+    crate::nt_demand::add_view(base, size, shared, offset, flags & 1 != 0, flags & 2 != 0);
+    unsafe { *(out as *mut u64) = base };
+    status::SUCCESS
+}
+
+/// VEIL_UNMAP_VIEW(addr): not one of these views if it fails.
+fn unmap_view(proc: &Process, addr: u64) -> NtStatus {
+    match crate::nt_demand::remove_view(addr) {
+        Some((base, _)) => {
+            proc.vad.lock().forget(base);
+            status::SUCCESS
+        }
+        None => status::INVALID_PARAMETER,
+    }
+}
+
 fn protect_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64, new: u64) -> NtStatus {
     if h != CURRENT_PROCESS {
         return status::INVALID_HANDLE;
     }
     let old_ptr = stack(4).unwrap_or(0);
     let (Some(base), Some(size)) = (read_u64(base_ptr), read_u64(size_ptr)) else { return status::ACCESS_VIOLATION };
+    // Pages not read from their file yet would lose the new protection.
+    crate::nt_demand::fault_range(base, size);
     match proc.vad.lock().virtual_protect(base, size as usize, new as u32) {
         Ok(old) => {
             if ptr_ok(old_ptr, 4) {

@@ -20,6 +20,7 @@ mod com;
 mod env;
 mod legacy;
 mod exception;
+mod fiber;
 mod file;
 mod locale;
 mod mapping;
@@ -51,6 +52,14 @@ const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
     pub(crate) fn VeilReg(call: *mut nt_abi::reg::RegCall) -> i32;
+    pub(crate) fn VeilNameObject(h: Handle, name: *const u16, kind: u64) -> i32;
+    pub(crate) fn VeilOpenNamed(name: *const u16, kind: u64, out: *mut Handle) -> i32;
+    pub(crate) fn VeilWaitAddress(addr: u64, compare: u64, size: u64, ms: u64) -> i32;
+    pub(crate) fn VeilWakeAddress(addr: u64) -> i32;
+    pub(crate) fn VeilPipe(op: u64, a: u64, b: u64, c: u64) -> i32;
+    pub(crate) fn VeilMutex(op: u64, a: u64, b: u64) -> i32;
+    pub(crate) fn VeilMapView(file: Handle, offset: u64, size: u64, out: *mut u64, flags: u64) -> i32;
+    pub(crate) fn VeilUnmapView(addr: u64) -> i32;
     pub(crate) fn NtTerminateProcess(process: Handle, status: NtStatus) -> NtStatus;
     pub(crate) fn NtWriteFile(file: Handle, event: Handle, apc: usize, apc_context: usize, iosb: *mut IoStatusBlock,
                               buffer: *const u8, length: u32, offset: *const i64, key: *const u32) -> NtStatus;
@@ -181,11 +190,10 @@ pub unsafe extern "system" fn WriteFile(file: Handle, buffer: *const u8, length:
     if !written.is_null() {
         unsafe { *written = 0 };
     }
-    if overlapped != 0 {
-        return fail(status::NOT_IMPLEMENTED); // overlapped I/O comes later
-    }
     let mut iosb = IoStatusBlock::default();
-    let s = unsafe { NtWriteFile(file, 0, 0, 0, &mut iosb, buffer, length, core::ptr::null(), core::ptr::null()) };
+    let offset = overlapped_offset(overlapped);
+    let s = unsafe { NtWriteFile(file, 0, 0, 0, &mut iosb, buffer, length, offset_ptr(&offset), core::ptr::null()) };
+    complete_overlapped(overlapped, s, iosb.information);
     if !status::is_success(s) {
         return fail(s);
     }
@@ -193,6 +201,93 @@ pub unsafe extern "system" fn WriteFile(file: Handle, buffer: *const u8, length:
         unsafe { *written = iosb.information as u32 };
     }
     1
+}
+
+// -----| named objects |-----
+
+pub(crate) const KIND_EVENT: u64 = 1;
+pub(crate) const KIND_MUTEX: u64 = 2;
+pub(crate) const KIND_SEMAPHORE: u64 = 3;
+
+/// Creating with a name that's taken: the object there (with
+/// ERROR_ALREADY_EXISTS), or a failure if another kind holds the name.
+pub(crate) fn named_existing(name: *const u16, kind: u64) -> Option<Handle> {
+    if name.is_null() {
+        return None;
+    }
+    let mut h: Handle = 0;
+    match unsafe { VeilOpenNamed(name, kind, &mut h) } {
+        0 => {
+            SetLastError(183);
+            Some(h)
+        }
+        s if s == status::OBJECT_NAME_NOT_FOUND => None,
+        _ => {
+            SetLastError(6); // ERROR_INVALID_HANDLE
+            Some(0)
+        }
+    }
+}
+
+pub(crate) fn name_new(h: Handle, name: *const u16, kind: u64) {
+    if !name.is_null() {
+        unsafe { VeilNameObject(h, name, kind) };
+    }
+    SetLastError(0);
+}
+
+pub(crate) fn open_named(name: *const u16, kind: u64) -> Handle {
+    let mut h: Handle = 0;
+    match unsafe { VeilOpenNamed(name, kind, &mut h) } {
+        0 => h,
+        s if s == status::OBJECT_NAME_NOT_FOUND => {
+            SetLastError(2);
+            0
+        }
+        _ => {
+            SetLastError(6);
+            0
+        }
+    }
+}
+
+/// OVERLAPPED: every operation finishes before the call returns, so one only
+/// gives the offset and receives the result.
+fn overlapped_offset(overlapped: usize) -> Option<i64> {
+    if overlapped == 0 {
+        return None;
+    }
+    let p = overlapped as *const u32;
+    Some(unsafe { (*p.add(5) as i64) << 32 | *p.add(4) as i64 })
+}
+
+fn offset_ptr(offset: &Option<i64>) -> *const i64 {
+    offset.as_ref().map_or(core::ptr::null(), |o| o)
+}
+
+fn complete_overlapped(overlapped: usize, s: NtStatus, information: u64) {
+    if overlapped == 0 {
+        return;
+    }
+    let p = overlapped as *mut u64;
+    unsafe {
+        *p = s as u32 as u64;
+        *p.add(1) = information;
+        // The low bit of hEvent only asks not to queue a completion.
+        let event = *p.add(3) & !1;
+        if event != 0 {
+            crate::sync::SetEvent(event);
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn GetOverlappedResult(_file: Handle, overlapped: *const u64, done: *mut u32, _wait: Bool) -> Bool {
+    let s = unsafe { *overlapped } as u32 as NtStatus;
+    if !done.is_null() {
+        unsafe { *done = *overlapped.add(1) as u32 };
+    }
+    check(s)
 }
 
 /// Files: from the handle's position. Consoles: waits for a whole typed line
@@ -203,13 +298,13 @@ pub unsafe extern "system" fn ReadFile(file: Handle, buffer: *mut u8, length: u3
     if !read.is_null() {
         unsafe { *read = 0 };
     }
-    if overlapped != 0 {
-        return fail(status::NOT_IMPLEMENTED); // overlapped I/O comes later
-    }
     let mut iosb = IoStatusBlock::default();
-    let s = unsafe { NtReadFile(file, 0, 0, 0, &mut iosb, buffer, length, core::ptr::null(), core::ptr::null()) };
+    let offset = overlapped_offset(overlapped);
+    let s = unsafe { NtReadFile(file, 0, 0, 0, &mut iosb, buffer, length, offset_ptr(&offset), core::ptr::null()) };
+    complete_overlapped(overlapped, s, iosb.information);
     if s == status::END_OF_FILE {
-        return 1;
+        // With an OVERLAPPED the end of a file is an error; without, no bytes.
+        return if overlapped != 0 { fail(s) } else { 1 };
     }
     if !status::is_success(s) {
         return fail(s);

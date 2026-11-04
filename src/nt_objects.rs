@@ -122,6 +122,12 @@ impl MutexObject {
         }
     }
 
+    /// Who a Windows mutex belongs to: the running thread, not the process
+    /// (`owner_pid` then holds this).
+    pub fn current_owner() -> u32 {
+        (crate::kthread::current_user() as usize >> 4) as u32 | 1
+    }
+
     /// Attempt a non-blocking acquisition for the given process.
     /// Returns true if the lock was acquired (or was already owned by this pid).
     pub fn try_acquire(&self, pid: u32) -> bool {
@@ -299,6 +305,7 @@ pub enum KernelObjectRef {
     Process(Arc<crate::process::Process>),
     Thread(Arc<crate::nt_process::ThreadObj>),
     Pipe(Arc<crate::nt_process::PipeEnd>),
+    Duplex(Arc<crate::nt_ipc::DuplexEnd>),
 }
 
 impl KernelObjectRef {
@@ -313,6 +320,7 @@ impl KernelObjectRef {
             Self::Process(_)   => ObjectType::Process,
             Self::Thread(_)    => ObjectType::Thread,
             Self::Pipe(_)      => ObjectType::File,
+            Self::Duplex(_)    => ObjectType::File,
         }
     }
 }

@@ -208,6 +208,19 @@ impl VadSpace {
         self.entries.sort_by_key(|e| e.base);
     }
 
+    /// A free stretch for a file view (nt_demand.rs), kept out of VirtualAlloc's way.
+    pub fn reserve_view(&mut self, size: usize) -> Option<u64> {
+        let size = align_up(size, 0x1000);
+        let base = self.find_free_region(0, size)?;
+        self.record_image(base, size);
+        Some(base)
+    }
+
+    /// Forget the region at `base`, whose pages are already gone.
+    pub fn forget(&mut self, base: u64) {
+        self.entries.retain(|e| e.base != base);
+    }
+
     // ----- Address selection -----
 
     /// Find a free region of at least `size` bytes.

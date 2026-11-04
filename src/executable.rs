@@ -162,6 +162,10 @@ pub struct PeFile {
     pub export_dir_range: Option<(u32, u32)>,
     /// Base RVA of the relocation directory and its size, if present.
     pub reloc_dir: Option<(u32, u32)>,
+    /// The import and export directories' RVAs (0: none). Parsing just the
+    /// headers leaves `imports` and `exports` empty; these find them in the image.
+    pub import_dir: u32,
+    pub export_dir: u32,
 }
 
 impl PeFile {
@@ -400,6 +404,8 @@ impl PeFile {
             exports,
             export_dir_range,
             reloc_dir,
+            import_dir: import_dir_rva,
+            export_dir: export_dir_rva,
         })
     }
 

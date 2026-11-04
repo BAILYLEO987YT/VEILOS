@@ -241,10 +241,14 @@ pub unsafe extern "system" fn InitOnceInitialize(once: *mut u64) {
 // -----| events and waits |-----
 
 #[no_mangle]
-pub extern "system" fn CreateEventW(_security: usize, manual_reset: Bool, initial: Bool, _name: *const u16) -> Handle {
+pub extern "system" fn CreateEventW(_security: usize, manual_reset: Bool, initial: Bool, name: *const u16) -> Handle {
+    if let Some(found) = crate::named_existing(name, crate::KIND_EVENT) {
+        return found;
+    }
     let mut h: Handle = 0;
     let s = unsafe { crate::NtCreateEvent(&mut h, EVENT_ALL_ACCESS, core::ptr::null(), if manual_reset != 0 { 0 } else { 1 }, (initial != 0) as u8) };
     if status::is_success(s) {
+        crate::name_new(h, name, crate::KIND_EVENT);
         h
     } else {
         fail(s);
@@ -253,19 +257,34 @@ pub extern "system" fn CreateEventW(_security: usize, manual_reset: Bool, initia
 }
 
 #[no_mangle]
-pub extern "system" fn CreateEventA(security: usize, manual_reset: Bool, initial: Bool, _name: *const u8) -> Handle {
-    CreateEventW(security, manual_reset, initial, core::ptr::null())
+pub unsafe extern "system" fn CreateEventA(security: usize, manual_reset: Bool, initial: Bool, name: *const u8) -> Handle {
+    if name.is_null() {
+        return CreateEventW(security, manual_reset, initial, core::ptr::null());
+    }
+    let w = unsafe { crate::util::widen(name) };
+    CreateEventW(security, manual_reset, initial, w.as_ptr())
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn OpenEventW(_access: u32, _inherit: Bool, name: *const u16) -> Handle {
+    crate::open_named(name, crate::KIND_EVENT)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn OpenEventA(access: u32, inherit: Bool, name: *const u8) -> Handle {
+    let w = unsafe { crate::util::widen(name) };
+    unsafe { OpenEventW(access, inherit, w.as_ptr()) }
 }
 
 /// Flags: CREATE_EVENT_MANUAL_RESET (1), CREATE_EVENT_INITIAL_SET (2).
 #[no_mangle]
-pub extern "system" fn CreateEventExW(security: usize, _name: *const u16, flags: u32, _access: u32) -> Handle {
-    CreateEventW(security, (flags & 1 != 0) as Bool, (flags & 2 != 0) as Bool, core::ptr::null())
+pub extern "system" fn CreateEventExW(security: usize, name: *const u16, flags: u32, _access: u32) -> Handle {
+    CreateEventW(security, (flags & 1 != 0) as Bool, (flags & 2 != 0) as Bool, name)
 }
 
 #[no_mangle]
-pub extern "system" fn CreateEventExA(security: usize, _name: *const u8, flags: u32, access: u32) -> Handle {
-    CreateEventExW(security, core::ptr::null(), flags, access)
+pub unsafe extern "system" fn CreateEventExA(security: usize, name: *const u8, flags: u32, _access: u32) -> Handle {
+    unsafe { CreateEventA(security, (flags & 1 != 0) as Bool, (flags & 2 != 0) as Bool, name) }
 }
 
 #[no_mangle]

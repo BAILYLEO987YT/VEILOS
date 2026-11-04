@@ -23,13 +23,17 @@ unsafe extern "system" {
 // -----| semaphores |-----
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateSemaphoreExW(_sa: usize, initial: i32, max: i32, _name: *const u16, _flags: u32, access: u32) -> Handle {
+pub unsafe extern "system" fn CreateSemaphoreExW(_sa: usize, initial: i32, max: i32, name: *const u16, _flags: u32, access: u32) -> Handle {
+    if let Some(found) = crate::named_existing(name, crate::KIND_SEMAPHORE) {
+        return found;
+    }
     let mut h: Handle = 0;
     let s = unsafe { NtCreateSemaphore(&mut h, access | 0x1F0003, 0, initial, max) };
     if s != 0 {
         crate::fail(s);
         return 0;
     }
+    crate::name_new(h, name, crate::KIND_SEMAPHORE);
     h
 }
 
@@ -39,8 +43,23 @@ pub unsafe extern "system" fn CreateSemaphoreW(sa: usize, initial: i32, max: i32
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateSemaphoreA(sa: usize, initial: i32, max: i32, _name: *const u8) -> Handle {
-    unsafe { CreateSemaphoreExW(sa, initial, max, core::ptr::null(), 0, 0) }
+pub unsafe extern "system" fn CreateSemaphoreA(sa: usize, initial: i32, max: i32, name: *const u8) -> Handle {
+    if name.is_null() {
+        return unsafe { CreateSemaphoreExW(sa, initial, max, core::ptr::null(), 0, 0) };
+    }
+    let w = unsafe { crate::util::widen(name) };
+    unsafe { CreateSemaphoreExW(sa, initial, max, w.as_ptr(), 0, 0) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn OpenSemaphoreW(_access: u32, _inherit: Bool, name: *const u16) -> Handle {
+    crate::open_named(name, crate::KIND_SEMAPHORE)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn OpenSemaphoreA(access: u32, inherit: Bool, name: *const u8) -> Handle {
+    let w = unsafe { crate::util::widen(name) };
+    unsafe { OpenSemaphoreW(access, inherit, w.as_ptr()) }
 }
 
 #[no_mangle]

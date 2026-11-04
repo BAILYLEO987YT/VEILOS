@@ -1,0 +1,60 @@
+--- named objects
+event: 1 err 0
+again: 1 err 183
+open: 1
+set through one, wait on others: 0 0
+reset through another: 258
+after the last close: 0 err 2
+never made: 0 err 2
+semaphore: 1 err 0
+open: 1, takes: 258 0 0
+previous 0, now free: 0
+event over a semaphore's name: 0 err 6
+open as a mutex: 0 err 6
+mutex: 1 err 0
+again: 1 err 183
+take: 0, recursively: 0
+release: 1 1
+once more, not owned: 0 err 288
+--- WaitOnAddress
+same value, timed out: 0 err 1460
+different value, at once: 1
+two bytes: 0 err 1460
+still waiting: 0
+joined: 0, woken 0
+single: 0
+--- fibers
+a fiber yet: 0
+converted: 1, is one: 1, data 0000000000001234
+twice: 0 err 1280
+back in main, current is main: 1
+trail: 1 1 1 2 3 3
+deep calls 1000, caught fault 77
+to thread: 1, a fiber now: 1
+again: 0 err 1280
+--- named pipes
+no server: 0 err 2
+wait for it: 0 err 2
+server: 1, type 3
+free now: 1
+connect: 1 err 0
+server got 12: hello server
+waiting to be read: 5
+echoed 5: reply
+client exit 0
+after it hung up: 0 err 109
+disconnect: 1
+disconnected: 0 err 231
+connected first: 0 err 535
+busy: 0 err 231
+server gone: 0 err 2
+--- nameless pipes
+exports: 1 1
+folder: 00000000
+server: 00000000
+client: 00000000
+server read 9: to server
+client read 9: to client
+client gone: 0 err 109
+done
+exit 6

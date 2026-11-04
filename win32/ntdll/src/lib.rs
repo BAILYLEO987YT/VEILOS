@@ -69,6 +69,14 @@ syscall_stubs! {
     VeilClipSet, ZwVeilClipSet => sys::VEIL_CLIP_SET;
     VeilClipGet, ZwVeilClipGet => sys::VEIL_CLIP_GET;
     VeilReg, ZwVeilReg => sys::VEIL_REG;
+    VeilMapView, ZwVeilMapView => sys::VEIL_MAP_VIEW;
+    VeilNameObject, ZwVeilNameObject => sys::VEIL_NAME_OBJECT;
+    VeilOpenNamed, ZwVeilOpenNamed => sys::VEIL_OPEN_NAMED;
+    VeilWaitAddress, ZwVeilWaitAddress => sys::VEIL_WAIT_ADDRESS;
+    VeilWakeAddress, ZwVeilWakeAddress => sys::VEIL_WAKE_ADDRESS;
+    VeilPipe, ZwVeilPipe => sys::VEIL_PIPE;
+    VeilMutex, ZwVeilMutex => sys::VEIL_MUTEX;
+    VeilUnmapView, ZwVeilUnmapView => sys::VEIL_UNMAP_VIEW;
     VeilUserCreateWindow, ZwVeilUserCreateWindow => sys::VEIL_USER_CREATE_WINDOW;
     VeilUserDestroyWindow, ZwVeilUserDestroyWindow => sys::VEIL_USER_DESTROY_WINDOW;
     VeilUserShowWindow, ZwVeilUserShowWindow => sys::VEIL_USER_SHOW_WINDOW;
@@ -143,6 +151,13 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
     match s {
         status::SUCCESS => 0,                   // ERROR_SUCCESS
         status::TIMEOUT => 258,                 // WAIT_TIMEOUT
+        status::DISK_FULL => 112,               // ERROR_DISK_FULL
+        s if s == 0xC000_00D4u32 as NtStatus => 17,  // STATUS_NOT_SAME_DEVICE
+        s if s == 0xC000_00ACu32 as NtStatus => 231, // STATUS_PIPE_NOT_AVAILABLE: ERROR_PIPE_BUSY
+        s if s == 0xC000_00B3u32 as NtStatus => 536, // STATUS_PIPE_LISTENING
+        s if s == 0xC000_00B2u32 as NtStatus => 535, // STATUS_PIPE_CONNECTED
+        s if s == 0xC000_00B5u32 as NtStatus => 121, // STATUS_IO_TIMEOUT: ERROR_SEM_TIMEOUT
+        s if s == 0xC000_0046u32 as NtStatus => 288, // STATUS_MUTANT_NOT_OWNED: ERROR_NOT_OWNER
         status::NO_MORE_FILES => 18,            // ERROR_NO_MORE_FILES
         status::NOT_IMPLEMENTED => 1,           // ERROR_INVALID_FUNCTION
         status::INVALID_INFO_CLASS => 87,       // ERROR_INVALID_PARAMETER

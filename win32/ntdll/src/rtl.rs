@@ -309,6 +309,10 @@ type CreateFile = unsafe extern "system" fn(*mut u64, u32, *const u8, *mut u8, *
 /// NtOpenFile: NtCreateFile with FILE_OPEN.
 #[no_mangle]
 pub unsafe extern "system" fn NtOpenFile(handle: *mut u64, access: u32, attrs: *const u8, iosb: *mut u8, share: u32, options: u32) -> NtStatus {
+    // Opening the named-pipe folder, or a nameless pipe through its server.
+    if let Some(s) = unsafe { open_pipe(handle, attrs) } {
+        return s;
+    }
     let create: CreateFile = unsafe { core::mem::transmute(crate::NtCreateFile as *const ()) };
     unsafe { create(handle, access, attrs, iosb, core::ptr::null(), 0, share, 1, options, core::ptr::null(), 0) }
 }
@@ -316,6 +320,63 @@ pub unsafe extern "system" fn NtOpenFile(handle: *mut u64, access: u32, attrs: *
 #[no_mangle]
 pub unsafe extern "system" fn ZwOpenFile(handle: *mut u64, access: u32, attrs: *const u8, iosb: *mut u8, share: u32, options: u32) -> NtStatus {
     unsafe { NtOpenFile(handle, access, attrs, iosb, share, options) }
+}
+
+/// OBJECT_ATTRIBUTES: Length, RootDirectory at 8, ObjectName at 16.
+unsafe fn pipe_attrs(attrs: *const u8) -> (u64, &'static [u16]) {
+    unsafe {
+        let root = core::ptr::read_unaligned(attrs.add(8) as *const u64);
+        let name = core::ptr::read_unaligned(attrs.add(16) as *const *const u8);
+        if name.is_null() {
+            return (root, &[]);
+        }
+        let len = core::ptr::read_unaligned(name as *const u16) as usize / 2;
+        let buf = core::ptr::read_unaligned(name.add(8) as *const *const u16);
+        (root, if len == 0 { &[] } else { core::slice::from_raw_parts(buf, len) })
+    }
+}
+
+fn is_pipe_folder(name: &[u16]) -> bool {
+    const FOLDER: &[u8] = b"\\Device\\NamedPipe\\";
+    name.len() == FOLDER.len() && name.iter().zip(FOLDER).all(|(&u, &b)| u < 0x80 && (u as u8).eq_ignore_ascii_case(&b))
+}
+
+fn veil_pipe() -> unsafe extern "system" fn(u64, u64, u64, u64) -> NtStatus {
+    unsafe { core::mem::transmute(crate::VeilPipe as *const ()) }
+}
+
+unsafe fn open_pipe(handle: *mut u64, attrs: *const u8) -> Option<NtStatus> {
+    let (root, name) = unsafe { pipe_attrs(attrs) };
+    if is_pipe_folder(name) {
+        // Nothing to open: an event stands for the folder.
+        type CreateEvent = unsafe extern "system" fn(*mut u64, u32, *const u8, u32, u8) -> NtStatus;
+        let create: CreateEvent = unsafe { core::mem::transmute(crate::NtCreateEvent as *const ()) };
+        return Some(unsafe { create(handle, 0x1F0003, core::ptr::null(), 0, 0) });
+    }
+    if root != 0 && name.is_empty() {
+        let s = unsafe { veil_pipe()(6, root, handle as u64, 0) };
+        // INVALID_HANDLE: the root wasn't a pipe, so it's an ordinary open.
+        if s != nt_abi::status::INVALID_HANDLE {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// A nameless pipe, reached through this handle (NtOpenFile with it as root),
+/// as Rust's standard library makes its pipes. Names under the folder aren't
+/// offered here: CreateNamedPipe is how those are made.
+#[no_mangle]
+pub unsafe extern "system" fn NtCreateNamedPipeFile(handle: *mut u64, _access: u32, attrs: *const u8, iosb: *mut u64, _share: u32, _disposition: u32, _options: u32, _pipe_type: u32, _read_mode: u32, _completion: u32, _max: u32, inbound: u32, outbound: u32, _timeout: *const i64) -> NtStatus {
+    let _ = attrs;
+    let s = unsafe { veil_pipe()(0, 0, handle as u64, inbound.max(outbound) as u64) };
+    if s == 0 && !iosb.is_null() {
+        unsafe {
+            *iosb = 0;
+            *iosb.add(1) = 2; // FILE_CREATED
+        }
+    }
+    s
 }
 
 const STATUS_NO_TOKEN: NtStatus = 0xC000_007Cu32 as i32;

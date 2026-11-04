@@ -761,6 +761,7 @@ impl FileSystem for NtfsFileSystem {
                 size,
                 cluster:   entry.file_ref_num as u32, // lower 32 bits
                 file_type: if entry.is_dir { FileType::Directory } else { FileType::File },
+                mtime:     0,
             });
         }
 
