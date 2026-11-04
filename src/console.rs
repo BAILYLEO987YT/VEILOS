@@ -83,6 +83,7 @@ impl Console {
         let text = match text.rfind('\x0c') {
             Some(i) => {
                 term.history.clear();
+                term.scroll_anchor = None;
                 *self.line_open.lock() = false;
                 &text[i + 1..]
             }

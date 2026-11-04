@@ -2386,6 +2386,10 @@ pub fn dispatch_pending_click(click: PendingClick) {
         return;
     }
 
+    if crate::apps::scroll_bar_click(window_id, x, y) {
+        return;
+    }
+
     // Each app type is pooled — look up the owning slot and dispatch there.
     // No singleton window_id comparisons; every instance is independent.
     if let Some(idx) = crate::apps::fm_slot_for_window(window_id) {
@@ -2435,6 +2439,7 @@ pub fn poll_input() {
     };
     // Windows programs' windows follow the pointer themselves.
     crate::nt_user::mouse_tick(mx as i32, my as i32, mb, rmb, wheel);
+    crate::apps::scroll_pointer(mx as i32, my as i32, mb, wheel);
 
     let last_mb = LAST_MB.load(Ordering::Relaxed);
     let last_rmb = LAST_RMB.load(Ordering::Relaxed);

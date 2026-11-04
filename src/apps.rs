@@ -22,6 +22,164 @@ use crate::gui_toolkit::{Renderer, Rect, ACTIVE_THEME};
 // -----| Text Editor |-----
 // =====================================================================
 
+// -----| Scrolling |-----
+
+const BAR_W: i32 = 12;
+const MIN_THUMB: i32 = 20;
+const WHEEL_ROWS: i32 = 3;
+
+/// The part of a window that scrolls, and the track beside it.
+#[derive(Clone, Copy)]
+struct ScrollArea {
+    right: i32,
+    y: i32,
+    h: u32,
+    /// Whole rows that fit, at least one.
+    rows: usize,
+}
+
+/// An app whose content is longer than its window: the wheel, and a scroll bar
+/// that can be dragged and clicked. Scrolling is in whole rows; `top` is the
+/// first on show, kept in range there as the window can grow and the content
+/// can shrink after scrolling.
+trait Scrollable {
+    fn window_id(&self) -> u32;
+    fn area(&self, win: Rect) -> ScrollArea;
+    fn total(&self) -> usize;
+    fn raw_top(&self) -> usize;
+    fn set_top(&mut self, top: usize, max: usize);
+    /// The thumb being dragged: where in it the pointer took hold.
+    fn grab(&self) -> Option<i32>;
+    fn set_grab(&mut self, grab: Option<i32>);
+
+    fn max_top(&self, rows: usize) -> usize {
+        self.total().saturating_sub(rows)
+    }
+    fn top(&self, rows: usize) -> usize {
+        self.raw_top().min(self.max_top(rows))
+    }
+    /// The thumb's top and height, if the content needs a bar.
+    fn thumb(&self, a: ScrollArea) -> Option<(i32, i32)> {
+        let total = self.total();
+        let max = self.max_top(a.rows);
+        if max == 0 {
+            return None;
+        }
+        let track = a.h as i32;
+        let h = (track as i64 * a.rows as i64 / total as i64).max(MIN_THUMB as i64).min(track as i64) as i32;
+        Some((a.y + ((track - h) as i64 * self.top(a.rows) as i64 / max as i64) as i32, h))
+    }
+    /// Positive goes towards the end.
+    fn scroll_rows(&mut self, by: i32, rows: usize) {
+        let max = self.max_top(rows);
+        let to = (self.top(rows) as i64 + by as i64).clamp(0, max as i64);
+        self.set_top(to as usize, max);
+    }
+    /// The thumb's top moved to `y`.
+    fn drag_thumb(&mut self, a: ScrollArea, y: i32) {
+        let max = self.max_top(a.rows);
+        let Some((_, h)) = self.thumb(a) else { return };
+        let span = (a.h as i32 - h).max(1) as i64;
+        let at = ((y - a.y) as i64).clamp(0, span);
+        self.set_top(((at * max as i64 + span / 2) / span) as usize, max);
+    }
+    /// A click at (x, y): true if the scroll bar took it, the thumb to drag or
+    /// the track to go a page.
+    fn bar_click(&mut self, a: ScrollArea, x: i32, y: i32) -> bool {
+        let Some((thumb_y, thumb_h)) = self.thumb(a) else { return false };
+        if x < a.right - BAR_W || y < a.y || y >= a.y + a.h as i32 {
+            return false;
+        }
+        if y >= thumb_y && y < thumb_y + thumb_h {
+            self.set_grab(Some(y - thumb_y));
+        } else {
+            let page = a.rows as i32;
+            self.scroll_rows(if y < thumb_y { -page } else { page }, a.rows);
+        }
+        true
+    }
+    fn draw_bar(&self, r: &Renderer, a: ScrollArea, track: Color, thumb: Color, held: Color) {
+        let Some((y, h)) = self.thumb(a) else { return };
+        let x = a.right - BAR_W;
+        r.fill_rect(Rect::new(x, a.y, BAR_W as u32, a.h), track);
+        r.fill_rect(Rect::new(x + 2, y, BAR_W as u32 - 4, h as u32), if self.grab().is_some() { held } else { thumb });
+    }
+}
+
+fn wheel_in<T: Scrollable>(pool: &[Mutex<T>], id: u32, rect: Rect, by: i32) -> bool {
+    for slot in pool {
+        if let Some(mut app) = slot.try_lock() {
+            if app.window_id() == id {
+                let rows = app.area(rect).rows;
+                app.scroll_rows(by, rows);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn drag_in<T: Scrollable>(pool: &[Mutex<T>], y: i32, left: bool) {
+    for slot in pool {
+        let Some(mut app) = slot.try_lock() else { continue };
+        let Some(grab) = app.grab() else { continue };
+        if !left {
+            app.set_grab(None);
+            continue;
+        }
+        let id = app.window_id();
+        let rect = DESKTOP_WM.try_lock().and_then(|wm| wm.windows.iter().find(|w| w.id == id).map(|w| w.rect));
+        if let Some(rect) = rect {
+            let a = app.area(rect);
+            app.drag_thumb(a, y - grab);
+        }
+    }
+}
+
+fn click_in<T: Scrollable>(pool: &[Mutex<T>], id: u32, rect: Rect, x: i32, y: i32) -> bool {
+    for slot in pool {
+        if let Some(mut app) = slot.try_lock() {
+            if app.window_id() == id {
+                let a = app.area(rect);
+                return app.bar_click(a, x, y);
+            }
+        }
+    }
+    false
+}
+
+/// The wheel and scroll bar thumbs, from the input poll. May run in the timer
+/// interrupt: try_lock only, and nothing is held across the two kinds.
+pub fn scroll_pointer(x: i32, y: i32, left: bool, wheel: i32) {
+    if wheel != 0 {
+        let under = DESKTOP_WM.try_lock().and_then(|wm| {
+            let id = wm.content_at(x, y)?;
+            let rect = wm.windows.iter().find(|w| w.id == id)?.rect;
+            Some((id, rect))
+        });
+        if let Some((id, rect)) = under {
+            let by = wheel * WHEEL_ROWS;
+            let _ = wheel_in(&FILE_MANAGER_POOL, id, rect, by)
+                || wheel_in(&TEXT_EDITOR_POOL, id, rect, by)
+                || wheel_in(&TERMINAL_POOL, id, rect, by)
+                || wheel_in(&CLIPBOARD_VIEWER_POOL, id, rect, by);
+        }
+    }
+    drag_in(&FILE_MANAGER_POOL, y, left);
+    drag_in(&TEXT_EDITOR_POOL, y, left);
+    drag_in(&TERMINAL_POOL, y, left);
+    drag_in(&CLIPBOARD_VIEWER_POOL, y, left);
+}
+
+/// A click in a window's content: true if a scroll bar took it.
+pub fn scroll_bar_click(id: u32, x: i32, y: i32) -> bool {
+    let Some(rect) = DESKTOP_WM.try_lock().and_then(|wm| wm.windows.iter().find(|w| w.id == id).map(|w| w.rect)) else { return false };
+    click_in(&FILE_MANAGER_POOL, id, rect, x, y)
+        || click_in(&TEXT_EDITOR_POOL, id, rect, x, y)
+        || click_in(&TERMINAL_POOL, id, rect, x, y)
+        || click_in(&CLIPBOARD_VIEWER_POOL, id, rect, x, y)
+}
+
 pub struct TextEditorState {
     pub window_id: u32,
     pub path: String,
@@ -32,11 +190,28 @@ pub struct TextEditorState {
     pub selection_start: Option<usize>,
     /// Character index where the selection ends (None = no selection).
     pub selection_end: Option<usize>,
+    thumb_grab: Option<i32>,
+}
+
+const EDITOR_ROW_H: i32 = 16;
+const EDITOR_HEADER_H: u32 = 28;
+
+impl Scrollable for TextEditorState {
+    fn window_id(&self) -> u32 { self.window_id }
+    fn area(&self, win: Rect) -> ScrollArea {
+        let h = win.h.saturating_sub(38 + EDITOR_HEADER_H);
+        ScrollArea { right: win.x + win.w as i32 - 1, y: win.y + 36 + EDITOR_HEADER_H as i32, h, rows: ((h as i32 / EDITOR_ROW_H) as usize).max(1) }
+    }
+    fn total(&self) -> usize { self.content.bytes().filter(|&b| b == b'\n').count() + 1 }
+    fn raw_top(&self) -> usize { self.scroll_y }
+    fn set_top(&mut self, top: usize, _max: usize) { self.scroll_y = top; }
+    fn grab(&self) -> Option<i32> { self.thumb_grab }
+    fn set_grab(&mut self, grab: Option<i32>) { self.thumb_grab = grab; }
 }
 
 impl TextEditorState {
     pub const fn new_const() -> Self {
-        Self { window_id: 0, path: String::new(), content: String::new(), cursor_pos: 0, scroll_y: 0, selection_start: None, selection_end: None }
+        Self { window_id: 0, path: String::new(), content: String::new(), cursor_pos: 0, scroll_y: 0, selection_start: None, selection_end: None, thumb_grab: None }
     }
 
     pub fn paint(&self) {
@@ -74,10 +249,11 @@ impl TextEditorState {
         };
 
         // Content
-        let text_y = cy + 28;
-        let text_h = ch.saturating_sub(28);
-        let row_h = 16i32;
-        let max_rows = (text_h as i32 / row_h) - 1;
+        let area = self.area(win.rect);
+        let text_y = area.y;
+        let row_h = EDITOR_ROW_H;
+        let max_rows = area.rows as i32;
+        let top = self.top(area.rows) as i32;
 
         let mut row = 0;
         let mut col = 0;
@@ -89,8 +265,8 @@ impl TextEditorState {
             if c == '\n' { row += 1; col = 0; continue; }
             if c == '\r' { continue; }
             
-            if row >= self.scroll_y as i32 && row < self.scroll_y as i32 + max_rows {
-                let sy = text_y + (row - self.scroll_y as i32) * row_h;
+            if row >= top && row < top + max_rows {
+                let sy = text_y + (row - top) * row_h;
                 let sx = cx + 8 + col * 8;
 
                 // Draw selection highlight behind the character.
@@ -109,11 +285,12 @@ impl TextEditorState {
             cursor_r = row; cursor_c = col;
         }
 
-        if cursor_r >= self.scroll_y as i32 && cursor_r < self.scroll_y as i32 + max_rows {
-            let cy_pos = text_y + (cursor_r - self.scroll_y as i32) * row_h;
+        if cursor_r >= top && cursor_r < top + max_rows {
+            let cy_pos = text_y + (cursor_r - top) * row_h;
             let cx_pos = cx + 8 + cursor_c * 8;
             r.fill_rect(Rect::new(cx_pos, cy_pos, 2, 14), p.cursor);
         }
+        self.draw_bar(&r, area, p.surface, p.border, p.accent);
     }
 
     pub fn on_key(&mut self, ch: char) {
@@ -137,15 +314,19 @@ impl TextEditorState {
             _ => {}
         }
         
-        // Very basic scroll following
+        // The view follows the cursor. Key handlers may hold the window list,
+        // so with no answer from it the view stays as it is.
         let mut row = 0;
         for (i, c) in self.content.chars().enumerate() {
             if i == self.cursor_pos { break; }
             if c == '\n' { row += 1; }
         }
-        if row < self.scroll_y { self.scroll_y = row; }
-        // hard to know max_rows exactly, rough limit:
-        if row > self.scroll_y + 15 { self.scroll_y = row.saturating_sub(15); }
+        let id = self.window_id;
+        if let Some(rect) = DESKTOP_WM.try_lock().and_then(|wm| wm.windows.iter().find(|w| w.id == id).map(|w| w.rect)) {
+            let rows = self.area(rect).rows;
+            if row < self.scroll_y { self.scroll_y = row; }
+            if row >= self.scroll_y + rows { self.scroll_y = row + 1 - rows; }
+        }
     }
 
     pub fn handle_click(&mut self, x: i32, y: i32) {
@@ -428,6 +609,24 @@ pub struct FileManagerState {
     pub is_dragging: bool,
     pub last_click_ms: u64,
     pub last_click_row: Option<usize>,
+    thumb_grab: Option<i32>,
+}
+
+const FM_ROW_H: i32 = 22;
+const FM_ADDRESS_H: u32 = 28;
+const FM_STATUS_H: u32 = 20;
+
+impl Scrollable for FileManagerState {
+    fn window_id(&self) -> u32 { self.window_id }
+    fn area(&self, win: Rect) -> ScrollArea {
+        let h = win.h.saturating_sub(38 + FM_ADDRESS_H + FM_STATUS_H);
+        ScrollArea { right: win.x + win.w as i32 - 1, y: win.y + 36 + FM_ADDRESS_H as i32, h, rows: ((h as i32 / FM_ROW_H) as usize).max(1) }
+    }
+    fn total(&self) -> usize { self.entries.len() }
+    fn raw_top(&self) -> usize { self.scroll_y as usize }
+    fn set_top(&mut self, top: usize, _max: usize) { self.scroll_y = top as u32; }
+    fn grab(&self) -> Option<i32> { self.thumb_grab }
+    fn set_grab(&mut self, grab: Option<i32>) { self.thumb_grab = grab; }
 }
 
 #[derive(Clone)]
@@ -453,6 +652,7 @@ impl FileManagerState {
             is_dragging: false,
             last_click_ms: 0,
             last_click_row: None,
+            thumb_grab: None,
         }
     }
 
@@ -494,6 +694,7 @@ impl FileManagerState {
         }
         self.selected = None;
         self.scroll_y = 0;
+        self.thumb_grab = None;
         self.refresh();
     }
 
@@ -510,21 +711,23 @@ impl FileManagerState {
         let cx = win.rect.x + 1;
         let cy = win.rect.y + 36;
         let cw = win.rect.w.saturating_sub(2);
-        let ch = win.rect.h.saturating_sub(38);
+        let list = self.area(win.rect);
 
         // Address bar
-        r.fill_rect(Rect::new(cx, cy, cw, 28), p.surface);
-        r.stroke_rect(Rect::new(cx, cy, cw, 28), p.border);
+        r.fill_rect(Rect::new(cx, cy, cw, FM_ADDRESS_H), p.surface);
+        r.stroke_rect(Rect::new(cx, cy, cw, FM_ADDRESS_H), p.border);
         r.draw_text(&alloc::format!("  PATH: {}", self.cwd), cx + 4, cy + 8, p.text_secondary);
 
         // File list
-        let list_y  = cy + 28;
-        let list_h  = ch.saturating_sub(28);
+        let list_y  = list.y;
+        let list_h  = list.h;
         r.fill_rect(Rect::new(cx, list_y, cw, list_h), p.background);
 
-        let row_h: i32 = 22;
-        let max_rows   = (list_h / row_h as u32) as usize;
-        let start      = self.scroll_y as usize;
+        let row_h      = FM_ROW_H;
+        let max_rows   = list.rows;
+        let start      = self.top(max_rows);
+        // The sizes stay clear of the bar.
+        let bar_room   = if self.thumb(list).is_some() { BAR_W } else { 0 };
 
         for (i, entry) in self.entries.iter().enumerate().skip(start).take(max_rows) {
             let ey     = list_y + (i - start) as i32 * row_h;
@@ -545,21 +748,16 @@ impl FileManagerState {
                 } else {
                     alloc::format!("{} B", entry.size)
                 };
-                r.draw_text(&size_str, cx + cw as i32 - 80, ey + 6, p.text_secondary);
+                r.draw_text(&size_str, cx + cw as i32 - 80 - bar_room, ey + 6, p.text_secondary);
             }
         }
 
         // Scrollbar
-        if self.entries.len() > max_rows {
-            let ratio = max_rows as f32 / self.entries.len() as f32;
-            let bar_h = (list_h as f32 * ratio) as u32;
-            let bar_y = list_y + (self.scroll_y as f32 * ratio) as i32;
-            r.fill_rect(Rect::new(cx + cw as i32 - 10, bar_y, 8, bar_h), p.border);
-        }
+        self.draw_bar(&r, list, p.surface, p.border, p.accent);
 
         // Status bar
         let sb_y = list_y + list_h as i32;
-        r.fill_rect(Rect::new(cx, sb_y, cw, 20), p.surface);
+        r.fill_rect(Rect::new(cx, sb_y, cw, FM_STATUS_H), p.surface);
         r.draw_text(&alloc::format!("  {} items", self.entries.len()), cx + 4, sb_y + 4, p.text_secondary);
     }
 
@@ -568,11 +766,13 @@ impl FileManagerState {
         let win = match wm.windows.iter().find(|w| w.id == self.window_id) {
             Some(w) => w, None => return,
         };
-        let list_y = win.rect.y + 64;
-        let row_h  = 22;
-        if y < list_y { drop(wm); return; }
-        let row = ((y - list_y) / row_h) as usize + self.scroll_y as usize;
+        let list = self.area(win.rect);
         drop(wm);
+        if y < list.y || y >= list.y + list.h as i32 { return; }
+
+        let visible = (y - list.y) / FM_ROW_H;
+        if visible as usize >= list.rows { return; }
+        let row = visible as usize + self.top(list.rows);
 
         if row < self.entries.len() {
             let now = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
@@ -836,7 +1036,10 @@ pub struct TerminalEmulator {
     pub window_id:    u32,
     pub history:      Vec<String>,
     pub input_buf:    String,
-    pub scroll_y:     i32,
+    /// The first line on show when scrolled back; None follows the output.
+    /// `history` only grows at the end, so a line number keeps its place.
+    pub scroll_anchor: Option<usize>,
+    thumb_grab:       Option<i32>,
     pub cursor_blink: bool,
     pub blink_tick:   u64,
     /// Selection state: (row, col) of start and end.
@@ -849,6 +1052,23 @@ pub struct TerminalEmulator {
     pub console: Option<alloc::sync::Arc<crate::console::Console>>,
 }
 
+const TERM_ROW_H: i32 = 16;
+/// The prompt's line and the margins round the output.
+const TERM_RESERVED_H: u32 = 28;
+
+impl Scrollable for TerminalEmulator {
+    fn window_id(&self) -> u32 { self.window_id }
+    fn area(&self, win: Rect) -> ScrollArea {
+        let h = win.h.saturating_sub(38 + TERM_RESERVED_H);
+        ScrollArea { right: win.x + win.w as i32 - 1, y: win.y + 36 + 4, h, rows: ((h as i32 / TERM_ROW_H) as usize).max(1) }
+    }
+    fn total(&self) -> usize { self.history.len() }
+    fn raw_top(&self) -> usize { self.scroll_anchor.unwrap_or(usize::MAX) }
+    fn set_top(&mut self, top: usize, max: usize) { self.scroll_anchor = if top >= max { None } else { Some(top) }; }
+    fn grab(&self) -> Option<i32> { self.thumb_grab }
+    fn set_grab(&mut self, grab: Option<i32>) { self.thumb_grab = grab; }
+}
+
 impl TerminalEmulator {
     /// Const-safe empty state for static initialisation.
     pub const fn new_const() -> Self {
@@ -856,7 +1076,8 @@ impl TerminalEmulator {
             window_id:    0,
             history:      Vec::new(),
             input_buf:    String::new(),
-            scroll_y:     0,
+            scroll_anchor: None,
+            thumb_grab:   None,
             cursor_blink: true,
             blink_tick:   0,
             selection_start: None,
@@ -919,18 +1140,15 @@ impl TerminalEmulator {
 
         r.fill_rect(Rect::new(cx, cy, cw, ch), Color { r: 8, g: 12, b: 8 });
 
-        let row_h    = 16i32;
-        let max_rows = (ch as i32 / row_h) - 1;
-        let start    = if self.history.len() as i32 > max_rows {
-            self.history.len() as i32 - max_rows
-        } else { 0 };
+        let row_h  = TERM_ROW_H;
+        let area   = self.area(win.rect);
+        let start  = self.top(area.rows);
 
         let text_c = Color { r: 0, g: 240, b: 60 };
-        for (i, line) in self.history.iter().enumerate().skip(start as usize) {
-            let ly = cy + (i as i32 - start) * row_h + 4;
-            if ly + row_h > cy + ch as i32 { break; }
-            r.draw_text(line, cx + 8, ly, text_c);
+        for (i, line) in self.history.iter().enumerate().skip(start).take(area.rows) {
+            r.draw_text(line, cx + 8, area.y + (i - start) as i32 * row_h, text_c);
         }
+        self.draw_bar(&r, area, Color { r: 10, g: 18, b: 10 }, Color { r: 0, g: 120, b: 40 }, text_c);
 
         // Prompt + input
         let prompt_y = cy + ch as i32 - row_h - 4;
@@ -946,6 +1164,8 @@ impl TerminalEmulator {
     }
 
     pub fn on_key(&mut self, ch: char) {
+        // Typing brings the prompt's latest output back into view.
+        self.scroll_anchor = None;
         // A program is running here: the input line is its console's.
         if let Some(console) = self.console.clone().filter(|c| c.is_live()) {
             match ch {
@@ -1428,11 +1648,36 @@ pub fn launcher_slot_for_window(id: u32) -> Option<usize> {
 pub struct ClipboardViewerApp {
     pub window_id: u32,
     pub scroll_y: usize,
+    thumb_grab: Option<i32>,
+}
+
+/// Scrolling is by this much; the heading and cards are taller.
+const CLIP_ROW_H: i32 = 20;
+const CLIP_HEADING_H: i32 = 28;
+const CLIP_CARD_H: i32 = 40;
+
+impl Scrollable for ClipboardViewerApp {
+    fn window_id(&self) -> u32 { self.window_id }
+    fn area(&self, win: Rect) -> ScrollArea {
+        let h = win.h.saturating_sub(38);
+        ScrollArea { right: win.x + win.w as i32 - 1, y: win.y + 36, h, rows: ((h as i32 / CLIP_ROW_H) as usize).max(1) }
+    }
+    /// With the clipboard busy this answers as if empty, and `scroll_rows`
+    /// leaves the view alone.
+    fn total(&self) -> usize {
+        let Some(clip) = crate::clipboard::CLIPBOARD.try_lock() else { return 0 };
+        let cards = clip.history.iter().filter(|e| !e.consumed).count() as i32;
+        ((CLIP_HEADING_H + cards * CLIP_CARD_H + CLIP_ROW_H - 1) / CLIP_ROW_H) as usize
+    }
+    fn raw_top(&self) -> usize { self.scroll_y }
+    fn set_top(&mut self, top: usize, _max: usize) { self.scroll_y = top; }
+    fn grab(&self) -> Option<i32> { self.thumb_grab }
+    fn set_grab(&mut self, grab: Option<i32>) { self.thumb_grab = grab; }
 }
 
 impl ClipboardViewerApp {
     pub const fn new() -> Self {
-        Self { window_id: 0, scroll_y: 0 }
+        Self { window_id: 0, scroll_y: 0, thumb_grab: None }
     }
 
     pub fn paint(&self) {
@@ -1452,8 +1697,14 @@ impl ClipboardViewerApp {
 
         r.fill_rect(Rect::new(cx, cy, cw, ch), p.background);
 
+        // Before taking the clipboard: these ask it too.
+        let area = self.area(win.rect);
+        let top = self.top(area.rows);
+        let bar_room = if self.thumb(area).is_some() { BAR_W as u32 } else { 0 };
+        self.draw_bar(&r, area, p.surface, p.border, p.accent);
+
         let clip = crate::clipboard::CLIPBOARD.lock();
-        let mut y = cy + 4 - (self.scroll_y as i32 * 20);
+        let mut y = cy + 4 - (top as i32 * CLIP_ROW_H);
 
         r.draw_text("CLIPBOARD HISTORY", cx + 8, y, p.text_secondary);
         y += 24;
@@ -1467,8 +1718,8 @@ impl ClipboardViewerApp {
             if entry.consumed { continue; }
             if y > cy + ch as i32 { break; }
             if y + 40 > cy {
-                r.fill_rect(Rect::new(cx + 4, y, cw - 8, 36), p.surface);
-                r.stroke_rect(Rect::new(cx + 4, y, cw - 8, 36), p.border);
+                r.fill_rect(Rect::new(cx + 4, y, cw - 8 - bar_room, 36), p.surface);
+                r.stroke_rect(Rect::new(cx + 4, y, cw - 8 - bar_room, 36), p.border);
                 
                 let chan_color = match entry.channel {
                     crate::clipboard::ClipboardChannel::Public => p.text_primary,
