@@ -67,6 +67,7 @@ pub mod nt_file;
 pub mod nt_exception;
 pub mod nt_process;
 pub mod nt_user;
+pub mod nt_registry;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;
@@ -685,6 +686,7 @@ async fn gui_refresh_task() {
         // Poll centrally — this handles window buttons, drags, and content clicks.
         // It works both here and in the timer ISR while a process is running.
         crate::desktop::poll_input();
+        crate::nt_registry::tick(ms);
 
         // Drain any desktop icon / app launcher clicks that the timer ISR
         // deferred (they involve heavy heap allocations — PNG decode, PE loading —

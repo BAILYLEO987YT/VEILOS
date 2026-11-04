@@ -2,7 +2,7 @@ use conquer_once::spin::Lazy;
 use crossbeam_queue::ArrayQueue;
 use x86_64::instructions::port::Port;
 use spin::Mutex;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 static MOUSE_BYTE_QUEUE: Lazy<ArrayQueue<u8>> = Lazy::new(|| ArrayQueue::new(256));
 
@@ -14,6 +14,8 @@ pub struct MouseState {
     /// Accumulated delta since last get_state() call.
     pub dx: i32,
     pub dy: i32,
+    /// Wheel notches not yet delivered (positive: towards the user).
+    pub wheel: i32,
 }
 
 pub static MOUSE_STATE: Mutex<MouseState> = Mutex::new(MouseState {
@@ -23,7 +25,12 @@ pub static MOUSE_STATE: Mutex<MouseState> = Mutex::new(MouseState {
     right_button: false,
     dx: 0,
     dy: 0,
+    wheel: 0,
 });
+
+/// Bytes in a packet: 3, or 4 once the mouse says it has a wheel.
+static PACKET_SIZE: AtomicUsize = AtomicUsize::new(3);
+static PENDING_WHEEL: AtomicI32 = AtomicI32::new(0);
 
 pub fn add_byte(byte: u8) {
     if let Err(_) = MOUSE_BYTE_QUEUE.push(byte) {
@@ -40,7 +47,7 @@ pub fn add_byte(byte: u8) {
 /// Folded into the next packet that does get the lock, so no movement is lost.
 static PENDING_DX: AtomicI32 = AtomicI32::new(0);
 static PENDING_DY: AtomicI32 = AtomicI32::new(0);
-static mut ISR_PACKET: [u8; 3] = [0u8; 3];
+static mut ISR_PACKET: [u8; 4] = [0u8; 4];
 static mut ISR_IDX: usize = 0;
 
 /// Called directly from the mouse ISR instead of `add_byte`.
@@ -61,8 +68,9 @@ pub fn add_byte_and_process(byte: u8) {
 
         ISR_PACKET[ISR_IDX] = byte;
         ISR_IDX += 1;
-        if ISR_IDX < 3 { return; } // Packet not yet complete.
+        if ISR_IDX < PACKET_SIZE.load(Ordering::Relaxed) { return; } // Packet not yet complete.
         ISR_IDX = 0;               // Reset for next packet.
+        let wheel = if PACKET_SIZE.load(Ordering::Relaxed) == 4 { ISR_PACKET[3] as i8 as i32 } else { 0 };
 
         let flags = ISR_PACKET[0];
         let mut dx = ISR_PACKET[1] as i32;
@@ -79,6 +87,7 @@ pub fn add_byte_and_process(byte: u8) {
             // Fold in movement from any packets that arrived while the lock was busy.
             let dx = dx + PENDING_DX.swap(0, Ordering::Relaxed);
             let dy = dy + PENDING_DY.swap(0, Ordering::Relaxed);
+            state.wheel += wheel + PENDING_WHEEL.swap(0, Ordering::Relaxed);
             state.x = (state.x + dx).clamp(0, crate::ui::screen_w() as i32 - 1);
             state.y = (state.y - dy).clamp(0, crate::ui::screen_h() as i32 - 1); // PS/2 Y is inverted
             state.left_button  = (flags & 0x01) != 0;
@@ -87,6 +96,7 @@ pub fn add_byte_and_process(byte: u8) {
             // Lock busy: remember the movement instead of dropping it.
             PENDING_DX.fetch_add(dx, Ordering::Relaxed);
             PENDING_DY.fetch_add(dy, Ordering::Relaxed);
+            PENDING_WHEEL.fetch_add(wheel, Ordering::Relaxed);
         }
     }
 }
@@ -226,6 +236,21 @@ async fn hw_init() {
     let _ = id; // logged above; value is informational only
 
     crate::interrupts::SleepFuture::new(5).await;
+
+    // 6a. The IntelliMouse knock: sample rates 200, 100, 80, and a mouse with
+    //     a wheel then reports device id 3 and sends 4-byte packets.
+    for rate in [200u8, 100, 80] {
+        mouse_write(0xF3);
+        mouse_read_logged("knock ACK");
+        mouse_write(rate);
+        mouse_read_logged("knock value ACK");
+    }
+    mouse_write(0xF2);
+    mouse_read_logged("get-id ACK");
+    if mouse_read_logged("device id") == 3 {
+        PACKET_SIZE.store(4, Ordering::Relaxed);
+        crate::serial_println!("[MOUSE] Wheel found: 4-byte packets");
+    }
 
     // 6. Set sample rate to 200 Hz for better precision.
     crate::serial_println!("[MOUSE] Setting sample rate 200...");

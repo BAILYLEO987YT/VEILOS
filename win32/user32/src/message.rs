@@ -51,6 +51,8 @@ pub const WM_PARENTNOTIFY: u32 = 0x0210;
 /// 16-bit range programs use).
 const VEIL_WAKE: u32 = 0x7FFF_0001;
 const VEIL_GEOMETRY: u32 = 0x7FFF_0002;
+/// The pointer left this top-level window.
+const VEIL_MOUSE_LEFT: u32 = 0x7FFF_0003;
 
 const PM_REMOVE: u32 = 1;
 
@@ -336,11 +338,75 @@ fn kernel_get(m: &mut Msg, timeout: u32, flags: u32, hwnd: Hwnd, min: u32, max: 
 fn private(m: &Msg) -> bool {
     match m.message {
         VEIL_WAKE => true,
+        VEIL_MOUSE_LEFT => {
+            mouse_gone(0);
+            true
+        }
         VEIL_GEOMETRY => {
             crate::window::geometry_changed(m.hwnd);
             true
         }
         _ => false,
+    }
+}
+
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_MOUSEHOVER: u32 = 0x02A1;
+
+/// The last click: (window, message, time, x, y).
+static LAST_CLICK: crate::dllrt::Lock<(Hwnd, u32, u32, i32, i32)> = crate::dllrt::Lock::new((0, 0, 0, 0, 0));
+
+/// A second click soon, in the same place, on a window of a CS_DBLCLKS class
+/// is a double click. (GetDoubleClickTime: 500 ms; SM_CXDOUBLECLK: 4.)
+fn double_click(m: &mut Msg, x: i32, y: i32) {
+    if !matches!(m.message, 0x0201 | 0x0204 | 0x0207) {
+        return;
+    }
+    let dblclks = {
+        let s = state();
+        s.get(m.hwnd).is_some_and(|w| s.classes[w.class].style & 0x8 != 0)
+    };
+    let mut last = LAST_CLICK.lock();
+    let again = dblclks && last.0 == m.hwnd && last.1 == m.message && m.time.wrapping_sub(last.2) <= 500 && (x - last.3).abs() <= 2 && (y - last.4).abs() <= 2;
+    if again {
+        m.message += 2;
+        *last = (0, 0, 0, 0, 0);
+    } else {
+        *last = (m.hwnd, m.message, m.time, x, y);
+    }
+}
+
+/// TrackMouseEvent's request: (window, flags, hover time, when the pointer last moved).
+static TRACKED: crate::dllrt::Lock<(Hwnd, u32, u32, u32)> = crate::dllrt::Lock::new((0, 0, 0, 0));
+const TME_HOVER: u32 = 1;
+const TME_LEAVE: u32 = 2;
+const TME_QUERY: u32 = 0x4000_0000;
+const TME_CANCEL: u32 = 0x8000_0000;
+
+/// The pointer is now over `now` (0: none of this process's windows): the
+/// tracked window hears if it left, and a hover starts over.
+fn mouse_gone(now: Hwnd) {
+    let tick = unsafe { GetTickCount() };
+    let leave = {
+        let mut t = TRACKED.lock();
+        if t.0 != 0 && t.0 == now {
+            t.3 = tick;
+        }
+        if t.0 != 0 && t.0 != now && t.1 & TME_LEAVE != 0 {
+            let h = t.0;
+            t.1 &= !TME_LEAVE;
+            if t.1 == 0 {
+                t.0 = 0;
+            }
+            h
+        } else {
+            0
+        }
+    };
+    if leave != 0 {
+        PostMessageW(leave, WM_MOUSELEAVE, 0, 0);
     }
 }
 
@@ -373,8 +439,17 @@ fn route(m: &mut Msg) {
             (target, cx, cy, inside)
         };
         m.hwnd = target;
+        // The wheel says where on the screen, and goes to the window under it.
+        if m.message == WM_MOUSEWHEEL {
+            m.lparam = ((m.pt_y as u16 as u64) << 16) | m.pt_x as u16 as u64;
+            return;
+        }
+        if m.message == WM_MOUSEMOVE {
+            mouse_gone(target);
+        }
         if inside {
             m.lparam = ((cy as u16 as u64) << 16) | cx as u16 as u64;
+            double_click(m, cx, cy);
         } else {
             // WM_NC*: the hit-test code, and the screen position.
             m.message -= 0x160;
@@ -400,6 +475,11 @@ fn paint_due(hwnd: Hwnd) -> Option<Hwnd> {
         .map(|w| w.hwnd)
 }
 
+/// Any of this thread's windows still to paint.
+pub fn paint_pending() -> bool {
+    paint_due(0).is_some()
+}
+
 fn in_range(msg: u32, min: u32, max: u32) -> bool {
     (min == 0 && max == 0) || (msg >= min && msg <= max)
 }
@@ -408,10 +488,9 @@ fn in_range(msg: u32, min: u32, max: u32) -> bool {
 fn next(out: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: bool, wait: bool) -> bool {
     let mut m = Msg::default();
     loop {
-        crate::paint::present_all();
         run_win_events();
         // The kernel's private messages first, whatever the filter.
-        while kernel_get(&mut m, 0, 1 | 2, 0, VEIL_WAKE, VEIL_GEOMETRY) {
+        while kernel_get(&mut m, 0, 1 | 2, 0, VEIL_WAKE, VEIL_MOUSE_LEFT) {
             private(&m);
         }
         let flags = if remove { 1 } else { 0 };
@@ -423,6 +502,8 @@ fn next(out: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: bool, wait: bool)
             if !typed(&mut m, remove) {
                 continue;
             }
+            // A steady stream of messages still shows progress.
+            crate::paint::present_if_due();
             return deliver(out, m);
         }
         // Painting.
@@ -434,13 +515,19 @@ fn next(out: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: bool, wait: bool)
         }
         // Timers.
         if in_range(WM_TIMER, min, max) && kernel_get(&mut m, 0, flags, hwnd, WM_TIMER, WM_TIMER) {
+            crate::paint::present_if_due();
             return deliver(out, m);
+        }
+        // Nothing left to do: what's drawn is finished, show it. All of it at
+        // once, so a window never appears half painted.
+        if wait || !paint_pending() {
+            crate::paint::present_all();
         }
         if !wait {
             return false;
         }
-        // Wait for anything, then look again.
-        kernel_get(&mut m, u32::MAX, 0, 0, 0, 0);
+        // Wait for anything (or a hover coming due), then look again.
+        kernel_get(&mut m, check_hover(), 0, 0, 0, 0);
     }
 }
 
@@ -701,10 +788,60 @@ pub extern "system" fn NotifyWinEvent(event: u32, hwnd: Hwnd, object: i32, child
     win_event(event, hwnd, object, child);
 }
 
-/// The desktop reports clicks, not movement: no WM_MOUSELEAVE / HOVER.
+/// TRACKMOUSEEVENT: size, flags, window, hover time.
 #[no_mangle]
-pub extern "system" fn TrackMouseEvent(_tme: *mut u8) -> Bool {
+pub unsafe extern "system" fn TrackMouseEvent(tme: *mut u8) -> Bool {
+    if tme.is_null() {
+        return 0;
+    }
+    let (flags, hwnd, hover) = unsafe {
+        (*(tme.add(4) as *const u32), core::ptr::read_unaligned(tme.add(8) as *const u64), *(tme.add(16) as *const u32))
+    };
+    if flags & TME_QUERY != 0 {
+        let t = TRACKED.lock();
+        unsafe {
+            *(tme.add(4) as *mut u32) = t.1;
+            core::ptr::write_unaligned(tme.add(8) as *mut u64, t.0);
+            *(tme.add(16) as *mut u32) = t.2;
+        }
+        return 1;
+    }
+    let mut t = TRACKED.lock();
+    if flags & TME_CANCEL != 0 {
+        if t.0 == hwnd {
+            t.1 &= !(flags & 3);
+            if t.1 == 0 {
+                t.0 = 0;
+            }
+        }
+        return 1;
+    }
+    // HOVER_DEFAULT: SPI_GETMOUSEHOVERTIME's 400 ms.
+    let time = if hover == 0xFFFF_FFFF || hover == 0 { 400 } else { hover };
+    *t = (hwnd, flags & 3, time, unsafe { GetTickCount() });
     1
+}
+
+/// A due WM_MOUSEHOVER, and how long until one is due otherwise.
+fn check_hover() -> u32 {
+    let (hwnd, due) = {
+        let mut t = TRACKED.lock();
+        if t.0 == 0 || t.1 & TME_HOVER == 0 {
+            return u32::MAX;
+        }
+        let waited = unsafe { GetTickCount() }.wrapping_sub(t.3);
+        if waited < t.2 {
+            return t.2 - waited;
+        }
+        t.1 &= !TME_HOVER;
+        let h = t.0;
+        if t.1 == 0 {
+            t.0 = 0;
+        }
+        (h, 0)
+    };
+    PostMessageW(hwnd, WM_MOUSEHOVER, 0, 0);
+    due
 }
 
 #[no_mangle]
@@ -820,6 +957,11 @@ pub fn def_window_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, unicode: bool) ->
             0
         }
         WM_ERASEBKGND => crate::paint::erase_background(hwnd, wp) as i64,
+        // A wheel nobody handled goes up to the parent.
+        WM_MOUSEWHEEL | 0x020E => {
+            let parent = state().get(hwnd).map_or(0, |w| w.parent);
+            if parent != 0 { send(parent, msg, wp, lp) } else { 0 }
+        }
         // WM_NOTIFYFORMAT, NF_QUERY: NFR_UNICODE or NFR_ANSI, as the window is.
         0x0055 if lp == 3 => if crate::window::IsWindowUnicode(hwnd) != 0 { 2 } else { 1 },
         WM_PAINT => {

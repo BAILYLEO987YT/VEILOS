@@ -84,6 +84,15 @@ const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
 const LVM_GETITEMTEXTW: u32 = LVM_FIRST + 115;
 const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
 const LVM_EDITLABELW: u32 = LVM_FIRST + 118;
+const LVM_INSERTGROUP: u32 = LVM_FIRST + 145;
+const LVM_SETGROUPINFO: u32 = LVM_FIRST + 147;
+const LVM_GETGROUPINFO: u32 = LVM_FIRST + 149;
+const LVM_REMOVEGROUP: u32 = LVM_FIRST + 150;
+const LVM_GETGROUPCOUNT: u32 = LVM_FIRST + 152;
+const LVM_ENABLEGROUPVIEW: u32 = LVM_FIRST + 157;
+const LVM_REMOVEALLGROUPS: u32 = LVM_FIRST + 160;
+const LVM_HASGROUP: u32 = LVM_FIRST + 161;
+const LVM_ISGROUPVIEWENABLED: u32 = LVM_FIRST + 175;
 const LVM_SETVIEW: u32 = LVM_FIRST + 142;
 const LVM_GETVIEW: u32 = LVM_FIRST + 143;
 const LVM_ISITEMVISIBLE: u32 = LVM_FIRST + 182;
@@ -109,6 +118,12 @@ const LVIF_IMAGE: u32 = 0x2;
 const LVIF_PARAM: u32 = 0x4;
 const LVIF_STATE: u32 = 0x8;
 const LVIF_INDENT: u32 = 0x10;
+const LVIF_GROUPID: u32 = 0x100;
+const I_GROUPIDNONE: i32 = -2;
+const LVGF_HEADER: u32 = 0x1;
+const LVGF_STATE: u32 = 0x4;
+const LVGF_ALIGN: u32 = 0x8;
+const LVGF_GROUPID: u32 = 0x10;
 const LVIF_NORECOMPUTE: u32 = 0x800;
 
 const LVIS_FOCUSED: u32 = 1;
@@ -199,6 +214,15 @@ struct Item {
     indent: i32,
     /// Where it was put (LVM_SETITEMPOSITION), in the icon views.
     pos: Option<(i32, i32)>,
+    group: i32,
+}
+
+#[derive(Clone)]
+struct Group {
+    id: i32,
+    header: Vec<u16>,
+    state: u32,
+    align: u32,
 }
 
 #[derive(Clone)]
@@ -237,6 +261,8 @@ struct List {
     edit_item: i32,
     has_focus: bool,
     icon_spacing: (i32, i32),
+    groups: Vec<Group>,
+    group_view: bool,
 }
 
 static LISTS: Lock<BTreeMap<Hwnd, List>> = Lock::new(BTreeMap::new());
@@ -347,7 +373,8 @@ fn view_rect(hwnd: Hwnd, i: i32) -> [i32; 4] {
         LVS_REPORT => {
             let h = row_height(hwnd);
             let w = columns_width(hwnd);
-            [0, i * h, w, (i + 1) * h]
+            let row = row_of(hwnd, i);
+            [0, row * h, w, (row + 1) * h]
         }
         LVS_LIST => {
             let h = row_height(hwnd);
@@ -370,6 +397,48 @@ fn view_rect(hwnd: Hwnd, i: i32) -> [i32; 4] {
             placed(hwnd, i, [col * sw, row * sh, (col + 1) * sw, (row + 1) * sh])
         }
     }
+}
+
+/// What's on a row in report view with groups showing.
+#[derive(Clone, Copy, PartialEq)]
+enum Row {
+    Header(i32),
+    Item(i32),
+}
+
+/// The rows in order: each group's header, then its items; items in no group
+/// at the end.
+fn group_rows(hwnd: Hwnd) -> Vec<Row> {
+    with(hwnd, |l| {
+        let mut rows = Vec::with_capacity(l.items.len() + l.groups.len());
+        for (k, g) in l.groups.iter().enumerate() {
+            rows.push(Row::Header(g.id));
+            // LVGS_COLLAPSED hides the items; a repeated id has them once.
+            if g.state & 1 == 0 && !l.groups[..k].iter().any(|o| o.id == g.id) {
+                rows.extend(l.items.iter().enumerate().filter(|(_, it)| it.group == g.id).map(|(i, _)| Row::Item(i as i32)));
+            }
+        }
+        let known = |id: i32| l.groups.iter().any(|g| g.id == id);
+        rows.extend(l.items.iter().enumerate().filter(|(_, it)| !known(it.group)).map(|(i, _)| Row::Item(i as i32)));
+        rows
+    })
+    .unwrap_or_default()
+}
+
+fn grouped(hwnd: Hwnd) -> bool {
+    view(hwnd) == LVS_REPORT && with(hwnd, |l| l.group_view && !l.groups.is_empty()).unwrap_or(false)
+}
+
+/// The report-view row an item is on.
+fn row_of(hwnd: Hwnd, i: i32) -> i32 {
+    if !grouped(hwnd) {
+        return i;
+    }
+    group_rows(hwnd).iter().position(|r| *r == Row::Item(i)).map_or(i, |p| p as i32)
+}
+
+fn total_rows(hwnd: Hwnd) -> i32 {
+    if grouped(hwnd) { group_rows(hwnd).len() as i32 } else { count(hwnd) }
 }
 
 fn placed(hwnd: Hwnd, i: i32, r: [i32; 4]) -> [i32; 4] {
@@ -445,7 +514,7 @@ fn layout(hwnd: Hwnd) {
         unsafe { crate::ShowWindow(h, if show { 8 } else { 0 }) };
     }
     let (content_w, content_h) = match v {
-        LVS_REPORT => (columns_width(hwnd), n * row_height(hwnd)),
+        LVS_REPORT => (columns_width(hwnd), total_rows(hwnd) * row_height(hwnd)),
         LVS_LIST => {
             let per = (c[3] / row_height(hwnd)).max(1);
             ((n + per - 1) / per * cell_width(hwnd), 0)
@@ -694,6 +763,7 @@ struct LvItem {
     image: i32,
     param: i64,
     indent: i32,
+    group: i32,
 }
 
 fn read_lvitem(p: *const u8) -> LvItem {
@@ -710,6 +780,7 @@ fn read_lvitem(p: *const u8) -> LvItem {
             image: d(36),
             param: core::ptr::read_unaligned(p.add(40) as *const i64),
             indent: d(48),
+            group: d(52),
         }
     }
 }
@@ -736,6 +807,7 @@ fn insert_item(hwnd: Hwnd, lp: i64, unicode: bool) -> i64 {
         state: if lv.mask & LVIF_STATE != 0 { lv.state & lv.state_mask & !(LVIS_SELECTED | LVIS_FOCUSED) } else { 0 },
         indent: if lv.mask & LVIF_INDENT != 0 { lv.indent } else { 0 },
         pos: None,
+        group: if lv.mask & LVIF_GROUPID != 0 { lv.group } else { I_GROUPIDNONE },
     };
     let wanted_state = if lv.mask & LVIF_STATE != 0 { lv.state & lv.state_mask & (LVIS_SELECTED | LVIS_FOCUSED) } else { 0 };
     let sorted = st & (LVS_SORTASCENDING | LVS_SORTDESCENDING) != 0;
@@ -826,6 +898,9 @@ fn set_item(hwnd: Hwnd, lv: &LvItem, unicode: bool) -> bool {
         if lv.mask & LVIF_INDENT != 0 {
             it.indent = lv.indent;
         }
+        if lv.mask & LVIF_GROUPID != 0 {
+            it.group = lv.group;
+        }
     });
     if changed != 0 {
         nmlistview(hwnd, LVN_ITEMCHANGED, i, 0, 0, 0, changed, (0, 0), item_param(hwnd, i));
@@ -869,6 +944,10 @@ fn get_item(hwnd: Hwnd, lp: i64, unicode: bool) -> bool {
         }
         if lv.mask & LVIF_INDENT != 0 {
             core::ptr::write_unaligned(p.add(48) as *mut i32, indent);
+        }
+        if lv.mask & LVIF_GROUPID != 0 {
+            let g = with(hwnd, |l| l.items.get(i as usize).map_or(I_GROUPIDNONE, |it| it.group)).unwrap_or(I_GROUPIDNONE);
+            core::ptr::write_unaligned(p.add(52) as *mut i32, g);
         }
     }
     true
@@ -1084,8 +1163,15 @@ fn hit(hwnd: Hwnd, x: i32, y: i32) -> (i32, u32, i32) {
     let (sx, sy) = with(hwnd, |l| (l.sx, l.sy)).unwrap_or((0, 0));
     let candidate = match v {
         LVS_REPORT => {
-            let i = (y - top + sy) / row_height(hwnd);
-            (i < n).then_some(i)
+            let row = (y - top + sy) / row_height(hwnd);
+            if grouped(hwnd) {
+                match group_rows(hwnd).get(row as usize) {
+                    Some(Row::Item(i)) => Some(*i),
+                    _ => None,
+                }
+            } else {
+                (row < n).then_some(row)
+            }
         }
         LVS_LIST => {
             let h = row_height(hwnd);
@@ -1174,7 +1260,8 @@ fn paint(hwnd: Hwnd, hdc: u64) {
     let top = header_height(hwnd);
     let normal_color = if text_color == CLR_DEFAULT { unsafe { crate::GetSysColor(8) } } else { text_color };
     let il = if v == 0 { images[0] } else { images[1] };
-    let (first, last) = if v == LVS_REPORT {
+    let is_grouped = grouped(hwnd);
+    let (first, last) = if v == LVS_REPORT && !is_grouped {
         let h = row_height(hwnd);
         let sy = with(hwnd, |l| l.sy).unwrap_or(0);
         (sy / h, ((sy + (c[3] - top)) / h + 1).min(n))
@@ -1182,12 +1269,63 @@ fn paint(hwnd: Hwnd, hdc: u64) {
         (0, n)
     };
     let lay = column_layout(hwnd);
+    // Group headers, on their rows.
+    if is_grouped {
+        let h = row_height(hwnd);
+        let (sx0, sy) = with(hwnd, |l| (l.sx, l.sy)).unwrap_or((0, 0));
+        for (row, g) in group_rows(hwnd).iter().enumerate() {
+            let Row::Header(id) = *g else { continue };
+            let y = row as i32 * h - sy + top;
+            if y + h <= top || y >= c[3] {
+                continue;
+            }
+            let (title, align) = with(hwnd, |l| l.groups.iter().find(|g| g.id == id).map(|g| (g.header.clone(), g.align))).flatten().unwrap_or_default();
+            unsafe { crate::SetTextColor(hdc, crate::GetSysColor(13)) };
+            let fmt = if align & 2 != 0 { 2 } else if align & 4 != 0 { 1 } else { 0 };
+            draw_text(hdc, &title, [4 - sx0, y, c[2], y + h], fmt, false);
+            let w = crate::text_size(hdc, &title).0;
+            let lx = if fmt == 0 { 12 + w - sx0 } else { 2 };
+            if fmt == 0 {
+                unsafe { crate::FillRect(hdc, &[lx, y + h / 2, c[2] - 2, y + h / 2 + 1], crate::GetSysColorBrush(16)) };
+            }
+        }
+    }
+    // NM_CUSTOMDRAW: the owner may watch, colour or take over.
+    const CDRF_SKIPDEFAULT: i64 = 4;
+    const CDRF_NOTIFYPOSTPAINT: i64 = 0x10;
+    const CDRF_NOTIFYITEMDRAW: i64 = 0x20;
+    const CDDS_ITEMPREPAINT: u32 = 0x1_0001;
+    const CDDS_ITEMPOSTPAINT: u32 = 0x1_0002;
+    const CDDS_SUBITEM: u32 = 0x2_0000;
+    let pre = crate::custom_draw(hwnd, 1, hdc, c, 0, 0, 0, 0, 0, 0).0;
+    if pre & CDRF_SKIPDEFAULT != 0 {
+        unsafe { crate::SelectObject(hdc, old) };
+        return;
+    }
     for i in first..last {
         let r = item_rect(hwnd, i);
         if r[3] <= top || r[1] >= c[3] || r[2] <= 0 || r[0] >= c[2] {
             continue;
         }
         let state = get_state(hwnd, i);
+        if is_grouped && row_of(hwnd, i) == i && group_rows(hwnd).get(i as usize) != Some(&Row::Item(i)) {
+            continue; // Collapsed.
+        }
+        let (mut cd_text, mut cd_back, mut item_flags) = (None, None, 0i64);
+        if pre & CDRF_NOTIFYITEMDRAW != 0 {
+            const NONE: u32 = 0xFFFF_FFFF;
+            let (rr, t, b) = crate::custom_draw(hwnd, CDDS_ITEMPREPAINT, hdc, r, i as u64, state, item_param(hwnd, i), NONE, NONE, 0);
+            if rr & CDRF_SKIPDEFAULT != 0 {
+                continue;
+            }
+            item_flags = rr;
+            if t != NONE {
+                cd_text = Some(t);
+            }
+            if b != NONE {
+                cd_back = Some(b);
+            }
+        }
         let (mut icon, label) = parts(hwnd, i);
         let sel = state & LVIS_SELECTED != 0 && (has_focus || st & LVS_SHOWSELALWAYS != 0);
         let (sel_bg, sel_fg) = if has_focus { (13, 14) } else { (15, 18) };
@@ -1239,11 +1377,30 @@ fn paint(hwnd: Hwnd, hdc: u64) {
                 }
                 let t = item_text(hwnd, i, sub);
                 let on = sel && (full || base);
+                // A cell of its own, if the owner asked (CDRF_NOTIFYSUBITEMDRAW).
+                let (mut cell_text, mut cell_back) = (cd_text, cd_back);
+                if item_flags & CDRF_NOTIFYITEMDRAW != 0 {
+                    const NONE: u32 = 0xFFFF_FFFF;
+                    let (rr, ct, cb) = crate::custom_draw(hwnd, CDDS_ITEMPREPAINT | CDDS_SUBITEM, hdc, cr, i as u64, state, item_param(hwnd, i), NONE, NONE, sub);
+                    if rr & CDRF_SKIPDEFAULT != 0 {
+                        continue;
+                    }
+                    if ct != NONE {
+                        cell_text = Some(ct);
+                    }
+                    if cb != NONE {
+                        cell_back = Some(cb);
+                    }
+                }
+                if let (Some(b), false) = (cell_back, on) {
+                    bg(hdc, &cr, b);
+                }
                 if on && !full {
                     let tw = crate::text_size(hdc, &t).0 + 6;
                     unsafe { crate::FillRect(hdc, &[cr[0], cr[1], (cr[0] + tw).min(cr[2]), cr[3]], crate::GetSysColorBrush(sel_bg)) };
                 }
-                unsafe { crate::SetTextColor(hdc, if on { crate::GetSysColor(sel_fg) } else { normal_color }) };
+                let color = if on { unsafe { crate::GetSysColor(sel_fg) } } else { cell_text.unwrap_or(normal_color) };
+                unsafe { crate::SetTextColor(hdc, color) };
                 draw_text(hdc, &t, cr, if base { 0 } else { fmt }, false);
             }
         } else {
@@ -1256,7 +1413,11 @@ fn paint(hwnd: Hwnd, hdc: u64) {
             if sel {
                 unsafe { crate::FillRect(hdc, &lr, crate::GetSysColorBrush(sel_bg)) };
             }
-            unsafe { crate::SetTextColor(hdc, if sel { crate::GetSysColor(sel_fg) } else { normal_color }) };
+            if let (Some(b), false) = (cd_back, sel) {
+                bg(hdc, &lr, b);
+            }
+            let color = if sel { unsafe { crate::GetSysColor(sel_fg) } } else { cd_text.unwrap_or(normal_color) };
+            unsafe { crate::SetTextColor(hdc, color) };
             draw_text(hdc, &t, lr, 0, v == 0);
         }
         if state & LVIS_FOCUSED != 0 && has_focus {
@@ -1266,12 +1427,18 @@ fn paint(hwnd: Hwnd, hdc: u64) {
         if v == LVS_REPORT && ex & LVS_EX_GRIDLINES != 0 {
             unsafe { crate::FillRect(hdc, &[r[0], r[3] - 1, c[2], r[3]], crate::GetSysColorBrush(15)) };
         }
+        if item_flags & CDRF_NOTIFYPOSTPAINT != 0 {
+            crate::custom_draw(hwnd, CDDS_ITEMPOSTPAINT, hdc, r, i as u64, state, item_param(hwnd, i), 0, 0, 0);
+        }
     }
     if v == LVS_REPORT && ex & LVS_EX_GRIDLINES != 0 {
         for (_, x, w) in lay.iter().copied() {
             let at = x + w - sx - 1;
             unsafe { crate::FillRect(hdc, &[at, top, at + 1, c[3]], crate::GetSysColorBrush(15)) };
         }
+    }
+    if pre & CDRF_NOTIFYPOSTPAINT != 0 {
+        crate::custom_draw(hwnd, 2, hdc, c, 0, 0, 0, 0, 0, 0);
     }
     unsafe { crate::SelectObject(hdc, old) };
 }
@@ -1481,19 +1648,26 @@ fn start_edit(hwnd: Hwnd, i: i32) -> Hwnd {
         return 0;
     }
     let text = item_text(hwnd, i, 0);
-    if label_notify(hwnd, i, LVN_BEGINLABELEDITW, LVN_BEGINLABELEDITA, Some(&text)) != 0 {
-        return 0;
-    }
+    // The item edited is the one selected and in focus.
+    set_state(hwnd, -1, 0, LVIS_SELECTED);
+    set_state(hwnd, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     ensure_visible(hwnd, i);
     let (_, mut r) = parts(hwnd, i);
     r[1] = r[1].min(item_rect(hwnd, i)[1]);
     r[3] = r[1] + line_height(hwnd) + 4;
     let font = with(hwnd, |l| l.font).unwrap_or(0);
-    let e = crate::labeledit::start(hwnd, r, &text, font);
+    // Made before it's announced: the owner may ask for it, to limit its text.
+    let e = crate::labeledit::create(hwnd, r, &text, font);
     with(hwnd, |l| {
         l.edit = e;
         l.edit_item = i;
     });
+    if label_notify(hwnd, i, LVN_BEGINLABELEDITW, LVN_BEGINLABELEDITA, Some(&text)) != 0 {
+        with(hwnd, |l| l.edit = 0);
+        unsafe { crate::DestroyWindow(e) };
+        return 0;
+    }
+    crate::labeledit::show(e);
     e
 }
 
@@ -1613,6 +1787,8 @@ unsafe extern "system" fn list_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -> i
                     edit_item: -1,
                     has_focus: false,
                     icon_spacing: (75, 75),
+                    groups: Vec::new(),
+                    group_view: false,
                 },
             );
             def()
@@ -2201,6 +2377,92 @@ unsafe extern "system" fn list_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -> i
         }
         LVM_GETSELECTIONMARK => with(hwnd, |l| l.mark as i64).unwrap_or(-1),
         LVM_SETSELECTIONMARK => with(hwnd, |l| core::mem::replace(&mut l.mark, lp as i32) as i64).unwrap_or(-1),
+        LVM_ENABLEGROUPVIEW => {
+            let on = wp != 0;
+            let was = with(hwnd, |l| core::mem::replace(&mut l.group_view, on)).unwrap_or(false);
+            layout(hwnd);
+            invalidate(hwnd);
+            // 0 unchanged, 1 changed.
+            (was != on) as i64
+        }
+        LVM_ISGROUPVIEWENABLED => with(hwnd, |l| l.group_view as i64).unwrap_or(0),
+        LVM_GETGROUPCOUNT => with(hwnd, |l| l.groups.len() as i64).unwrap_or(0),
+        LVM_HASGROUP => with(hwnd, |l| l.groups.iter().any(|g| g.id == wp as i32) as i64).unwrap_or(0),
+        LVM_INSERTGROUP => {
+            if lp == 0 {
+                return -1;
+            }
+            let mut g = Group { id: 0, header: Vec::new(), state: 0, align: 1 };
+            read_group(lp as *const u8, &mut g);
+            let at = with(hwnd, |l| {
+                let at = if wp as i32 == -1 { l.groups.len() } else { (wp as usize).min(l.groups.len()) };
+                l.groups.insert(at, g);
+                at as i64
+            })
+            .unwrap_or(-1);
+            layout(hwnd);
+            invalidate(hwnd);
+            at
+        }
+        LVM_SETGROUPINFO => {
+            if lp == 0 {
+                return -1;
+            }
+            let found = with(hwnd, |l| match l.groups.iter_mut().find(|g| g.id == wp as i32) {
+                Some(g) => {
+                    read_group(lp as *const u8, g);
+                    g.id as i64
+                }
+                None => -1,
+            })
+            .unwrap_or(-1);
+            layout(hwnd);
+            invalidate(hwnd);
+            found
+        }
+        LVM_GETGROUPINFO => {
+            if lp == 0 {
+                return -1;
+            }
+            let Some(Some(g)) = with(hwnd, |l| l.groups.iter().find(|g| g.id == wp as i32).cloned()) else { return -1 };
+            let p = lp as *mut u8;
+            unsafe {
+                let mask = core::ptr::read_unaligned(p.add(4) as *const u32);
+                if mask & LVGF_HEADER != 0 {
+                    let dst = core::ptr::read_unaligned(p.add(8) as *const u64);
+                    let cap = core::ptr::read_unaligned(p.add(16) as *const i32);
+                    crate::put_text(dst, cap, &g.header, true);
+                }
+                if mask & LVGF_GROUPID != 0 {
+                    core::ptr::write_unaligned(p.add(36) as *mut i32, g.id);
+                }
+                if mask & LVGF_STATE != 0 {
+                    let sm = core::ptr::read_unaligned(p.add(40) as *const u32);
+                    core::ptr::write_unaligned(p.add(44) as *mut u32, g.state & sm);
+                }
+                if mask & LVGF_ALIGN != 0 {
+                    core::ptr::write_unaligned(p.add(48) as *mut u32, g.align);
+                }
+            }
+            g.id as i64
+        }
+        LVM_REMOVEGROUP => {
+            let at = with(hwnd, |l| {
+                let Some(i) = l.groups.iter().position(|g| g.id == wp as i32) else { return -1 };
+                l.groups.remove(i);
+                i as i64
+            })
+            .unwrap_or(-1);
+            layout(hwnd);
+            invalidate(hwnd);
+            at
+        }
+        LVM_REMOVEALLGROUPS => {
+            with(hwnd, |l| l.groups.clear());
+            layout(hwnd);
+            invalidate(hwnd);
+            0
+        }
         LVM_SETVIEW => {
             let new = wp as u32;
             if new > 3 {
@@ -2230,6 +2492,27 @@ unsafe extern "system" fn list_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -> i
             (r[3] > header_height(hwnd) && r[1] < c[3] && r[2] > 0 && r[0] < c[2]) as i64
         }
         _ => def(),
+    }
+}
+
+/// LVGROUP's fields that its mask names.
+fn read_group(p: *const u8, g: &mut Group) {
+    unsafe {
+        let mask = core::ptr::read_unaligned(p.add(4) as *const u32);
+        if mask & LVGF_HEADER != 0 {
+            g.header = crate::wstr(core::ptr::read_unaligned(p.add(8) as *const u64) as *const u16);
+        }
+        if mask & LVGF_GROUPID != 0 {
+            g.id = core::ptr::read_unaligned(p.add(36) as *const i32);
+        }
+        if mask & LVGF_STATE != 0 {
+            let sm = core::ptr::read_unaligned(p.add(40) as *const u32);
+            let s = core::ptr::read_unaligned(p.add(44) as *const u32);
+            g.state = (g.state & !sm) | (s & sm);
+        }
+        if mask & LVGF_ALIGN != 0 {
+            g.align = core::ptr::read_unaligned(p.add(48) as *const u32);
+        }
     }
 }
 

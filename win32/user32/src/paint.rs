@@ -52,11 +52,39 @@ pub fn present(root: Hwnd) {
 
 /// Present everything this thread has drawn.
 pub fn present_all() {
+    LAST_PRESENT.store(unsafe { GetTickCount() }, core::sync::atomic::Ordering::Relaxed);
     let tid = unsafe { crate::GetCurrentThreadId() };
     let roots: Vec<Hwnd> = state().windows.iter().filter(|w| w.tid == tid && w.dirty.is_some()).map(|w| w.hwnd).collect();
     for r in roots {
         present(r);
     }
+}
+
+/// Paints under way on this process's windows: nothing is presented until
+/// they're done, so half-drawn windows (erased, not yet drawn) never show.
+static PAINTING: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static LAST_PRESENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn GetTickCount() -> u32;
+}
+
+/// For a program that draws without returning to its message loop: at most
+/// one present a frame, and none in the middle of painting.
+pub fn present_if_due() {
+    use core::sync::atomic::Ordering;
+    if PAINTING.load(Ordering::Relaxed) > 0 {
+        return;
+    }
+    let now = unsafe { GetTickCount() };
+    if now.wrapping_sub(LAST_PRESENT.load(Ordering::Relaxed)) < 16 {
+        return;
+    }
+    if crate::message::paint_pending() {
+        return;
+    }
+    present_all();
 }
 
 // -----| DCs |-----
@@ -103,17 +131,17 @@ fn make_dc(hwnd: Hwnd, clip: Option<[i32; 4]>, frame: bool) -> u64 {
 }
 
 fn release(hdc: u64) -> bool {
-    let (root, others) = {
+    let others = {
         let mut dcs = DCS.lock();
         let Some(i) = dcs.iter().position(|d| d.0 == hdc) else { return false };
         let root = dcs.swap_remove(i).1;
-        (root, dcs.iter().any(|d| d.1 == root))
+        dcs.iter().any(|d| d.1 == root)
     };
     unsafe { crate::DeleteDC(hdc) };
-    // Not in the middle of another DC's drawing (a paint measuring text
-    // through GetDC, say): that one presents when it's done.
+    // The message loop presents when the program goes idle. Not in the middle
+    // of another DC's drawing (a paint measuring text through GetDC, say).
     if !others {
-        present(root);
+        present_if_due();
     }
     true
 }
@@ -295,6 +323,7 @@ pub extern "system" fn RedrawWindow(hwnd: Hwnd, r: *const [i32; 4], _rgn: u64, f
 /// PAINTSTRUCT: hdc, fErase, rcPaint, fRestore, fIncUpdate, reserved.
 #[no_mangle]
 pub extern "system" fn BeginPaint(hwnd: Hwnd, ps: *mut u8) -> u64 {
+    PAINTING.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let (update, erase, framed) = {
         let mut s = state();
         let Some(w) = s.get_mut(hwnd) else { return 0 };
@@ -326,6 +355,7 @@ pub extern "system" fn EndPaint(hwnd: Hwnd, ps: *const u8) -> Bool {
     if !ps.is_null() {
         release(unsafe { *(ps as *const u64) });
     }
+    PAINTING.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     crate::keyboard::show_caret_after_paint(hwnd);
     1
 }

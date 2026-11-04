@@ -284,6 +284,9 @@ pub(crate) struct ScrollBar {
     pub page: u32,
     pub pos: i32,
     pub disabled: u32,
+    /// While the thumb is being dragged: where it's shown.
+    pub tracking: bool,
+    pub track: i32,
 }
 
 impl Wnd {

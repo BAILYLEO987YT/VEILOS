@@ -68,6 +68,7 @@ syscall_stubs! {
     NtReleaseSemaphore, ZwReleaseSemaphore => sys::NT_RELEASE_SEMAPHORE;
     VeilClipSet, ZwVeilClipSet => sys::VEIL_CLIP_SET;
     VeilClipGet, ZwVeilClipGet => sys::VEIL_CLIP_GET;
+    VeilReg, ZwVeilReg => sys::VEIL_REG;
     VeilUserCreateWindow, ZwVeilUserCreateWindow => sys::VEIL_USER_CREATE_WINDOW;
     VeilUserDestroyWindow, ZwVeilUserDestroyWindow => sys::VEIL_USER_DESTROY_WINDOW;
     VeilUserShowWindow, ZwVeilUserShowWindow => sys::VEIL_USER_SHOW_WINDOW;

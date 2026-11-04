@@ -214,7 +214,7 @@ fn paint_list(hwnd: Hwnd, hdc: u64) {
         let row = [0, y, r[2], y + h];
         let is_sel = if multi(style) { selected.get(i).copied().unwrap_or(false) } else { sel == Some(i) };
         if owner {
-            draw_item(hwnd, hdc, 2, i, *data, row, is_sel, focused && caret == i);
+            draw_item(hwnd, hdc, 2, i, *data, row, is_sel, focused && caret == i, 0);
             continue;
         }
         if is_sel {
@@ -236,14 +236,14 @@ fn paint_list(hwnd: Hwnd, hdc: u64) {
 /// WM_DRAWITEM for an owner-drawn list item (ctl_type: ODT_LISTBOX 2,
 /// ODT_COMBOBOX 3).
 #[allow(clippy::too_many_arguments)]
-fn draw_item(hwnd: Hwnd, hdc: u64, ctl_type: u32, i: usize, data: u64, r: [i32; 4], selected: bool, focus: bool) {
+fn draw_item(hwnd: Hwnd, hdc: u64, ctl_type: u32, i: usize, data: u64, r: [i32; 4], selected: bool, focus: bool, extra: u32) {
     let (parent, id) = state().get(hwnd).map_or((0, 0), |w| (w.parent, w.id));
     let mut dis = [0u8; 64];
     dis[0..4].copy_from_slice(&ctl_type.to_le_bytes());
     dis[4..8].copy_from_slice(&(id as u32).to_le_bytes());
     dis[8..12].copy_from_slice(&(i as u32).to_le_bytes());
     dis[12..16].copy_from_slice(&1u32.to_le_bytes());
-    dis[16..20].copy_from_slice(&((selected as u32) | (focus as u32) << 4).to_le_bytes());
+    dis[16..20].copy_from_slice(&((selected as u32) | (focus as u32) << 4 | extra).to_le_bytes());
     dis[24..32].copy_from_slice(&hwnd.to_le_bytes());
     dis[32..40].copy_from_slice(&hdc.to_le_bytes());
     for (k, v) in r.iter().enumerate() {
@@ -335,6 +335,34 @@ pub unsafe extern "system" fn listbox_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i6
                 if msg == 0x0203 && style & LBS_NOTIFY != 0 {
                     notify(hwnd, LBN_DBLCLK);
                 }
+                crate::window::SetCapture(hwnd);
+            }
+            0
+        }
+        // Dragging moves a single selection along.
+        0x0200 => {
+            if crate::window::GetCapture() == hwnd && style & (0x8 | 0x800) == 0 {
+                let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
+                let Some((top, h, n, sel)) = get(hwnd, |l| (l.top, l.item_h, l.items.len(), l.sel)) else { return 0 };
+                if y >= 0 {
+                    let i = top + (y / h.max(1)) as usize;
+                    if i < n && sel != Some(i) {
+                        pick(hwnd, i, false);
+                    }
+                }
+            }
+            0
+        }
+        0x0202 => {
+            if crate::window::GetCapture() == hwnd {
+                crate::window::ReleaseCapture();
+            }
+            0
+        }
+        0x020A => {
+            let delta = ((wp >> 16) & 0xFFFF) as i16 as i32;
+            for _ in 0..(delta.abs() * 3 / 120).max(1) {
+                send(hwnd, 0x0115, if delta > 0 { 0 } else { 1 }, 0);
             }
             0
         }
@@ -664,7 +692,8 @@ fn paint_combo(hwnd: Hwnd, hdc: u64) {
         let field = [r[0] + 3, r[1] + 3, r[2] - 3 - btn, r[3] - 3];
         if let Some(s) = sel {
             if style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE) != 0 {
-                draw_item(hwnd, hdc, 3, s, items[s].1, field, focused, focused);
+                // ODS_COMBOBOXEDIT
+                draw_item(hwnd, hdc, 3, s, items[s].1, field, focused, focused, 0x1000);
             } else {
                 if focused {
                     crate::paint::FillRect(hdc, &field, crate::paint::GetSysColorBrush(13));
@@ -1047,9 +1076,14 @@ pub unsafe extern "system" fn combo_list_proc(hwnd: Hwnd, msg: u32, wp: u64, lp:
             let old = if font != 0 { unsafe { crate::SelectObject(hdc, font) } } else { 0 };
             if let Some((items, sel, h)) = cget(combo, |c| (c.items.clone(), c.sel, c.item_h)) {
                 unsafe { crate::SetBkMode(hdc, 1) };
-                for (i, (t, _)) in items.iter().enumerate() {
+                let owner_drawn = controls::style(combo) & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE) != 0;
+                for (i, (t, data)) in items.iter().enumerate() {
                     let y = i as i32 * h;
                     let row = [0, y, r[2], y + h];
+                    if owner_drawn {
+                        draw_item(combo, hdc, 3, i, *data, row, sel == Some(i), false, 0);
+                        continue;
+                    }
                     let color = if sel == Some(i) {
                         crate::paint::FillRect(hdc, &row, crate::paint::GetSysColorBrush(13));
                         14

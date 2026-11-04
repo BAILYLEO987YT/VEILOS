@@ -758,6 +758,7 @@ pub fn on_process_exit(process: &Arc<Process>) {
     }
 
     crate::nt_user::process_exited(process.pid);
+    crate::nt_registry::process_exited(process.pid as u32);
 
     // 3. Drop the process's worker threads.
     if let Some(mut tm) = crate::process::THREAD_MANAGER.try_lock() {

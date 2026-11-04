@@ -12,7 +12,6 @@ const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_NOT_SUPPORTED: u32 = 50;
-const ERROR_NO_MORE_ITEMS: u32 = 259;
 
 // -----| the console as a screen buffer |-----
 //
@@ -188,87 +187,6 @@ pub unsafe extern "system" fn GetConsoleTitleA(out: *mut u8, cap: u32) -> u32 {
 #[no_mangle]
 pub unsafe extern "system" fn GetConsoleOriginalTitleW(out: *mut u16, cap: u32) -> u32 {
     unsafe { GetConsoleTitleW(out, cap) }
-}
-
-// -----| the registry: empty |-----
-//
-// Nothing is stored yet: every key is missing and nothing can be created,
-// so programs fall back to their defaults.
-
-#[no_mangle]
-pub extern "system" fn RegOpenKeyExW(_key: Handle, _sub: *const u16, _opts: u32, _sam: u32, out: *mut Handle) -> u32 {
-    if !out.is_null() {
-        unsafe { *out = 0 };
-    }
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegOpenKeyExA(key: Handle, _sub: *const u8, opts: u32, sam: u32, out: *mut Handle) -> u32 {
-    RegOpenKeyExW(key, core::ptr::null(), opts, sam, out)
-}
-
-#[no_mangle]
-pub extern "system" fn RegOpenKeyW(key: Handle, _sub: *const u16, out: *mut Handle) -> u32 {
-    RegOpenKeyExW(key, core::ptr::null(), 0, 0, out)
-}
-
-#[no_mangle]
-pub extern "system" fn RegCreateKeyExW(_key: Handle, _sub: *const u16, _r: u32, _class: usize, _opts: u32, _sam: u32, _sa: usize, out: *mut Handle, _disp: *mut u32) -> u32 {
-    if !out.is_null() {
-        unsafe { *out = 0 };
-    }
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegCreateKeyExA(key: Handle, _sub: *const u8, r: u32, class: usize, opts: u32, sam: u32, sa: usize, out: *mut Handle, disp: *mut u32) -> u32 {
-    RegCreateKeyExW(key, core::ptr::null(), r, class, opts, sam, sa, out, disp)
-}
-
-#[no_mangle]
-pub extern "system" fn RegQueryValueExW(_key: Handle, _name: *const u16, _r: usize, _kind: *mut u32, _data: *mut u8, _size: *mut u32) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegQueryValueExA(_key: Handle, _name: *const u8, _r: usize, _kind: *mut u32, _data: *mut u8, _size: *mut u32) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegGetValueW(_key: Handle, _sub: *const u16, _name: *const u16, _flags: u32, _kind: *mut u32, _data: *mut u8, _size: *mut u32) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegSetValueExW(_key: Handle, _name: *const u16, _r: u32, _kind: u32, _data: *const u8, _size: u32) -> u32 {
-    ERROR_INVALID_HANDLE
-}
-
-#[no_mangle]
-pub extern "system" fn RegDeleteKeyExW(_key: Handle, _sub: *const u16, _sam: u32, _r: u32) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegDeleteValueW(_key: Handle, _name: *const u16) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegEnumKeyExW(_key: Handle, _i: u32, _name: *mut u16, _len: *mut u32, _r: usize, _class: *mut u16, _clen: *mut u32, _time: *mut u64) -> u32 {
-    ERROR_NO_MORE_ITEMS
-}
-
-#[no_mangle]
-pub extern "system" fn RegEnumValueW(_key: Handle, _i: u32, _name: *mut u16, _len: *mut u32, _r: usize, _kind: *mut u32, _data: *mut u8, _dlen: *mut u32) -> u32 {
-    ERROR_NO_MORE_ITEMS
-}
-
-#[no_mangle]
-pub extern "system" fn RegCloseKey(_key: Handle) -> u32 {
-    0
 }
 
 // -----| volumes and drives |-----

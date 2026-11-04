@@ -632,32 +632,38 @@ impl FileSystem for FatFileSystem {
             old[..need].to_vec()
         };
 
+        let first = chain.first().copied().unwrap_or(0);
+        let (date, time) = fat_now();
+
+        // An existing file's entry goes before its data: vvfat commits a file
+        // when its clusters are written, with the size the entry has by then.
+        // Written after, the host file keeps the size of the write before.
+        if let Some(item) = &existing {
+            self.update_entry(dev, dir, item, |e| {
+                e[11] |= ATTR_ARCHIVE;
+                e[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
+                e[26..28].copy_from_slice(&(first as u16).to_le_bytes());
+                e[28..32].copy_from_slice(&size.to_le_bytes());
+                e[22..24].copy_from_slice(&time.to_le_bytes());
+                e[24..26].copy_from_slice(&date.to_le_bytes());
+                e[18..20].copy_from_slice(&date.to_le_bytes());
+            })?;
+        }
+
         let mut buf = vec![0u8; cb];
         for (k, &c) in chain.iter().enumerate() {
             let part = &data[k * cb..data.len().min((k + 1) * cb)];
             buf[..part.len()].copy_from_slice(part);
             buf[part.len()..].fill(0);
             if !dev.write_sectors(self.cluster_lba(c), self.sectors_per_cluster, buf.as_ptr() as u64) {
-                if fresh {
+                if fresh && existing.is_none() {
                     let _ = self.free_chain(dev, chain[0]);
                 }
                 return Err(VfsError::WriteError);
             }
         }
-        let first = chain.first().copied().unwrap_or(0);
-        let (date, time) = fat_now();
-
         match existing {
-            Some(item) => {
-                self.update_entry(dev, dir, &item, |e| {
-                    e[11] |= ATTR_ARCHIVE;
-                    e[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
-                    e[26..28].copy_from_slice(&(first as u16).to_le_bytes());
-                    e[28..32].copy_from_slice(&size.to_le_bytes());
-                    e[22..24].copy_from_slice(&time.to_le_bytes());
-                    e[24..26].copy_from_slice(&date.to_le_bytes());
-                    e[18..20].copy_from_slice(&date.to_le_bytes());
-                })?;
+            Some(_) => {
                 // Release the clusters the shorter file no longer uses.
                 if need == 0 && !old.is_empty() {
                     self.free_chain(dev, old[0])?;

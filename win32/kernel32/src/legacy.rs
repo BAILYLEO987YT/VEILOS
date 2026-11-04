@@ -1,21 +1,16 @@
 //! What older and system programs (regedit, iexpress) ask for beyond the
-//! calls that do the work: ANSI file and string functions, INI files (none
-//! are read yet: callers get their defaults), the registry calls that were
-//! missing, one-time initialization, path helpers, security descriptors (kept
-//! as blank blocks: files have no ACLs), and version.dll's answer that a file
-//! has no version resource.
+//! calls that do the work: ANSI file and string functions, one-time
+//! initialization, path helpers, and security descriptors (kept as blank
+//! blocks: files have no ACLs).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::util::{widen, wstr};
 use crate::{Bool, Handle};
 
-const ERROR_FILE_NOT_FOUND: u32 = 2;
-const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_INVALID_PARAMETER: u32 = 87;
-const ERROR_RESOURCE_DATA_NOT_FOUND: u32 = 1812;
 const ERROR_NONE_MAPPED: u32 = 1332;
 
 // -----| ANSI strings |-----
@@ -175,50 +170,6 @@ pub unsafe extern "system" fn GetTempFileNameA(dir: *const u8, prefix: *const u8
         }
     }
     n
-}
-
-// -----| INI files: none read yet, so the defaults |-----
-
-#[no_mangle]
-pub unsafe extern "system" fn GetPrivateProfileStringA(_sec: *const u8, _key: *const u8, def: *const u8, out: *mut u8, cap: u32, _file: *const u8) -> u32 {
-    if out.is_null() || cap == 0 {
-        return 0;
-    }
-    let mut n = 0;
-    while !def.is_null() && (n as u32) + 1 < cap && unsafe { *def.add(n) } != 0 {
-        unsafe { *out.add(n) = *def.add(n) };
-        n += 1;
-    }
-    unsafe { *out.add(n) = 0 };
-    n as u32
-}
-
-#[no_mangle]
-pub extern "system" fn GetPrivateProfileIntA(_sec: *const u8, _key: *const u8, def: i32, _file: *const u8) -> u32 {
-    def as u32
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn GetPrivateProfileSectionA(_sec: *const u8, out: *mut u8, cap: u32, _file: *const u8) -> u32 {
-    if !out.is_null() && cap >= 2 {
-        unsafe {
-            *out = 0;
-            *out.add(1) = 0;
-        }
-    }
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn WritePrivateProfileStringA(_sec: *const u8, _key: *const u8, _v: *const u8, _file: *const u8) -> Bool {
-    crate::SetLastError(ERROR_NOT_SUPPORTED);
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn WritePrivateProfileSectionA(_sec: *const u8, _v: *const u8, _file: *const u8) -> Bool {
-    crate::SetLastError(ERROR_NOT_SUPPORTED);
-    0
 }
 
 // -----| resources |-----
@@ -441,76 +392,7 @@ pub unsafe extern "system" fn QISearch(this: *mut u8, table: *const [usize; 2], 
     E_NOINTERFACE
 }
 
-// -----| more of the (empty) registry |-----
-
-const ERROR_SUCCESS: u32 = 0;
-
-#[no_mangle]
-pub extern "system" fn RegFlushKey(_key: Handle) -> u32 {
-    ERROR_SUCCESS
-}
-
-#[no_mangle]
-pub extern "system" fn RegSetValueExA(_key: Handle, _name: *const u8, _r: u32, _kind: u32, _data: *const u8, _size: u32) -> u32 {
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegSetValueW(_key: Handle, _sub: *const u16, _kind: u32, _data: *const u16, _size: u32) -> u32 {
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegDeleteKeyW(_key: Handle, _sub: *const u16) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
 /// ERROR_NO_MORE_ITEMS (no subkeys).
-#[no_mangle]
-pub extern "system" fn RegEnumKeyW(_key: Handle, _i: u32, _name: *mut u16, _cap: u32) -> u32 {
-    259
-}
-
-#[no_mangle]
-pub extern "system" fn RegRenameKey(_key: Handle, _sub: *const u16, _new: *const u16) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegConnectRegistryW(_machine: *const u16, _key: Handle, _out: *mut Handle) -> u32 {
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegLoadKeyW(_key: Handle, _sub: *const u16, _file: *const u16) -> u32 {
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegUnLoadKeyW(_key: Handle, _sub: *const u16) -> u32 {
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegSaveKeyW(_key: Handle, _file: *const u16, _sa: usize) -> u32 {
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegRestoreKeyW(_key: Handle, _file: *const u16, _flags: u32) -> u32 {
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegSetKeySecurity(_key: Handle, _info: u32, _sd: *const u8) -> u32 {
-    ERROR_SUCCESS
-}
-
-#[no_mangle]
-pub extern "system" fn RegNotifyChangeKeyValue(_key: Handle, _sub: Bool, _filter: u32, _event: Handle, _async: Bool) -> u32 {
-    ERROR_SUCCESS
-}
-
 // -----| security: blank descriptors, no ACLs |-----
 
 #[no_mangle]
@@ -682,39 +564,3 @@ pub extern "system" fn SetSecurityInfo(_h: Handle, _kind: u32, _info: u32, _o: *
     ERROR_NOT_SUPPORTED
 }
 
-// -----| version.dll: files have no version resource yet |-----
-
-#[no_mangle]
-pub extern "system" fn GetFileVersionInfoSizeW(_name: *const u16, handle: *mut u32) -> u32 {
-    if !handle.is_null() {
-        unsafe { *handle = 0 };
-    }
-    crate::SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn GetFileVersionInfoSizeA(_name: *const u8, handle: *mut u32) -> u32 {
-    GetFileVersionInfoSizeW(core::ptr::null(), handle)
-}
-
-#[no_mangle]
-pub extern "system" fn GetFileVersionInfoW(_name: *const u16, _h: u32, _n: u32, _out: *mut u8) -> Bool {
-    crate::SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn GetFileVersionInfoA(_name: *const u8, _h: u32, _n: u32, _out: *mut u8) -> Bool {
-    GetFileVersionInfoW(core::ptr::null(), 0, 0, core::ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "system" fn VerQueryValueW(_block: *const u8, _sub: *const u16, _out: *mut usize, _len: *mut u32) -> Bool {
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn VerQueryValueA(_block: *const u8, _sub: *const u8, _out: *mut usize, _len: *mut u32) -> Bool {
-    0
-}

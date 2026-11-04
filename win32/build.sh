@@ -53,8 +53,11 @@ fwd advapi32.dll CreateProcessAsUserW DecryptFileW DuplicateEncryptionInfoFile G
     SetSecurityDescriptorOwner SetSecurityDescriptorSacl GetSidSubAuthority GetSidSubAuthorityCount MapGenericMask \
     GetNamedSecurityInfoW SetNamedSecurityInfoW GetSecurityInfo SetSecurityInfo RegFlushKey RegSetValueExA \
     RegSetValueW RegDeleteKeyW RegEnumKeyW RegRenameKey RegConnectRegistryW RegLoadKeyW RegUnLoadKeyW RegSaveKeyW \
+    RegOpenKeyA RegOpenCurrentUser RegDeleteKeyA RegDeleteKeyExA RegDeleteTreeW RegDeleteTreeA RegGetValueA RegQueryValueW \
+    RegDeleteValueA RegEnumKeyExA RegEnumValueA RegQueryInfoKeyA \
     RegRestoreKeyW RegSetKeySecurity RegNotifyChangeKeyValue RegCloseKey RegCreateKeyA RegCreateKeyExA RegCreateKeyExW RegCreateKeyW     RegDeleteKeyExW RegDeleteValueW RegEnumKeyExW RegEnumValueW RegGetValueW RegOpenKeyExA RegOpenKeyExW     RegOpenKeyW RegQueryInfoKeyW RegQueryValueExA RegQueryValueExW RegSetKeyValueA RegSetKeyValueW     RegSetValueExW EventActivityIdControl EventEnabled EventProviderEnabled EventRegister     EventSetInformation EventUnregister EventWrite EventWriteEx EventWriteTransfer
 fwd urlmon.dll FindMimeFromData
+fwd authz.dll AuthzInitializeResourceManager AuthzFreeResourceManager AuthzInitializeContextFromSid AuthzFreeContext AuthzAccessCheck
 fwd version.dll GetFileVersionInfoSizeW GetFileVersionInfoSizeA GetFileVersionInfoW GetFileVersionInfoA VerQueryValueW VerQueryValueA
 fwd propsys.dll PSGetPropertyDescriptionListFromString PropVariantToStringVectorAlloc
 fwd winspool.drv OpenPrinterW OpenPrinterA ClosePrinter GetPrinterDriverW EnumPrintersW GetDefaultPrinterW DocumentPropertiesW

@@ -689,6 +689,14 @@ fn paint(hwnd: Hwnd, hdc: u64) {
         })
         .unwrap_or(true)
     };
+    const CDRF_SKIPDEFAULT: i64 = 4;
+    const CDRF_NOTIFYITEMDRAW: i64 = 0x20;
+    const CDRF_NOTIFYPOSTPAINT: i64 = 0x10;
+    let pre = crate::custom_draw(hwnd, 1, hdc, c, 0, 0, 0, 0, 0, 0).0;
+    if pre & CDRF_SKIPDEFAULT != 0 {
+        unsafe { crate::SelectObject(hdc, old) };
+        return;
+    }
     for (row, (id, depth)) in vis.iter().copied().enumerate() {
         let row = row as i32 - top;
         if row < 0 {
@@ -697,6 +705,23 @@ fn paint(hwnd: Hwnd, hdc: u64) {
         let y = row * h;
         if y >= c[3] {
             break;
+        }
+        // The owner may colour the item, or draw it itself.
+        let (mut cd_text, mut cd_back, mut item_post) = (None, None, false);
+        if pre & CDRF_NOTIFYITEMDRAW != 0 {
+            let (st_now, param) = node(hwnd, id, |n| (n.state, n.param)).unwrap_or((0, 0));
+            const NONE: u32 = 0xFFFF_FFFF;
+            let (r, t, b) = crate::custom_draw(hwnd, 0x1_0001, hdc, [0, y, c[2], y + h], id, st_now, param, NONE, NONE, depth);
+            if r & CDRF_SKIPDEFAULT != 0 {
+                continue;
+            }
+            item_post = r & CDRF_NOTIFYPOSTPAINT != 0;
+            if t != NONE {
+                cd_text = Some(t);
+            }
+            if b != NONE {
+                cd_back = Some(b);
+            }
         }
         let mid = y + h / 2;
         let bx = indent_x(hwnd, depth) + indent / 2 - sx;
@@ -775,6 +800,16 @@ fn paint(hwnd: Hwnd, hdc: u64) {
                 color = crate::GetSysColor(f);
             }
         }
+        if let Some(b) = cd_back {
+            unsafe {
+                let br = crate::CreateSolidBrush(b);
+                crate::FillRect(hdc, &label, br);
+                crate::DeleteObject(br);
+            }
+        }
+        if let Some(t) = cd_text {
+            color = t;
+        }
         unsafe { crate::SetTextColor(hdc, color) };
         let mut tt = t.clone();
         let mut tr = [x + 2, y, x + tw + 4, y + h];
@@ -784,6 +819,12 @@ fn paint(hwnd: Hwnd, hdc: u64) {
             unsafe { crate::DrawFocusRect(hdc, &label) };
         }
         let _ = TVIS_BOLD;
+        if item_post {
+            crate::custom_draw(hwnd, 0x1_0002, hdc, [0, y, c[2], y + h], id, 0, 0, 0, 0, depth);
+        }
+    }
+    if pre & CDRF_NOTIFYPOSTPAINT != 0 {
+        crate::custom_draw(hwnd, 2, hdc, c, 0, 0, 0, 0, 0, 0);
     }
     unsafe { crate::SelectObject(hdc, old) };
 }
@@ -1039,9 +1080,6 @@ fn start_edit(hwnd: Hwnd, id: u64) -> Hwnd {
         return 0;
     }
     let text = node_text(hwnd, id);
-    if label_notify(hwnd, id, TVN_BEGINLABELEDITW, TVN_BEGINLABELEDITA, Some(&text)) != 0 {
-        return 0;
-    }
     ensure_visible(hwnd, id);
     let vis = visible(hwnd);
     let Some(row) = vis.iter().position(|v| v.0 == id) else { return 0 };
@@ -1051,11 +1089,18 @@ fn start_edit(hwnd: Hwnd, id: u64) -> Hwnd {
     let y = (row as i32 - top) * h;
     let x = label_x(hwnd, depth) - sx;
     let c = client(hwnd);
-    let e = crate::labeledit::start(hwnd, [x, y, c[2], y + h + 2], &text, font);
+    // Made before it's announced: the owner may ask for it, to limit its text.
+    let e = crate::labeledit::create(hwnd, [x, y, c[2], y + h + 2], &text, font);
     with(hwnd, |t| {
         t.edit = e;
         t.edit_item = id;
     });
+    if label_notify(hwnd, id, TVN_BEGINLABELEDITW, TVN_BEGINLABELEDITA, Some(&text)) != 0 {
+        with(hwnd, |t| t.edit = 0);
+        unsafe { crate::DestroyWindow(e) };
+        return 0;
+    }
+    crate::labeledit::show(e);
     e
 }
 

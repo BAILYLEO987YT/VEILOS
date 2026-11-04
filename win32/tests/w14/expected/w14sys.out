@@ -1,0 +1,136 @@
+--- registry
+open missing: 2, handle null 1
+create deep: 0 disp 1
+create existing: 0 disp 2
+set sz 0
+set dword 0
+set qword 0
+set binary 0
+set multi 0
+set default 0
+set no terminator 0
+set expand 0
+query (any case) 0 kind 1 size 12: "hello"
+size only 0 size 12
+too small 234 size 12
+missing 2
+dword 0 kind 4 0x12345678
+default 0: "dflt"
+get terminates 0 size 8: "abc"
+wrong type 1630
+through a subkey path 0 0x12345678
+expanded 0 kind 1 size 22: "aXYZb"
+not expanded 0 kind 2: "a%W14VAR%b"
+ansi query 0 kind 1 size 6 "hello"
+ansi set 0
+read wide 0 size 14: "narrow"
+ansi size of dword 0 4
+info 0 subkeys 1 longest 1 values 9 longest name 6 largest data 22
+  value 0 len 4 kind 1 size 12 name: "Text"
+  value 1 len 6 kind 4 size 4 name: "Number"
+  value 2 len 3 kind 11 size 8 name: "Big"
+  value 3 len 3 kind 3 size 3 name: "Bin"
+  value 4 len 5 kind 7 size 18 name: "Multi"
+  value 5 len 0 kind 1 size 10 name: ""
+  value 6 len 4 kind 1 size 8 name: "Bare"
+  value 7 len 3 kind 2 size 22 name: "Exp"
+  value 8 len 5 kind 1 size 14 name: "FromA"
+enum values end 259 at 9
+  key 0 len 1 name: "A"
+enum keys end 259 at 1
+enum into a small buffer 234
+  sorted: "A"
+  sorted: "alpha"
+  sorted: "Beta"
+  sorted: "zeta"
+delete value 2, again 0
+delete key with subkeys 5
+delete leaf 0
+delete now-empty 0
+delete missing 2
+set key value 0
+use after close 6
+delete tree 0
+gone 2
+open a root with no subkey 0
+--- ini
+no file: 7 "default"
+int default 42
+any case, trimmed: 10 "value here"
+quotes: 9 "in quotes"
+empty: 0 ""
+comment: 1 "d"
+cut: 3 "val"
+sections 13 : [First] [Second]
+keys 4 : [x] [y]
+section 8 : [x=1] [y=2]
+names 13 : [First] [Second]
+sections cut 3
+ints 123 4294967289 16 12 5
+wide 1: "2"
+wide keys 4
+wide int 123
+change 1
+add 1
+new section 1
+file (181):
+; comment\r\n
+[First]\r\n
+name = value here  \r\n
+Quoted="in quotes"\r\n
+num=123\r\n
+neg=-7\r\n
+hex=0x10\r\n
+bad=12abc\r\n
+empty=\r\n
+added=new\r\n
+; note=no\r\n
+noequals\r\n
+\r\n
+[Second]\r\n
+x=changed\r\n
+y=2\r\n
+[Third]\r\n
+z=9\r\n
+<end>
+delete key 1
+delete section 1
+file (146):
+; comment\r\n
+[First]\r\n
+name = value here  \r\n
+Quoted="in quotes"\r\n
+neg=-7\r\n
+hex=0x10\r\n
+bad=12abc\r\n
+empty=\r\n
+added=new\r\n
+; note=no\r\n
+noequals\r\n
+\r\n
+[Third]\r\n
+z=9\r\n
+<end>
+wide write 1
+back 4 "wide"
+fresh file 1
+file (12):
+[New]\r\n
+k=v\r\n
+<end>
+--- version
+has one 1, handle 0
+got 1
+root 1 len 52
+signature 0xfeef04bd file 0x10002.0x30004 product 0x50006.0x70008
+translation 1 len 4
+  0x4b00409
+string 1 len 17
+  value: "W14 test program"
+other case 1
+  value: "VEILOS"
+missing 0
+ansi 1 len 13
+  value "VEILOS tests"
+missing file 0, error is set 1
+exit 0

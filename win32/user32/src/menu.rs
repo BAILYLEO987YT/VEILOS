@@ -953,7 +953,13 @@ struct Loop {
     /// The item chosen (its id), or None while running / cancelled.
     chosen: Option<u32>,
     done: bool,
+    /// Where the pointer is resting (level, item): acted on when the timer
+    /// runs out.
+    rest: Option<(usize, usize)>,
 }
+
+const REST_TIMER: u64 = 0x7F31;
+const REST_MS: u32 = 300;
 
 /// EndMenu was called.
 static CANCEL: Lock<bool> = Lock::new(false);
@@ -1191,6 +1197,51 @@ fn hit(lp: &Loop, m: &nt_abi::Msg) -> Option<(Option<usize>, Option<usize>)> {
 
 /// Run the menu loop until an item is chosen or the menu is left: the
 /// chosen item's id.
+/// Start (or stop) waiting on the pointer's resting place.
+fn rest_at(lp: &mut Loop, at: Option<(usize, usize)>) {
+    if at.is_some() {
+        crate::message::SetTimer(lp.owner, REST_TIMER, REST_MS, 0);
+    } else if lp.rest.is_some() {
+        crate::message::KillTimer(lp.owner, REST_TIMER);
+    }
+    lp.rest = at;
+}
+
+/// The pointer on an item. A submenu stays open while the pointer crosses its
+/// parent on the way there: only resting on another item changes anything.
+fn hover(lp: &mut Loop, l: usize, i: usize) {
+    if lp.rest.is_some_and(|(rl, _)| rl < l) {
+        rest_at(lp, None);
+    }
+    let Some(it) = get_item(lp.levels[l].menu, i).filter(selectable) else { return };
+    let below = lp.levels.len() > l + 1;
+    if lp.levels[l].sel == Some(i) {
+        if below {
+            rest_at(lp, None);
+        }
+    } else if below {
+        rest_at(lp, Some((l, i)));
+    } else {
+        set_sel(lp, l, Some(i));
+        rest_at(lp, (it.sub != 0).then_some((l, i)));
+    }
+}
+
+/// The pointer has stayed: close what's below, and open its submenu.
+fn rested(lp: &mut Loop) {
+    let at = lp.rest;
+    rest_at(lp, None);
+    let Some((l, i)) = at else { return };
+    if l >= lp.levels.len() {
+        return;
+    }
+    close_from(lp, l + 1);
+    set_sel(lp, l, Some(i));
+    if get_item(lp.levels[l].menu, i).is_some_and(|it| it.sub != 0) {
+        choose(lp, Some(l), i, false);
+    }
+}
+
 fn run(lp: &mut Loop) -> Option<u32> {
     *CANCEL.lock() = false;
     let mut m = nt_abi::Msg::default();
@@ -1203,15 +1254,34 @@ fn run(lp: &mut Loop) -> Option<u32> {
             break;
         }
         match m.message {
-            0x0100 | 0x0104 => key(lp, m.wparam as u32),
+            0x0100 | 0x0104 => {
+                rest_at(lp, None);
+                key(lp, m.wparam as u32);
+            }
             0x0101 | 0x0105 => {}
-            0x0102 | 0x0106 => mnemonic(lp, m.wparam as u16),
-            0x0201 | 0x0204 | 0x00A1 | 0x00A4 => match hit(lp, &m) {
-                Some((level, Some(i))) => choose(lp, level, i, false),
-                Some((_, None)) => {}
-                // A click anywhere else leaves the menu (and is eaten).
-                None => lp.done = true,
+            0x0102 | 0x0106 => {
+                rest_at(lp, None);
+                mnemonic(lp, m.wparam as u16);
+            }
+            0x0201 | 0x0204 | 0x00A1 | 0x00A4 => {
+                rest_at(lp, None);
+                match hit(lp, &m) {
+                    Some((level, Some(i))) => choose(lp, level, i, false),
+                    Some((_, None)) => {}
+                    // A click anywhere else leaves the menu (and is eaten).
+                    None => lp.done = true,
+                }
+            }
+            0x0200 | 0x00A0 => match hit(lp, &m) {
+                Some((Some(l), Some(i))) => hover(lp, l, i),
+                // Along the bar, an open menu follows.
+                Some((None, Some(i))) if !lp.levels.is_empty() && lp.bar_sel != Some(i) => {
+                    rest_at(lp, None);
+                    bar_select(lp, i, true, false);
+                }
+                _ => rest_at(lp, None),
             },
+            0x0113 if m.hwnd == lp.owner && m.wparam == REST_TIMER => rested(lp),
             0x0200..=0x020E | 0x00A0..=0x00AD => {}
             _ => {
                 crate::message::TranslateMessage(&m);
@@ -1219,6 +1289,7 @@ fn run(lp: &mut Loop) -> Option<u32> {
             }
         }
     }
+    rest_at(lp, None);
     close_from(lp, 0);
     if lp.bar != 0 {
         *HOT_BAR.lock() = (0, None);
@@ -1245,7 +1316,7 @@ pub extern "system" fn TrackPopupMenu(menu: u64, flags: u32, x: i32, y: i32, _re
     }
     let notify = flags & TPM_NONOTIFY == 0;
     let system = is_system(owner, menu);
-    let mut lp = Loop { owner, bar: 0, bar_sel: None, levels: Vec::new(), notify, system, chosen: None, done: false };
+    let mut lp = Loop { owner, bar: 0, bar_sel: None, levels: Vec::new(), notify, system, chosen: None, done: false, rest: None };
     if notify {
         send(owner, WM_ENTERMENULOOP, 1, 0);
         send(owner, WM_INITMENU, menu, 0);
@@ -1292,7 +1363,7 @@ fn bar_loop(hwnd: Hwnd, start: usize, open: bool, keyboard: bool) {
     if bar == 0 {
         return;
     }
-    let mut lp = Loop { owner: hwnd, bar, bar_sel: None, levels: Vec::new(), notify: true, system: false, chosen: None, done: false };
+    let mut lp = Loop { owner: hwnd, bar, bar_sel: None, levels: Vec::new(), notify: true, system: false, chosen: None, done: false, rest: None };
     send(hwnd, WM_ENTERMENULOOP, 0, 0);
     send(hwnd, WM_INITMENU, bar, 0);
     bar_select(&mut lp, start, open, keyboard);
@@ -1318,7 +1389,7 @@ pub fn key_menu(hwnd: Hwnd, ch: u16) {
         let sys = GetSystemMenu(hwnd, 0);
         let mut wr = [0i32; 4];
         crate::window::GetWindowRect(hwnd, &mut wr);
-        let mut lp = Loop { owner: hwnd, bar: 0, bar_sel: None, levels: Vec::new(), notify: true, system: true, chosen: None, done: false };
+        let mut lp = Loop { owner: hwnd, bar: 0, bar_sel: None, levels: Vec::new(), notify: true, system: true, chosen: None, done: false, rest: None };
         send(hwnd, WM_ENTERMENULOOP, 0, 0);
         send(hwnd, WM_INITMENU, sys, 0);
         open_popup(&mut lp, sys, 0, wr[0], wr[1] + 31, true);

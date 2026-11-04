@@ -278,6 +278,34 @@ unsafe extern "system" fn trackbar_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) 
                 track_move(hwnd, r.pos - r.page, 2);
             } else if p >= hi {
                 track_move(hwnd, r.pos + r.page, 3);
+            } else {
+                // The thumb: it follows the mouse until released.
+                unsafe { crate::SetCapture(hwnd) };
+            }
+            0
+        }
+        0x0200 => {
+            if unsafe { crate::GetCapture() } == hwnd {
+                let (x, y) = lohi(lp);
+                let vert = style(hwnd) & TBS_VERT != 0;
+                let (_, a, b) = track_geometry(hwnd);
+                let r = get(hwnd);
+                let at = (if vert { y } else { x }).clamp(a, b);
+                let span = (b - a).max(1) as i64;
+                let to = r.min + (((at - a) as i64 * (r.max - r.min) as i64 + span / 2) / span) as i32;
+                if to != r.pos {
+                    set(hwnd, |t| t.pos = to);
+                    redraw(hwnd);
+                    track_notify(hwnd, 5); // TB_THUMBTRACK
+                }
+            }
+            0
+        }
+        0x0202 => {
+            if unsafe { crate::GetCapture() } == hwnd {
+                unsafe { crate::ReleaseCapture() };
+                track_notify(hwnd, 4); // TB_THUMBPOSITION
+                track_notify(hwnd, 8); // TB_ENDTRACK
             }
             0
         }

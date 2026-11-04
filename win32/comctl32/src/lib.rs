@@ -15,6 +15,10 @@
 //!   tabs.rs       the tab control
 //!   propsheet.rs  property sheets and wizards
 //!   labeledit.rs  in-place label editing for list and tree views
+//!   rebar.rs      the rebar
+//!   comboex.rs    the extended combo box
+//!   datetime.rs   the month calendar and date and time picker
+//!   pictures.rs   the standard toolbar pictures
 
 #![no_std]
 // build.rs gives some exports their Windows ordinals; the linker then sees
@@ -23,7 +27,9 @@
 
 extern crate alloc;
 
+mod comboex;
 mod controls;
+mod datetime;
 #[path = "../../dllrt.rs"]
 mod dllrt;
 mod dpa;
@@ -31,7 +37,9 @@ mod header;
 mod imagelist;
 mod labeledit;
 mod listview;
+mod pictures;
 mod propsheet;
+mod rebar;
 mod status;
 mod tabs;
 mod toolbar;
@@ -78,6 +86,9 @@ unsafe extern "system" {
     pub(crate) fn TrackMouseEvent(tme: *mut u8) -> Bool;
     pub(crate) fn VeilCallProc(proc: usize, proc_unicode: Bool, hwnd: Hwnd, msg: u32, wp: u64, lp: i64, from_unicode: Bool) -> i64;
     pub(crate) fn DestroyWindow(hwnd: Hwnd) -> Bool;
+    pub(crate) fn SetCapture(hwnd: Hwnd) -> Hwnd;
+    pub(crate) fn GetCapture() -> Hwnd;
+    pub(crate) fn ReleaseCapture() -> Bool;
     pub(crate) fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
     pub(crate) fn EnableWindow(hwnd: Hwnd, on: Bool) -> Bool;
     pub(crate) fn IsWindowVisible(hwnd: Hwnd) -> Bool;
@@ -216,6 +227,32 @@ pub(crate) fn merge_sort<T: Clone>(v: &mut Vec<T>, cmp: &mut dyn FnMut(&T, &T) -
     v.extend_from_slice(&right[j..]);
 }
 
+/// NM_CUSTOMDRAW: what the owner answers, and the colours it chose.
+/// `extra` runs on the structure before it's sent (colours, sub-item, level).
+pub(crate) fn custom_draw(hwnd: Hwnd, stage: u32, hdc: u64, rc: [i32; 4], item: u64, state: u32, param: i64, text: u32, back: u32, sub: i32) -> (i64, u32, u32) {
+    const NM_CUSTOMDRAW: u32 = (-12i32) as u32;
+    // NMCUSTOMDRAW, then clrText, clrTextBk and a word for iSubItem / iLevel.
+    let mut m = [0u8; 136];
+    let id = unsafe { GetDlgCtrlID(hwnd) } as u64;
+    m[0..8].copy_from_slice(&hwnd.to_le_bytes());
+    m[8..16].copy_from_slice(&id.to_le_bytes());
+    m[16..20].copy_from_slice(&NM_CUSTOMDRAW.to_le_bytes());
+    m[24..28].copy_from_slice(&stage.to_le_bytes());
+    m[32..40].copy_from_slice(&hdc.to_le_bytes());
+    for (k, v) in rc.iter().enumerate() {
+        m[40 + k * 4..44 + k * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    m[56..64].copy_from_slice(&item.to_le_bytes());
+    m[64..68].copy_from_slice(&state.to_le_bytes());
+    m[72..80].copy_from_slice(&param.to_le_bytes());
+    m[80..84].copy_from_slice(&text.to_le_bytes());
+    m[84..88].copy_from_slice(&back.to_le_bytes());
+    m[88..92].copy_from_slice(&sub.to_le_bytes());
+    let parent = unsafe { GetParent(hwnd) };
+    let r = unsafe { SendMessageW(parent, WM_NOTIFY, id, m.as_mut_ptr() as i64) };
+    (r, u32::from_le_bytes(m[80..84].try_into().unwrap()), u32::from_le_bytes(m[84..88].try_into().unwrap()))
+}
+
 /// Width and height of `s` in the DC's font.
 pub(crate) fn text_size(hdc: u64, s: &[u16]) -> (i32, i32) {
     let mut sz = [0i32; 2];
@@ -310,6 +347,9 @@ pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) ->
         treeview::register_class();
         toolbar::register_class();
         tabs::register_class();
+        rebar::register_class();
+        comboex::register_class();
+        datetime::register_classes();
     }
     1
 }

@@ -27,14 +27,14 @@ unsafe extern "system" fn edit_subclass(hwnd: Hwnd, msg: u32, wp: u64, lp: i64, 
     crate::DefSubclassProc(hwnd, msg, wp, lp)
 }
 
-/// An edit box with `text` selected, focused, in `owner` at `r`.
-pub fn start(owner: Hwnd, r: [i32; 4], text: &[u16], font: u64) -> Hwnd {
+/// A hidden edit box with `text` selected, in `owner` at `r`.
+pub fn create(owner: Hwnd, r: [i32; 4], text: &[u16], font: u64) -> Hwnd {
     let mut t = text.to_vec();
     t.push(0);
     let class = crate::wide("EDIT");
-    // WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL
+    // WS_CHILD | WS_BORDER | ES_AUTOHSCROLL
     let e = unsafe {
-        crate::CreateWindowExW(0, class.as_ptr(), t.as_ptr(), 0x5080_0080, r[0], r[1], r[2] - r[0], r[3] - r[1], owner, 0, 0, 0)
+        crate::CreateWindowExW(0, class.as_ptr(), t.as_ptr(), 0x4080_0080, r[0], r[1], r[2] - r[0], r[3] - r[1], owner, 0, 0, 0)
     };
     if e == 0 {
         return 0;
@@ -44,8 +44,15 @@ pub fn start(owner: Hwnd, r: [i32; 4], text: &[u16], font: u64) -> Hwnd {
         crate::SendMessageW(e, 0x00B1, 0, -1);
     }
     crate::SetWindowSubclass(e, edit_subclass as *const () as usize, 1, owner);
-    unsafe { crate::SetFocus(e) };
     e
+}
+
+/// The box on screen, with the focus.
+pub fn show(e: Hwnd) {
+    unsafe {
+        crate::ShowWindow(e, 5);
+        crate::SetFocus(e);
+    }
 }
 
 /// The edit box's text.

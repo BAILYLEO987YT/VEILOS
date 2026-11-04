@@ -27,6 +27,8 @@ mod mem;
 mod module;
 mod pool;
 mod process;
+mod profile;
+mod registry;
 mod resource;
 mod support;
 mod system;
@@ -48,6 +50,7 @@ const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
+    pub(crate) fn VeilReg(call: *mut nt_abi::reg::RegCall) -> i32;
     pub(crate) fn NtTerminateProcess(process: Handle, status: NtStatus) -> NtStatus;
     pub(crate) fn NtWriteFile(file: Handle, event: Handle, apc: usize, apc_context: usize, iosb: *mut IoStatusBlock,
                               buffer: *const u8, length: u32, offset: *const i64, key: *const u32) -> NtStatus;

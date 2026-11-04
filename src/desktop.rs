@@ -529,6 +529,15 @@ impl DesktopWindowManager {
         }
     }
 
+    /// The window whose content is at (x, y), if the topmost there is one.
+    pub fn content_at(&self, x: i32, y: i32) -> Option<u32> {
+        self.windows.iter().rev().find_map(|w| match w.hit_test(x, y) {
+            WindowHit::None => None,
+            WindowHit::Content => Some(Some(w.id)),
+            _ => Some(None),
+        }).flatten()
+    }
+
     pub fn on_mouse_down(&mut self, x: i32, y: i32) -> PendingClick {
         // Hit-test in reverse Z order (topmost first).
         // windows is kept sorted by repaint_all(), so we just reverse-iterate.
@@ -2420,10 +2429,12 @@ pub fn poll_input() {
         }
     }
 
-    let (mx, my, mb, rmb) = {
-        let state = crate::task::mouse::MOUSE_STATE.lock();
-        (state.x as usize, state.y as usize, state.left_button, state.right_button)
+    let (mx, my, mb, rmb, wheel) = {
+        let mut state = crate::task::mouse::MOUSE_STATE.lock();
+        (state.x as usize, state.y as usize, state.left_button, state.right_button, core::mem::replace(&mut state.wheel, 0))
     };
+    // Windows programs' windows follow the pointer themselves.
+    crate::nt_user::mouse_tick(mx as i32, my as i32, mb, rmb, wheel);
 
     let last_mb = LAST_MB.load(Ordering::Relaxed);
     let last_rmb = LAST_RMB.load(Ordering::Relaxed);

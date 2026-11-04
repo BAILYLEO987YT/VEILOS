@@ -11,7 +11,6 @@ use crate::{Bool, Handle};
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NO_TOKEN: u32 = 1008;
-const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 
@@ -349,38 +348,6 @@ pub unsafe extern "system" fn FoldStringW(_flags: u32, src: *const u16, n: i32, 
     }
     unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), out, s.len()) };
     s.len() as i32
-}
-
-// -----| the registry: the calls that were missing |-----
-
-#[no_mangle]
-pub extern "system" fn RegCreateKeyW(_key: Handle, _sub: *const u16, out: *mut Handle) -> u32 {
-    if !out.is_null() {
-        unsafe { *out = 0 };
-    }
-    ERROR_ACCESS_DENIED
-}
-
-#[no_mangle]
-pub extern "system" fn RegCreateKeyA(key: Handle, _sub: *const u8, out: *mut Handle) -> u32 {
-    RegCreateKeyW(key, core::ptr::null(), out)
-}
-
-#[no_mangle]
-pub extern "system" fn RegSetKeyValueW(_key: Handle, _sub: *const u16, _name: *const u16, _kind: u32, _data: *const u8, _len: u32) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegSetKeyValueA(_key: Handle, _sub: *const u8, _name: *const u8, _kind: u32, _data: *const u8, _len: u32) -> u32 {
-    ERROR_FILE_NOT_FOUND
-}
-
-#[no_mangle]
-pub extern "system" fn RegQueryInfoKeyW(_key: Handle, _class: *mut u16, _clen: *mut u32, _r: usize, _subkeys: *mut u32, _maxsub: *mut u32,
-                                        _maxclass: *mut u32, _values: *mut u32, _maxname: *mut u32, _maxdata: *mut u32, _sd: *mut u32,
-                                        _time: *mut u64) -> u32 {
-    ERROR_INVALID_HANDLE
 }
 
 // -----| files and modules |-----

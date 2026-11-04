@@ -526,11 +526,56 @@ pub unsafe extern "system" fn edit_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) 
             key_down(hwnd, wp as u32);
             0
         }
-        0x0201 | 0x0203 => {
+        0x0201 => {
             crate::window::SetFocus(hwnd);
             let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
             let i = char_at(hwnd, x, y);
             move_caret(hwnd, i, crate::keyboard::GetKeyState(0x10) < 0);
+            crate::window::SetCapture(hwnd);
+            0
+        }
+        // A double click takes the word.
+        0x0203 => {
+            let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            let i = char_at(hwnd, x, y);
+            let t = text(hwnd);
+            let is_word = |c: u16| c != b' ' as u16 && c != b'\t' as u16 && c != CR && c != LF;
+            let mut a = i.min(t.len());
+            while a > 0 && is_word(t[a - 1]) {
+                a -= 1;
+            }
+            let mut b = i.min(t.len());
+            while b < t.len() && is_word(t[b]) {
+                b += 1;
+            }
+            get(hwnd, |e| e.anchor = a);
+            move_caret(hwnd, b, true);
+            0
+        }
+        // Dragging extends the selection.
+        0x0200 => {
+            if crate::window::GetCapture() == hwnd {
+                let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+                let i = char_at(hwnd, x, y);
+                if get(hwnd, |e| e.caret) != Some(i) {
+                    move_caret(hwnd, i, true);
+                }
+            }
+            0
+        }
+        0x0202 => {
+            if crate::window::GetCapture() == hwnd {
+                crate::window::ReleaseCapture();
+            }
+            0
+        }
+        // The wheel: three lines a notch.
+        0x020A if multi => {
+            let delta = ((wp >> 16) & 0xFFFF) as i16 as i32;
+            let lines = delta.abs() * 3 / 120;
+            for _ in 0..lines.max(1) {
+                crate::message::send(hwnd, 0x0115, if delta > 0 { 0 } else { 1 }, 0);
+            }
             0
         }
         0x0007 => {

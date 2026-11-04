@@ -145,6 +145,7 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::VEIL_USER_QUERY => crate::nt_user::query(a0, a1),
         sys::VEIL_CLIP_SET => crate::nt_user::clip_set(proc.pid as u32, a0, a1),
         sys::VEIL_CLIP_GET => crate::nt_user::clip_get(proc.pid as u32, a0, a1, a2),
+        sys::VEIL_REG => crate::nt_registry::call(proc.pid as u32, a0),
         sys::VEIL_LOAD_DLL => load_dll(&proc, a0, a1, a2, a3),
         sys::VEIL_GET_PROC_ADDRESS => get_proc_address(&proc, a0, a1, a2),
         _ => status::NOT_IMPLEMENTED,

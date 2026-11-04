@@ -20,6 +20,7 @@ const SB_LINEDOWN: u32 = 1;
 const SB_PAGEUP: u32 = 2;
 const SB_PAGEDOWN: u32 = 3;
 const SB_THUMBPOSITION: u32 = 4;
+const SB_THUMBTRACK: u32 = 5;
 const SB_TOP: u32 = 6;
 const SB_BOTTOM: u32 = 7;
 const SB_ENDSCROLL: u32 = 8;
@@ -116,7 +117,7 @@ pub unsafe extern "system" fn GetScrollInfo(hwnd: Hwnd, bar: i32, si: *mut u32) 
         f[5] = sb.pos as u32;
     }
     if mask & SIF_TRACKPOS != 0 {
-        f[6] = sb.pos as u32;
+        f[6] = (if sb.tracking { sb.track } else { sb.pos }) as u32;
     }
     let _ = SIF_DISABLENOSCROLL;
     1
@@ -241,7 +242,8 @@ pub fn draw(hdc: u64, r: [i32; 4], vertical: bool, sb: &ScrollBar, enabled: bool
     if enabled && range > 0 && track_len > 8 && (sb.page == 0 || (sb.page as i32) < range) {
         let size = if sb.page > 0 { (track_len * sb.page as i32 / range).max(8) } else { thick.max(8) };
         let span = (range - (sb.page as i32).max(1)).max(1);
-        let off = btn + (track_len - size) * (sb.pos - sb.min) / span;
+        let shown = if sb.tracking { sb.track } else { sb.pos };
+        let off = btn + (track_len - size) * (shown - sb.min) / span;
         button(at(off, off + size));
     }
 }
@@ -307,14 +309,133 @@ pub fn nc_click(hwnd: Hwnd, vertical: bool, sx: i32, sy: i32) {
     crate::window::GetWindowRect(hwnd, &mut wr);
     let i = vertical as usize;
     let Some(r) = bar_rects(hwnd)[i] else { return };
-    let Some(sb) = state().get(hwnd).map(|w| w.scroll[i]) else { return };
     let (x, y) = (sx - wr[0] - r[0], sy - wr[1] - r[1]);
     let (len, thick, along) = if vertical { (r[3] - r[1], r[2] - r[0], y) } else { (r[2] - r[0], r[3] - r[1], x) };
-    let code = click_code(len, thick, &sb, along);
-    let msg = if vertical { WM_VSCROLL } else { WM_HSCROLL };
-    let wp = if code == SB_THUMBPOSITION { (sb.pos as u16 as u64) << 16 | code as u64 } else { code as u64 };
-    send(hwnd, msg, wp, 0);
-    send(hwnd, msg, SB_ENDSCROLL as u64, 0);
+    let bar = if vertical { SB_VERT } else { SB_HORZ };
+    track(hwnd, bar, Bar { target: hwnd, ctl: 0, msg: if vertical { WM_VSCROLL } else { WM_HSCROLL }, vertical, origin: (wr[0] + r[0], wr[1] + r[1]), len, thick }, along);
+}
+
+/// A scroll bar being pressed.
+struct Bar {
+    /// Who hears, and the control to name (0 for a window's own bar).
+    target: Hwnd,
+    ctl: i64,
+    msg: u32,
+    vertical: bool,
+    /// Its start on the screen, and its size.
+    origin: (i32, i32),
+    len: i32,
+    thick: i32,
+}
+
+fn bar_info(hwnd: Hwnd, bar: i32) -> ScrollBar {
+    match slot(hwnd, bar) {
+        Some(i) => state().get(hwnd).map(|w| w.scroll[i]).unwrap_or_default(),
+        None => ScrollBar::default(),
+    }
+}
+
+fn set_tracking(hwnd: Hwnd, bar: i32, tracking: bool, pos: i32) {
+    if let Some(i) = slot(hwnd, bar) {
+        if let Some(w) = state().get_mut(hwnd) {
+            w.scroll[i].tracking = tracking;
+            w.scroll[i].track = pos;
+        }
+    }
+    redraw(hwnd, bar);
+}
+
+/// Hold the button down on a scroll bar until it's released: the thumb
+/// follows the mouse (SB_THUMBTRACK, then SB_THUMBPOSITION), the arrows and
+/// the track repeat. Other messages go on being handled meanwhile.
+fn track(hwnd: Hwnd, bar: i32, b: Bar, along: i32) {
+    let sb = bar_info(hwnd, bar);
+    let code = click_code(b.len, b.thick, &sb, along);
+    let geometry = |sb: &ScrollBar| {
+        let btn = b.thick.min(b.len / 2);
+        let range = sb.max - sb.min + 1;
+        let track_len = b.len - 2 * btn;
+        let size = if sb.page > 0 { (track_len * sb.page as i32 / range.max(1)).max(8) } else { b.thick.max(8) };
+        let span = (range - (sb.page as i32).max(1)).max(1);
+        (btn, track_len - size, span)
+    };
+    crate::window::SetCapture(hwnd);
+    let mut m = nt_abi::Msg::default();
+    if code == SB_THUMBPOSITION {
+        let (btn, room, span) = geometry(&sb);
+        let start = btn + room * (sb.pos - sb.min) / span;
+        let grab = along - start;
+        let mut pos = sb.pos;
+        set_tracking(hwnd, bar, true, pos);
+        loop {
+            if crate::message::GetMessageW(&mut m, 0, 0, 0) == 0 {
+                crate::message::PostQuitMessage(m.wparam as i32);
+                break;
+            }
+            match m.message {
+                0x0200 | 0x00A0 => {
+                    let at = if b.vertical { m.pt_y - b.origin.1 } else { m.pt_x - b.origin.0 };
+                    let cur = bar_info(hwnd, bar);
+                    let (btn, room, span) = geometry(&cur);
+                    let new = if room > 0 { cur.min + (((at - grab - btn) as i64 * span as i64 + room as i64 / 2) / room as i64) as i32 } else { cur.min };
+                    let top = if cur.page > 0 { cur.max - cur.page as i32 + 1 } else { cur.max };
+                    let new = new.clamp(cur.min, top.max(cur.min));
+                    if new != pos {
+                        pos = new;
+                        set_tracking(hwnd, bar, true, pos);
+                        send(b.target, b.msg, (pos as u16 as u64) << 16 | SB_THUMBTRACK as u64, b.ctl);
+                    }
+                }
+                0x0202 | 0x00A2 => break,
+                _ => {
+                    crate::message::TranslateMessage(&m);
+                    crate::message::DispatchMessageW(&m);
+                }
+            }
+        }
+        set_tracking(hwnd, bar, false, pos);
+        send(b.target, b.msg, (pos as u16 as u64) << 16 | SB_THUMBPOSITION as u64, b.ctl);
+    } else {
+        send(b.target, b.msg, code as u64, b.ctl);
+        // As Windows: a pause, then a steady repeat while it's held.
+        let mut next = unsafe { GetTickCount() }.wrapping_add(350);
+        'held: loop {
+            while crate::message::PeekMessageW(&mut m, 0, 0, 0, 1) != 0 {
+                match m.message {
+                    0x0202 | 0x00A2 => break 'held,
+                    0x0200 | 0x00A0 => {}
+                    0x0012 => {
+                        crate::message::PostQuitMessage(m.wparam as i32);
+                        break 'held;
+                    }
+                    _ => {
+                        crate::message::TranslateMessage(&m);
+                        crate::message::DispatchMessageW(&m);
+                    }
+                }
+            }
+            let now = unsafe { GetTickCount() };
+            if now.wrapping_sub(next) as i32 >= 0 {
+                next = now.wrapping_add(50);
+                // Paging stops when the thumb reaches the pointer.
+                let mut p = [0i32; 2];
+                crate::paint::GetCursorPos(&mut p);
+                let at = if b.vertical { p[1] - b.origin.1 } else { p[0] - b.origin.0 };
+                if click_code(b.len, b.thick, &bar_info(hwnd, bar), at) == code {
+                    send(b.target, b.msg, code as u64, b.ctl);
+                }
+            }
+            unsafe { Sleep(10) };
+        }
+    }
+    crate::window::ReleaseCapture();
+    send(b.target, b.msg, SB_ENDSCROLL as u64, b.ctl);
+}
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn GetTickCount() -> u32;
+    fn Sleep(ms: u32);
 }
 
 // -----| the ScrollBar control |-----
@@ -346,14 +467,12 @@ pub unsafe extern "system" fn scrollbar_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: 
         WM_LBUTTONDOWN => {
             let mut r = [0i32; 4];
             crate::window::GetClientRect(hwnd, &mut r);
-            let sb = state().get(hwnd).map(|w| w.scroll[0]).unwrap_or_default();
             let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
             let (len, thick, along) = if vertical { (r[3], r[2], y) } else { (r[2], r[3], x) };
-            let code = click_code(len, thick, &sb, along);
+            let mut o = [[0i32, 0i32]];
+            crate::window::MapWindowPoints(hwnd, 0, o.as_mut_ptr(), 1);
             let m = if vertical { WM_VSCROLL } else { WM_HSCROLL };
-            let w = if code == SB_THUMBPOSITION { (sb.pos as u16 as u64) << 16 | code as u64 } else { code as u64 };
-            send(parent, m, w, hwnd as i64);
-            send(parent, m, SB_ENDSCROLL as u64, hwnd as i64);
+            track(hwnd, SB_CTL, Bar { target: parent, ctl: hwnd as i64, msg: m, vertical, origin: (o[0][0], o[0][1]), len, thick }, along);
             0
         }
         WM_KEYDOWN => {

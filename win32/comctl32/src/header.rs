@@ -67,7 +67,18 @@ struct Header {
     items: Vec<Item>,
     font: u64,
     images: u64,
+    /// A divider being dragged: (item, where it started, its width then).
+    sizing: Option<(usize, i32, i32)>,
+    /// The item a click went down on.
+    pressed: Option<usize>,
 }
+
+/// Near enough to a divider to grab it.
+const GRIP: i32 = 4;
+const HDN_BEGINTRACKW: i32 = -326;
+const HDN_ENDTRACKW: i32 = -327;
+const HDN_BEGINTRACKA: i32 = -306;
+const HDN_ENDTRACKA: i32 = -307;
 
 static HEADERS: Lock<BTreeMap<Hwnd, Header>> = Lock::new(BTreeMap::new());
 
@@ -113,8 +124,18 @@ fn paint(hwnd: Hwnd, hdc: u64) {
         crate::SetBkMode(hdc, 1);
         crate::SetTextColor(hdc, crate::GetSysColor(18));
     }
+    const CDRF_SKIPDEFAULT: i64 = 4;
+    const CDRF_NOTIFYITEMDRAW: i64 = 0x20;
+    let pre = crate::custom_draw(hwnd, 1, hdc, r, 0, 0, 0, 0, 0, 0).0;
+    if pre & CDRF_SKIPDEFAULT != 0 {
+        unsafe { crate::SelectObject(hdc, old) };
+        return;
+    }
     for (i, rr) in rects(hwnd) {
         let it = &items[i];
+        if pre & CDRF_NOTIFYITEMDRAW != 0 && crate::custom_draw(hwnd, 0x1_0001, hdc, rr, i as u64, 0, it.param, 0, 0, 0).0 & CDRF_SKIPDEFAULT != 0 {
+            continue;
+        }
         // BDR_RAISEDOUTER | BDR_RAISEDINNER... just the right and bottom edges,
         // Windows 10's flat look.
         unsafe {
@@ -146,7 +167,6 @@ fn paint(hwnd: Hwnd, hdc: u64) {
         }
     }
     unsafe { crate::SelectObject(hdc, old) };
-    let _ = r;
 }
 
 fn read_item(lp: i64, unicode: bool, it: &mut Item) -> u32 {
@@ -255,10 +275,45 @@ unsafe extern "system" fn header_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) ->
         0x0031 => with(hwnd, |h| h.font as i64).unwrap_or(0),
         0x0201 => {
             let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            let all = rects(hwnd);
+            // A divider: the last one within reach, so a zero-width column can
+            // be pulled out again.
+            if let Some((i, r)) = all.iter().rev().find(|(_, r)| (x - r[2]).abs() <= GRIP) {
+                if notify(hwnd, HDN_BEGINTRACKW, HDN_BEGINTRACKA, *i as i32, 0, 0) == 0 {
+                    with(hwnd, |h| h.sizing = Some((*i, x, r[2] - r[0])));
+                    unsafe { crate::SetCapture(hwnd) };
+                }
+                return 0;
+            }
+            let hit = all.iter().find(|(_, r)| x >= r[0] && x < r[2] && y >= r[1] && y < r[3]).map(|h| h.0);
+            with(hwnd, |h| h.pressed = hit);
+            unsafe { crate::SetCapture(hwnd) };
+            0
+        }
+        0x0200 => {
+            let x = (lp & 0xFFFF) as i16 as i32;
+            if let Some(Some((i, start, width))) = with(hwnd, |h| h.sizing) {
+                let w = (width + x - start).max(0);
+                // Through HDM_SETITEM, so the owner hears HDN_ITEMCHANGED.
+                let mut hd = [0u8; 72];
+                hd[0..4].copy_from_slice(&HDI_WIDTH.to_le_bytes());
+                hd[4..8].copy_from_slice(&w.to_le_bytes());
+                unsafe { crate::SendMessageW(hwnd, HDM_SETITEMW, i as u64, hd.as_ptr() as i64) };
+            }
+            0
+        }
+        0x0202 => {
+            let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            unsafe { crate::ReleaseCapture() };
+            let (sizing, pressed) = with(hwnd, |h| (h.sizing.take(), h.pressed.take())).unwrap_or((None, None));
+            if let Some((i, _, _)) = sizing {
+                notify(hwnd, HDN_ENDTRACKW, HDN_ENDTRACKA, i as i32, 0, 0);
+                return 0;
+            }
             let style = unsafe { crate::GetWindowLongPtrW(hwnd, -16) } as u32;
-            let hit = rects(hwnd).into_iter().find(|(_, r)| x >= r[0] && x < r[2] && y >= r[1] && y < r[3]);
-            if let (Some((i, _)), true) = (hit, style & HDS_BUTTONS != 0) {
-                notify(hwnd, HDN_ITEMCLICKW, HDN_ITEMCLICKA, i as i32, 0, 0);
+            let hit = rects(hwnd).into_iter().find(|(_, r)| x >= r[0] && x < r[2] && y >= r[1] && y < r[3]).map(|h| h.0);
+            if style & HDS_BUTTONS != 0 && hit.is_some() && hit == pressed {
+                notify(hwnd, HDN_ITEMCLICKW, HDN_ITEMCLICKA, hit.unwrap() as i32, 0, 0);
             }
             0
         }

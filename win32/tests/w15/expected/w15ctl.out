@@ -1,0 +1,97 @@
+init 1
+window 1
+rebar created 1
+insert 1
+insert 1
+bands 2 rows 1
+id 78 at 1, id 9 at -1
+get 1
+band text: "Second"
+id 78 param 5678 child ok 1 min 60 22
+bad get 0
+one row 1, second after first 1
+bar height positive 1
+child in band 0 1
+rows after break 2
+below the first 1
+show 1
+hidden visible 0
+shown visible 1
+bk none 1, now 030201
+delete 1, bands 1, bad 0
+comboex created 1
+has combo 1
+insert 0
+insert 1
+insert 2
+insert at 1: 1
+count 4, notified 4
+get 0: 1 image 1 indent 0 param 100 text: "Alpha"
+get 1: 1 image 3 indent 2 param 500 text: "Between"
+get 2: 1 image 2 indent 1 param 101 text: "Beta"
+get 3: 1 image 3 indent 2 param 102 text: "Gamma"
+bad get 0
+set 1
+param 999 text: "Changed"
+sel 2
+current: "Changed"
+delete -> 3, notified 1
+old list 0
+list back 1
+ex old 0
+ex now 1
+month cal 1
+set 1
+get 1
+sel 2024-02-29 dow 4
+bad date 0
+min rect 1, sensible 1
+no range 0
+range 1
+get range 3
+picker 1
+set 1
+get 0
+value 2025-12-25 dow 4 13:05:09
+set none 1
+get none 1
+format 1
+shown: "2025-12-25 13:05"
+shown: "Thursday 25 December 25, 1:05 PM"
+time picker 1
+time 2025-01-02 dow 4 23:59:58
+view on 1
+view again 0
+enabled 1
+insert 0
+insert 1
+duplicate 2
+groups 3 has1 1 has9 0
+item 0
+item 1
+item 2
+item 3
+group of 0: 2
+group of 1: 1
+group of 2: 2
+group of 3: 1
+order: apple above pear 1, pear above carrot 1, carrot above leek 1
+gap between groups 1
+get 2
+group: "Vegetables"
+id 2, bad -1
+set 2
+renamed: "Veg"
+remove bad -1
+std first 0
+has list 1, images 15
+view first 15
+hist first 27, images 32
+size 16 16
+add bitmap 0
+buttons 1
+save picture: ink 1, background 1
+list prepaint 1, items 1, post 1
+tree items 1, toolbar items 1
+done
+exit 7

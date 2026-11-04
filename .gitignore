@@ -8,6 +8,8 @@
 # Runtime state written by VEILOS (user database, last login)
 storage/etc/users.vdb
 storage/etc/last_user
+storage/etc/registry.dat
+storage/etc/registry.bad
 
 # Win32 test programs: intermediate build output (the binaries are copied to storage/tests)
 win32/tests/*/build/

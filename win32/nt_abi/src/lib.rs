@@ -144,8 +144,10 @@ pub mod sys {
     /// VEIL_CLIP_GET(buf: *mut u16, cap, chars_out*, sequence_out*): the
     /// clipboard's latest text (buf null: just its length and sequence).
     pub const VEIL_CLIP_GET: u32 = BASE + 50;
+    /// VEIL_REG(call: *mut reg::RegCall): the registry; returns a Win32 error.
+    pub const VEIL_REG: u32 = BASE + 51;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 51;
+    pub const END: u32 = BASE + 52;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
@@ -209,6 +211,48 @@ pub const WINDOW_VISIBLE: u32 = 1;
 pub const WINDOW_POPUP: u32 = 2;
 /// Owned by another window (a dialog): no taskbar button.
 pub const WINDOW_OWNED: u32 = 4;
+
+/// The registry's one syscall: a request and what comes back.
+pub mod reg {
+    pub const OPEN: u32 = 1;
+    pub const CREATE: u32 = 2;
+    pub const CLOSE: u32 = 3;
+    pub const QUERY_VALUE: u32 = 4;
+    pub const SET_VALUE: u32 = 5;
+    pub const DELETE_VALUE: u32 = 6;
+    pub const DELETE_KEY: u32 = 7;
+    pub const ENUM_KEY: u32 = 8;
+    pub const ENUM_VALUE: u32 = 9;
+    pub const INFO: u32 = 10;
+    pub const FLUSH: u32 = 11;
+    pub const RENAME: u32 = 12;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct RegCall {
+        pub op: u32,
+        /// DELETE_KEY: 1 to take what's under it. CREATE returns 1 created, 2 opened.
+        pub flags: u32,
+        pub key: u64,
+        /// A key path or value name, not NUL-terminated.
+        pub name: u64,
+        pub name_len: u32,
+        pub kind: u32,
+        /// In or out, with its capacity going in and its size coming back.
+        /// RENAME: the new name, in characters.
+        pub data: u64,
+        pub data_len: u32,
+        pub index: u32,
+        pub out_key: u64,
+        /// ENUM_*: where the name goes (characters, with room for a NUL).
+        pub out_name: u64,
+        pub out_name_cap: u32,
+        pub out_name_len: u32,
+        /// INFO: subkeys, longest subkey name, values, longest value name,
+        /// largest data.
+        pub info: [u32; 6],
+    }
+}
 
 /// In a WM_CHAR / WM_SYSCHAR the desktop typed (lParam bit 28, reserved on
 /// Windows): user32 delivers it only if its key-down was translated, as

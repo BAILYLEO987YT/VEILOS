@@ -54,6 +54,18 @@ impl Surface {
     fn new(w: u32, h: u32) -> Self {
         Surface { w, h, pixels: alloc::vec![0x00FF_FFFF; w as usize * h as usize] }
     }
+
+    /// Change size keeping the picture, so a resize doesn't blank the window
+    /// until the program has repainted.
+    fn resize(&mut self, w: u32, h: u32) {
+        let mut new = Surface::new(w, h);
+        let (cw, ch) = (self.w.min(w) as usize, self.h.min(h) as usize);
+        for y in 0..ch {
+            let from = y * self.w as usize;
+            new.pixels[y * w as usize..][..cw].copy_from_slice(&self.pixels[from..from + cw]);
+        }
+        *self = new;
+    }
 }
 
 pub struct UserWindow {
@@ -193,12 +205,19 @@ pub fn deliver(vid: u32, message: u32, wparam: u64, lparam: u64) -> bool {
                 WM_RBUTTONDOWN => 0x2,
                 _ => 0,
             };
-            post_to(win.tid, hwnd, message, buttons, lp);
-            // The desktop reports clicks, not releases: the button comes up at once.
-            if message == WM_LBUTTONDOWN {
-                post_to(win.tid, hwnd, WM_LBUTTONUP, 0, lp);
-            } else if message == WM_RBUTTONDOWN {
-                post_to(win.tid, hwnd, WM_RBUTTONUP, 0, lp);
+            post_to(win.tid, hwnd, message, buttons | modifier_keys(), lp);
+            // The window has the mouse until the button comes up.
+            let (up, held) = {
+                let m = crate::task::mouse::MOUSE_STATE.lock();
+                if message == WM_LBUTTONDOWN { (WM_LBUTTONUP, m.left_button) } else { (WM_RBUTTONUP, m.right_button) }
+            };
+            if message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN {
+                if held {
+                    TRACK.lock().capture = Some((vid, up));
+                } else {
+                    // Released before the click got here.
+                    post_to(win.tid, hwnd, up, modifier_keys(), lp);
+                }
             }
         }
         WM_CHAR => {
@@ -215,6 +234,89 @@ pub fn deliver(vid: u32, message: u32, wparam: u64, lparam: u64) -> bool {
         _ => post_to(win.tid, hwnd, message, wparam, lparam),
     }
     true
+}
+
+// -----| the mouse beyond clicks |-----
+
+/// What the pointer is doing to Windows programs' windows.
+struct MouseTrack {
+    /// A window a button went down in, and the message when it comes up.
+    capture: Option<(u32, u32)>,
+    /// The window under the pointer.
+    hover: u32,
+    last: (i32, i32),
+}
+
+static TRACK: Mutex<MouseTrack> = Mutex::new(MouseTrack { capture: None, hover: 0, last: (-1, -1) });
+
+const WM_MOUSEWHEEL: u32 = 0x020A;
+/// The pointer left this window.
+const VEIL_MOUSE_LEFT: u32 = 0x7FFF_0003;
+
+fn modifier_keys() -> u64 {
+    (key_down(VK_SHIFT) as u64) << 2 | (key_down(VK_CONTROL) as u64) << 3
+}
+
+/// Screen coordinates as the window's pixels, for lParam.
+fn client_lparam(win: &UserWindow, x: i32, y: i32) -> u64 {
+    let (cx, cy) = (x - win.content[0].load(Ordering::Relaxed), y - win.content[1].load(Ordering::Relaxed));
+    ((cy as u16 as u64) << 16) | cx as u16 as u64
+}
+
+/// A mouse move replaces one the program hasn't taken yet: a slow program
+/// sees where the pointer is now, not everywhere it has been.
+fn post_move(win: &UserWindow, wparam: u64, lparam: u64) {
+    let (x, y) = cursor();
+    let msg = Msg { hwnd: win.hwnd as u64, message: WM_MOUSEMOVE, wparam, lparam, time: now() as u32, pt_x: x, pt_y: y, private: 0 };
+    with_queue(win.tid, |q| match q.messages.back_mut() {
+        Some(last) if last.message == WM_MOUSEMOVE && last.hwnd == msg.hwnd => *last = msg,
+        _ => q.messages.push_back(msg),
+    });
+}
+
+/// Every desktop poll: movement, button releases and the wheel.
+pub fn mouse_tick(x: i32, y: i32, left: bool, right: bool, wheel: i32) {
+    let Some(mut t) = TRACK.try_lock() else { return };
+    let moved = t.last != (x, y);
+    t.last = (x, y);
+    let buttons = left as u64 | (right as u64) << 1 | modifier_keys();
+    if let Some((vid, up)) = t.capture {
+        let held = if up == WM_LBUTTONUP { left } else { right };
+        match by_vid(vid) {
+            Some(win) if !held => {
+                post_to(win.tid, win.hwnd as u64, up, buttons, client_lparam(&win, x, y));
+                t.capture = None;
+            }
+            Some(win) if moved => post_move(&win, buttons, client_lparam(&win, x, y)),
+            Some(_) => {}
+            None => t.capture = None,
+        }
+    }
+    // Who's under the pointer (with the mouse held, the capture's window).
+    let under = match t.capture {
+        Some((vid, _)) => vid,
+        None => match crate::desktop::DESKTOP_WM.try_lock() {
+            Some(wm) => wm.content_at(x, y).filter(|&v| owns(v)).unwrap_or(0),
+            None => t.hover,
+        },
+    };
+    if under != t.hover {
+        if let Some(old) = by_vid(t.hover) {
+            post_to(old.tid, old.hwnd as u64, VEIL_MOUSE_LEFT, 0, 0);
+        }
+        t.hover = under;
+    }
+    let Some(win) = by_vid(under) else { return };
+    if moved && t.capture.is_none() {
+        post_move(&win, buttons, client_lparam(&win, x, y));
+    }
+    if wheel != 0 {
+        // One notch is WHEEL_DELTA (120); forward, away from the user, is
+        // positive. lParam carries the window's pixels here; user32 puts the
+        // screen position there, having found the child.
+        let delta = (-wheel * 120).clamp(-32768, 32767);
+        post_to(win.tid, win.hwnd as u64, WM_MOUSEWHEEL, ((delta as i16 as u16 as u64) << 16) | buttons, client_lparam(&win, x, y));
+    }
 }
 
 // -----| keys |-----
@@ -416,9 +518,10 @@ impl crate::gui_toolkit::Widget for PixelWidget {
         let w = &self.window;
         let (x, y) = (w.content[0].load(Ordering::Relaxed), w.content[1].load(Ordering::Relaxed));
         let (cw, ch) = (w.content[2].load(Ordering::Relaxed).max(0) as u32, w.content[3].load(Ordering::Relaxed).max(0) as u32);
-        if let Some(s) = w.surface.try_lock() {
-            crate::ui::draw_pixels_atomic(&s.pixels, s.w, s.h, x, y, cw.min(s.w), ch.min(s.h));
-        }
+        // Wait out a present that's copying: skipping would show what's
+        // behind the window for a frame, and the window would flash.
+        let s = w.surface.lock();
+        crate::ui::draw_pixels_atomic(&s.pixels, s.w, s.h, x, y, cw.min(s.w), ch.min(s.h));
     }
     fn handle_event(&mut self, _ev: crate::gui_toolkit::WidgetEvent) -> bool {
         false
@@ -593,7 +696,7 @@ pub fn set_pos(hwnd: u64, place: u64, flags: u64) -> NtStatus {
         *win.reported.lock() = place;
         let mut s = win.surface.lock();
         if s.w != place.w || s.h != place.h {
-            *s = Surface::new(place.w, place.h);
+            s.resize(place.w, place.h);
         }
     }
     crate::apps::TERMINAL_OUTPUT.store(true, Ordering::Release);
@@ -685,7 +788,7 @@ fn report_changes(tid: u32) {
         *rep = now;
         drop(rep);
         if sized {
-            *w.surface.lock() = Surface::new(now.w, now.h);
+            w.surface.lock().resize(now.w, now.h);
         }
         post_to(tid, w.hwnd as u64, VEIL_GEOMETRY, 0, 0);
     }

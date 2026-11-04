@@ -1,7 +1,7 @@
 //! The toolbar ("ToolbarWindow32"): buttons with images and text, separators,
 //! check and group buttons, drop-downs. A click sends WM_COMMAND to the
 //! owner. Bitmaps added with TB_ADDBITMAP land in one image list per toolbar
-//! (Windows' own HINST_COMMCTRL pictures take their slots but draw nothing).
+//! (Windows' own HINST_COMMCTRL pictures are VEILOS's drawings: pictures.rs).
 //! Not yet: customizing, tooltips on hover (the desktop reports clicks, not
 //! movement), hot tracking.
 
@@ -138,8 +138,10 @@ struct Bar {
     images: u64,
     hot_images: u64,
     disabled_images: u64,
-    /// Pictures from HINST_COMMCTRL: slots with no image.
+    /// How many pictures have been added.
     bitmaps: i32,
+    /// The standard sets in the image list, and where each starts.
+    standard: Vec<(u64, i32)>,
     tooltips: Hwnd,
     owner: Hwnd,
     indent: i32,
@@ -296,9 +298,19 @@ fn paint(hwnd: Hwnd, hdc: u64) {
     let old = unsafe { crate::SelectObject(hdc, crate::font_or_default(font)) };
     unsafe { crate::SetBkMode(hdc, 1) };
     let (light, dark) = unsafe { (crate::GetSysColorBrush(20), crate::GetSysColorBrush(16)) };
+    const CDRF_SKIPDEFAULT: i64 = 4;
+    const CDRF_NOTIFYITEMDRAW: i64 = 0x20;
+    let pre = crate::custom_draw(hwnd, 1, hdc, c, 0, 0, 0, 0, 0, 0).0;
+    if pre & CDRF_SKIPDEFAULT != 0 {
+        unsafe { crate::SelectObject(hdc, old) };
+        return;
+    }
     for (i, r) in rects(hwnd).iter().enumerate() {
         let (b, text) = &buttons[i];
         if b.state & TBSTATE_HIDDEN != 0 {
+            continue;
+        }
+        if pre & CDRF_NOTIFYITEMDRAW != 0 && crate::custom_draw(hwnd, 0x1_0001, hdc, *r, b.id as u64, 0, b.data as i64, 0, 0, 0).0 & CDRF_SKIPDEFAULT != 0 {
             continue;
         }
         if b.style & BTNS_SEP != 0 {
@@ -434,6 +446,37 @@ fn add_strings(hwnd: Hwnd, wp: u64, lp: i64, unicode: bool) -> i64 {
     .unwrap_or(-1)
 }
 
+/// A standard set of pictures added to the toolbar's image list: the index
+/// of the first.
+fn load_standard(hwnd: Hwnd, id: u64) -> Option<i64> {
+    if let Some(Some(first)) = with(hwnd, |b| b.standard.iter().find(|s| s.0 == id).map(|s| s.1)) {
+        return Some(first as i64);
+    }
+    let large = id & 1 == 1;
+    let (cx, cy) = if large { (24, 24) } else { (16, 16) };
+    // The list made for the set's size; pictures go in after what's there.
+    let il = match with(hwnd, |b| b.images).unwrap_or(0) {
+        0 => {
+            let il = crate::imagelist::ImageList_Create(cx, cy, 0x20, 16, 8);
+            with(hwnd, |b| {
+                b.images = il;
+                b.bitmap_size = (cx, cy);
+            });
+            il
+        }
+        il => il,
+    };
+    let first = crate::imagelist::ImageList_GetImageCount(il);
+    let (bm, n) = crate::pictures::make(id, cx, cy)?;
+    crate::imagelist::ImageList_AddMasked(il, bm, crate::pictures::KEY);
+    unsafe { crate::DeleteObject(bm) };
+    with(hwnd, |b| {
+        b.bitmaps = first + n as i32;
+        b.standard.push((id, first));
+    });
+    Some(first as i64)
+}
+
 /// TB_ADDBITMAP: `n` pictures from a TBADDBITMAP.
 fn add_bitmap(hwnd: Hwnd, n: u64, lp: i64) -> i64 {
     if lp == 0 {
@@ -441,10 +484,10 @@ fn add_bitmap(hwnd: Hwnd, n: u64, lp: i64) -> i64 {
     }
     let (inst, id) = unsafe { (*(lp as *const u64), *(lp as *const u64).add(1)) };
     let first = with(hwnd, |b| b.bitmaps).unwrap_or(0);
-    with(hwnd, |b| b.bitmaps += n as i32);
     if inst == HINST_COMMCTRL {
-        return first as i64;
+        return load_standard(hwnd, id).unwrap_or(first as i64);
     }
+    with(hwnd, |b| b.bitmaps += n as i32);
     let (bw, bh) = with(hwnd, |b| b.bitmap_size).unwrap_or((16, 15));
     let existing = with(hwnd, |b| b.images).unwrap_or(0);
     let il = if existing != 0 {
@@ -531,6 +574,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -
                     hot_images: 0,
                     disabled_images: 0,
                     bitmaps: 0,
+                    standard: Vec::new(),
                     tooltips: 0,
                     owner,
                     indent: 0,
@@ -580,6 +624,7 @@ unsafe extern "system" fn toolbar_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -
                     crate::notify(hwnd, TBN_DROPDOWN, &e);
                 } else {
                     with(hwnd, |b| b.pressed = Some(i));
+                    unsafe { crate::SetCapture(hwnd) };
                 }
             }
             0
@@ -588,6 +633,9 @@ unsafe extern "system" fn toolbar_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -
             let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
             let at = rects(hwnd).iter().position(|r| x >= r[0] && x < r[2] && y >= r[1] && y < r[3]);
             let was = with(hwnd, |b| b.pressed.take()).flatten();
+            if was.is_some() {
+                unsafe { crate::ReleaseCapture() };
+            }
             crate::notify(hwnd, NM_CLICK, &[]);
             if let (Some(i), true) = (at, at == was) {
                 click(hwnd, i);
@@ -678,19 +726,10 @@ unsafe extern "system" fn toolbar_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) -
         TB_GETSTATE => index_of(hwnd, wp).and_then(|i| with(hwnd, |b| b.buttons[i].state as i64)).unwrap_or(-1),
         TB_ADDBITMAP => add_bitmap(hwnd, wp, lp),
         TB_LOADIMAGES => {
-            // Standard pictures: slots only (TBADDBITMAP from HINST_COMMCTRL).
-            let n = match wp {
-                0 | 1 => 15,
-                4 | 5 => 12,
-                8 | 9 => 5,
-                _ => 0,
-            };
-            with(hwnd, |b| {
-                let first = b.bitmaps;
-                b.bitmaps += n;
-                first as i64
-            })
-            .unwrap_or(-1)
+            if lp as u64 != HINST_COMMCTRL {
+                return -1;
+            }
+            load_standard(hwnd, wp).unwrap_or(-1)
         }
         TB_ADDSTRINGW | TB_ADDSTRINGA => add_strings(hwnd, wp, lp, msg == TB_ADDSTRINGW),
         TB_GETITEMRECT => {
