@@ -45,6 +45,15 @@ removed: 0
 still there
 own handle: 1, stdout after closing it: 1 13
 --- folder listings
+find with a trailing backslash: 0 error 87
+rooted, trailing backslash: 0 error 2
+no such folder, trailing backslash: 0 error 3
+quotes in a name: 0 error 123
+an empty name: 0 error 3
+full path of nothing: 0 error 123
+full path of here: 1
+a bar in a name: 0 error 123
+find the folder itself: 1 w18dir directory 1
 class 1, single 1: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
 class 1, single 0: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
 class 2, single 1: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end

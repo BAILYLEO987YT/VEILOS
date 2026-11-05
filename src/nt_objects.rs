@@ -308,6 +308,8 @@ pub enum KernelObjectRef {
     Duplex(Arc<crate::nt_ipc::DuplexEnd>),
     /// The NUL device: reads end at once, writes go nowhere.
     Null,
+    /// A Winsock socket (nt_socket.rs).
+    Socket(Arc<crate::nt_socket::SocketObj>),
 }
 
 impl KernelObjectRef {
@@ -324,6 +326,7 @@ impl KernelObjectRef {
             Self::Pipe(_)      => ObjectType::File,
             Self::Duplex(_)    => ObjectType::File,
             Self::Null         => ObjectType::File,
+            Self::Socket(_)    => ObjectType::File,
         }
     }
 }

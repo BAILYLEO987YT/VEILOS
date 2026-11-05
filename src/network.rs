@@ -352,6 +352,9 @@ pub struct NetworkStack {
     /// UDP sockets closed while datagrams were still queued: removed once
     /// those have been sent, or at the deadline (TICKS).
     closing: Vec<(SocketHandle, u64)>,
+    /// TCP connections closed by their programs: kept until the FIN exchange
+    /// is done (or the deadline, TICKS), so the last data isn't thrown away.
+    tcp_closing: Vec<(SocketHandle, u64)>,
 }
 
 /// IANA dynamic/ephemeral port range.
@@ -385,6 +388,7 @@ impl NetworkStack {
             dhcp_start_tick: None,
             next_ephemeral: *EPHEMERAL_PORTS.start(),
             closing: Vec::new(),
+            tcp_closing: Vec::new(),
         }
     }
 
@@ -398,6 +402,43 @@ impl NetworkStack {
         self.process_dhcp();
         self.process_dns();
         self.reap_closing(crate::interrupts::TICKS.load(Ordering::Relaxed));
+        self.reap_tcp_closing(crate::interrupts::TICKS.load(Ordering::Relaxed));
+    }
+
+    /// Close a TCP socket the way a program's closesocket does: what's queued
+    /// still goes out, then FIN; the socket goes once that's done.
+    pub fn close_tcp_gracefully(&mut self, handle: SocketHandle, deadline: u64) {
+        self.sockets.get_mut::<tcp::Socket>(handle).close();
+        self.tcp_closing.push((handle, deadline));
+    }
+
+    fn reap_tcp_closing(&mut self, now: u64) {
+        let mut i = 0;
+        while i < self.tcp_closing.len() {
+            let (handle, deadline) = self.tcp_closing[i];
+            let state = self.sockets.get::<tcp::Socket>(handle).state();
+            if matches!(state, tcp::State::Closed | tcp::State::TimeWait) || now >= deadline {
+                self.sockets.get_mut::<tcp::Socket>(handle).abort();
+                self.sockets.remove(handle);
+                self.tcp_closing.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// The resolver's socket, made on first use (the server DHCP gave, or QEMU's).
+    pub fn dns_socket(&mut self) -> SocketHandle {
+        if let Some(h) = self.dns_handle {
+            return h;
+        }
+        let servers = match NETWORK_CONFIG.lock().dns {
+            Some(ip) => vec![IpAddress::Ipv4(ip)],
+            None => vec![IpAddress::Ipv4(QEMU_DNS)],
+        };
+        let h = self.sockets.add(dns::Socket::new(&servers, Vec::new()));
+        self.dns_handle = Some(h);
+        h
     }
 
     // ---- DHCP -------------------------------------------------------

@@ -1,0 +1,23 @@
+[package]
+name = "secur32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS secur32.dll: Schannel (the SSPI TLS client) over rustls"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Built on its own (win32/build.sh), with the standard library, unlike the
+# no_std DLLs of the workspace.
+[workspace]

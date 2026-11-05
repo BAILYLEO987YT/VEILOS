@@ -1,0 +1,12 @@
+--- the test server
+hello: TLSv1_3 HTTP/1.1 200 OK "hello over tls\n"
+big: 1048576 bytes, checksum eb7c9dc5
+TLS 1.2 only: TLSv1_2 HTTP/1.1 200 OK
+missing page: HTTP/1.1 404 Not Found
+--- certificates that must not pass
+wrong name: write: invalid peer certificate: certificate not valid for name "wrong.example"; certificate is only valid for DnsName("w20.test"), IpAddress(127.0.0.1) or IpAddress(10.0.2.2)
+unknown issuer: write: invalid peer certificate: UnknownIssuer
+--- a real site
+example.com: HTTP/1.1 200 OK, says Example Domain: true
+done
+exit 7

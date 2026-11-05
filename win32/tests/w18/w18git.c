@@ -219,6 +219,46 @@ static void listings(void)
     WriteFile(f, "hello", 5, &n, NULL);
     CloseHandle(f);
     CreateDirectoryA("w18dir\\sub", NULL);
+    WIN32_FIND_DATAA fd;
+    SetLastError(0);
+    HANDLE ff = FindFirstFileA("w18dir\\", &fd);
+    DWORD ferr = GetLastError();
+    printf("find with a trailing backslash: %d error %lu\n", ff != INVALID_HANDLE_VALUE, ferr);
+    if (ff != INVALID_HANDLE_VALUE)
+        FindClose(ff);
+    char here[MAX_PATH], rooted[MAX_PATH + 16];
+    GetCurrentDirectoryA(MAX_PATH, here);
+    sprintf(rooted, "%s\\w18dir\\", here);
+    SetLastError(0);
+    ff = FindFirstFileA(rooted, &fd);
+    ferr = GetLastError();
+    printf("rooted, trailing backslash: %d error %lu\n", ff != INVALID_HANDLE_VALUE, ferr);
+    sprintf(rooted, "%s\\w18none\\", here);
+    ff = FindFirstFileA(rooted, &fd);
+    ferr = GetLastError();
+    printf("no such folder, trailing backslash: %d error %lu\n", ff != INVALID_HANDLE_VALUE, ferr);
+    SetLastError(0);
+    DWORD qa = GetFileAttributesA("\"echo a.org/\"");
+    ferr = GetLastError();
+    printf("quotes in a name: %d error %lu\n", qa != INVALID_FILE_ATTRIBUTES, ferr);
+    SetLastError(0);
+    qa = GetFileAttributesA("");
+    ferr = GetLastError();
+    printf("an empty name: %d error %lu\n", qa != INVALID_FILE_ATTRIBUTES, ferr);
+    char full[MAX_PATH];
+    SetLastError(0);
+    DWORD fl = GetFullPathNameA("", MAX_PATH, full, NULL);
+    ferr = GetLastError();
+    printf("full path of nothing: %lu error %lu\n", fl, ferr);
+    fl = GetFullPathNameA(".", MAX_PATH, full, NULL);
+    printf("full path of here: %d\n", fl > 0 && strcmp(full, here) == 0);
+    qa = GetFileAttributesA("a|b");
+    ferr = GetLastError();
+    printf("a bar in a name: %d error %lu\n", qa != INVALID_FILE_ATTRIBUTES, ferr);
+    ff = FindFirstFileA("w18dir", &fd);
+    printf("find the folder itself: %d %s directory %d\n", ff != INVALID_HANDLE_VALUE, fd.cFileName, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+    if (ff != INVALID_HANDLE_VALUE)
+        FindClose(ff);
     ListDir list = (ListDir)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryDirectoryFile");
     int classes[][2] = {{1, 64}, {2, 68}, {3, 94}, {37, 104}, {38, 80}};
     for (int i = 0; i < 5; i++) {

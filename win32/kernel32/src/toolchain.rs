@@ -207,6 +207,51 @@ pub extern "system" fn SystemFunction036(out: *mut u8, len: u32) -> u8 {
     random(out, len as usize) as u8
 }
 
+// -----| crypto that isn't here |-----
+//
+// What a missing import answers is 0, which for CNG is STATUS_SUCCESS: libssh2
+// (in curl) opened its algorithms, believed it, and went on with no handles.
+// These say no instead, each in its family's way. Forwarders in bcrypt,
+// crypt32, advapi32, wldap32 and iphlpapi point their missing functions here.
+
+/// CNG (bcrypt): STATUS_NOT_SUPPORTED.
+#[no_mangle]
+pub extern "system" fn VeilCngUnsupported() -> i32 {
+    0xC000_00BBu32 as i32
+}
+
+/// CryptoAPI and certificate functions: FALSE or NULL, ERROR_NOT_SUPPORTED.
+#[no_mangle]
+pub extern "system" fn VeilCryptUnsupported() -> usize {
+    crate::SetLastError(50);
+    0
+}
+
+/// CryptoAPI keys: none to import, encrypt with or destroy.
+#[no_mangle]
+pub extern "system" fn CryptImportKey(_prov: usize, _data: *const u8, _len: u32, _pub: usize, _flags: u32, key: *mut usize) -> i32 {
+    if !key.is_null() {
+        unsafe { *key = 0 };
+    }
+    VeilCryptUnsupported() as i32
+}
+
+#[no_mangle]
+pub extern "system" fn CryptEncrypt(_key: usize, _hash: usize, _last: i32, _flags: u32, _data: *mut u8, _len: *mut u32, _size: u32) -> i32 {
+    VeilCryptUnsupported() as i32
+}
+
+#[no_mangle]
+pub extern "system" fn CryptDestroyKey(_key: usize) -> i32 {
+    VeilCryptUnsupported() as i32
+}
+
+/// LDAP calls that answer an error number: LDAP_NOT_SUPPORTED.
+#[no_mangle]
+pub extern "system" fn VeilLdapUnsupported() -> u32 {
+    0x5C
+}
+
 #[no_mangle]
 pub extern "system" fn BCryptGenRandom(_algorithm: usize, out: *mut u8, len: u32, _flags: u32) -> i32 {
     if random(out, len as usize) { 0 } else { 0xC000_0001u32 as i32 }
@@ -350,29 +395,6 @@ pub extern "system" fn WSAGetLastError() -> i32 {
 #[no_mangle]
 pub extern "system" fn WSASetLastError(e: i32) {
     WSA_ERROR.store(e, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// SEC_E_UNSUPPORTED_FUNCTION, whatever it's called with: a security call is
-/// only reached once a connection exists.
-extern "system" fn security_unsupported() -> u32 {
-    0x8009_0302
-}
-
-/// SecurityFunctionTable: a version, then function pointers.
-#[repr(C)]
-pub struct SecurityTable(usize, [extern "system" fn() -> u32; 32]);
-unsafe impl Sync for SecurityTable {}
-
-static SECURITY_TABLE: SecurityTable = SecurityTable(1, [security_unsupported; 32]);
-
-#[no_mangle]
-pub extern "system" fn InitSecurityInterfaceA() -> *const SecurityTable {
-    &SECURITY_TABLE
-}
-
-#[no_mangle]
-pub extern "system" fn InitSecurityInterfaceW() -> *const SecurityTable {
-    &SECURITY_TABLE
 }
 
 // -----| the profile folder |-----

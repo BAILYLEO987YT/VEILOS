@@ -365,7 +365,16 @@ pub extern "system" fn FlushFileBuffers(h: Handle) -> Bool {
 }
 
 /// FILE_BASIC_INFORMATION for a path: (attributes, last write time).
+/// An empty or all-blank name is no name: Windows doesn't take it for the
+/// current folder (cmd, given one, took the command it was running for a folder).
+fn blank(name: &[u16]) -> bool {
+    name.iter().all(|&u| u == b' ' as u16)
+}
+
 fn basic(name: &[u16]) -> Result<(u32, [u8; 40]), NtStatus> {
+    if blank(name) {
+        return Err(status::OBJECT_PATH_NOT_FOUND);
+    }
     let mut info = [0u8; 40];
     let s = with_name(name, |oa| unsafe { crate::NtQueryAttributesFile(oa, info.as_mut_ptr()) });
     if status::is_success(s) {
@@ -533,6 +542,10 @@ pub unsafe extern "system" fn SetCurrentDirectoryA(name: *const u8) -> Bool {
 
 #[no_mangle]
 pub unsafe extern "system" fn GetFullPathNameW(name: *const u16, size: u32, buffer: *mut u16, file_part: *mut *mut u16) -> u32 {
+    if blank(unsafe { wstr(name) }) {
+        crate::SetLastError(123); // ERROR_INVALID_NAME
+        return 0;
+    }
     let full = full_path(unsafe { wstr(name) });
     let n = unsafe { wide_out(full.as_slice(), buffer, size) };
     if !file_part.is_null() && (n as usize) == full.len {
@@ -544,6 +557,10 @@ pub unsafe extern "system" fn GetFullPathNameW(name: *const u16, size: u32, buff
 
 #[no_mangle]
 pub unsafe extern "system" fn GetFullPathNameA(name: *const u8, size: u32, buffer: *mut u8, file_part: *mut *mut u8) -> u32 {
+    if blank(unsafe { widen(name) }.as_slice()) {
+        crate::SetLastError(123); // ERROR_INVALID_NAME
+        return 0;
+    }
     let full = full_path(unsafe { widen(name) }.as_slice());
     let n = unsafe { narrow_out(full.as_slice(), buffer, size) };
     if !file_part.is_null() && (n as usize) == full.len {
@@ -613,11 +630,29 @@ unsafe fn narrow_find(w: &[u8; 592], data: *mut u8) {
 
 #[no_mangle]
 pub unsafe extern "system" fn FindFirstFileW(pattern: *const u16, data: *mut u8) -> Handle {
-    let full = full_path(unsafe { wstr(pattern) });
+    let given = unsafe { wstr(pattern) };
+    let full = full_path(given);
     let s = full.as_slice();
     let split = s.iter().rposition(|&u| is_sep(u)).unwrap_or(2);
     let dir = &s[..(split + 1).max(3).min(s.len())];
     let mask = &s[(split + 1).min(s.len())..];
+    // Nothing after the last backslash names nothing: "C:\dir\" isn't a
+    // listing of dir (cmd took the first file it got as a folder to go to).
+    // As Windows answers: relative, ERROR_INVALID_PARAMETER; otherwise
+    // ERROR_FILE_NOT_FOUND, or ERROR_PATH_NOT_FOUND with no such folder.
+    // (Looked at as given: the full path has lost the trailing backslash.)
+    if mask.is_empty() || given.last().is_some_and(|&c| is_sep(c)) {
+        let rooted = given.first().is_some_and(|&c| is_sep(c)) || (given.len() >= 2 && given[1] == b':' as u16);
+        let error = if !rooted {
+            87
+        } else if basic(s).is_ok_and(|(a, _)| a & nf::ATTRIBUTE_DIRECTORY != 0) {
+            2
+        } else {
+            3
+        };
+        crate::SetLastError(error);
+        return INVALID_HANDLE_VALUE;
+    }
     let h = match open(dir, nf::READ_DATA, nf::OPEN, nf::DIRECTORY_FILE) {
         Ok((h, _)) => h,
         Err(st) => {

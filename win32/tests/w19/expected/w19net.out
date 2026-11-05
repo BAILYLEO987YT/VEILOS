@@ -1,0 +1,65 @@
+--- start-up
+WSAStartup: 0 version 2.2
+bad socket: -1 error 10038
+tcp socket: 1
+closed: 0
+udp socket: 1
+unknown family: 0 error 10047
+--- names
+numeric: 0 127.0.0.1 port 80
+localhost: 0 127.0.0.1
+example.com: 0, has an address: 1
+no such host: 11001
+inet_pton: 1
+inet_ntop: 10.1.2.3
+bad text: 0
+gethostname: 0, has a name: 1
+--- a conversation
+connect: 0
+peer port: 47019, length 16
+own port given: 1
+nodelay: 0
+sent: 17
+echo: hello there
+big: 1000000 bytes, checksum 80e87dc5
+then: after
+shutdown: 0
+server saw the end: SEEN END
+then the end: 0
+--- refused
+connect: -1 error 10061
+--- reset
+connect: 0
+recv: -1 error 10054
+send after: -1 error 10054
+--- non-blocking
+ioctlsocket: 0
+connect: -1 error 10035
+select: 1, writable 1, failed 0
+nothing yet: -1 error 10035
+not readable soon: 0
+readable later: 1 1
+got: 5 late
+poll, nothing: 0 revents 0
+--- a listener
+bind: 0
+port given: 1
+listen: 0
+client 0 connect: 0
+client 1 connect: 0
+accepted 0: 1 from 127.0.0.1
+client 0 got: to client 0
+server got: and back
+after the client closed: 0
+accepted 1: 1 from 127.0.0.1
+client 1 got: to client 1
+server got: and back
+after the client closed: 0
+listener gone: -1 error 10061
+--- UDP
+sendto: 6
+recvfrom: 6 fedcba, from port 47019
+timed out: -1 error 10060
+cleanup: 0
+done
+exit 6

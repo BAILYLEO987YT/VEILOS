@@ -202,6 +202,11 @@ pub fn vfs_path(nt: &str) -> Option<String> {
     if b.len() < 2 || b[1] != b':' || !b[0].is_ascii_alphabetic() {
         return None;
     }
+    // Characters no Windows name has: ERROR_INVALID_NAME, which cmd relies on
+    // to tell a quoted command from a file's name.
+    if p[2..].chars().any(|c| matches!(c, '"' | '<' | '>' | '|' | '*' | '?') || (c as u32) < 0x20) {
+        return None;
+    }
     let mut out = String::from("/");
     for part in p[2..].split(|c| c == '\\' || c == '/').filter(|s| !s.is_empty()) {
         match part {

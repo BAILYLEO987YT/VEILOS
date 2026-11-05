@@ -9,7 +9,7 @@ LLVM="/c/Program Files/LLVM/bin"
 OUT=target/x86_64-pc-windows-msvc/release
 cargo build --release
 mkdir -p ../storage/system
-for dll in ntdll kernel32 ucrtbase gdi32 user32 comctl32 shell32 comdlg32 riched20; do
+for dll in ntdll kernel32 ucrtbase gdi32 user32 comctl32 shell32 comdlg32 riched20 ws2_32; do
     cp "$OUT/$dll.dll" "../storage/system/$dll.dll"
 done
 
@@ -47,7 +47,7 @@ EXPORTS
     cp "target/forwarders/$out" "../storage/system/$out"
 }
 # advapi32.dll: the registry, tokens, ETW and the rest kernel32 implements.
-fwd advapi32.dll IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeSid FreeSid IsWellKnownSid CheckTokenMembership ConvertSidToStringSidA ConvertSidToStringSidW SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
+fwd advapi32.dll CryptImportKey CryptEncrypt CryptDestroyKey IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeSid FreeSid IsWellKnownSid CheckTokenMembership ConvertSidToStringSidA ConvertSidToStringSidW SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
     CryptCreateHash CryptHashData CryptGetHashParam CryptDestroyHash CreateProcessAsUserW DecryptFileW DuplicateEncryptionInfoFile GetFileSecurityW     GetSecurityDescriptorOwner GetTokenInformation GetUserNameA GetUserNameW IsTextUnicode OpenProcessToken     OpenThreadToken RevertToSelf AdjustTokenPrivileges LookupPrivilegeValueW LookupAccountSidW InitializeAcl \
     InitializeSecurityDescriptor IsValidSecurityDescriptor GetSecurityDescriptorControl GetSecurityDescriptorDacl \
     GetSecurityDescriptorGroup GetSecurityDescriptorSacl SetSecurityDescriptorDacl SetSecurityDescriptorGroup \
@@ -58,14 +58,33 @@ fwd advapi32.dll IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeS
     RegDeleteValueA RegEnumKeyExA RegEnumValueA RegQueryInfoKeyA \
     RegRestoreKeyW RegSetKeySecurity RegNotifyChangeKeyValue RegCloseKey RegCreateKeyA RegCreateKeyExA RegCreateKeyExW RegCreateKeyW     RegDeleteKeyExW RegDeleteValueW RegEnumKeyExW RegEnumValueW RegGetValueW RegOpenKeyExA RegOpenKeyExW     RegOpenKeyW RegQueryInfoKeyW RegQueryValueExA RegQueryValueExW RegSetKeyValueA RegSetKeyValueW     RegSetValueExW EventActivityIdControl EventEnabled EventProviderEnabled EventRegister     EventSetInformation EventUnregister EventWrite EventWriteEx EventWriteTransfer
 fwd urlmon.dll FindMimeFromData
-# ws2_32.dll, by Windows' ordinals: start-up and byte order so far (S4 brings sockets).
-printf 'LIBRARY ws2_32.dll\nEXPORTS\n    htonl=kernel32.htonl @8\n    htons=kernel32.htons @9\n    ntohl=kernel32.ntohl @14\n    ntohs=kernel32.ntohs @15\n    WSAGetLastError=kernel32.WSAGetLastError @111\n    WSASetLastError=kernel32.WSASetLastError @112\n    WSAStartup=kernel32.WSAStartup @115\n    WSACleanup=kernel32.WSACleanup @116\n' > target/forwarders/ws2_32.dll.def
-"$LLVM/lld-link.exe" /nologo /DLL /NOENTRY /NODEFAULTLIB /MACHINE:X64 /DEF:target/forwarders/ws2_32.dll.def target/forwarders/empty.obj /OUT:target/forwarders/ws2_32.dll
-cp target/forwarders/ws2_32.dll ../storage/system/ws2_32.dll
-fwd secur32.dll InitSecurityInterfaceA InitSecurityInterfaceW
 # What the Rust toolchain loads besides.
 fwd bcryptprimitives.dll ProcessPrng
 fwd bcrypt.dll BCryptGenRandom
+# A forwarder DLL from its .def: what it doesn't offer yet points at kernel32
+# functions that fail plainly (VeilCngUnsupported and friends, toolchain.rs).
+fwd_link() {
+    "$LLVM/lld-link.exe" /nologo /DLL /NOENTRY /NODEFAULTLIB /MACHINE:X64 /DEF:"target/forwarders/$1.def" target/forwarders/empty.obj /OUT:"target/forwarders/$1"
+    cp "target/forwarders/$1" "../storage/system/$1"
+}
+# bcrypt.dll: random numbers; no algorithms yet.
+printf 'LIBRARY bcrypt.dll\nEXPORTS\n    BCryptGenRandom=kernel32.BCryptGenRandom\n' > target/forwarders/bcrypt.dll.def
+for f in BCryptCloseAlgorithmProvider BCryptCreateHash BCryptDecrypt BCryptDeriveKey BCryptDestroyHash BCryptDestroyKey BCryptDestroySecret BCryptEncrypt BCryptExportKey BCryptFinalizeKeyPair BCryptFinishHash BCryptGenerateKeyPair BCryptGetProperty BCryptHashData BCryptImportKey BCryptImportKeyPair BCryptOpenAlgorithmProvider BCryptSecretAgreement BCryptSetProperty BCryptSignHash BCryptVerifySignature BCryptGenerateSymmetricKey BCryptDuplicateHash BCryptHash BCryptKeyDerivation BCryptDeriveKeyPBKDF2; do printf '    %s=kernel32.VeilCngUnsupported\n' "$f" >> target/forwarders/bcrypt.dll.def; done
+fwd_link bcrypt.dll
+# crypt32.dll: the server certificates Schannel hands out (secur32 keeps them);
+# no certificate stores of its own yet.
+printf 'LIBRARY crypt32.dll\nEXPORTS\n' > target/forwarders/crypt32.dll.def
+for f in CertCloseStore CertEnumCertificatesInStore CertFreeCertificateContext CertDuplicateCertificateContext; do printf '    %s=secur32.%s\n' "$f" "$f" >> target/forwarders/crypt32.dll.def; done
+for f in CertAddCertificateContextToStore CertCreateCertificateChainEngine CertFindCertificateInStore CertFindExtension CertFreeCRLContext CertFreeCTLContext CertFreeCertificateChain CertFreeCertificateChainEngine CertGetCertificateChain CertGetNameStringA CertGetNameStringW CertOpenStore CertOpenSystemStoreA CertOpenSystemStoreW CryptDecodeObjectEx CryptQueryObject CryptStringToBinaryA CryptStringToBinaryW CryptBinaryToStringA CryptBinaryToStringW PFXImportCertStore CertCreateCertificateContext CertGetCertificateContextProperty CertVerifyCertificateChainPolicy CryptProtectData CryptUnprotectData; do printf '    %s=kernel32.VeilCryptUnsupported\n' "$f" >> target/forwarders/crypt32.dll.def; done
+fwd_link crypt32.dll
+# wldap32.dll: no LDAP.
+printf 'LIBRARY wldap32.dll\nEXPORTS\n' > target/forwarders/wldap32.dll.def
+for f in ldap_bind_s ldap_search_s ldap_set_option ldap_simple_bind_s ldap_unbind_s ldap_msgfree ldap_value_free_len ldap_memfree ber_free; do printf '    %s=kernel32.VeilLdapUnsupported\n' "$f" >> target/forwarders/wldap32.dll.def; done
+for f in ldap_err2string ldap_first_attribute ldap_first_entry ldap_get_dn ldap_get_values_len ldap_next_attribute ldap_next_entry ldap_sslinit ldap_init; do printf '    %s=kernel32.VeilCryptUnsupported\n' "$f" >> target/forwarders/wldap32.dll.def; done
+fwd_link wldap32.dll
+# iphlpapi.dll: interface names have no numbers here (0 is "not found").
+printf 'LIBRARY iphlpapi.dll\nEXPORTS\n    if_nametoindex=kernel32.VeilCryptUnsupported\n' > target/forwarders/iphlpapi.dll.def
+fwd_link iphlpapi.dll
 fwd userenv.dll GetUserProfileDirectoryW
 fwd oleaut32.dll SysAllocStringLen SysFreeString SysStringLen GetErrorInfo SetErrorInfo
 fwd ole32.dll CoCreateGuid CoCreateInstance CoInitializeEx CoUninitialize CoTaskMemFree CoCreateFreeThreadedMarshaler
@@ -74,3 +93,13 @@ fwd version.dll GetFileVersionInfoSizeW GetFileVersionInfoSizeA GetFileVersionIn
 fwd propsys.dll PSGetPropertyDescriptionListFromString PropVariantToStringVectorAlloc
 fwd winspool.drv OpenPrinterW OpenPrinterA ClosePrinter GetPrinterDriverW EnumPrintersW GetDefaultPrinterW DocumentPropertiesW
 echo "installed: $(ls ../storage/system | tr '\n' ' ')"
+
+# secur32.dll: Schannel over rustls. It uses the standard library (and crates
+# from crates.io), so it's built on its own, outside this folder: the kernel's
+# .cargo/config.toml (build-std) would apply to anything below the repository.
+SECUR32_WORK="${TEMP:-/tmp}/veilos-secur32"
+rm -rf "$SECUR32_WORK/src"
+mkdir -p "$SECUR32_WORK"
+cp -r secur32/Cargo.toml secur32/src "$SECUR32_WORK/"
+(cd "$SECUR32_WORK" && cargo build --release --target x86_64-pc-windows-msvc)
+cp "$SECUR32_WORK/target/x86_64-pc-windows-msvc/release/secur32.dll" ../storage/system/secur32.dll

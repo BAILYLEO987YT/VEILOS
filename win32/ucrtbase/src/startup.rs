@@ -856,6 +856,11 @@ pub extern "C" fn __pxcptinfoptrs() -> *mut usize {
 
 /// SEH filter for the startup code: let the exception go on.
 #[no_mangle]
+pub extern "C" fn _seh_filter_dll(_code: u32, _ptrs: usize) -> i32 {
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+#[no_mangle]
 pub extern "C" fn _seh_filter_exe(_code: u32, _ptrs: usize) -> i32 {
     0
 }
