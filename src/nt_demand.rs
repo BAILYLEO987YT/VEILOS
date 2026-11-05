@@ -2,8 +2,8 @@
 // VEILOS: pages from files, on demand (WIN32_DESIGN.md, S1)
 // =============================================================================
 //
-// A program image or a read-only file view is a `Region` of an address space:
-// nothing is read or mapped until a page is first touched. A fault (in ring 3,
+// A program image, a read-only file view or a thread's stack is a `Region` of an
+// address space: nothing is read or mapped until a page is first touched. A fault (in ring 3,
 // or the kernel touching user memory) reads that page's bytes from the file,
 // applies its base relocations if the image moved, and maps it. So a 338 MB
 // program costs what it uses, and no file passes through the kernel heap.
@@ -44,7 +44,7 @@ pub struct Sec {
 
 enum Backing {
     Image {
-        _hold: ImageHold,
+        hold: ImageHold,
         headers: u32,
         sections: Vec<Sec>,
         /// How far the image moved from its preferred base.
@@ -60,12 +60,13 @@ enum Backing {
         offset: u64,
         flags: PageTableFlags,
     },
+    /// Pages of zeros.
+    Zero,
 }
 
 struct Region {
     base: u64,
     size: u64,
-    file: Arc<SharedFile>,
     backing: Backing,
 }
 
@@ -90,9 +91,9 @@ fn current() -> Option<Arc<Space>> {
 /// Add an image at `base` to the active address space.
 pub fn add_image(base: u64, size: u64, file: Arc<SharedFile>, headers: u32, sections: Vec<Sec>, delta: u64, reloc_dir: Option<(u32, u32)>) {
     let relocs = if delta != 0 { index_relocs(&file, &sections, reloc_dir) } else { BTreeMap::new() };
-    let hold = ImageHold::new(file.clone());
-    let backing = Backing::Image { _hold: hold, headers, sections, delta, relocs, linked: AtomicBool::new(false) };
-    let r = Region { base, size, file, backing };
+    let hold = ImageHold::new(file);
+    let backing = Backing::Image { hold, headers, sections, delta, relocs, linked: AtomicBool::new(false) };
+    let r = Region { base, size, backing };
     space(crate::address_space::active()).regions.lock().push(Arc::new(r));
 }
 
@@ -115,7 +116,13 @@ pub fn add_view(base: u64, size: u64, file: Arc<SharedFile>, offset: u64, writab
     if !executable {
         flags |= PageTableFlags::NO_EXECUTE;
     }
-    let r = Region { base, size, file: file.clone(), backing: Backing::View { file, offset, flags } };
+    let r = Region { base, size, backing: Backing::View { file, offset, flags } };
+    space(crate::address_space::active()).regions.lock().push(Arc::new(r));
+}
+
+/// Zero pages at `base`, as they're touched.
+pub fn add_zero(base: u64, size: u64) {
+    let r = Region { base, size, backing: Backing::Zero };
     space(crate::address_space::active()).regions.lock().push(Arc::new(r));
 }
 
@@ -165,7 +172,7 @@ pub fn fault_in(addr: u64) -> bool {
     let Some(r) = s.regions.lock().iter().find(|r| page >= r.base && page < r.base + r.size).cloned() else { return false };
     let mut mapper = unsafe { memory::get_mapper() };
     if mapper.translate_addr(VirtAddr::new(page)).is_some() {
-        return false; // Present, so this is a protection fault.
+        return true; // Another thread got here first; callers only ask about pages that weren't there.
     }
     let Some(frame) = memory::allocate_frame() else {
         crate::serial_println!("[DEMAND] out of memory bringing in {:#x}", page);
@@ -192,15 +199,17 @@ pub fn fault_in(addr: u64) -> bool {
 /// The contents of `page` into `bytes`; the protection it should have.
 fn fill(r: &Region, page: u64, bytes: &mut [u8]) -> PageTableFlags {
     match &r.backing {
+        Backing::Zero => USER | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
         Backing::View { file, offset, flags } => {
             let _ = file.read_at(offset + (page - r.base), bytes);
             *flags
         }
-        Backing::Image { headers, sections, delta, relocs, linked, .. } => {
+        Backing::Image { hold, headers, sections, delta, relocs, linked } => {
+            let file = hold.file();
             let rva = (page - r.base) as u32;
             if rva < *headers {
                 let n = (*headers - rva).min(PAGE as u32) as usize;
-                let _ = r.file.read_at(rva as u64, &mut bytes[..n]);
+                let _ = file.read_at(rva as u64, &mut bytes[..n]);
             }
             let (mut w, mut x) = (false, false);
             for s in sections {
@@ -218,11 +227,11 @@ fn fill(r: &Region, page: u64, bytes: &mut [u8]) -> PageTableFlags {
                 if start < end {
                     let at = (start - rva) as usize;
                     let from = s.raw_ptr as u64 + (start - lo) as u64;
-                    let _ = r.file.read_at(from, &mut bytes[at..at + (end - start) as usize]);
+                    let _ = file.read_at(from, &mut bytes[at..at + (end - start) as usize]);
                 }
             }
             if *delta != 0 {
-                apply_relocs(r, sections, relocs, *delta, rva, bytes);
+                apply_relocs(file, sections, relocs, *delta, rva, bytes);
             }
             if !linked.load(Ordering::Acquire) {
                 return USER | PageTableFlags::WRITABLE;
@@ -265,11 +274,11 @@ fn index_relocs(file: &SharedFile, sections: &[Sec], dir: Option<(u32, u32)>) ->
     index
 }
 
-fn apply_relocs(r: &Region, sections: &[Sec], relocs: &BTreeMap<u32, (u64, u32)>, delta: u64, rva: u32, bytes: &mut [u8]) {
+fn apply_relocs(file: &SharedFile, sections: &[Sec], relocs: &BTreeMap<u32, (u64, u32)>, delta: u64, rva: u32, bytes: &mut [u8]) {
     const HIGHLOW: u16 = 3;
     const DIR64: u16 = 10;
     if let Some(&(at, n)) = relocs.get(&rva) {
-        for e in entries(r, at, n) {
+        for e in entries(file, at, n) {
             let off = (e & 0xFFF) as usize;
             match e >> 12 {
                 DIR64 if off + 8 <= bytes.len() => {
@@ -278,7 +287,7 @@ fn apply_relocs(r: &Region, sections: &[Sec], relocs: &BTreeMap<u32, (u64, u32)>
                 }
                 // Starts here and ends on the next page: this page's part.
                 DIR64 => {
-                    if let Some(v) = moved_value(r, sections, rva + off as u32, delta) {
+                    if let Some(v) = moved_value(file, sections, rva + off as u32, delta) {
                         let n = bytes.len() - off;
                         bytes[off..].copy_from_slice(&v.to_le_bytes()[..n]);
                     }
@@ -294,10 +303,10 @@ fn apply_relocs(r: &Region, sections: &[Sec], relocs: &BTreeMap<u32, (u64, u32)>
     // Started on the page before and ends on this one: this page's part.
     if rva >= PAGE as u32 {
         if let Some(&(at, n)) = relocs.get(&(rva - PAGE as u32)) {
-            for e in entries(r, at, n) {
+            for e in entries(file, at, n) {
                 let off = (e & 0xFFF) as usize;
                 if e >> 12 == DIR64 && off + 8 > PAGE as usize {
-                    if let Some(v) = moved_value(r, sections, rva - PAGE as u32 + off as u32, delta) {
+                    if let Some(v) = moved_value(file, sections, rva - PAGE as u32 + off as u32, delta) {
                         let n = off + 8 - PAGE as usize;
                         bytes[..n].copy_from_slice(&v.to_le_bytes()[8 - n..]);
                     }
@@ -308,14 +317,14 @@ fn apply_relocs(r: &Region, sections: &[Sec], relocs: &BTreeMap<u32, (u64, u32)>
 }
 
 /// A value that crosses a page, read whole from the file and moved.
-fn moved_value(r: &Region, sections: &[Sec], rva: u32, delta: u64) -> Option<u64> {
+fn moved_value(file: &SharedFile, sections: &[Sec], rva: u32, delta: u64) -> Option<u64> {
     let mut b = [0u8; 8];
     let from = rva_to_file(sections, rva)?;
-    matches!(r.file.read_at(from, &mut b), Ok(8)).then(|| u64::from_le_bytes(b).wrapping_add(delta))
+    matches!(file.read_at(from, &mut b), Ok(8)).then(|| u64::from_le_bytes(b).wrapping_add(delta))
 }
 
-fn entries(r: &Region, at: u64, n: u32) -> Vec<u16> {
+fn entries(file: &SharedFile, at: u64, n: u32) -> Vec<u16> {
     let mut raw = alloc::vec![0u8; n as usize * 2];
-    let _ = r.file.read_at(at, &mut raw);
+    let _ = file.read_at(at, &mut raw);
     raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
 }

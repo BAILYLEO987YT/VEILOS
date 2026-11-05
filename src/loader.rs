@@ -138,6 +138,31 @@ pub fn load_and_spawn_pe_with(
     result
 }
 
+/// Zeroed pages for the program, `bytes` of them, owned like the rest.
+fn extra_pages(
+    bytes: usize,
+    mapper: &mut impl Mapper<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    mapped_pages: &mut Vec<u64>,
+) -> Result<u64, &'static str> {
+    let pages = (bytes as u64).div_ceil(0x1000);
+    let base = alloc_teb_range(pages);
+    for i in 0..pages {
+        let addr = base + i * 0x1000;
+        let frame = memory::allocate_frame().ok_or("No frame for process parameters")?;
+        memory::map_page(
+            Page::containing_address(VirtAddr::new(addr)),
+            frame,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE,
+            mapper,
+            frame_allocator,
+        );
+        mapped_pages.push(addr);
+        unsafe { core::ptr::write_bytes(addr as *mut u8, 0, 4096) };
+    }
+    Ok(base)
+}
+
 fn load_and_spawn_pe_inner(
     path: &str,
     options: &LaunchOptions,
@@ -417,6 +442,14 @@ fn load_and_spawn_pe_inner(
         },
     };
     let command_line = options.command_line.clone().unwrap_or_else(|| alloc::format!("\"{}\"", dos_path));
+    // The command line and a large environment get pages of their own: Windows
+    // allows 32767 characters of each, and rustc's linker lines use them.
+    let line_units: Vec<u16> = command_line.encode_utf16().take(32_766).collect();
+    let line_base = extra_pages((line_units.len() + 1) * 2, mapper, frame_allocator, mapped_pages)?;
+    let env_base = match &options.environment {
+        Some(block) if block.len() > 0x1000 - 2 => extra_pages((block.len() + 2) * 2, mapper, frame_allocator, mapped_pages)?,
+        _ => env_base,
+    };
     unsafe {
         use nt_abi::layout::*;
         let pp = params_base as *mut u8;
@@ -436,7 +469,10 @@ fn load_and_spawn_pe_inner(
         };
         put(PARAMS_CURRENT_DIRECTORY, &exe_dir, 261);
         put(PARAMS_IMAGE_PATH_NAME, &dos_path, 0);
-        put(PARAMS_COMMAND_LINE, &command_line.chars().take(1000).collect::<String>(), 0);
+        core::ptr::copy_nonoverlapping(line_units.as_ptr(), line_base as *mut u16, line_units.len());
+        *(pp.add(PARAMS_COMMAND_LINE) as *mut u16) = (line_units.len() * 2) as u16;
+        *(pp.add(PARAMS_COMMAND_LINE + 2) as *mut u16) = ((line_units.len() + 1) * 2) as u16;
+        *(pp.add(PARAMS_COMMAND_LINE + 8) as *mut u64) = line_base;
 
         // Environment: "NAME=value\0" ... "\0".
         let cpus = crate::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
@@ -462,8 +498,7 @@ fn load_and_spawn_pe_inner(
         ];
         let mut at = env_base as *mut u16;
         if let Some(block) = &options.environment {
-            // The caller's block, as far as it fits (two pages).
-            let n = block.len().min(0x1000 - 2);
+            let n = block.len();
             core::ptr::copy_nonoverlapping(block.as_ptr(), at, n);
             at = at.add(n);
             *at = 0;

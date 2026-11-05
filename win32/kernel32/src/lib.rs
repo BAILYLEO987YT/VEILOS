@@ -17,10 +17,13 @@
 
 mod atom;
 mod com;
+mod crypt;
 mod env;
 mod legacy;
 mod exception;
 mod fiber;
+mod iocp;
+mod toolchain;
 mod file;
 mod locale;
 mod mapping;
@@ -58,6 +61,7 @@ unsafe extern "system" {
     pub(crate) fn VeilWakeAddress(addr: u64) -> i32;
     pub(crate) fn VeilPipe(op: u64, a: u64, b: u64, c: u64) -> i32;
     pub(crate) fn VeilMutex(op: u64, a: u64, b: u64) -> i32;
+    pub(crate) fn VeilSysInfo(op: u64, out: u64, size: u64) -> i32;
     pub(crate) fn VeilMapView(file: Handle, offset: u64, size: u64, out: *mut u64, flags: u64) -> i32;
     pub(crate) fn VeilUnmapView(addr: u64) -> i32;
     pub(crate) fn NtTerminateProcess(process: Handle, status: NtStatus) -> NtStatus;
@@ -87,6 +91,8 @@ unsafe extern "system" {
     pub(crate) fn NtResetEvent(event: Handle, previous: *mut i32) -> NtStatus;
     pub(crate) fn NtWaitForSingleObject(handle: Handle, alertable: u8, timeout: *const i64) -> NtStatus;
     pub(crate) fn NtYieldExecution() -> NtStatus;
+    pub(crate) fn LdrVeilTlsBegin();
+    pub(crate) fn LdrVeilTlsEnd();
     pub(crate) fn VeilLoadDll(name: *const u16, chars: usize, base: *mut u64, inits: *mut nt_abi::InitCall, capacity: usize, count: *mut u32) -> NtStatus;
     pub(crate) fn VeilGetProcAddress(module: u64, name: *const u8, address: *mut u64) -> NtStatus;
     pub(crate) fn RtlNtStatusToDosError(status: NtStatus) -> u32;
@@ -191,9 +197,9 @@ pub unsafe extern "system" fn WriteFile(file: Handle, buffer: *const u8, length:
         unsafe { *written = 0 };
     }
     let mut iosb = IoStatusBlock::default();
-    let offset = overlapped_offset(overlapped);
+    let offset = iocp::offset_of(overlapped);
     let s = unsafe { NtWriteFile(file, 0, 0, 0, &mut iosb, buffer, length, offset_ptr(&offset), core::ptr::null()) };
-    complete_overlapped(overlapped, s, iosb.information);
+    iocp::complete(file, overlapped, s, iosb.information, true);
     if !status::is_success(s) {
         return fail(s);
     }
@@ -251,43 +257,8 @@ pub(crate) fn open_named(name: *const u16, kind: u64) -> Handle {
     }
 }
 
-/// OVERLAPPED: every operation finishes before the call returns, so one only
-/// gives the offset and receives the result.
-fn overlapped_offset(overlapped: usize) -> Option<i64> {
-    if overlapped == 0 {
-        return None;
-    }
-    let p = overlapped as *const u32;
-    Some(unsafe { (*p.add(5) as i64) << 32 | *p.add(4) as i64 })
-}
-
 fn offset_ptr(offset: &Option<i64>) -> *const i64 {
     offset.as_ref().map_or(core::ptr::null(), |o| o)
-}
-
-fn complete_overlapped(overlapped: usize, s: NtStatus, information: u64) {
-    if overlapped == 0 {
-        return;
-    }
-    let p = overlapped as *mut u64;
-    unsafe {
-        *p = s as u32 as u64;
-        *p.add(1) = information;
-        // The low bit of hEvent only asks not to queue a completion.
-        let event = *p.add(3) & !1;
-        if event != 0 {
-            crate::sync::SetEvent(event);
-        }
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "system" fn GetOverlappedResult(_file: Handle, overlapped: *const u64, done: *mut u32, _wait: Bool) -> Bool {
-    let s = unsafe { *overlapped } as u32 as NtStatus;
-    if !done.is_null() {
-        unsafe { *done = *overlapped.add(1) as u32 };
-    }
-    check(s)
 }
 
 /// Files: from the handle's position. Consoles: waits for a whole typed line
@@ -298,10 +269,14 @@ pub unsafe extern "system" fn ReadFile(file: Handle, buffer: *mut u8, length: u3
     if !read.is_null() {
         unsafe { *read = 0 };
     }
+    // A pipe with nothing to read yet: pending, finished by a worker.
+    if let Some(r) = iocp::read_pending(file, buffer, length, overlapped) {
+        return r;
+    }
     let mut iosb = IoStatusBlock::default();
-    let offset = overlapped_offset(overlapped);
+    let offset = iocp::offset_of(overlapped);
     let s = unsafe { NtReadFile(file, 0, 0, 0, &mut iosb, buffer, length, offset_ptr(&offset), core::ptr::null()) };
-    complete_overlapped(overlapped, s, iosb.information);
+    iocp::complete(file, overlapped, s, iosb.information, true);
     if s == status::END_OF_FILE {
         // With an OVERLAPPED the end of a file is an error; without, no bytes.
         return if overlapped != 0 { fail(s) } else { 1 };
@@ -416,6 +391,7 @@ pub extern "system" fn SetConsoleOutputCP(_cp: u32) -> Bool {
 pub extern "system" fn CloseHandle(handle: Handle) -> Bool {
     // A file mapping lets go of its file (and contents) too.
     mapping::closed(handle);
+    iocp::closed(handle);
     check(unsafe { NtClose(handle) })
 }
 

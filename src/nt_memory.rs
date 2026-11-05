@@ -175,6 +175,7 @@ pub struct VadSpace {
 // identity-mapped MMIO (GiB 3), which every address space shares (see
 // address_space). KUSER_SHARED_DATA (0x7FFE0000) is mapped by the loader.
 const USER_SPACE_START: u64 = 0x0001_0000_0000;
+const GRANULARITY: u64 = 0x1_0000;
 const USER_SPACE_END:   u64 = 0x0000_7FFF_FFFF_F000; // Top of user address space
 
 impl VadSpace {
@@ -237,8 +238,10 @@ impl VadSpace {
             return Some(hint_aligned);
         }
 
-        // Fall back to bump allocator, scanning past any conflicts.
-        let mut candidate = self.next_alloc;
+        // Fall back to bump allocator, scanning past any conflicts. Regions
+        // start on Windows' 64 KiB allocation granularity, which programs
+        // rely on (memmap2 rounds a view's address down to it to unmap).
+        let mut candidate = align_up_u64(self.next_alloc, GRANULARITY);
         loop {
             if candidate + size_aligned as u64 > USER_SPACE_END { return None; }
             if self.is_free(candidate, size_aligned) {
@@ -247,9 +250,9 @@ impl VadSpace {
             }
             // Step over the conflicting entry.
             if let Some(blocker) = self.entries.iter().find(|e| e.overlaps(candidate, size_aligned)) {
-                candidate = align_up_u64(blocker.end(), 0x1000);
+                candidate = align_up_u64(blocker.end(), GRANULARITY);
             } else {
-                candidate += 0x1000;
+                candidate += GRANULARITY;
             }
         }
     }

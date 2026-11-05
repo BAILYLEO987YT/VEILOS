@@ -174,7 +174,9 @@ pub unsafe extern "system" fn LoadLibraryExW(name: *const u16, _file: Handle, _f
     let mut base = 0u64;
     let mut inits = [InitCall::default(); 64];
     let mut count = 0u32;
+    unsafe { crate::LdrVeilTlsBegin() };
     let s = unsafe { crate::VeilLoadDll(name.as_ptr(), name.len(), &mut base, inits.as_mut_ptr(), inits.len(), &mut count) };
+    unsafe { crate::LdrVeilTlsEnd() };
     if !status::is_success(s) {
         fail(s);
         return 0;

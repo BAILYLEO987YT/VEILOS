@@ -9,12 +9,30 @@
 //! the process.
 
 use core::ptr::read_unaligned;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const DLL_THREAD_ATTACH: u32 = 2;
 const DLL_THREAD_DETACH: u32 = 3;
 const LDRP_IMAGE_DLL: u32 = 0x4;
-/// Slots in a thread's ThreadLocalStoragePointer array.
-const TLS_ARRAY_SLOTS: usize = 64;
+/// Slots in a thread's ThreadLocalStoragePointer array. One more follows
+/// them: the next array in `THREADS`.
+const TLS_ARRAY_SLOTS: usize = nt_abi::layout::TLS_ARRAY_SLOTS;
+
+/// Held while a DLL is loaded and while a thread gets its TLS, so that a new
+/// thread either sees the DLL or is in `THREADS` for it to be given a block.
+static TLS_LOCK: AtomicBool = AtomicBool::new(false);
+/// The arrays of the threads started after the first (under `TLS_LOCK`).
+static THREADS: AtomicU64 = AtomicU64::new(0);
+
+fn lock_tls() {
+    while TLS_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+}
+
+fn unlock_tls() {
+    TLS_LOCK.store(false, Ordering::Release);
+}
 
 type DllEntry = unsafe extern "system" fn(u64, u32, usize) -> i32;
 type TlsCallback = unsafe extern "system" fn(u64, u32, usize);
@@ -92,20 +110,16 @@ fn tls_callbacks(base: u64, dir: u64, reason: u32) {
     }
 }
 
-/// Give this thread its copy of every module's TLS data, then tell the
-/// modules about it.
-fn attach() {
-    let tls_array = unsafe {
-        crate::RtlAllocateHeap(heap(), 8, TLS_ARRAY_SLOTS * 8) as *mut u64 // HEAP_ZERO_MEMORY
-    };
-    unsafe { *((teb() + 0x58) as *mut u64) = tls_array as u64 };
+/// Fill the empty slots of a thread's array: a copy of the TLS data of every
+/// module that has an index and isn't there yet.
+fn give_blocks(tls_array: *mut u64) {
     modules(LOAD_ORDER, |e| {
         let base = unsafe { rd64(e + 0x30) };
         if let Some(dir) = tls_directory(base) {
             unsafe {
                 let (start, end, index_va, zero_fill) = (rd64(dir), rd64(dir + 8), rd64(dir + 16), rd32(dir + 32) as u64);
                 let index = if index_va != 0 { rd32(index_va) as usize } else { usize::MAX };
-                if index < TLS_ARRAY_SLOTS && !tls_array.is_null() {
+                if index < TLS_ARRAY_SLOTS && *tls_array.add(index) == 0 {
                     let size = (end - start + zero_fill) as usize;
                     let block = crate::RtlAllocateHeap(heap(), 8, size.max(1));
                     if !block.is_null() {
@@ -116,7 +130,47 @@ fn attach() {
             }
         }
     });
+}
+
+/// Give this thread its copy of every module's TLS data, then tell the
+/// modules about it.
+fn attach() {
+    lock_tls();
+    let tls_array = unsafe {
+        crate::RtlAllocateHeap(heap(), 8, (TLS_ARRAY_SLOTS + 1) * 8) as *mut u64 // HEAP_ZERO_MEMORY
+    };
+    unsafe { *((teb() + 0x58) as *mut u64) = tls_array as u64 };
+    if !tls_array.is_null() {
+        give_blocks(tls_array);
+        unsafe { *tls_array.add(TLS_ARRAY_SLOTS) = THREADS.load(Ordering::Relaxed) };
+        THREADS.store(tls_array as u64, Ordering::Relaxed);
+    }
+    unlock_tls();
     notify(DLL_THREAD_ATTACH, false);
+}
+
+/// LoadLibrary is about to link a DLL.
+#[no_mangle]
+pub extern "system" fn LdrVeilTlsBegin() {
+    lock_tls();
+}
+
+/// LoadLibrary has linked it: every thread running now gets a block for each
+/// new module with TLS, before the module's own code runs.
+#[no_mangle]
+pub extern "system" fn LdrVeilTlsEnd() {
+    if !heap().is_null() {
+        let main = unsafe { rd64(peb() + nt_abi::layout::PEB_MAIN_TLS_ARRAY as u64) } as *mut u64;
+        if !main.is_null() {
+            give_blocks(main);
+        }
+        let mut array = THREADS.load(Ordering::Relaxed) as *mut u64;
+        while !array.is_null() {
+            give_blocks(array);
+            array = unsafe { *array.add(TLS_ARRAY_SLOTS) } as *mut u64;
+        }
+    }
+    unlock_tls();
 }
 
 /// TLS callbacks and DllMains, for `reason`: the DLLs in initialisation
@@ -165,15 +219,37 @@ pub unsafe extern "system" fn RtlExitUserThread(code: u32) -> ! {
     notify(DLL_THREAD_DETACH, true);
     let array = unsafe { rd64(teb() + 0x58) } as *mut u64;
     if !array.is_null() {
-        for i in 0..TLS_ARRAY_SLOTS {
-            let block = unsafe { *array.add(i) };
-            if block != 0 {
-                unsafe { crate::RtlFreeHeap(heap(), 0, block as *mut u8) };
+        lock_tls();
+        let main_field = (peb() + nt_abi::layout::PEB_MAIN_TLS_ARRAY as u64) as *mut u64;
+        let is_main = unsafe { *main_field } == array as u64;
+        if is_main {
+            // Its array and first blocks are the loader's, not the heap's.
+            unsafe { *main_field = 0 };
+        } else {
+            let mut at = THREADS.load(Ordering::Relaxed) as *mut u64;
+            if at == array {
+                THREADS.store(unsafe { *array.add(TLS_ARRAY_SLOTS) }, Ordering::Relaxed);
+            } else {
+                while !at.is_null() {
+                    let next = unsafe { *at.add(TLS_ARRAY_SLOTS) } as *mut u64;
+                    if next == array {
+                        unsafe { *at.add(TLS_ARRAY_SLOTS) = *array.add(TLS_ARRAY_SLOTS) };
+                        break;
+                    }
+                    at = next;
+                }
             }
         }
-        unsafe {
-            *((teb() + 0x58) as *mut u64) = 0;
-            crate::RtlFreeHeap(heap(), 0, array as *mut u8);
+        unlock_tls();
+        unsafe { *((teb() + 0x58) as *mut u64) = 0 };
+        if !is_main {
+            for i in 0..TLS_ARRAY_SLOTS {
+                let block = unsafe { *array.add(i) };
+                if block != 0 {
+                    unsafe { crate::RtlFreeHeap(heap(), 0, block as *mut u8) };
+                }
+            }
+            unsafe { crate::RtlFreeHeap(heap(), 0, array as *mut u8) };
         }
     }
     loop {

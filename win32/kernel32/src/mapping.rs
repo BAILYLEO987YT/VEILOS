@@ -176,6 +176,9 @@ pub unsafe extern "system" fn MapViewOfFile(h: Handle, access: u32, hi: u32, lo:
     unsafe { MapViewOfFileEx(h, access, hi, lo, bytes, 0) }
 }
 
+/// `Mapping::handle` once the handle has closed with views still open.
+const CLOSED: Handle = u64::MAX - 7;
+
 /// The mapping whose contents hold `addr`.
 fn holding(addr: usize) -> Option<usize> {
     with(|t| t.iter().position(|m| m.handle != 0 && m.base != 0 && addr >= m.base && addr < m.base + m.size as usize))
@@ -222,6 +225,11 @@ pub extern "system" fn UnmapViewOfFile(addr: usize) -> Bool {
     };
     write_back(i);
     with(|t| t[i].views = t[i].views.saturating_sub(1));
+    // Its handle went while views were open: the last view ends it.
+    let m = with(|t| t[i]);
+    if m.handle == CLOSED && m.views == 0 {
+        release(i);
+    }
     1
 }
 
@@ -236,10 +244,20 @@ pub fn closed(h: Handle) {
     let Some(i) = with(|t| t.iter().position(|m| m.handle == h && h != 0)) else { return };
     let m = with(|t| t[i]);
     write_back(i);
+    // Programs close the mapping and go on writing through a view of it.
+    if m.views != 0 {
+        with(|t| t[i].handle = CLOSED);
+        return;
+    }
+    release(i);
+}
+
+fn release(i: usize) {
+    let m = with(|t| t[i]);
     if m.file != 0 {
         crate::CloseHandle(m.file);
     }
-    if m.base != 0 && m.views == 0 {
+    if m.base != 0 {
         unsafe { crate::mem::VirtualFree(m.base, 0, 0x8000) };
     }
     with(|t| t[i] = EMPTY);

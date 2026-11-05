@@ -541,6 +541,61 @@ pub unsafe extern "system" fn SetFileInformationByHandle(h: Handle, class: u32, 
     }
 }
 
+/// FILE_ID_BOTH_DIR_INFO entries, as many as fit, from NtQueryDirectoryFile.
+fn directory_info(h: Handle, out: *mut u8, size: u32, restart: bool) -> Bool {
+    const NAME_AT: usize = 104;
+    let mut at = 0usize;
+    let mut previous: Option<usize> = None;
+    let mut restart = restart as u8;
+    loop {
+        // FILE_DIRECTORY_INFORMATION: times at 8, sizes at 40, attributes at
+        // 56, name length at 60, name at 64.
+        let mut entry = [0u8; 64 + 520];
+        let mut iosb = nt_abi::IoStatusBlock::default();
+        let s = unsafe {
+            crate::NtQueryDirectoryFile(h, 0, 0, 0, &mut iosb, entry.as_mut_ptr(), entry.len() as u32, 1, 1, core::ptr::null(), restart)
+        };
+        restart = 0;
+        if s == status::NO_MORE_FILES {
+            if at != 0 {
+                return 1;
+            }
+            crate::SetLastError(18); // ERROR_NO_MORE_FILES
+            return 0;
+        }
+        if s != status::SUCCESS {
+            return fail(s);
+        }
+        let bytes = u32::from_le_bytes(entry[60..64].try_into().unwrap()) as usize;
+        let need = (NAME_AT + bytes + 7) & !7;
+        if at + need > size as usize {
+            // Doesn't fit: this one is lost to the position unless it's rewound,
+            // so a buffer is only ever filled to what's certain to fit.
+            if at == 0 {
+                crate::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
+                return 0;
+            }
+            return 1;
+        }
+        unsafe {
+            let e = out.add(at);
+            core::ptr::write_bytes(e, 0, NAME_AT);
+            core::ptr::copy_nonoverlapping(entry.as_ptr().add(8), e.add(8), 52 + 4 - 4);
+            core::ptr::write_unaligned(e.add(60) as *mut u32, bytes as u32);
+            core::ptr::copy_nonoverlapping(entry.as_ptr().add(64), e.add(NAME_AT), bytes);
+            if let Some(p) = previous {
+                core::ptr::write_unaligned(out.add(p) as *mut u32, (at - p) as u32);
+            }
+        }
+        previous = Some(at);
+        at += need;
+        // A longest name must still fit, so nothing is ever read and dropped.
+        if at + ((NAME_AT + 520 + 7) & !7) > size as usize {
+            return 1;
+        }
+    }
+}
+
 /// FILE_INFO_BY_HANDLE_CLASS: FileBasicInfo (0) and FileStandardInfo (1),
 /// from the NT information classes they mirror.
 #[no_mangle]
@@ -548,6 +603,22 @@ pub unsafe extern "system" fn GetFileInformationByHandleEx(h: Handle, class: u32
     let nt_class = match class {
         0 => 4, // FileBasicInformation
         1 => 5, // FileStandardInformation
+        2 => 9, // FileNameInformation
+        9 => {
+            // FILE_ATTRIBUTE_TAG_INFO: no reparse points here.
+            let mut basic = [0u8; 40];
+            let mut iosb = nt_abi::IoStatusBlock::default();
+            let r = check(unsafe { crate::NtQueryInformationFile(h, &mut iosb, basic.as_mut_ptr(), 40, 4) });
+            if r != 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(basic.as_ptr().add(32), out, 4);
+                    core::ptr::write_bytes(out.add(4), 0, 4);
+                }
+            }
+            return r;
+        }
+        10 => return directory_info(h, out, size, false),
+        11 => return directory_info(h, out, size, true),
         _ => {
             crate::SetLastError(ERROR_NOT_SUPPORTED);
             return 0;

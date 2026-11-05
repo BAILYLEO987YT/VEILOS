@@ -243,7 +243,10 @@ unsafe fn open_handle(path: *const u16, flags: i32) -> u64 {
         (false, _, true) => 5,     // TRUNCATE_EXISTING
         _ => 3,                    // OPEN_EXISTING
     };
-    unsafe { CreateFileW(path, access, 7, 0, creation, 0x80, 0) }
+    // Inheritable, as the C runtime's files are: a program redirects a child by
+    // pointing stdout at one of them.
+    let sa: [u64; 3] = [24, 0, 1];
+    unsafe { CreateFileW(path, access, 7, sa.as_ptr() as usize, creation, 0x80, 0) }
 }
 
 #[no_mangle]

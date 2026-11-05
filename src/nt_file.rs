@@ -48,6 +48,10 @@ impl ImageHold {
         file.images.fetch_add(1, Ordering::AcqRel);
         Self(file)
     }
+
+    pub fn file(&self) -> &SharedFile {
+        &self.0
+    }
 }
 
 impl Drop for ImageHold {
@@ -134,6 +138,14 @@ impl FileObject {
         self.shared.as_deref()
     }
 
+    /// Where it is now.
+    pub fn current_path(&self) -> String {
+        match &self.shared {
+            Some(s) => s.path.lock().clone(),
+            None => self.path.lock().clone(),
+        }
+    }
+
     /// The open file, for mapping.
     pub fn shared(&self) -> Option<Arc<SharedFile>> {
         self.shared.clone()
@@ -211,6 +223,19 @@ pub fn vfs_path(nt: &str) -> Option<String> {
     Some(out)
 }
 
+/// `name` (backslashes, no drive) inside the directory at `dir`.
+fn relative_path(dir: &str, name: &str) -> String {
+    let mut out = String::from(dir.trim_end_matches('/'));
+    for part in name.split(|c| c == '\\' || c == '/').filter(|s| !s.is_empty() && *s != ".") {
+        out.push('/');
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
 /// What's at `path`: (is a directory, size). An open file's size is the live one.
 fn stat(path: &str) -> Option<(bool, u64)> {
     if path == "/" {
@@ -258,7 +283,17 @@ pub fn create_file(proc: &crate::process::Process, out: u64, access: u64, oa: u6
         return status::ACCESS_VIOLATION;
     }
     let Some(name) = read_object_name(oa) else { return status::ACCESS_VIOLATION };
-    let Some(path) = vfs_path(&name) else { return status::OBJECT_NAME_INVALID };
+    // OBJECT_ATTRIBUTES.RootDirectory: the name is relative to that directory.
+    let root = unsafe { (*(oa as *const ObjectAttributes)).root_directory } as u64;
+    let path = if root != 0 {
+        let Some(crate::nt_objects::KernelObjectRef::File(dir)) = crate::nt_process::object(proc, root) else { return status::INVALID_HANDLE };
+        relative_path(&dir.current_path(), &name)
+    } else {
+        match vfs_path(&name) {
+            Some(p) => p,
+            None => return status::OBJECT_NAME_INVALID,
+        }
+    };
     let existing = stat(&path);
     let want_dir = options & file::DIRECTORY_FILE != 0;
 
@@ -319,7 +354,9 @@ pub fn create_file(proc: &crate::process::Process, out: u64, access: u64, oa: u6
         delete_on_close: AtomicBool::new(options & file::DELETE_ON_CLOSE != 0),
         listing: Mutex::new(None),
     });
-    let h = proc.handles.lock().allocate_ref(crate::nt_objects::KernelObjectRef::File(obj), access, 0);
+    let inherit = unsafe { (*(oa as *const ObjectAttributes)).attributes } & 2 != 0; // OBJ_INHERIT
+    let kept = if inherit { 0 } else { crate::nt_objects::HANDLE_NO_INHERIT };
+    let h = proc.handles.lock().allocate_ref(crate::nt_objects::KernelObjectRef::File(obj), access, kept);
     unsafe { *(out as *mut u64) = h as u64 };
     write_iosb(iosb, status::SUCCESS, info);
     status::SUCCESS
@@ -402,6 +439,22 @@ pub fn query_information(f: &FileObject, iosb: u64, out: u64, length: usize, cla
         file::BASIC_INFORMATION => 40,
         file::STANDARD_INFORMATION => 24,
         file::POSITION_INFORMATION => 8,
+        file::INTERNAL_INFORMATION => 8,
+        // FileNameLength, then the name.
+        file::NAME_INFORMATION => {
+            if length < 4 || !ptr_ok(out, length) {
+                return status::BUFFER_TOO_SMALL;
+            }
+            let path = f.current_path();
+            let units: Vec<u16> = path.chars().map(|c| if c == '/' { '\\' } else { c }).collect::<String>().encode_utf16().collect();
+            let bytes = (units.len() * 2).min(length - 4);
+            unsafe {
+                core::ptr::write_unaligned(out as *mut u32, (units.len() * 2) as u32);
+                core::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, (out + 4) as *mut u8, bytes);
+            }
+            write_iosb(iosb, status::SUCCESS, 4 + bytes as u64);
+            return status::SUCCESS;
+        }
         _ => return status::INVALID_INFO_CLASS,
     };
     if length < need {
@@ -427,6 +480,14 @@ pub fn query_information(f: &FileObject, iosb: u64, out: u64, length: usize, cla
                 *((out + 20) as *mut u8) = pending as u8;
                 *((out + 21) as *mut u8) = f.is_dir as u8;
                 core::ptr::write_unaligned((out + 22) as *mut u16, 0);
+            }
+            // A number for the file: its path, which is what two opens share.
+            file::INTERNAL_INFORMATION => {
+                let mut h = 0xCBF2_9CE4_8422_2325u64;
+                for b in open_key(&f.current_path()).bytes() {
+                    h = (h ^ b as u64).wrapping_mul(0x0100_0000_01B3);
+                }
+                core::ptr::write_unaligned(out as *mut u64, h);
             }
             _ => core::ptr::write_unaligned(out as *mut u64, *f.position.lock()),
         }

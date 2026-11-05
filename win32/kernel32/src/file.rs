@@ -168,13 +168,24 @@ fn console_name(name: &[u16]) -> Option<u32> {
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateFileW(name: *const u16, access: u32, _share: u32, _security: usize, creation: u32, flags: u32, _template: Handle) -> Handle {
+pub unsafe extern "system" fn CreateFileW(name: *const u16, access: u32, _share: u32, security: usize, creation: u32, flags: u32, _template: Handle) -> Handle {
     let name = unsafe { wstr(name) };
     if let Some(which) = console_name(name) {
         return crate::GetStdHandle(which);
     }
     if crate::fiber::pipe_name(name) {
-        return crate::fiber::pipe_client(name.as_ptr());
+        return crate::fiber::pipe_client(name.as_ptr(), security);
+    }
+    if is_ascii_name(name, "NUL") || is_ascii_name(name, "\\\\.\\NUL") || is_ascii_name(name, "\\\\?\\NUL") {
+        let mut h: Handle = 0;
+        let s = unsafe { crate::VeilPipe(7, &mut h as *mut Handle as u64, 0, 0) };
+        if s != 0 {
+            fail(s);
+            return INVALID_HANDLE_VALUE;
+        }
+        crate::process::apply_inherit(h, security);
+        crate::SetLastError(0);
+        return h;
     }
     let disposition = match creation {
         1 => nf::CREATE,       // CREATE_NEW
@@ -193,6 +204,7 @@ pub unsafe extern "system" fn CreateFileW(name: *const u16, access: u32, _share:
     }
     match open(name, access, disposition, options) {
         Ok((h, info)) => {
+            crate::process::apply_inherit(h, security);
             // CREATE_ALWAYS / OPEN_ALWAYS on an existing file: ERROR_ALREADY_EXISTS.
             let existed = (creation == 2 || creation == 4) && (info == nf::OPENED || info == nf::OVERWRITTEN);
             crate::SetLastError(if existed { 183 } else { 0 });
@@ -250,7 +262,7 @@ pub extern "system" fn GetFileType(h: Handle) -> u32 {
         status::SUCCESS => match info[0] {
             0x07 | 0x08 => FILE_TYPE_DISK,
             0x11 => 3, // FILE_TYPE_PIPE
-            0x50 | 0x14 => FILE_TYPE_CHAR,
+            0x50 | 0x14 | 0x15 => FILE_TYPE_CHAR,
             _ => FILE_TYPE_UNKNOWN,
         },
         s => {

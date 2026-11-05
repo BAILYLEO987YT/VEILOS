@@ -311,6 +311,9 @@ type CreateFile = unsafe extern "system" fn(*mut u64, u32, *const u8, *mut u8, *
 pub unsafe extern "system" fn NtOpenFile(handle: *mut u64, access: u32, attrs: *const u8, iosb: *mut u8, share: u32, options: u32) -> NtStatus {
     // Opening the named-pipe folder, or a nameless pipe through its server.
     if let Some(s) = unsafe { open_pipe(handle, attrs) } {
+        if s == 0 {
+            unsafe { apply_inherit(handle, attrs) };
+        }
         return s;
     }
     let create: CreateFile = unsafe { core::mem::transmute(crate::NtCreateFile as *const ()) };
@@ -345,6 +348,17 @@ fn veil_pipe() -> unsafe extern "system" fn(u64, u64, u64, u64) -> NtStatus {
     unsafe { core::mem::transmute(crate::VeilPipe as *const ()) }
 }
 
+/// A pipe end goes to children only with OBJ_INHERIT: a child holding the write
+/// end of its own stdin would never see the end of it.
+unsafe fn apply_inherit(handle: *mut u64, attrs: *const u8) {
+    // OBJECT_ATTRIBUTES.Attributes, after the length, root and name.
+    let inherit = !attrs.is_null() && unsafe { *(attrs.add(24) as *const u32) } & 2 != 0;
+    let info = [inherit as u8, 0];
+    type SetObject = unsafe extern "system" fn(u64, u32, *const u8, u32) -> NtStatus;
+    let set: SetObject = unsafe { core::mem::transmute(crate::NtSetInformationObject as *const ()) };
+    unsafe { set(*handle, 4, info.as_ptr(), 2) };
+}
+
 unsafe fn open_pipe(handle: *mut u64, attrs: *const u8) -> Option<NtStatus> {
     let (root, name) = unsafe { pipe_attrs(attrs) };
     if is_pipe_folder(name) {
@@ -368,8 +382,10 @@ unsafe fn open_pipe(handle: *mut u64, attrs: *const u8) -> Option<NtStatus> {
 /// offered here: CreateNamedPipe is how those are made.
 #[no_mangle]
 pub unsafe extern "system" fn NtCreateNamedPipeFile(handle: *mut u64, _access: u32, attrs: *const u8, iosb: *mut u64, _share: u32, _disposition: u32, _options: u32, _pipe_type: u32, _read_mode: u32, _completion: u32, _max: u32, inbound: u32, outbound: u32, _timeout: *const i64) -> NtStatus {
-    let _ = attrs;
     let s = unsafe { veil_pipe()(0, 0, handle as u64, inbound.max(outbound) as u64) };
+    if s == 0 {
+        unsafe { apply_inherit(handle, attrs) };
+    }
     if s == 0 && !iosb.is_null() {
         unsafe {
             *iosb = 0;
@@ -377,6 +393,12 @@ pub unsafe extern "system" fn NtCreateNamedPipeFile(handle: *mut u64, _access: u
         }
     }
     s
+}
+
+/// The status behind the last error: not kept, so nothing to report.
+#[no_mangle]
+pub extern "system" fn RtlGetLastNtStatus() -> NtStatus {
+    0
 }
 
 const STATUS_NO_TOKEN: NtStatus = 0xC000_007Cu32 as i32;

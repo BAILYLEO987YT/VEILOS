@@ -20,6 +20,7 @@ unsafe extern "system" {
     fn WaitForSingleObject(h: u64, ms: u32) -> u32;
     fn GetExitCodeProcess(h: u64, code: *mut u32) -> i32;
     fn CreatePipe(read: *mut u64, write: *mut u64, sa: usize, size: u32) -> i32;
+    fn SetHandleInformation(h: u64, mask: u32, flags: u32) -> i32;
     fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, size: u32) -> u32;
 }
 
@@ -265,6 +266,13 @@ pub unsafe extern "C" fn _pipe(fds: *mut i32, size: u32, mode: i32) -> i32 {
         crate::errno_from_win32();
         return -1;
     }
+    const O_NOINHERIT: i32 = 0x80;
+    if mode & O_NOINHERIT == 0 {
+        unsafe {
+            SetHandleInformation(r, 1, 1);
+            SetHandleInformation(w, 1, 1);
+        }
+    }
     let mode = if mode & (stdio::O_TEXT | stdio::O_BINARY) == 0 { 0 } else { mode };
     let fr = stdio::_open_osfhandle(r as isize, mode);
     let fw = stdio::_open_osfhandle(w as isize, mode | stdio::O_WRONLY);
@@ -285,6 +293,8 @@ unsafe fn popen(command: &[u16], mode: &[u8]) -> *mut stdio::File {
         crate::errno_from_win32();
         return core::ptr::null_mut();
     }
+    // Only the child's end goes to the child, or it would hold its own pipe open.
+    unsafe { SetHandleInformation(if reading { w } else { r }, 1, 1) };
     stdio::flush_all();
     let out = unsafe { [crate::GetStdHandle(0xFFFF_FFF6), crate::GetStdHandle(0xFFFF_FFF5), crate::GetStdHandle(0xFFFF_FFF4)] };
     let std = if reading { [out[0], w, out[2]] } else { [r, out[1], out[2]] };

@@ -1,0 +1,107 @@
+--- overlapped pipes
+read: 0 err 997
+not done: 0 err 996, event 258
+event once written: 0
+result: 1 n=9 late data
+ready: 1 n=5 ready, event 0
+read: 0 err 997
+waited: 1 n=9
+read: 0 err 997
+cancel: 1
+cancelled: 0 err 995 n=0
+nothing to cancel: 0 err 1168
+read: 0 err 997
+hung up: 0 err 109
+--- completion ports
+port: 1
+empty: 0 err 258, overlapped null 1
+post: 1
+posted: 1 n=123 key=456 same 1
+bind: 1
+write: 1
+packet: 1 n=9 key=11 same 1
+bind: 1
+read: 0 err 997
+nothing yet: 0 err 258
+packet: 1 n=9 key=22 same 1 late data
+ex: 1 removed 2: 101/1 102/2
+ex empty: 0 err 258 removed 0
+--- final paths
+prefix \\?\ 1, length matches 1, tail \w17dir\final.txt
+too small asks for more: 1
+folder, tail \w17dir
+same file 1, other file 0
+--- mapped output
+size: 1
+mapped: 1 1
+mapping closed: 1
+flush: 0, unmap: 1
+rename: 1
+size 300000, bytes 1 2
+last byte 5a
+temp gone: 1
+--- hashes
+provider: 1
+1 1 size 20 len 20 a9993e364706816aba3e25717850c26c9cd0d89d
+1 1 size 32 len 32 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+1 1 size 20 len 20 da39a3ee5e6b4b0d3255bfef95601890afd80709
+1 1 size 32 len 32 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+1 1 size 20 len 20 291e9a6c66994949b57ba5e650361e98fc36b1ba
+1 1 size 32 len 32 41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3
+release: 1
+--- NUL
+NUL: open 1, type 2, write 1 n=4, read 1 n=0
+nul: open 1, type 2, write 1 n=4, read 1 n=0
+\\.\NUL: open 1, type 2, write 1 n=4, read 1 n=0
+--- ports released
+made and closed 200
+empty port: 0 error 258
+posted: 1 n=5 key=77
+--- LoadLibrary with a path
+by name alone: 0 error 126
+by path: 1
+export: 42
+data export: 7
+TLS callback process attaches: 1
+main thread TLS: 5
+thread already running: 5 then 6
+thread started later: 5 then 100
+main thread still: 9
+by long path prefix, same module: 1
+by name once loaded, same module: 1
+missing path: 0 error 126
+--- which handles children get
+pipe, no attributes: 0 0
+pipe, inherit: 1 1
+named pipe, no attributes: 0
+its client, inherit: 1
+file, no attributes: 0
+duplicate, inherit: 1
+file, inherit: 1
+duplicate, no inherit: 0
+duplicate, same attributes: 1
+file, inherit false: 0
+--- child reads stdin to the end
+started: 1
+finished: 1
+bytes it read: 12
+--- the same through the NT calls
+folder: 0
+ours: 0 inheritable 0
+theirs: 0 inheritable 1
+started: 1
+finished: 1
+bytes it read: 12
+--- heap churn
+wrong bytes: 0, failed: 0
+--- small answers
+pointers round trip: 1
+types: 182 101 84 48 10
+memory: 1, sensible 1
+prng: 1 1 1 differ 1, not zero 1
+job: 1, assign self 1
+lock: 1, unlock: 1
+reopen shared-none is refused or a handle: 1
+stack guarantee: 1
+done
+exit 4

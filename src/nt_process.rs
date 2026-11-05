@@ -216,13 +216,12 @@ pub fn create_thread(proc: &Arc<Process>, start: u64, param: u64, flags: u64, re
     let tid = alloc_tid();
     let mut pages = Vec::new();
 
-    // Stack.
-    let stack_base = NEXT_STACK.fetch_add(THREAD_STACK * 2, Ordering::Relaxed);
-    if let Err(s) = map_user(stack_base, THREAD_STACK / 0x1000, false, &mut pages) {
-        free_pages(&mut pages);
-        return s;
-    }
-    let stack_top = stack_base + THREAD_STACK;
+    // Stack: its size in pages in the upper half of `flags`, at least the
+    // default, zero pages as they're touched. A gap below it catches overflow.
+    let stack_size = ((flags >> 32) * 0x1000).max(THREAD_STACK).next_multiple_of(0x1_0000);
+    let stack_base = NEXT_STACK.fetch_add(stack_size + THREAD_STACK, Ordering::Relaxed);
+    crate::nt_demand::add_zero(stack_base, stack_size);
+    let stack_top = stack_base + stack_size;
     // As if called: a null return address and home space.
     let rsp = stack_top - 40;
 
@@ -246,7 +245,7 @@ pub fn create_thread(proc: &Arc<Process>, start: u64, param: u64, flags: u64, re
     }
     {
         let mut vad = proc.vad.lock();
-        vad.record_image(stack_base, THREAD_STACK as usize);
+        vad.record_image(stack_base, stack_size as usize);
         vad.record_image(teb, 0x2000);
     }
 
@@ -361,6 +360,14 @@ fn signalled(obj: &KernelObjectRef, take: bool) -> bool {
 /// Wait for one (`all` false) or all of `objs`. Returns the index of the
 /// signalled object (any), 0 (all), or STATUS_TIMEOUT.
 pub fn wait(objs: &[KernelObjectRef], all: bool, until: Option<u64>) -> NtStatus {
+    let mut note = crate::nt_syscalls::WaitNote::new(match objs.first() {
+        Some(KernelObjectRef::Event(_)) => "a wait on an event",
+        Some(KernelObjectRef::Semaphore(_)) => "a wait on a semaphore",
+        Some(KernelObjectRef::Mutex(_)) => "a wait on a mutex",
+        Some(KernelObjectRef::Thread(_)) => "a wait on a thread",
+        Some(KernelObjectRef::Process(_)) => "a wait on a process",
+        _ => "a wait",
+    });
     loop {
         if all {
             if objs.iter().all(|o| signalled(o, false)) {
@@ -376,6 +383,7 @@ pub fn wait(objs: &[KernelObjectRef], all: bool, until: Option<u64>) -> NtStatus
             return status::TIMEOUT;
         }
         crate::loader::kill_if_requested();
+        note.tick();
         crate::nt_syscalls::wait_a_little();
     }
 }
@@ -471,6 +479,7 @@ pub fn query_thread(proc: &Arc<Process>, h: u64, class: u64, out: u64, length: u
 /// target_handle*, access, attributes, options): from this process, to
 /// this process or one it has a handle to.
 pub fn duplicate(proc: &Arc<Process>, src_proc: u64, src: u64, dst_proc: u64, out: u64) -> NtStatus {
+    let attributes = stack(5).unwrap_or(0) as u32;
     let options = stack(6).unwrap_or(0) as u32;
     if src_proc != CURRENT_PROCESS {
         match object(proc, src_proc) {
@@ -487,7 +496,14 @@ pub fn duplicate(proc: &Arc<Process>, src_proc: u64, src: u64, dst_proc: u64, ou
             _ => return status::INVALID_HANDLE,
         }
     };
-    let h = target.handles.lock().allocate_ref(obj, 0x001F_FFFF, 0);
+    // DUPLICATE_SAME_ATTRIBUTES keeps the source's; otherwise OBJ_INHERIT says.
+    let inherit = if options & 4 != 0 {
+        proc.handles.lock().inheritable(src as u32).unwrap_or(false)
+    } else {
+        attributes & 2 != 0
+    };
+    let kept = if inherit { 0 } else { crate::nt_objects::HANDLE_NO_INHERIT };
+    let h = target.handles.lock().allocate_ref(obj, 0x001F_FFFF, kept);
     if options & 1 != 0 && src != CURRENT_PROCESS && src != CURRENT_THREAD {
         // DUPLICATE_CLOSE_SOURCE
         proc.handles.lock().close(src as u32);
@@ -570,6 +586,7 @@ pub fn create_pipe(proc: &Process, read_out: u64, write_out: u64, size: u64) -> 
 /// Read or write a pipe end; returns (status, bytes).
 pub fn pipe_io(end: &PipeEnd, buffer: u64, length: usize, writing: bool) -> (NtStatus, usize) {
     let pipe = &end.pipe;
+    let mut note = crate::nt_syscalls::WaitNote::new(if writing { "a pipe write" } else { "a pipe read" });
     if writing {
         if !end.write {
             return (status::ACCESS_DENIED, 0);
@@ -589,6 +606,7 @@ pub fn pipe_io(end: &PipeEnd, buffer: u64, length: usize, writing: bool) -> (NtS
             }
             if done < length {
                 crate::loader::kill_if_requested();
+                note.tick();
                 crate::nt_syscalls::wait_a_little();
             }
         }
@@ -615,6 +633,7 @@ pub fn pipe_io(end: &PipeEnd, buffer: u64, length: usize, writing: bool) -> (NtS
                 return (status::SUCCESS, 0);
             }
             crate::loader::kill_if_requested();
+            note.tick();
             crate::nt_syscalls::wait_a_little();
         }
     }
@@ -677,7 +696,7 @@ pub fn create_process(proc: &Arc<Process>, params: u64, result: u64) -> NtStatus
     let p = unsafe { core::ptr::read_unaligned(params as *const ProcessParams) };
     let Some(image) = read_wide(p.image, 520) else { return status::INVALID_PARAMETER };
     let Some(path) = crate::nt_file::vfs_path(&image) else { return status::OBJECT_PATH_NOT_FOUND };
-    if crate::vfs::VFS.read_file(&path).is_err() {
+    if crate::vfs::VFS.stat(&path).is_none_or(|s| s.is_dir) {
         return status::OBJECT_NAME_NOT_FOUND;
     }
 
@@ -744,6 +763,7 @@ pub fn query_volume(proc: &Arc<Process>, h: u64, iosb: u64, out: u64, length: u6
     }
     let device: u32 = match object(proc, h) {
         Some(KernelObjectRef::Duplex(_)) => 0x11,  // FILE_DEVICE_NAMED_PIPE
+        Some(KernelObjectRef::Null) => 0x15,       // FILE_DEVICE_NULL
         Some(KernelObjectRef::File(_)) => 0x07,    // FILE_DEVICE_DISK
         Some(KernelObjectRef::Console(_)) => 0x50, // FILE_DEVICE_CONSOLE
         Some(KernelObjectRef::Pipe(_)) => 0x11,    // FILE_DEVICE_NAMED_PIPE

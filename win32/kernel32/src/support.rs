@@ -397,6 +397,12 @@ pub unsafe extern "system" fn GetFileInformationByHandle(h: Handle, out: *mut u8
     info[32..36].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
     info[36..40].copy_from_slice(&(size as u32).to_le_bytes());
     info[40..44].copy_from_slice(&u32::from_le_bytes(std[16..20].try_into().unwrap()).max(1).to_le_bytes());
+    // nFileIndexHigh, then nFileIndexLow.
+    let mut index = 0u64;
+    let mut iosb = nt_abi::IoStatusBlock::default();
+    unsafe { crate::NtQueryInformationFile(h, &mut iosb, &mut index as *mut u64 as *mut u8, 8, nt_abi::file::INTERNAL_INFORMATION) };
+    info[44..48].copy_from_slice(&((index >> 32) as u32).to_le_bytes());
+    info[48..52].copy_from_slice(&(index as u32).to_le_bytes());
     unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), out, 52) };
     1
 }

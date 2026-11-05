@@ -33,9 +33,10 @@ const WAIT_TIMEOUT: u32 = 258;
 // -----| threads |-----
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateThread(_sa: usize, _stack: usize, start: u64, param: u64, flags: u32, tid: *mut u32) -> Handle {
+pub unsafe extern "system" fn CreateThread(_sa: usize, stack: usize, start: u64, param: u64, flags: u32, tid: *mut u32) -> Handle {
     let mut r = ThreadResult::default();
-    let s = unsafe { VeilCreateThread(start, param, flags as u64, &mut r) };
+    // The stack size in the upper half (0: the default).
+    let s = unsafe { VeilCreateThread(start, param, flags as u64 | (stack as u64 >> 12) << 32, &mut r) };
     if s != status::SUCCESS {
         fail(s);
         return 0;
@@ -368,9 +369,7 @@ pub unsafe extern "system" fn CreateProcessW(
 
     // Its command line: as given, or the application name.
     let mut line = WBuf::new();
-    if !command_line.is_null() {
-        line.extend(unsafe { wstr(command_line) });
-    } else {
+    if command_line.is_null() {
         line.push(b'"' as u16);
         line.extend(image.as_slice());
         line.push(b'"' as u16);
@@ -411,7 +410,8 @@ pub unsafe extern "system" fn CreateProcessW(
 
     let params = ProcessParams {
         image: image.as_ptr() as u64,
-        command_line: line.as_ptr() as u64,
+        // As given, however long; `line` holds just the program's own name.
+        command_line: if command_line.is_null() { line.as_ptr() as u64 } else { command_line as u64 },
         current_directory: if cwd.len > 0 { cwd.as_ptr() as u64 } else { 0 },
         environment: env,
         flags: flags as u64,
@@ -504,8 +504,26 @@ pub unsafe extern "system" fn GetStartupInfoA(info: *mut u8) {
 // -----| pipes and handles |-----
 
 #[no_mangle]
-pub unsafe extern "system" fn CreatePipe(read: *mut Handle, write: *mut Handle, _sa: usize, size: u32) -> Bool {
-    check(unsafe { VeilCreatePipe(read, write, size as u64) })
+pub unsafe extern "system" fn CreatePipe(read: *mut Handle, write: *mut Handle, sa: usize, size: u32) -> Bool {
+    let ok = check(unsafe { VeilCreatePipe(read, write, size as u64) });
+    if ok != 0 {
+        unsafe {
+            apply_inherit(*read, sa);
+            apply_inherit(*write, sa);
+        }
+    }
+    ok
+}
+
+/// A new handle goes to children only if its SECURITY_ATTRIBUTES ask. A pipe's
+/// reader sees the end only once every write handle is closed, so a child
+/// handed the write end of its own stdin would wait forever.
+/// (Events, mutexes and the like still start out inheritable: a stray copy of
+/// those changes nothing a program can see.)
+pub fn apply_inherit(h: Handle, sa: usize) {
+    // SECURITY_ATTRIBUTES: length, descriptor, bInheritHandle.
+    let inherit = sa != 0 && unsafe { *((sa + 16) as *const u32) } != 0;
+    SetHandleInformation(h, HANDLE_FLAG_INHERIT, if inherit { HANDLE_FLAG_INHERIT } else { 0 });
 }
 
 #[no_mangle]
@@ -515,10 +533,11 @@ pub unsafe extern "system" fn DuplicateHandle(
     dst_process: Handle,
     dst: *mut Handle,
     access: u32,
-    _inherit: Bool,
+    inherit: Bool,
     options: u32,
 ) -> Bool {
-    check(unsafe { NtDuplicateObject(src_process, src, dst_process, dst, access, 0, options) })
+    let attributes = if inherit != 0 { 2 } else { 0 }; // OBJ_INHERIT
+    check(unsafe { NtDuplicateObject(src_process, src, dst_process, dst, access, attributes, options) })
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]

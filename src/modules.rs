@@ -453,6 +453,25 @@ impl Linker {
             return Ok(Some(i));
         }
         let Some((path, file, data)) = self.find_dll_file(name) else { return Ok(None) };
+        self.load_found(mem, name, path, file, data)
+    }
+
+    /// Load the DLL at exactly `path`, as LoadLibrary does when given a full
+    /// path. A system DLL already loaded stays the only copy of itself.
+    fn load_dll_at<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, path: &str, name: &str) -> Result<Option<usize>, &'static str> {
+        let loaded = |m: &Module| {
+            m.path.eq_ignore_ascii_case(path) || (m.name == name && m.path.to_ascii_uppercase().starts_with("/SYSTEM/"))
+        };
+        if let Some(i) = self.modules.iter().position(loaded) {
+            return Ok(Some(i));
+        }
+        let Ok(file) = crate::nt_file::open_mapped(path) else { return Ok(None) };
+        let Ok(data) = read_headers(&file) else { return Ok(None) };
+        self.load_found(mem, name, String::from(path), file, data)
+    }
+
+    /// Map the DLL file that was found, and bind what it imports.
+    fn load_found<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, name: &str, path: String, file: Arc<SharedFile>, data: Vec<u8>) -> Result<Option<usize>, &'static str> {
         let mut pe = match PeFile::parse(&data) {
             Ok(pe) => pe,
             Err(e) => {
@@ -667,51 +686,54 @@ impl Linker {
         self.data.alloc(mem, size.max(1), 16)
     }
 
+    /// Give module `i` a TLS index if it has a TLS directory, and note its
+    /// callbacks. Its data range and zero fill come back for making a block.
+    fn assign_tls(&mut self, i: usize) -> Option<(u64, u64, u64)> {
+        let base = self.modules[i].base;
+        let (rva, size) = data_dir(base, DIR_TLS);
+        if rva == 0 || size < 40 {
+            return None;
+        }
+        let dir = base + rva as u64;
+        let (start, end, index_addr, callbacks) = (read_u64(dir), read_u64(dir + 8), read_u64(dir + 16), read_u64(dir + 24));
+        let zero_fill = read_u32(dir + 32) as u64;
+        let index = self.tls_count;
+        self.tls_count += 1;
+        if index_addr != 0 {
+            unsafe { core::ptr::write_unaligned(index_addr as *mut u32, index) };
+        }
+        let mut cbs = Vec::new();
+        if callbacks != 0 {
+            for k in 0..64 {
+                let cb = read_u64(callbacks + k * 8);
+                if cb == 0 {
+                    break;
+                }
+                cbs.push(cb);
+            }
+        }
+        crate::serial_println!("[MODULES] {}: TLS index {}, {} bytes, {} callback(s)", self.modules[i].name, index, end.saturating_sub(start), cbs.len());
+        self.modules[i].tls_index = Some(index);
+        self.modules[i].tls_callbacks = cbs;
+        Some((start, end, zero_fill))
+    }
+
     /// Give every module with a TLS directory an index and a block for the
-    /// main thread, and point TEB.ThreadLocalStoragePointer at them.
-    fn setup_tls<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, teb: u64) -> Result<(), &'static str> {
-        let mut blocks = Vec::new();
+    /// main thread, and point TEB.ThreadLocalStoragePointer at them. The array
+    /// is always there and full size: a DLL loaded later adds to it.
+    fn setup_tls<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, teb: u64, peb: u64) -> Result<(), &'static str> {
+        let array = self.data_alloc(mem, nt_abi::layout::TLS_ARRAY_SLOTS as u64 * 8)?;
         for i in 0..self.modules.len() {
-            let base = self.modules[i].base;
-            let (rva, size) = data_dir(base, DIR_TLS);
-            if rva == 0 || size < 40 {
-                continue;
-            }
-            let dir = base + rva as u64;
-            let (start, end, index_addr, callbacks) = (read_u64(dir), read_u64(dir + 8), read_u64(dir + 16), read_u64(dir + 24));
-            let zero_fill = read_u32(dir + 32) as u64;
-            let index = self.tls_count;
-            self.tls_count += 1;
-            if index_addr != 0 {
-                unsafe { core::ptr::write_unaligned(index_addr as *mut u32, index) };
-            }
+            let Some((start, end, zero_fill)) = self.assign_tls(i) else { continue };
             let template = end.saturating_sub(start);
             let block = self.data_alloc(mem, template + zero_fill)?;
             if template > 0 {
                 unsafe { core::ptr::copy_nonoverlapping(start as *const u8, block as *mut u8, template as usize) };
             }
-            blocks.push(block);
-            let mut cbs = Vec::new();
-            if callbacks != 0 {
-                for k in 0..64 {
-                    let cb = read_u64(callbacks + k * 8);
-                    if cb == 0 {
-                        break;
-                    }
-                    cbs.push(cb);
-                }
-            }
-            crate::serial_println!("[MODULES] {}: TLS index {}, {} bytes, {} callback(s)", self.modules[i].name, index, template + zero_fill, cbs.len());
-            self.modules[i].tls_index = Some(index);
-            self.modules[i].tls_callbacks = cbs;
+            write_u64(array + self.modules[i].tls_index.unwrap_or(0) as u64 * 8, block);
         }
-        if !blocks.is_empty() {
-            let array = self.data_alloc(mem, blocks.len() as u64 * 8)?;
-            for (k, b) in blocks.iter().enumerate() {
-                write_u64(array + k as u64 * 8, *b);
-            }
-            write_u64(teb + 0x58, array); // TEB.ThreadLocalStoragePointer
-        }
+        write_u64(teb + 0x58, array); // TEB.ThreadLocalStoragePointer
+        write_u64(peb + nt_abi::layout::PEB_MAIN_TLS_ARRAY as u64, array);
         Ok(())
     }
 
@@ -901,7 +923,7 @@ impl Linker {
     pub fn link<M: Mapper<Size4KiB>, F: FrameAllocator<Size4KiB>>(&mut self, mem: &mut Mem<M, F>, teb: u64, peb: u64, ldr: u64) -> Result<(), &'static str> {
         let exe = self.modules.iter().position(|m| m.is_exe).ok_or("no EXE module")?;
         self.bind_imports(mem, exe)?;
-        self.setup_tls(mem, teb)?;
+        self.setup_tls(mem, teb, peb)?;
         let order = self.init_order();
         self.ldr = ldr;
         self.initialized = order.clone();
@@ -923,7 +945,16 @@ impl Linker {
         let file = name.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(name);
         let n = normalize(file);
         let first = self.modules.len();
-        let p = self.provider(mem, &n).map_err(|_| nt_abi::status::NO_MEMORY)?;
+        // A full path means that file. If nothing is there (C:\Windows\System32
+        // doesn't exist here), the name is looked for as usual.
+        let exact = match crate::nt_file::vfs_path(name) {
+            Some(path) if file.len() != name.len() => self.load_dll_at(mem, &path, &n).map_err(|_| nt_abi::status::NO_MEMORY)?,
+            _ => None,
+        };
+        let p = match exact {
+            Some(i) => Provider { real: Some(i), builtin: Vec::new(), label: n.clone() },
+            None => self.provider(mem, &n).map_err(|_| nt_abi::status::NO_MEMORY)?,
+        };
         let Some(idx) = p.real else {
             // Only the kernel's built-ins: a pseudo handle GetProcAddress knows.
             let reg = crate::dll::DLL_REGISTRY.lock();
@@ -959,9 +990,15 @@ impl Linker {
         visit(self, idx, first, &mut seen, &mut order);
         let mut inits = Vec::new();
         for &i in &order {
+            // The threads' blocks are ntdll's to make (LdrVeilTlsEnd), before these run.
+            self.assign_tls(i);
+            if self.tls_count as usize > nt_abi::layout::TLS_ARRAY_SLOTS {
+                crate::serial_println!("[MODULES] {}: out of TLS indexes", self.modules[i].name);
+                return Err(nt_abi::status::NO_MEMORY);
+            }
             let m = &self.modules[i];
-            if data_dir(m.base, DIR_TLS).0 != 0 {
-                crate::serial_println!("[MODULES] {}: static TLS in a DLL loaded at run time isn't set up", m.name);
+            for &cb in &m.tls_callbacks {
+                inits.push((cb, m.base));
             }
             if m.entry != 0 {
                 inits.push((m.entry, m.base));

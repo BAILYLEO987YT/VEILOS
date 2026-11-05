@@ -383,6 +383,7 @@ pub fn init_frame_allocator(memory_map: &'static MemoryMap) {
         frames, bitmap.free, bitmap.free / 256, bitmap_bytes / 1024, bitmap_phys
     );
     x86_64::instructions::interrupts::without_interrupts(|| *FRAMES.lock() = Some(bitmap));
+    TOTAL_FRAMES.store(free_frame_count(), core::sync::atomic::Ordering::Relaxed);
 }
 
 fn with_frames<R>(f: impl FnOnce(&mut FrameBitmap) -> R) -> Option<R> {
@@ -390,6 +391,13 @@ fn with_frames<R>(f: impl FnOnce(&mut FrameBitmap) -> R) -> Option<R> {
 }
 
 /// Number of free frames (diagnostics).
+/// Frames there were to start with (0 before the allocator is up).
+pub fn total_frame_count() -> usize {
+    TOTAL_FRAMES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+static TOTAL_FRAMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 pub fn free_frame_count() -> usize {
     with_frames(|b| b.free).unwrap_or(0)
 }

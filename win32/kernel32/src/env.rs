@@ -23,7 +23,7 @@ pub extern "system" fn GetCommandLineW() -> *const u16 {
     unsafe { (*(params().add(layout::PARAMS_COMMAND_LINE) as *const UnicodeString)).buffer }
 }
 
-static COMMAND_LINE_A: Static<[u8; 2048]> = Static(UnsafeCell::new([0; 2048]));
+static COMMAND_LINE_A: Static<[u8; 98304]> = Static(UnsafeCell::new([0; 98304]));
 
 #[no_mangle]
 pub extern "system" fn GetCommandLineA() -> *const u8 {
@@ -31,7 +31,7 @@ pub extern "system" fn GetCommandLineA() -> *const u8 {
     unsafe {
         if *buf == 0 {
             let w = wstr(GetCommandLineW());
-            narrow_out(&w[..w.len().min(2047)], buf, 2048);
+            narrow_out(w, buf, 98304);
         }
     }
     buf

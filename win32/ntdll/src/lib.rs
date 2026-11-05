@@ -76,6 +76,7 @@ syscall_stubs! {
     VeilWakeAddress, ZwVeilWakeAddress => sys::VEIL_WAKE_ADDRESS;
     VeilPipe, ZwVeilPipe => sys::VEIL_PIPE;
     VeilMutex, ZwVeilMutex => sys::VEIL_MUTEX;
+    VeilSysInfo, ZwVeilSysInfo => sys::VEIL_SYSINFO;
     VeilUnmapView, ZwVeilUnmapView => sys::VEIL_UNMAP_VIEW;
     VeilUserCreateWindow, ZwVeilUserCreateWindow => sys::VEIL_USER_CREATE_WINDOW;
     VeilUserDestroyWindow, ZwVeilUserDestroyWindow => sys::VEIL_USER_DESTROY_WINDOW;
@@ -158,6 +159,7 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
         s if s == 0xC000_00B2u32 as NtStatus => 535, // STATUS_PIPE_CONNECTED
         s if s == 0xC000_00B5u32 as NtStatus => 121, // STATUS_IO_TIMEOUT: ERROR_SEM_TIMEOUT
         s if s == 0xC000_0046u32 as NtStatus => 288, // STATUS_MUTANT_NOT_OWNED: ERROR_NOT_OWNER
+        s if s == 0xC000_0120u32 as NtStatus => 995, // STATUS_CANCELLED: ERROR_OPERATION_ABORTED
         status::NO_MORE_FILES => 18,            // ERROR_NO_MORE_FILES
         status::NOT_IMPLEMENTED => 1,           // ERROR_INVALID_FUNCTION
         status::INVALID_INFO_CLASS => 87,       // ERROR_INVALID_PARAMETER

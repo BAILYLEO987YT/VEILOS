@@ -271,18 +271,19 @@ pub fn pipe_name(name: &[u16]) -> bool {
 }
 
 /// CreateFile on a pipe's name: a client end.
-pub fn pipe_client(name: *const u16) -> Handle {
+pub fn pipe_client(name: *const u16, sa: usize) -> Handle {
     let mut h: Handle = 0;
     let s = unsafe { crate::VeilPipe(1, name as u64, &mut h as *mut Handle as u64, 0) };
     if s != 0 {
         crate::fail(s);
         return INVALID_HANDLE_VALUE;
     }
+    crate::process::apply_inherit(h, sa);
     h
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateNamedPipeW(name: *const u16, _open: u32, _mode: u32, _max: u32, out_size: u32, in_size: u32, _timeout: u32, _sa: usize) -> Handle {
+pub unsafe extern "system" fn CreateNamedPipeW(name: *const u16, _open: u32, _mode: u32, _max: u32, out_size: u32, in_size: u32, _timeout: u32, sa: usize) -> Handle {
     if !pipe_name(unsafe { wstr(name) }) {
         crate::SetLastError(123); // ERROR_INVALID_NAME
         return INVALID_HANDLE_VALUE;
@@ -293,6 +294,7 @@ pub unsafe extern "system" fn CreateNamedPipeW(name: *const u16, _open: u32, _mo
         crate::fail(s);
         return INVALID_HANDLE_VALUE;
     }
+    crate::process::apply_inherit(h, sa);
     h
 }
 

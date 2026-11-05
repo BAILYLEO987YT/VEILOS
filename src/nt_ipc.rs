@@ -53,6 +53,51 @@ fn read_name(p: u64) -> Option<String> {
     None
 }
 
+// -----| small questions |-----
+
+/// VEIL_SYSINFO(op, out*, size).
+pub fn sys_info(op: u64, out: u64, size: u64) -> NtStatus {
+    if !ptr_ok(out, size as usize) {
+        return status::ACCESS_VIOLATION;
+    }
+    match op {
+        0 => {
+            fill_random(unsafe { core::slice::from_raw_parts_mut(out as *mut u8, size as usize) });
+            status::SUCCESS
+        }
+        1 if size >= 16 => {
+            let free = crate::memory::free_frame_count() as u64 * 4096;
+            let total = crate::memory::total_frame_count() as u64 * 4096;
+            unsafe {
+                *(out as *mut u64) = total.max(free);
+                *(out as *mut u64).add(1) = free;
+            }
+            status::SUCCESS
+        }
+        _ => status::INVALID_PARAMETER,
+    }
+}
+
+/// Random bytes: RDRAND where the CPU has it. Elsewhere (QEMU's default CPU)
+/// this is the time stamp counter stirred by a generator, good enough for hash
+/// tables and temp names but NOT for keys.
+fn fill_random(out: &mut [u8]) {
+    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let has_rdrand = unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 30) != 0;
+    for chunk in out.chunks_mut(8) {
+        let mut v = 0u64;
+        let got = has_rdrand && unsafe { core::arch::x86_64::_rdrand64_step(&mut v) } == 1;
+        if !got {
+            // SplitMix64, with the clock mixed in on every step.
+            let mut z = STATE.fetch_add(0x9E37_79B9_7F4A_7C15 ^ crate::time::rdtsc(), Ordering::Relaxed);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            v = z ^ (z >> 31);
+        }
+        chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
+    }
+}
+
 // -----| named objects |-----
 
 static NAMED: Mutex<BTreeMap<String, (u32, KernelObjectRef)>> = Mutex::new(BTreeMap::new());
@@ -153,11 +198,13 @@ pub fn wait_address(addr: u64, compare: u64, size: u64, ms: u64) -> NtStatus {
         return status::SUCCESS;
     }
     let until = (ms != u64::MAX).then(|| crate::time::now_ms().saturating_add(ms));
+    let mut note = crate::nt_syscalls::WaitNote::new("WaitOnAddress");
     while seq.load(Ordering::SeqCst) == seen {
         if until.is_some_and(|t| crate::time::now_ms() >= t) {
             return STATUS_TIMEOUT;
         }
         crate::loader::kill_if_requested();
+        note.tick();
         crate::nt_syscalls::wait_a_little();
     }
     status::SUCCESS
@@ -361,6 +408,15 @@ pub fn pipe_call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 crate::loader::kill_if_requested();
                 crate::nt_syscalls::wait_a_little();
             }
+        }
+        // A handle to the NUL device: out*.
+        7 => {
+            if !ptr_ok(a, 8) {
+                return status::ACCESS_VIOLATION;
+            }
+            let h = proc.handles.lock().allocate_ref(KernelObjectRef::Null, 0x0012_019F, 0);
+            unsafe { *(a as *mut u64) = h as u64 };
+            status::SUCCESS
         }
         // Connect as a client to the instance of a server handle: server, out*.
         6 => {

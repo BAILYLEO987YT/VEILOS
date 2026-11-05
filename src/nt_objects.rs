@@ -306,6 +306,8 @@ pub enum KernelObjectRef {
     Thread(Arc<crate::nt_process::ThreadObj>),
     Pipe(Arc<crate::nt_process::PipeEnd>),
     Duplex(Arc<crate::nt_ipc::DuplexEnd>),
+    /// The NUL device: reads end at once, writes go nowhere.
+    Null,
 }
 
 impl KernelObjectRef {
@@ -321,6 +323,7 @@ impl KernelObjectRef {
             Self::Thread(_)    => ObjectType::Thread,
             Self::Pipe(_)      => ObjectType::File,
             Self::Duplex(_)    => ObjectType::File,
+            Self::Null         => ObjectType::File,
         }
     }
 }

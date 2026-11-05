@@ -153,6 +153,7 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::VEIL_WAKE_ADDRESS => crate::nt_ipc::wake_address(a0),
         sys::VEIL_PIPE => crate::nt_ipc::pipe_call(&proc, a0, a1, a2, a3),
         sys::VEIL_MUTEX => crate::nt_ipc::mutex_call(&proc, a0, a1, a2),
+        sys::VEIL_SYSINFO => crate::nt_ipc::sys_info(a0, a1, a2),
         sys::VEIL_UNMAP_VIEW => unmap_view(&proc, a0),
         sys::VEIL_LOAD_DLL => load_dll(&proc, a0, a1, a2, a3),
         sys::VEIL_GET_PROC_ADDRESS => get_proc_address(&proc, a0, a1, a2),
@@ -221,6 +222,11 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
     match object(proc, handle) {
         Some(KernelObjectRef::File(f)) if writing => crate::nt_file::write(&f, iosb, buffer, length, offset),
         Some(KernelObjectRef::File(f)) => crate::nt_file::read(&f, iosb, buffer, length, offset),
+        Some(KernelObjectRef::Null) => {
+            let (s, n) = if writing { (status::SUCCESS, length) } else { (status::END_OF_FILE, 0) };
+            unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: s as u32 as u64, information: n as u64 } };
+            s
+        }
         Some(KernelObjectRef::Duplex(end)) => {
             let (s, n) = end.io(buffer, length, writing);
             unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: s as u32 as u64, information: n as u64 } };
@@ -294,6 +300,43 @@ fn delay_execution(interval: u64) -> NtStatus {
 
 /// Inside a syscall (interrupts off, no locks held): let other threads run,
 /// or sleep until the next interrupt if there are none.
+/// Says so in the log when a blocking call has gone on a long time, with what
+/// it's waiting for and the program's likely return addresses. Made before
+/// waiting: the user stack pointer it reads belongs to another thread after.
+pub struct WaitNote {
+    what: &'static str,
+    rsp: u64,
+    next_ms: u64,
+    every_ms: u64,
+}
+
+impl WaitNote {
+    pub fn new(what: &'static str) -> Self {
+        Self { what, rsp: crate::smp::current_syscall_user_rsp(), next_ms: crate::time::now_ms() + 15_000, every_ms: 30_000 }
+    }
+
+    pub fn tick(&mut self) {
+        let now = crate::time::now_ms();
+        if now < self.next_ms {
+            return;
+        }
+        self.next_ms = now + self.every_ms;
+        self.every_ms = self.every_ms.saturating_mul(2);
+        let mut trail = alloc::string::String::new();
+        for i in 0..256 {
+            let at = self.rsp + i * 8;
+            if !crate::memory::user_ptr_ok(at, 8) {
+                break;
+            }
+            let v = unsafe { *(at as *const u64) };
+            if (0x1_4000_0000..0x1_5000_0000).contains(&v) || (0x2_0000_0000..0x3_0000_0000).contains(&v) {
+                trail.push_str(&alloc::format!(" {:#x}", v));
+            }
+        }
+        crate::serial_println!("[WAIT] pid {} still in {}:{}", crate::kthread::current_pid(), self.what, trail);
+    }
+}
+
 pub fn wait_a_little() {
     if crate::kthread::others_ready() {
         crate::kthread::yield_now();

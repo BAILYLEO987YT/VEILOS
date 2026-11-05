@@ -4,7 +4,9 @@
 //! Each block has a 16-byte header: its capacity (bytes after the header, a
 //! multiple of 16), the size the caller asked for, and a tag. Freed blocks
 //! go on free lists: one per 16-byte size class up to SMALL_LIMIT (exact
-//! fit), one first-fit list above that (blocks split when much too big).
+//! fit), and above that bins of four per doubling, each holding sizes in one
+//! range (blocks split when much too big). A single first-fit list here once
+//! grew until rustc spent its time walking it with the lock held.
 //! New blocks are carved from the newest segment; when it's full a new one
 //! is mapped. Requests of BIG_LIMIT or more get their own mapping, released
 //! on free. A spinlock serialises each heap.
@@ -20,6 +22,10 @@ const SMALL_LIMIT: usize = 1024;
 const SMALL_CLASSES: usize = SMALL_LIMIT / ALIGN + 1;
 const BIG_LIMIT: usize = 512 * 1024;
 const SEGMENT_SIZE: usize = 1024 * 1024;
+/// SMALL_LIMIT to BIG_LIMIT is nine doublings, of four bins each.
+const LARGE_BINS: usize = 36;
+/// How many blocks of a request's own bin to try; they may be too small.
+const BIN_TRIES: usize = 8;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -50,7 +56,9 @@ struct FreeLink {
 pub struct Heap {
     lock: AtomicBool,
     small: [*mut Block; SMALL_CLASSES],
-    large: *mut Block,
+    large: [*mut Block; LARGE_BINS],
+    /// A bit per bin in `large` that has blocks.
+    large_used: u64,
     /// Carving position and end of the newest segment.
     top: usize,
     end: usize,
@@ -60,6 +68,13 @@ pub struct Heap {
 
 fn round_up(n: usize) -> usize {
     (n + ALIGN - 1) & !(ALIGN - 1)
+}
+
+/// The bin for a capacity above SMALL_LIMIT. Everything in a higher bin is
+/// bigger than anything in this one.
+fn large_bin(cap: usize) -> usize {
+    let log = usize::BITS as usize - 1 - cap.leading_zeros() as usize;
+    (((log - 10) * 4) + ((cap >> (log - 2)) & 3)).min(LARGE_BINS - 1)
 }
 
 unsafe fn map(size: usize) -> Option<usize> {
@@ -96,7 +111,8 @@ impl Heap {
             heap.write(Heap {
                 lock: AtomicBool::new(false),
                 small: [core::ptr::null_mut(); SMALL_CLASSES],
-                large: core::ptr::null_mut(),
+                large: [core::ptr::null_mut(); LARGE_BINS],
+                large_used: 0,
                 top: first,
                 end: base + SEGMENT_SIZE,
                 // The first segment holds this header; destroy frees it last.
@@ -165,28 +181,50 @@ impl Heap {
             }
             return None;
         }
-        // First fit in the large list; split off what's left if it's worth it.
-        let mut prev: *mut *mut Block = &mut self.large;
-        let mut b = self.large;
-        while !b.is_null() {
+        // A few of this size's own bin, then whatever is in the next bin that
+        // has any: all of those fit.
+        let bin = large_bin(cap);
+        let mut prev: *mut *mut Block = &mut self.large[bin];
+        let mut b = self.large[bin];
+        let mut tries = 0;
+        while !b.is_null() && tries < BIN_TRIES {
             let next = unsafe { (*(b as *mut u8).add(HEADER).cast::<FreeLink>()).next };
             if unsafe { (*b).capacity } >= cap {
                 unsafe { *prev = next };
-                let spare = unsafe { (*b).capacity } - cap;
-                if spare >= HEADER + SMALL_LIMIT {
-                    unsafe {
-                        (*b).capacity = cap;
-                        let rest = (b as usize + HEADER + cap) as *mut Block;
-                        rest.write(Block { capacity: spare - HEADER, requested: 0, tag: TAG_FREE });
-                        self.put_free(rest);
-                    }
+                if self.large[bin].is_null() {
+                    self.large_used &= !(1u64 << bin);
                 }
-                return Some(b);
+                return Some(unsafe { self.split(b, cap) });
             }
             prev = unsafe { &mut (*(b as *mut u8).add(HEADER).cast::<FreeLink>()).next };
             b = next;
+            tries += 1;
         }
-        None
+        let higher = self.large_used & (!0u64 << (bin + 1));
+        if higher == 0 {
+            return None;
+        }
+        let i = higher.trailing_zeros() as usize;
+        let b = self.large[i];
+        self.large[i] = unsafe { (*(b as *mut u8).add(HEADER).cast::<FreeLink>()).next };
+        if self.large[i].is_null() {
+            self.large_used &= !(1u64 << i);
+        }
+        Some(unsafe { self.split(b, cap) })
+    }
+
+    /// Give back what's left of `b` beyond `cap`, if it's worth it.
+    unsafe fn split(&mut self, b: *mut Block, cap: usize) -> *mut Block {
+        let spare = unsafe { (*b).capacity } - cap;
+        if spare >= HEADER + SMALL_LIMIT {
+            unsafe {
+                (*b).capacity = cap;
+                let rest = (b as usize + HEADER + cap) as *mut Block;
+                rest.write(Block { capacity: spare - HEADER, requested: 0, tag: TAG_FREE });
+                self.put_free(rest);
+            }
+        }
+        b
     }
 
     unsafe fn carve(&mut self, cap: usize) -> *mut Block {
@@ -211,8 +249,10 @@ impl Heap {
             unsafe { (*link).next = self.small[class] };
             self.small[class] = b;
         } else {
-            unsafe { (*link).next = self.large };
-            self.large = b;
+            let bin = large_bin(cap);
+            unsafe { (*link).next = self.large[bin] };
+            self.large[bin] = b;
+            self.large_used |= 1u64 << bin;
         }
     }
 

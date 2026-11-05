@@ -164,8 +164,10 @@ pub mod sys {
     pub const VEIL_PIPE: u32 = BASE + 58;
     /// VEIL_MUTEX(op, a, b): create (owned, out*) or release (handle).
     pub const VEIL_MUTEX: u32 = BASE + 59;
+    /// VEIL_SYSINFO(op, out*, size). Op 0: random bytes. Op 1: [total, free] memory.
+    pub const VEIL_SYSINFO: u32 = BASE + 60;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 60;
+    pub const END: u32 = BASE + 61;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
@@ -384,6 +386,8 @@ pub mod file {
     pub const DIRECTORY_INFORMATION: u32 = 1;
     pub const BASIC_INFORMATION: u32 = 4;
     pub const STANDARD_INFORMATION: u32 = 5;
+    pub const INTERNAL_INFORMATION: u32 = 6;
+    pub const NAME_INFORMATION: u32 = 9;
     pub const RENAME_INFORMATION: u32 = 10;
     pub const DISPOSITION_INFORMATION: u32 = 13;
     pub const POSITION_INFORMATION: u32 = 14;
@@ -408,6 +412,12 @@ pub mod layout {
     pub const PEB_LDR: usize = 0x18;
     pub const PEB_PROCESS_PARAMETERS: usize = 0x20;
     pub const PEB_PROCESS_HEAP: usize = 0x30;
+    /// The first thread's TLS array, past the end of a real PEB: that thread
+    /// starts before anything could note it, and a DLL loaded later needs it.
+    pub const PEB_MAIN_TLS_ARRAY: usize = 0x7F0;
+    /// Slots in every thread's ThreadLocalStoragePointer array. TLS indexes are
+    /// never reused, and every crate's proc macro DLL takes one.
+    pub const TLS_ARRAY_SLOTS: usize = 256;
     /// RTL_USER_PROCESS_PARAMETERS.
     pub const PARAMS_STD_INPUT: usize = 0x20;
     pub const PARAMS_STD_OUTPUT: usize = 0x28;

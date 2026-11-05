@@ -656,7 +656,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // Fallback: report compile-time heap size constant.
             history.push(String::from("  MEMORY USAGE (approximate):"));
             let heap_start = crate::allocator::HEAP_START;
-            let heap_size  = crate::allocator::HEAP_SIZE;
+            let heap_size  = crate::allocator::heap_usage().1;
             history.push(alloc::format!("  Heap base: {:#x}  size: {} KiB",
                 heap_start, heap_size / 1024));
             history.push(String::from("  (per-allocation tracking not yet implemented)"));

@@ -1422,6 +1422,11 @@ pub type HvResult<T> = Result<T, HvError>;
 // =====================================================================
 
 pub fn init() {
+    // CPUID.1:ECX bit 31: already inside a hypervisor, where VMX can't be relied on.
+    if unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 31) != 0 {
+        println!("[HV] Running inside a hypervisor: VMX left off.");
+        return;
+    }
     match enable_vmx() {
         Ok(()) => {
             println!("[HV] VEILOS Hypervisor (VHV) online.");

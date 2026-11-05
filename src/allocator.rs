@@ -29,16 +29,24 @@ static ALLOCATOR: IrqSafeHeap = IrqSafeHeap(LockedHeap::empty());
 
 // We pick an arbitrary unused virtual address for our heap to start at.
 pub const HEAP_START: usize = 0x4444_4444_0000;
-pub const HEAP_SIZE: usize = 64 * 1024 * 1024; // 64 MB for Professional Compositing
+/// The heap is an eighth of RAM within these bounds. Every user thread's kernel
+/// stack comes from it, so what fits here limits how many threads can run.
+const MIN_HEAP_SIZE: usize = 64 * 1024 * 1024;
+const MAX_HEAP_SIZE: usize = 512 * 1024 * 1024;
+
+fn chosen_heap_size() -> usize {
+    (crate::memory::total_frame_count() * 4096 / 8).clamp(MIN_HEAP_SIZE, MAX_HEAP_SIZE)
+}
 
 pub fn init_heap(
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapToError<Size4KiB>> {
+    let heap_size = chosen_heap_size();
     // Determine the range of memory pages our heap will use
     let page_range = {
         let heap_start = VirtAddr::new(HEAP_START as u64);
-        let heap_end = heap_start + HEAP_SIZE as u64 - 1u64;
+        let heap_end = heap_start + heap_size as u64 - 1u64;
         let heap_start_page = Page::containing_address(heap_start);
         let heap_end_page = Page::containing_address(heap_end);
         Page::range_inclusive(heap_start_page, heap_end_page)
@@ -60,7 +68,7 @@ pub fn init_heap(
 
     // Now that the virtual memory is securely mapped to physical RAM, initialize the Allocator!
     unsafe {
-        without_interrupts(|| ALLOCATOR.0.lock().init(HEAP_START as *mut u8, HEAP_SIZE));
+        without_interrupts(|| ALLOCATOR.0.lock().init(HEAP_START as *mut u8, heap_size));
     }
 
     Ok(())
