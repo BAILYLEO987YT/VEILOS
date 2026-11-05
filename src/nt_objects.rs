@@ -388,6 +388,14 @@ impl HandleTable {
         Self { entries }
     }
 
+    /// A process this table holds a handle to.
+    pub fn find_process(&self, pid: u32) -> Option<Arc<crate::process::Process>> {
+        self.entries.iter().flatten().find_map(|e| match &e.object {
+            KernelObjectRef::Process(p) if p.pid == pid => Some(p.clone()),
+            _ => None,
+        })
+    }
+
     /// Whether children get a copy of `handle` (HANDLE_FLAG_INHERIT).
     pub fn inheritable(&self, handle: Handle) -> Option<bool> {
         let e = self.entries.get(handle as usize)?.as_ref()?;

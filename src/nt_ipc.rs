@@ -409,6 +409,16 @@ pub fn pipe_call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 crate::nt_syscalls::wait_a_little();
             }
         }
+        // A new handle to this process's console, redirected or not: out*.
+        8 => {
+            if !ptr_ok(a, 8) {
+                return status::ACCESS_VIOLATION;
+            }
+            let Some(console) = proc.console.clone() else { return status::INVALID_HANDLE };
+            let h = proc.handles.lock().allocate_ref(KernelObjectRef::Console(console), 0x0012_019F, 0);
+            unsafe { *(a as *mut u64) = h as u64 };
+            status::SUCCESS
+        }
         // A handle to the NUL device: out*.
         7 => {
             if !ptr_ok(a, 8) {

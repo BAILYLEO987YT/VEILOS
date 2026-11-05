@@ -898,10 +898,84 @@ pub extern "system" fn OpenThread(_access: u32, _inherit: Bool, _tid: u32) -> Ha
     0
 }
 
+/// Every process is in the one processor group, group 0.
 #[no_mangle]
-pub extern "system" fn OpenProcess(_access: u32, _inherit: Bool, _pid: u32) -> Handle {
-    crate::SetLastError(ERROR_ACCESS_DENIED);
-    0
+pub unsafe extern "system" fn GetProcessGroupAffinity(_process: Handle, count: *mut u16, groups: *mut u16) -> Bool {
+    if count.is_null() {
+        crate::SetLastError(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    let room = unsafe { *count };
+    unsafe { *count = 1 };
+    if room < 1 || groups.is_null() {
+        crate::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    unsafe { *groups = 0 };
+    1
+}
+
+/// One group, one NUMA node, one package, and each CPU a core of its own, as
+/// far as VEILOS knows. Relations: 0 cores, 1 NUMA, 3 packages, 4 groups,
+/// 0xFFFF all; no caches are described.
+#[no_mangle]
+pub unsafe extern "system" fn GetLogicalProcessorInformationEx(relation: u32, out: *mut u8, length: *mut u32) -> Bool {
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    if length.is_null() {
+        crate::SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut info = [0u8; 48];
+    unsafe { crate::mem::GetSystemInfo(info.as_mut_ptr()) };
+    let cpus = u32::from_le_bytes(info[32..36].try_into().unwrap()).clamp(1, 64) as usize;
+    let all_cpus = if cpus == 64 { u64::MAX } else { (1u64 << cpus) - 1 };
+    let want = |r: u32| relation == r || relation == 0xFFFF;
+    const AFFINITY_ENTRY: usize = 48;
+    const GROUP_ENTRY: usize = 80;
+    let need = want(0) as usize * cpus * AFFINITY_ENTRY + (want(1) as usize + want(3) as usize) * AFFINITY_ENTRY + want(4) as usize * GROUP_ENTRY;
+    let room = unsafe { *length } as usize;
+    unsafe { *length = need as u32 };
+    if out.is_null() || room < need {
+        crate::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    unsafe { core::ptr::write_bytes(out, 0, need) };
+    let mut at = out;
+    // Relationship, Size, then PROCESSOR_RELATIONSHIP or NUMA_NODE_RELATIONSHIP:
+    // both have GroupCount at 30 and their GROUP_AFFINITY at 32.
+    let mut entry = |kind: u32, mask: u64| unsafe {
+        (at as *mut u32).write_unaligned(kind);
+        (at.add(4) as *mut u32).write_unaligned(AFFINITY_ENTRY as u32);
+        (at.add(30) as *mut u16).write_unaligned(1);
+        (at.add(32) as *mut u64).write_unaligned(mask);
+        at = at.add(AFFINITY_ENTRY);
+    };
+    if want(0) {
+        for i in 0..cpus {
+            entry(0, 1u64 << i);
+        }
+    }
+    if want(1) {
+        entry(1, all_cpus);
+    }
+    if want(3) {
+        entry(3, all_cpus);
+    }
+    if want(4) {
+        // GROUP_RELATIONSHIP: maximum and active group counts, then at 32 a
+        // PROCESSOR_GROUP_INFO: maximum and active CPUs, and at 40 their mask.
+        unsafe {
+            (at as *mut u32).write_unaligned(4);
+            (at.add(4) as *mut u32).write_unaligned(GROUP_ENTRY as u32);
+            (at.add(8) as *mut u16).write_unaligned(1);
+            (at.add(10) as *mut u16).write_unaligned(1);
+            *at.add(32) = cpus as u8;
+            *at.add(33) = cpus as u8;
+            (at.add(72) as *mut u64).write_unaligned(all_cpus);
+        }
+    }
+    1
 }
 
 #[no_mangle]

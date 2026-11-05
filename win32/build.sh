@@ -47,7 +47,7 @@ EXPORTS
     cp "target/forwarders/$out" "../storage/system/$out"
 }
 # advapi32.dll: the registry, tokens, ETW and the rest kernel32 implements.
-fwd advapi32.dll SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
+fwd advapi32.dll IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeSid FreeSid IsWellKnownSid CheckTokenMembership ConvertSidToStringSidA ConvertSidToStringSidW SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
     CryptCreateHash CryptHashData CryptGetHashParam CryptDestroyHash CreateProcessAsUserW DecryptFileW DuplicateEncryptionInfoFile GetFileSecurityW     GetSecurityDescriptorOwner GetTokenInformation GetUserNameA GetUserNameW IsTextUnicode OpenProcessToken     OpenThreadToken RevertToSelf AdjustTokenPrivileges LookupPrivilegeValueW LookupAccountSidW InitializeAcl \
     InitializeSecurityDescriptor IsValidSecurityDescriptor GetSecurityDescriptorControl GetSecurityDescriptorDacl \
     GetSecurityDescriptorGroup GetSecurityDescriptorSacl SetSecurityDescriptorDacl SetSecurityDescriptorGroup \
@@ -58,8 +58,8 @@ fwd advapi32.dll SystemFunction036 CryptAcquireContextA CryptAcquireContextW Cry
     RegDeleteValueA RegEnumKeyExA RegEnumValueA RegQueryInfoKeyA \
     RegRestoreKeyW RegSetKeySecurity RegNotifyChangeKeyValue RegCloseKey RegCreateKeyA RegCreateKeyExA RegCreateKeyExW RegCreateKeyW     RegDeleteKeyExW RegDeleteValueW RegEnumKeyExW RegEnumValueW RegGetValueW RegOpenKeyExA RegOpenKeyExW     RegOpenKeyW RegQueryInfoKeyW RegQueryValueExA RegQueryValueExW RegSetKeyValueA RegSetKeyValueW     RegSetValueExW EventActivityIdControl EventEnabled EventProviderEnabled EventRegister     EventSetInformation EventUnregister EventWrite EventWriteEx EventWriteTransfer
 fwd urlmon.dll FindMimeFromData
-# ws2_32.dll, by Windows' ordinals: start-up only so far (S4 brings sockets).
-printf 'LIBRARY ws2_32.dll\nEXPORTS\n    WSAGetLastError=kernel32.WSAGetLastError @111\n    WSASetLastError=kernel32.WSASetLastError @112\n    WSAStartup=kernel32.WSAStartup @115\n    WSACleanup=kernel32.WSACleanup @116\n' > target/forwarders/ws2_32.dll.def
+# ws2_32.dll, by Windows' ordinals: start-up and byte order so far (S4 brings sockets).
+printf 'LIBRARY ws2_32.dll\nEXPORTS\n    htonl=kernel32.htonl @8\n    htons=kernel32.htons @9\n    ntohl=kernel32.ntohl @14\n    ntohs=kernel32.ntohs @15\n    WSAGetLastError=kernel32.WSAGetLastError @111\n    WSASetLastError=kernel32.WSASetLastError @112\n    WSAStartup=kernel32.WSAStartup @115\n    WSACleanup=kernel32.WSACleanup @116\n' > target/forwarders/ws2_32.dll.def
 "$LLVM/lld-link.exe" /nologo /DLL /NOENTRY /NODEFAULTLIB /MACHINE:X64 /DEF:target/forwarders/ws2_32.dll.def target/forwarders/empty.obj /OUT:target/forwarders/ws2_32.dll
 cp target/forwarders/ws2_32.dll ../storage/system/ws2_32.dll
 fwd secur32.dll InitSecurityInterfaceA InitSecurityInterfaceW

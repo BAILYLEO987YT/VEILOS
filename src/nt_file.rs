@@ -632,9 +632,16 @@ pub fn query_directory(f: &FileObject) -> NtStatus {
     if !f.is_dir {
         return status::INVALID_PARAMETER;
     }
-    if class != file::DIRECTORY_INFORMATION {
-        return status::INVALID_INFO_CLASS;
-    }
+    // All start the same; the name's place is what differs. (The rest of what
+    // the longer ones add stays zero: no EAs, no short names, no file ids.)
+    let name_at = match class {
+        file::DIRECTORY_INFORMATION => file::DIRECTORY_INFORMATION_SIZE,
+        file::FULL_DIRECTORY_INFORMATION => 68,
+        file::BOTH_DIRECTORY_INFORMATION => 94,
+        file::ID_FULL_DIRECTORY_INFORMATION => 80,
+        file::ID_BOTH_DIRECTORY_INFORMATION => 104,
+        _ => return status::INVALID_INFO_CLASS,
+    };
     let mut listing = f.listing.lock();
     if listing.is_none() || restart {
         let mask: Vec<char> = if mask_ptr != 0 { read_unicode(mask_ptr).unwrap_or_default().chars().collect() } else { Vec::new() };
@@ -660,7 +667,7 @@ pub fn query_directory(f: &FileObject) -> NtStatus {
         return status::NO_MORE_FILES;
     };
     let units: Vec<u16> = name.encode_utf16().collect();
-    let need = file::DIRECTORY_INFORMATION_SIZE + units.len() * 2;
+    let need = name_at + units.len() * 2;
     if length < need {
         return status::BUFFER_TOO_SMALL;
     }
@@ -669,13 +676,13 @@ pub fn query_directory(f: &FileObject) -> NtStatus {
     }
     *next += 1;
     unsafe {
-        core::ptr::write_bytes(out as *mut u8, 0, file::DIRECTORY_INFORMATION_SIZE);
+        core::ptr::write_bytes(out as *mut u8, 0, name_at);
         put_basic(out + 8, is_dir, mtime); // the four times, then (overwritten below) attributes
         core::ptr::write_unaligned((out + 40) as *mut u64, size); // EndOfFile
         core::ptr::write_unaligned((out + 48) as *mut u64, (size + 4095) & !4095); // AllocationSize
         core::ptr::write_unaligned((out + 56) as *mut u32, attributes(is_dir));
         core::ptr::write_unaligned((out + 60) as *mut u32, (units.len() * 2) as u32);
-        core::ptr::copy_nonoverlapping(units.as_ptr(), (out + 64) as *mut u16, units.len());
+        core::ptr::copy_nonoverlapping(units.as_ptr(), (out as usize + name_at) as *mut u16, units.len());
     }
     write_iosb(iosb, status::SUCCESS, need as u64);
     status::SUCCESS

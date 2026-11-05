@@ -1,0 +1,72 @@
+--- SIDs
+allocate: 1
+allocate two: 1
+valid: 1 length 12
+length two: 16
+text: S-1-5-18
+text two: S-1-5-32-544
+wide: S-1-5-18
+system is system: 1
+system is admins: 0
+admins is admins: 1
+equal to itself: 1
+equal to another: 0
+copy: 1 equal 1
+copy too small: 0 error 122
+membership call: 1
+--- owners
+token user: 1
+w18owned.txt: error 0 valid 1 mine 1
+w18ownd: error 0 valid 1 mine 1
+missing: error 2
+--- byte order
+htons 3412 ntohs 3412
+htonl 78563412 ntohl 78563412
+--- processes by id
+self: 1
+no such id: 0 error 87
+started: 1
+by id: 1
+waited: 0
+its code: 47
+after its end: 1
+inheritable when asked: 1
+its code again: 47
+--- descriptors
+own handles: 1
+position shared: 3
+original after closing the copy: 3
+original after closing the copy's handle: 2
+own handle at 20: 1
+20 after closing the first: 1
+length: 9
+removed: 0
+--- the console by name
+still there
+own handle: 1, stdout after closing it: 1 13
+--- folder listings
+class 1, single 1: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 1, single 0: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 2, single 1: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 2, single 0: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 3, single 1: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 3, single 0: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 37, single 1: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 37, single 0: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 38, single 1: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+class 38, single 0: ./1/0 ../1/0 a.txt/0/5 sub/1/0 end
+unknown class: c0000003
+--- processors
+asking the size: 0 error 122, has size 1
+cores: 1
+every CPU in a core: 1
+groups: 1
+one group: 1, all active: 1, mask: 1
+packages: 1
+all CPUs in the package: 1
+NUMA: 1
+all CPUs in the node: 1
+process groups, no room: 0 error 122 count 1
+process groups: 1 count 1 first 0
+done
+exit 5

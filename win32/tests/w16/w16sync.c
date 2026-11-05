@@ -95,7 +95,8 @@ static void address(void)
     printf("still waiting: %ld\n", woken);
     word = 1;
     WakeByAddressAll((void *)&word);
-    printf("joined: %lu, woken %ld\n", WaitForMultipleObjects(3, t, TRUE, 5000), woken);
+    DWORD joined = WaitForMultipleObjects(3, t, TRUE, 5000);
+    printf("joined: %lu, woken %ld\n", joined, woken);
     for (int i = 0; i < 3; i++) CloseHandle(t[i]);
 
     word = 0;
@@ -191,6 +192,7 @@ static void fibers(void)
 
 static DWORD WINAPI pipe_client(void *arg)
 {
+    Sleep(200); /* After the server is in ConnectNamedPipe: earlier gets 535, on Windows too. */
     HANDLE h = CreateFileA(PIPE, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return GetLastError();
     char buf[32];

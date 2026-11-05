@@ -58,6 +58,7 @@ syscall_stubs! {
     NtQueryInformationThread, ZwQueryInformationThread => sys::NT_QUERY_INFORMATION_THREAD;
     NtResumeThread, ZwResumeThread => sys::NT_RESUME_THREAD;
     NtDuplicateObject, ZwDuplicateObject => sys::NT_DUPLICATE_OBJECT;
+    NtOpenProcess, ZwOpenProcess => sys::NT_OPEN_PROCESS;
     NtQueryVolumeInformationFile, ZwQueryVolumeInformationFile => sys::NT_QUERY_VOLUME_INFORMATION_FILE;
     VeilCreateThread, ZwVeilCreateThread => sys::VEIL_CREATE_THREAD;
     VeilCreateProcess, ZwVeilCreateProcess => sys::VEIL_CREATE_PROCESS;

@@ -497,3 +497,240 @@ pub unsafe extern "system" fn GetDefaultPrinterW(_buf: *mut u16, size: *mut u32)
 pub extern "system" fn DocumentPropertiesW(_hwnd: u64, _h: Handle, _name: *const u16, _out: *mut u8, _in: *const u8, _mode: u32) -> i32 {
     -1
 }
+
+// -----| SIDs |-----
+
+/// A SID's parts: revision, sub-authority count, six authority bytes, then the
+/// sub-authorities.
+unsafe fn sid_len(sid: *const u8) -> usize {
+    8 + 4 * unsafe { *sid.add(1) } as usize
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn IsValidSid(sid: *const u8) -> Bool {
+    (!sid.is_null() && unsafe { *sid == 1 && *sid.add(1) <= 15 }) as Bool
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn GetLengthSid(sid: *const u8) -> u32 {
+    unsafe { sid_len(sid) as u32 }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn EqualSid(a: *const u8, b: *const u8) -> Bool {
+    crate::SetLastError(0);
+    let n = unsafe { sid_len(a) };
+    (n == unsafe { sid_len(b) } && unsafe { core::slice::from_raw_parts(a, n) == core::slice::from_raw_parts(b, n) }) as Bool
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn CopySid(size: u32, out: *mut u8, sid: *const u8) -> Bool {
+    let n = unsafe { sid_len(sid) };
+    if (size as usize) < n {
+        crate::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(sid, out, n) };
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn AllocateAndInitializeSid(authority: *const u8, count: u8, a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32, out: *mut *mut u8) -> Bool {
+    if authority.is_null() || out.is_null() || count == 0 || count > 8 {
+        crate::SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let sid = crate::mem::LocalAlloc(0, 8 + 4 * count as usize);
+    if sid.is_null() {
+        return 0;
+    }
+    let parts = [a0, a1, a2, a3, a4, a5, a6, a7];
+    unsafe {
+        *sid = 1;
+        *sid.add(1) = count;
+        core::ptr::copy_nonoverlapping(authority, sid.add(2), 6);
+        for i in 0..count as usize {
+            (sid.add(8 + 4 * i) as *mut u32).write_unaligned(parts[i]);
+        }
+        *out = sid;
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn FreeSid(sid: *mut u8) -> *mut u8 {
+    crate::mem::LocalFree(sid);
+    core::ptr::null_mut()
+}
+
+/// The well-known SIDs programs ask about, by WELL_KNOWN_SID_TYPE.
+#[no_mangle]
+pub unsafe extern "system" fn IsWellKnownSid(sid: *const u8, kind: u32) -> Bool {
+    let want: &[u8] = match kind {
+        1 => &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],                  // Everyone
+        17 => &[1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0],                // Authenticated Users
+        22 => &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],                // Local System
+        26 => &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0], // Administrators
+        _ => return 0,
+    };
+    let n = unsafe { sid_len(sid) };
+    (n == want.len() && unsafe { core::slice::from_raw_parts(sid, n) } == want) as Bool
+}
+
+/// The one user is in no group a program would ask about, but is itself.
+#[no_mangle]
+pub unsafe extern "system" fn CheckTokenMembership(_token: Handle, sid: *const u8, member: *mut Bool) -> Bool {
+    if sid.is_null() || member.is_null() {
+        crate::SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    unsafe { *member = EqualSid(sid, USER_SID.as_ptr()) };
+    1
+}
+
+/// "S-1-5-18", returning its length.
+unsafe fn sid_text(sid: *const u8, out: &mut [u8; 192]) -> usize {
+    fn number(out: &mut [u8; 192], at: &mut usize, mut v: u64) {
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        loop {
+            digits[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        out[*at] = b'-';
+        *at += 1;
+        while n > 0 {
+            n -= 1;
+            out[*at] = digits[n];
+            *at += 1;
+        }
+    }
+    out[0] = b'S';
+    let mut at = 1;
+    number(out, &mut at, unsafe { *sid } as u64);
+    let mut authority = 0u64;
+    for i in 0..6 {
+        authority = authority << 8 | unsafe { *sid.add(2 + i) } as u64;
+    }
+    number(out, &mut at, authority);
+    for i in 0..unsafe { *sid.add(1) } as usize {
+        number(out, &mut at, unsafe { (sid.add(8 + 4 * i) as *const u32).read_unaligned() } as u64);
+    }
+    at
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ConvertSidToStringSidA(sid: *const u8, out: *mut *mut u8) -> Bool {
+    if unsafe { IsValidSid(sid) } == 0 || out.is_null() {
+        crate::SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut text = [0u8; 192];
+    let n = unsafe { sid_text(sid, &mut text) };
+    let p = crate::mem::LocalAlloc(0, n + 1);
+    if p.is_null() {
+        return 0;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(text.as_ptr(), p, n);
+        *p.add(n) = 0;
+        *out = p;
+    }
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ConvertSidToStringSidW(sid: *const u8, out: *mut *mut u16) -> Bool {
+    if unsafe { IsValidSid(sid) } == 0 || out.is_null() {
+        crate::SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut text = [0u8; 192];
+    let n = unsafe { sid_text(sid, &mut text) };
+    let p = crate::mem::LocalAlloc(0, 2 * (n + 1)) as *mut u16;
+    if p.is_null() {
+        return 0;
+    }
+    unsafe {
+        for i in 0..n {
+            p.add(i).write_unaligned(text[i] as u16);
+        }
+        p.add(n).write_unaligned(0);
+        *out = p;
+    }
+    1
+}
+
+/// FAT keeps no owners, so everything belongs to the user: the owner and group
+/// of any file that exists are the user's SID, and there is no DACL. The caller
+/// frees `descriptor` with LocalFree; the SID pointers point into it.
+#[no_mangle]
+pub unsafe extern "system" fn GetNamedSecurityInfoW(name: *const u16, kind: u32, _info: u32, owner: *mut *const u8, group: *mut *const u8, dacl: *mut usize, sacl: *mut usize, descriptor: *mut *mut u8) -> u32 {
+    const SE_FILE_OBJECT: u32 = 1;
+    if kind != SE_FILE_OBJECT || name.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if unsafe { crate::file::GetFileAttributesW(name) } == u32::MAX {
+        return crate::GetLastError();
+    }
+    // A self-relative SECURITY_DESCRIPTOR: revision, control, then offsets to
+    // owner, group, SACL and DACL.
+    let size = 20 + USER_SID.len();
+    let sd = crate::mem::LocalAlloc(0x40, size);
+    if sd.is_null() {
+        return crate::GetLastError();
+    }
+    unsafe {
+        *sd = 1;
+        (sd.add(2) as *mut u16).write_unaligned(0x8000);
+        (sd.add(4) as *mut u32).write_unaligned(20);
+        (sd.add(8) as *mut u32).write_unaligned(20);
+        core::ptr::copy_nonoverlapping(USER_SID.as_ptr(), sd.add(20), USER_SID.len());
+        if !owner.is_null() {
+            *owner = sd.add(20);
+        }
+        if !group.is_null() {
+            *group = sd.add(20);
+        }
+        if !dacl.is_null() {
+            *dacl = 0;
+        }
+        if !sacl.is_null() {
+            *sacl = 0;
+        }
+        if descriptor.is_null() {
+            crate::mem::LocalFree(sd);
+        } else {
+            *descriptor = sd;
+        }
+    }
+    0
+}
+
+// -----| byte order |-----
+
+// ws2_32's, but programs use them with no socket in sight: git writes its index
+// with htons, and a stub answering 0 saved every file name's length as 0.
+#[no_mangle]
+pub extern "system" fn htons(v: u16) -> u16 {
+    v.to_be()
+}
+
+#[no_mangle]
+pub extern "system" fn ntohs(v: u16) -> u16 {
+    u16::from_be(v)
+}
+
+#[no_mangle]
+pub extern "system" fn htonl(v: u32) -> u32 {
+    v.to_be()
+}
+
+#[no_mangle]
+pub extern "system" fn ntohl(v: u32) -> u32 {
+    u32::from_be(v)
+}

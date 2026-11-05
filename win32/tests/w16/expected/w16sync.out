@@ -21,7 +21,7 @@ same value, timed out: 0 err 1460
 different value, at once: 1
 two bytes: 0 err 1460
 still waiting: 0
-joined: 0, woken 0
+joined: 0, woken 3
 single: 0
 --- fibers
 a fiber yet: 0

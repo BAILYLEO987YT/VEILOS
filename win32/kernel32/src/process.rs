@@ -22,6 +22,7 @@ unsafe extern "system" {
     fn NtWaitForMultipleObjects(count: u32, handles: *const Handle, kind: u32, alertable: u8, timeout: *const i64) -> NtStatus;
     fn NtQueryInformationProcess(process: Handle, class: u32, info: *mut u8, length: u32, ret: *mut u32) -> NtStatus;
     fn NtQueryInformationThread(thread: Handle, class: u32, info: *mut u8, length: u32, ret: *mut u32) -> NtStatus;
+    fn NtOpenProcess(out: *mut Handle, access: u32, attributes: *const u8, client_id: *const u64) -> NtStatus;
     fn NtDuplicateObject(src_process: Handle, src: Handle, dst_process: Handle, dst: *mut Handle, access: u32, attributes: u32, options: u32) -> NtStatus;
     fn RtlExitUserThread(code: u32) -> !;
 }
@@ -544,6 +545,24 @@ pub unsafe extern "system" fn DuplicateHandle(
 unsafe extern "system" {
     fn NtSetInformationObject(h: Handle, class: u32, info: *const u8, length: u32) -> NtStatus;
     fn NtQueryObject(h: Handle, class: u32, info: *mut u8, length: u32, ret: *mut u32) -> NtStatus;
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn OpenProcess(access: u32, inherit: Bool, pid: u32) -> Handle {
+    // OBJECT_ATTRIBUTES: its length, and Attributes at 24 (OBJ_INHERIT).
+    let mut attributes = [0u8; 48];
+    attributes[0] = 48;
+    if inherit != 0 {
+        attributes[24] = 2;
+    }
+    let client = [pid as u64, 0];
+    let mut h: Handle = 0;
+    let s = unsafe { NtOpenProcess(&mut h, access, attributes.as_ptr(), client.as_ptr()) };
+    if s != status::SUCCESS {
+        fail(s);
+        return 0;
+    }
+    h
 }
 
 const HANDLE_FLAG_INHERIT: u32 = 1;

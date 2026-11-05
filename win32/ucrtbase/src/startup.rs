@@ -151,8 +151,17 @@ fn set_up_args() {
         __argv = table(args.iter().map(|a| to_narrow(a)));
         _wcmdln = wide_copy(line);
         _acmdln = to_narrow(line);
-        _wpgmptr = *__wargv;
-        _pgmptr = *__argv;
+        // The program's full path, whatever its command line calls it: git works
+        // out where it's installed from this, and runs itself as plain "git".
+        let mut path = [0u16; 1024];
+        let n = crate::GetModuleFileNameW(0, path.as_mut_ptr(), path.len() as u32) as usize;
+        if n > 0 && n < path.len() {
+            _wpgmptr = wide_copy(&path[..n]);
+            _pgmptr = to_narrow(&path[..n]);
+        } else {
+            _wpgmptr = *__wargv;
+            _pgmptr = *__argv;
+        }
     }
 }
 
@@ -688,6 +697,35 @@ pub extern "C" fn abort() -> ! {
         unsafe { h(SIGABRT) };
     }
     fatal("abnormal program termination", 3)
+}
+
+/// A failed assert() ends the program, saying which: it must never carry on.
+fn assertion_failed(message: &str, file: &str, line: u32) -> ! {
+    stdio::flush_all();
+    let h = unsafe { crate::GetStdHandle(0xFFFF_FFF4) };
+    let mut digits = [0u8; 10];
+    let mut at = digits.len();
+    let mut v = line;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let line = unsafe { core::str::from_utf8_unchecked(&digits[at..]) };
+    for part in ["Assertion failed: ", message, ", file ", file, ", line ", line, "\r\n"] {
+        let mut n = 0;
+        unsafe { WriteFile(h, part.as_ptr(), part.len() as u32, &mut n, 0) };
+    }
+    abort()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _assert(message: *const u8, file: *const u8, line: u32) -> ! {
+    let text = |p: *const u8| unsafe { core::str::from_utf8_unchecked(crate::string::slice(p)) };
+    assertion_failed(text(message), text(file), line)
 }
 
 #[no_mangle]

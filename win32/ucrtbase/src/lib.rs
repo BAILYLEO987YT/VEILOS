@@ -61,6 +61,7 @@ unsafe extern "system" {
     fn ReadFile(h: Handle, buf: *mut u8, len: u32, read: *mut u32, overlapped: usize) -> i32;
     fn CreateFileW(name: *const u16, access: u32, share: u32, sa: usize, creation: u32, flags: u32, template: Handle) -> Handle;
     fn CloseHandle(h: Handle) -> i32;
+    fn DuplicateHandle(src_process: Handle, src: Handle, dst_process: Handle, dst: *mut Handle, access: u32, inherit: i32, options: u32) -> i32;
     fn SetFilePointerEx(h: Handle, distance: i64, new: *mut i64, method: u32) -> i32;
     fn SetEndOfFile(h: Handle) -> i32;
     fn FlushFileBuffers(h: Handle) -> i32;

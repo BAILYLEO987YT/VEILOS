@@ -234,10 +234,26 @@ pub fn api_set_host(name: &str) -> Option<&'static str> {
     })
 }
 
-/// The name behind an API-set ordinal: some contracts export functions by
-/// ordinal only, and the host DLL's ordinals are its own.
+/// The name behind an ordinal, where our DLL's ordinals aren't Windows' own. Some
+/// API-set contracts export functions by ordinal only, and the host DLL's ordinals
+/// are its own. Programs import ws2_32 by ordinal, and lld-link numbers forwarded
+/// exports itself, ignoring the ones it's given.
 fn api_set_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
     let n = dll.to_ascii_lowercase();
+    if n == "ws2_32.dll" || n == "ws2_32" {
+        return match ordinal {
+            8 => Some("htonl"),
+            9 => Some("htons"),
+            14 => Some("ntohl"),
+            15 => Some("ntohs"),
+            111 => Some("WSAGetLastError"),
+            112 => Some("WSASetLastError"),
+            115 => Some("WSAStartup"),
+            116 => Some("WSACleanup"),
+            // Never whatever our numbering happens to put there.
+            _ => Some("#unknown-ws2_32-ordinal"),
+        };
+    }
     match ordinal {
         170 if n.starts_with("api-ms-win-shcore-path-l1-1-") => Some("PathIsNetworkPathW"),
         _ => None,

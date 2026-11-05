@@ -166,8 +166,10 @@ pub mod sys {
     pub const VEIL_MUTEX: u32 = BASE + 59;
     /// VEIL_SYSINFO(op, out*, size). Op 0: random bytes. Op 1: [total, free] memory.
     pub const VEIL_SYSINFO: u32 = BASE + 60;
+    /// NtOpenProcess(handle*, access, attributes*, client_id*).
+    pub const NT_OPEN_PROCESS: u32 = BASE + 61;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 61;
+    pub const END: u32 = BASE + 62;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
@@ -384,6 +386,10 @@ pub mod file {
     pub const ATTRIBUTE_NORMAL: u32 = 0x80;
     // FILE_INFORMATION_CLASS values served
     pub const DIRECTORY_INFORMATION: u32 = 1;
+    pub const FULL_DIRECTORY_INFORMATION: u32 = 2;
+    pub const BOTH_DIRECTORY_INFORMATION: u32 = 3;
+    pub const ID_BOTH_DIRECTORY_INFORMATION: u32 = 37;
+    pub const ID_FULL_DIRECTORY_INFORMATION: u32 = 38;
     pub const BASIC_INFORMATION: u32 = 4;
     pub const STANDARD_INFORMATION: u32 = 5;
     pub const INTERNAL_INFORMATION: u32 = 6;

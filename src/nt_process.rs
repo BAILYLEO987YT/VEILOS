@@ -478,6 +478,29 @@ pub fn query_thread(proc: &Arc<Process>, h: u64, class: u64, out: u64, length: u
 /// NtDuplicateObject(source_process, source_handle, target_process,
 /// target_handle*, access, attributes, options): from this process, to
 /// this process or one it has a handle to.
+/// NtOpenProcess: a process by its id. One that has ended is still found while
+/// this process holds a handle to it, as a parent does for its child.
+pub fn open_process(proc: &Arc<Process>, out: u64, attributes: u64, client_id: u64) -> NtStatus {
+    if !ptr_ok(out, 8) || !ptr_ok(client_id, 16) {
+        return status::ACCESS_VIOLATION;
+    }
+    let pid = unsafe { *(client_id as *const u64) } as u32;
+    let found = if pid == proc.pid {
+        Some(proc.clone())
+    } else {
+        // Not both locks at once: the table's is taken while tearing down.
+        let held = proc.handles.lock().find_process(pid);
+        held.or_else(|| crate::process::PROCESSOR.lock().find(pid))
+    };
+    let Some(target) = found else { return status::INVALID_PARAMETER };
+    // OBJECT_ATTRIBUTES.Attributes; OBJ_INHERIT.
+    let inherit = ptr_ok(attributes, 48) && unsafe { *((attributes + 24) as *const u32) } & 2 != 0;
+    let kept = if inherit { 0 } else { crate::nt_objects::HANDLE_NO_INHERIT };
+    let h = proc.handles.lock().allocate_ref(KernelObjectRef::Process(target), 0x001F_FFFF, kept);
+    unsafe { *(out as *mut u64) = h as u64 };
+    status::SUCCESS
+}
+
 pub fn duplicate(proc: &Arc<Process>, src_proc: u64, src: u64, dst_proc: u64, out: u64) -> NtStatus {
     let attributes = stack(5).unwrap_or(0) as u32;
     let options = stack(6).unwrap_or(0) as u32;

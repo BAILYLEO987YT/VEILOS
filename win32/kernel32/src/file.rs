@@ -157,21 +157,25 @@ fn is_ascii_name(name: &[u16], s: &str) -> bool {
 }
 
 /// The console's own names open its standard handles.
-fn console_name(name: &[u16]) -> Option<u32> {
-    if is_ascii_name(name, "CONOUT$") {
-        Some(-11i32 as u32)
-    } else if is_ascii_name(name, "CONIN$") || is_ascii_name(name, "CON") {
-        Some(-10i32 as u32)
-    } else {
-        None
-    }
+fn console_name(name: &[u16]) -> bool {
+    is_ascii_name(name, "CONOUT$") || is_ascii_name(name, "CONIN$") || is_ascii_name(name, "CON")
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn CreateFileW(name: *const u16, access: u32, _share: u32, security: usize, creation: u32, flags: u32, _template: Handle) -> Handle {
     let name = unsafe { wstr(name) };
-    if let Some(which) = console_name(name) {
-        return crate::GetStdHandle(which);
+    if console_name(name) {
+        // A handle of its own, whatever stdout points at: git opens CONOUT$ to
+        // see if there's a console, and closes it again.
+        let mut h: Handle = 0;
+        let s = unsafe { crate::VeilPipe(8, &mut h as *mut Handle as u64, 0, 0) };
+        if s != 0 {
+            fail(s);
+            return INVALID_HANDLE_VALUE;
+        }
+        crate::process::apply_inherit(h, security);
+        crate::SetLastError(0);
+        return h;
     }
     if crate::fiber::pipe_name(name) {
         return crate::fiber::pipe_client(name.as_ptr(), security);

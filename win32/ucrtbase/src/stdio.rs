@@ -301,11 +301,21 @@ pub unsafe extern "C" fn _close(fd: i32) -> i32 {
     let h = f.handle;
     *f = CLOSED;
     set_std(fd as usize, 0);
-    // Descriptors made by _dup share the handle: close it with the last.
-    if !fds().iter().any(|o| o.open && o.handle == h) {
-        unsafe { CloseHandle(h) };
-    }
+    unsafe { CloseHandle(h) };
     0
+}
+
+/// A handle of its own for a new descriptor. The file position stays shared, as
+/// both reach the one file object; closing either leaves the other working.
+fn duplicate_handle(handle: u64) -> Option<u64> {
+    const CURRENT_PROCESS: u64 = u64::MAX;
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+    let mut copy = 0;
+    if unsafe { crate::DuplicateHandle(CURRENT_PROCESS, handle, CURRENT_PROCESS, &mut copy, 0, 1, DUPLICATE_SAME_ACCESS) } == 0 {
+        errno_from_win32();
+        return None;
+    }
+    Some(copy)
 }
 
 #[no_mangle]
@@ -316,7 +326,9 @@ pub unsafe extern "C" fn _dup(fd: i32) -> i32 {
         set_errno(EMFILE);
         return -1;
     };
-    fds()[i] = Fd { peek: None, ..copy };
+    let Some(handle) = duplicate_handle(copy.handle) else { return -1 };
+    fds()[i] = Fd { handle, peek: None, ..copy };
+    set_std(i, handle);
     i as i32
 }
 
@@ -330,11 +342,12 @@ pub unsafe extern "C" fn _dup2(fd: i32, target: i32) -> i32 {
     if target == fd {
         return 0;
     }
+    let Some(handle) = duplicate_handle(copy.handle) else { return -1 };
     if fds()[target as usize].open {
         unsafe { _close(target) };
     }
-    fds()[target as usize] = Fd { peek: None, ..copy };
-    set_std(target as usize, copy.handle);
+    fds()[target as usize] = Fd { handle, peek: None, ..copy };
+    set_std(target as usize, handle);
     0
 }
 

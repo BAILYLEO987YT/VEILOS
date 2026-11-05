@@ -545,11 +545,6 @@ pub extern "system" fn LookupAccountSidW(_system: *const u16, _sid: *const u8, _
 }
 
 #[no_mangle]
-pub extern "system" fn GetNamedSecurityInfoW(_name: *const u16, _kind: u32, _info: u32, _o: *mut usize, _g: *mut usize, _d: *mut usize, _s: *mut usize, _sd: *mut usize) -> u32 {
-    ERROR_NOT_SUPPORTED
-}
-
-#[no_mangle]
 pub extern "system" fn SetNamedSecurityInfoW(_name: *const u16, _kind: u32, _info: u32, _o: *const u8, _g: *const u8, _d: *const u8, _s: *const u8) -> u32 {
     ERROR_NOT_SUPPORTED
 }
