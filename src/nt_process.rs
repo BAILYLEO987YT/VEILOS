@@ -788,7 +788,7 @@ pub fn query_volume(proc: &Arc<Process>, h: u64, iosb: u64, out: u64, length: u6
         Some(KernelObjectRef::Duplex(_)) => 0x11,  // FILE_DEVICE_NAMED_PIPE
         Some(KernelObjectRef::Null) => 0x15,       // FILE_DEVICE_NULL
         Some(KernelObjectRef::File(_)) => 0x07,    // FILE_DEVICE_DISK
-        Some(KernelObjectRef::Console(_)) => 0x50, // FILE_DEVICE_CONSOLE
+        Some(KernelObjectRef::Console(_)) | Some(KernelObjectRef::ConsoleBuffer(_)) => 0x50, // FILE_DEVICE_CONSOLE
         Some(KernelObjectRef::Pipe(_)) => 0x11,    // FILE_DEVICE_NAMED_PIPE
         Some(_) => 0x22,                           // FILE_DEVICE_UNKNOWN
         None => return status::INVALID_HANDLE,

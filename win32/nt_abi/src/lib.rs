@@ -170,8 +170,10 @@ pub mod sys {
     pub const NT_OPEN_PROCESS: u32 = BASE + 61;
     /// VEIL_SOCKET(op, a, b, c, [d, e]): Winsock's sockets (src/nt_socket.rs).
     pub const VEIL_SOCKET: u32 = BASE + 62;
+    /// VEIL_CONSOLE(op, handle, a, b, [c, d]): the console calls (src/nt_console.rs).
+    pub const VEIL_CONSOLE: u32 = BASE + 63;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 63;
+    pub const END: u32 = BASE + 64;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).

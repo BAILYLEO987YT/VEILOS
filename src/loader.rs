@@ -282,7 +282,7 @@ fn load_and_spawn_pe_inner(
     process_inner.image_base = mapped_image_base;
     if is_console {
         process_inner.console = match &options.console {
-            ConsoleChoice::New => Some(Arc::new(crate::console::Console::new(pid))),
+            ConsoleChoice::New => Some(crate::console::Console::new(pid)),
             ConsoleChoice::Inherit(c) => Some(c.clone()),
             ConsoleChoice::None => None,
         };
@@ -548,7 +548,9 @@ fn load_and_spawn_pe_inner(
         for (i, offset) in [PARAMS_STD_INPUT, PARAMS_STD_OUTPUT, PARAMS_STD_ERROR].into_iter().enumerate() {
             let object = match (&options.std_objects, &process.console) {
                 (Some(objects), _) => objects[i].clone(),
-                (None, Some(console)) => Some(crate::nt_objects::KernelObjectRef::Console(console.clone())),
+                // Input: the console; output and errors: its active screen buffer.
+                (None, Some(console)) if i == 0 => Some(crate::nt_objects::KernelObjectRef::Console(console.clone())),
+                (None, Some(console)) => Some(crate::nt_objects::KernelObjectRef::ConsoleBuffer(console.active())),
                 (None, None) => None,
             };
             let h = object.map_or(0, |o| handles.allocate_ref(o, 0x001F_01FF, 0));

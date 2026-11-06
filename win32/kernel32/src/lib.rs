@@ -18,6 +18,7 @@
 mod atom;
 mod com;
 mod crypt;
+mod console;
 mod env;
 mod legacy;
 mod exception;
@@ -290,82 +291,11 @@ pub unsafe extern "system" fn ReadFile(file: Handle, buffer: *mut u8, length: u3
     1
 }
 
-#[no_mangle]
-pub unsafe extern "system" fn WriteConsoleA(console: Handle, buffer: *const u8, length: u32, written: *mut u32, _reserved: usize) -> Bool {
-    unsafe { WriteFile(console, buffer, length, written, 0) }
-}
 
-/// UTF-16 in, UTF-8 to the console; `written` counts UTF-16 units.
-#[no_mangle]
-pub unsafe extern "system" fn WriteConsoleW(console: Handle, buffer: *const u16, length: u32, written: *mut u32, _reserved: usize) -> Bool {
-    let units = unsafe { core::slice::from_raw_parts(buffer, length as usize) };
-    let mut out = [0u8; 512];
-    let mut n = 0;
-    for c in char::decode_utf16(units.iter().copied()) {
-        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
-        if n + 4 > out.len() {
-            if unsafe { WriteFile(console, out.as_ptr(), n as u32, core::ptr::null_mut(), 0) } == 0 {
-                return 0;
-            }
-            n = 0;
-        }
-        n += c.encode_utf8(&mut out[n..]).len();
-    }
-    if n > 0 && unsafe { WriteFile(console, out.as_ptr(), n as u32, core::ptr::null_mut(), 0) } == 0 {
-        return 0;
-    }
-    if !written.is_null() {
-        unsafe { *written = length };
-    }
-    1
-}
 
-#[no_mangle]
-pub unsafe extern "system" fn ReadConsoleA(console: Handle, buffer: *mut u8, length: u32, read: *mut u32, _control: usize) -> Bool {
-    unsafe { ReadFile(console, buffer, length, read, 0) }
-}
 
-/// The typed line as UTF-16; `read` counts UTF-16 units.
-#[no_mangle]
-pub unsafe extern "system" fn ReadConsoleW(console: Handle, buffer: *mut u16, length: u32, read: *mut u32, _control: usize) -> Bool {
-    // A UTF-16 unit needs at most 3 UTF-8 bytes; keep the line within both.
-    let mut bytes = [0u8; 1024];
-    let want = (length as usize).min(bytes.len() / 3).max(1) as u32;
-    let mut got = 0u32;
-    if unsafe { ReadFile(console, bytes.as_mut_ptr(), want, &mut got, 0) } == 0 {
-        return 0;
-    }
-    let text = core::str::from_utf8(&bytes[..got as usize]).unwrap_or("?");
-    let mut n = 0usize;
-    for unit in text.encode_utf16() {
-        if n == length as usize {
-            break;
-        }
-        unsafe { *buffer.add(n) = unit };
-        n += 1;
-    }
-    if !read.is_null() {
-        unsafe { *read = n as u32 };
-    }
-    1
-}
 
-/// Consoles: modes and code pages are accepted; text is UTF-8 (code page 65001).
-#[no_mangle]
-pub unsafe extern "system" fn GetConsoleMode(console: Handle, mode: *mut u32) -> Bool {
-    if file::GetFileType(console) != file::FILE_TYPE_CHAR {
-        return fail(status::INVALID_HANDLE);
-    }
-    if !mode.is_null() {
-        unsafe { *mode = 0x7 }; // processed input / line input / echo (or processed + wrap output)
-    }
-    1
-}
 
-#[no_mangle]
-pub extern "system" fn SetConsoleMode(console: Handle, _mode: u32) -> Bool {
-    if file::GetFileType(console) == file::FILE_TYPE_CHAR { 1 } else { fail(status::INVALID_HANDLE) }
-}
 
 #[no_mangle]
 pub extern "system" fn GetConsoleCP() -> u32 {

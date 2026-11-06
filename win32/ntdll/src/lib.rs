@@ -60,6 +60,7 @@ syscall_stubs! {
     NtDuplicateObject, ZwDuplicateObject => sys::NT_DUPLICATE_OBJECT;
     NtOpenProcess, ZwOpenProcess => sys::NT_OPEN_PROCESS;
     VeilSocket, ZwVeilSocket => sys::VEIL_SOCKET;
+    VeilConsole, ZwVeilConsole => sys::VEIL_CONSOLE;
     NtQueryVolumeInformationFile, ZwQueryVolumeInformationFile => sys::NT_QUERY_VOLUME_INFORMATION_FILE;
     VeilCreateThread, ZwVeilCreateThread => sys::VEIL_CREATE_THREAD;
     VeilCreateProcess, ZwVeilCreateProcess => sys::VEIL_CREATE_PROCESS;

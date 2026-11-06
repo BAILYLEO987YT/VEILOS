@@ -1,0 +1,89 @@
+buffer: 1 sized 1 windowed 1
+--- the grid through Win32 calls
+size 40x12 window 0,0-39,11 attr 07
+  cursor after text: 5,2 attr 07
+   0|hello|
+   1|second line|
+   2|THIrd|
+   3||
+  cursor after wrapping: 3,1 attr 07
+   0|0123456789012345678901234567890123456789|
+   1|ABC|
+  cursor at the edge: 39,0 attr 07
+  cursor after one more: 1,1 attr 07
+   0|0123456789012345678901234567890123456789|
+   1|Z|
+  cursor after tabs: 17,0 attr 07
+   0|a       b       X|
+  cursor after colour: 16,2 attr 07
+   2|          colour|
+  attrs 2,8: 07 07 1e 1e 1e 1e 1e 1e 07 07
+filled 5
+wrote 6
+   4|   #####|
+   5|direct|
+  attrs 4,2: 07 4f 4f 4f 07 07 07
+  cursor unmoved by them: 16,2 attr 07
+   0|liline 1|
+   1|..line 2|
+   2|..line 3|
+   3|..line 4|
+   4|..........|
+   5|line 5|
+  cursor after scrolling: 0,11 attr 07
+   0|row 3|
+   1|row 4|
+  10|row 13|
+  11||
+--- escape sequences
+mode before: 7
+VT on: 1
+  cursor after CUP: 1,0 attr 07
+   0|xop|
+   1||
+   2|    at 3,up|
+   3||
+   4||
+   5|           left  right|
+   6||
+   7||
+   0|0123|
+   1|     fghij|
+   2||
+   3|u  xyz|
+   0|red RED GREEN plain INVbg.|
+  attrs 0,0: 07 07 07 04 04 04 04 04 0a 0a 0a 0a 0a 07 07 07 07 07 07 07 4007 4007 4007 17 17
+  attrs 1,0: 0c 09 0e
+   0|1  2345|
+   0|line 0|
+   1|line 1|
+   2||
+   3|line 2|
+   4|line 4|
+   5|line 5|
+   0|reg 0|
+   1|reg 3|
+   2||
+   3|new|
+   4|reg 4|
+   5|reg 5|
+  cursor after restore: 15,2 attr 07
+cursor shown after ?25l: 0
+cursor shown after ?25h: 1
+  cursor VT at the edge: 39,0 attr 07
+  cursor then CRLF: 0,1 attr 07
+title: a title
+   0|0123456789012345678901234567890123456789|
+   1|after|
+   0|raw\x2190[31mesc|
+--- input
+input mode: 1f7
+events waiting: 14
+line: 13 [helxo world\x0d\x0a]
+raw read: 2
+peeked 2, still 2
+event 0: type 1 down 1 vk 26 char 0000 state 0
+event 1: type 1 down 1 vk 51 char 0071 state 8
+as VT: 7 [\x1b[A\x1b[Cz]
+done
+exit 8

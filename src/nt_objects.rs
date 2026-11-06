@@ -310,6 +310,8 @@ pub enum KernelObjectRef {
     Null,
     /// A Winsock socket (nt_socket.rs).
     Socket(Arc<crate::nt_socket::SocketObj>),
+    /// A console screen buffer: a console's output side (console.rs).
+    ConsoleBuffer(Arc<crate::console::BufferObj>),
 }
 
 impl KernelObjectRef {
@@ -327,6 +329,7 @@ impl KernelObjectRef {
             Self::Duplex(_)    => ObjectType::File,
             Self::Null         => ObjectType::File,
             Self::Socket(_)    => ObjectType::File,
+            Self::ConsoleBuffer(_) => ObjectType::Console,
         }
     }
 }

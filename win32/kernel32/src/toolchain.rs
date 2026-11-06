@@ -49,10 +49,6 @@ pub extern "system" fn GetCurrentProcessorNumber() -> u32 {
     0
 }
 
-#[no_mangle]
-pub extern "system" fn FreeConsole() -> Bool {
-    1
-}
 
 #[no_mangle]
 pub unsafe extern "system" fn IsWow64Process(_process: Handle, wow: *mut Bool) -> Bool {

@@ -166,9 +166,11 @@ pub unsafe extern "system" fn CreateFileW(name: *const u16, access: u32, _share:
     let name = unsafe { wstr(name) };
     if console_name(name) {
         // A handle of its own, whatever stdout points at: git opens CONOUT$ to
-        // see if there's a console, and closes it again.
+        // see if there's a console, and closes it again. CONIN$ is the input
+        // side; CONOUT$, and CON opened for writing, the active screen buffer.
+        let output = is_ascii_name(name, "CONOUT$") || (is_ascii_name(name, "CON") && access & 0x4000_0000 != 0);
         let mut h: Handle = 0;
-        let s = unsafe { crate::VeilPipe(8, &mut h as *mut Handle as u64, 0, 0) };
+        let s = unsafe { crate::VeilPipe(8, &mut h as *mut Handle as u64, output as u64, 0) };
         if s != 0 {
             fail(s);
             return INVALID_HANDLE_VALUE;

@@ -61,6 +61,7 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::NT_DUPLICATE_OBJECT => crate::nt_process::duplicate(&proc, a0, a1, a2, a3),
         sys::NT_OPEN_PROCESS => crate::nt_process::open_process(&proc, a0, a2, a3),
         sys::VEIL_SOCKET => crate::nt_socket::call(&proc, a0, a1, a2, a3),
+        sys::VEIL_CONSOLE => crate::nt_console::call(&proc, a0, a1, a2, a3),
         sys::VEIL_CREATE_THREAD => crate::nt_process::create_thread(&proc, a0, a1, a2, a3),
         sys::VEIL_CREATE_PROCESS => crate::nt_process::create_process(&proc, a0, a1),
         sys::VEIL_CREATE_PIPE => crate::nt_process::create_pipe(&proc, a0, a1, a2),
@@ -239,9 +240,15 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
             unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: s as u32 as u64, information: n as u64 } };
             s
         }
+        Some(KernelObjectRef::ConsoleBuffer(b)) if writing => {
+            let data = unsafe { core::slice::from_raw_parts(buffer as *const u8, length) }.to_vec();
+            b.write_utf8(&data);
+            unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: 0, information: length as u64 } };
+            status::SUCCESS
+        }
+        Some(KernelObjectRef::ConsoleBuffer(_)) => 0xC000_0010u32 as NtStatus, // STATUS_INVALID_DEVICE_REQUEST
         Some(KernelObjectRef::Console(console)) if writing => {
-            let mut data = Vec::with_capacity(length);
-            data.extend_from_slice(unsafe { core::slice::from_raw_parts(buffer as *const u8, length) });
+            let data = unsafe { core::slice::from_raw_parts(buffer as *const u8, length) }.to_vec();
             console.write(&data);
             unsafe { *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: 0, information: length as u64 } };
             status::SUCCESS
@@ -250,10 +257,11 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
             if length == 0 {
                 return status::SUCCESS;
             }
-            // Wait for a whole typed line.
-            let data = loop {
-                if let Some(line) = console.read_line(length) {
-                    break line;
+            // Text as the input mode gives it (a line, or what's typed), as
+            // UTF-8: at most a third as many units as bytes, so it fits.
+            let units = loop {
+                if let Some(text) = console.read_text((length / 3).max(1)) {
+                    break text;
                 }
                 if !console.is_live() {
                     return status::END_OF_FILE;
@@ -261,9 +269,11 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
                 crate::loader::kill_if_requested();
                 wait_a_little();
             };
+            let data = alloc::string::String::from_utf16_lossy(&units);
+            let n = data.len().min(length);
             unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, data.len());
-                *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: 0, information: data.len() as u64 };
+                core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, n);
+                *(iosb as *mut IoStatusBlock) = IoStatusBlock { status: 0, information: n as u64 };
             }
             status::SUCCESS
         }

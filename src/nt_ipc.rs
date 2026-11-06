@@ -417,13 +417,15 @@ pub fn pipe_call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 crate::nt_syscalls::wait_a_little();
             }
         }
-        // A new handle to this process's console, redirected or not: out*.
+        // A new handle to this process's console, redirected or not: out*,
+        // then 0 for its input (CONIN$) or 1 for its active screen buffer (CONOUT$).
         8 => {
             if !ptr_ok(a, 8) {
                 return status::ACCESS_VIOLATION;
             }
             let Some(console) = proc.console.clone() else { return status::INVALID_HANDLE };
-            let h = proc.handles.lock().allocate_ref(KernelObjectRef::Console(console), 0x0012_019F, 0);
+            let object = if b == 1 { KernelObjectRef::ConsoleBuffer(console.active()) } else { KernelObjectRef::Console(console) };
+            let h = proc.handles.lock().allocate_ref(object, 0x0012_019F, 0);
             unsafe { *(a as *mut u64) = h as u64 };
             status::SUCCESS
         }

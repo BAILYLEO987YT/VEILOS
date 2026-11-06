@@ -901,8 +901,9 @@ pub fn open_file_absolute(path: &str, name: &str) {
                         term.history.clear();
                         term.history.push(alloc::format!("=== {} ===", name));
                         term.console = Some(console.clone());
+                        let (cols, rows) = term.grid_size();
                         drop(term);
-                        console.attach(idx);
+                        console.attach(idx, cols, rows);
                     }
                 }
                 Err(e) => {
@@ -1098,7 +1099,8 @@ impl TerminalEmulator {
                 // It hasn't run yet (it's queued on the executor this runs
                 // on), so nothing it writes is missed.
                 Some(console) => {
-                    console.attach(self.slot);
+                    let (cols, rows) = self.grid_size();
+                    console.attach(self.slot, cols, rows);
                     self.console = Some(console.clone());
                 }
                 None => self.history.push(alloc::format!("  started {}", name)),
@@ -1113,6 +1115,60 @@ impl TerminalEmulator {
             self.history.push(String::from("VEILOS TERMINAL v2.0"));
             self.history.push(String::from("TYPE 'HELP' FOR COMMANDS"));
             self.history.push(String::from(""));
+        }
+    }
+
+    /// Columns and rows of a console's grid in this terminal's window.
+    pub fn grid_size(&self) -> (usize, usize) {
+        let wm = DESKTOP_WM.lock();
+        let Some(win) = wm.windows.iter().find(|w| w.id == self.window_id) else {
+            return (crate::console::DEFAULT_COLUMNS, crate::console::DEFAULT_ROWS);
+        };
+        let cols = (win.rect.w.saturating_sub(2 + 16 + 12) / 8) as usize;
+        let rows = (win.rect.h.saturating_sub(38 + 8) as i32 / TERM_ROW_H) as usize;
+        (cols.max(10), rows.max(2))
+    }
+
+    /// A console program's screen: its active buffer's window, in colour,
+    /// with the cursor.
+    fn paint_console(&self, r: &Renderer, console: &crate::console::Console, cx: i32, cy: i32) {
+        let buf = console.active();
+        let b = buf.buf.lock();
+        let (l, t, w, h) = b.window;
+        let (x0, y0) = (cx + 8, cy + 4);
+        for row in 0..h {
+            let y = t + row;
+            if y >= b.height {
+                break;
+            }
+            let py = y0 + row as i32 * TERM_ROW_H;
+            let mut x = 0;
+            while x < w && l + x < b.width {
+                let attr = b.cell(l + x, y).attr;
+                let mut text = String::new();
+                let mut end = x;
+                while end < w && l + end < b.width && b.cell(l + end, y).attr == attr {
+                    let ch = b.cell(l + end, y).ch as u32;
+                    text.push(if ch < 0x20 { '?' } else { char::from_u32(ch).unwrap_or('?') });
+                    end += 1;
+                }
+                let (fg, bg) = console_colours(attr);
+                if attr & 0xF0 != 0 || attr & 0x4000 != 0 {
+                    r.fill_rect(Rect::new(x0 + x as i32 * 8, py, ((end - x) * 8) as u32, TERM_ROW_H as u32), bg);
+                }
+                r.draw_text(&text, x0 + x as i32 * 8, py + 2, fg);
+                if attr & 0x8000 != 0 {
+                    r.fill_rect(Rect::new(x0 + x as i32 * 8, py + TERM_ROW_H - 2, ((end - x) * 8) as u32, 1), fg);
+                }
+                x = end;
+            }
+        }
+        let (cx_, cy_) = b.cursor;
+        if b.cursor_visible && self.cursor_blink && cx_ >= l && cx_ < l + w && cy_ >= t && cy_ < t + h {
+            let (fg, _) = console_colours(b.attr);
+            let px = x0 + (cx_ - l) as i32 * 8;
+            let py = y0 + (cy_ - t) as i32 * TERM_ROW_H;
+            r.fill_rect(Rect::new(px, py + TERM_ROW_H - 4, 8, 2), fg);
         }
     }
 
@@ -1139,6 +1195,12 @@ impl TerminalEmulator {
         let ch = win.rect.h.saturating_sub(38);
 
         r.fill_rect(Rect::new(cx, cy, cw, ch), Color { r: 8, g: 12, b: 8 });
+        if let Some(console) = self.console.as_ref().filter(|c| c.is_live()) {
+            drop(wm);
+            r.fill_rect(Rect::new(cx, cy, cw, ch), Color { r: 12, g: 12, b: 12 });
+            self.paint_console(&r, console, cx, cy);
+            return;
+        }
 
         let row_h  = TERM_ROW_H;
         let area   = self.area(win.rect);
@@ -1166,17 +1228,23 @@ impl TerminalEmulator {
     pub fn on_key(&mut self, ch: char) {
         // Typing brings the prompt's latest output back into view.
         self.scroll_anchor = None;
-        // A program is running here: the input line is its console's.
+        // A program is running here: keys go to its console, which edits
+        // and echoes lines itself (console.rs).
         if let Some(console) = self.console.clone().filter(|c| c.is_live()) {
-            match ch {
-                '\n' | '\r' => {
-                    let line = core::mem::take(&mut self.input_buf);
-                    console.typed_line(self, &line);
-                }
-                '\x08' => { self.input_buf.pop(); }
-                c if !c.is_control() => self.input_buf.push(c),
-                _ => {}
-            }
+            let (vk, unit) = match ch {
+                '\n' | '\r' => (0x0D, 0x0D),
+                '\x08' => (0x08, 0x08),
+                '\t' => (0x09, 0x09),
+                '\x1b' => (0x1B, 0x1B),
+                ' ' => (0x20, 0x20),
+                c if c.is_ascii_alphanumeric() => (c.to_ascii_uppercase() as u16, c as u16),
+                c if (c as u32) < 0x10000 => (0, c as u16),
+                _ => return,
+            };
+            console.push_input(&[
+                crate::console::key_record(true, vk, unit, 0),
+                crate::console::key_record(false, vk, unit, 0),
+            ]);
             return;
         }
         match ch {
@@ -2090,4 +2158,16 @@ pub fn load_config_vsh() {
             crate::serial_println!("[VSCRIPT] /config.vsh not found — using defaults.");
         }
     }
+}
+
+/// A console attribute's foreground and background, in the colours Windows'
+/// terminal shows (its Campbell scheme). COMMON_LVB_REVERSE_VIDEO swaps them.
+fn console_colours(attr: u16) -> (Color, Color) {
+    const P: [(u8, u8, u8); 16] = [
+        (12, 12, 12), (0, 55, 218), (19, 161, 14), (58, 150, 221), (197, 15, 31), (136, 23, 152), (193, 156, 0), (204, 204, 204),
+        (118, 118, 118), (59, 120, 255), (22, 198, 12), (97, 214, 214), (231, 72, 86), (180, 0, 158), (249, 241, 165), (242, 242, 242),
+    ];
+    let c = |i: u16| { let (r, g, b) = P[(i & 0xF) as usize]; Color { r, g, b } };
+    let (fg, bg) = (c(attr), c(attr >> 4));
+    if attr & 0x4000 != 0 { (bg, fg) } else { (fg, bg) }
 }
