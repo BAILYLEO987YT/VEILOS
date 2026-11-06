@@ -38,6 +38,7 @@ fn main() {
         ("DSA_DestroyCallback", 388),
         ("LoadIconMetric", 380),
         ("LoadIconWithScaleDown", 381),
+        ("SetPathWordBreakProc", 384),
         ("SetWindowSubclass", 410),
         ("GetWindowSubclass", 411),
         ("RemoveWindowSubclass", 412),

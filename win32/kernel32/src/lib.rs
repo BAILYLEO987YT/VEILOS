@@ -402,7 +402,25 @@ pub extern "system" fn ExitProcess(code: u32) -> ! {
 }
 
 #[no_mangle]
-pub extern "system" fn DllMain(_module: usize, _reason: u32, _reserved: usize) -> i32 {
+pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) -> i32 {
+    // DLL_PROCESS_ATTACH: VEILOS_MISSING_CALLS=zero asks for missing calls
+    // to return 0 rather than end the program (src/subsystem.rs).
+    if reason == 1 {
+        let name: [u16; 20] = {
+            let mut w = [0u16; 20];
+            for (i, b) in b"VEILOS_MISSING_CALLS".iter().enumerate() {
+                w[i] = *b as u16;
+            }
+            w
+        };
+        let mut z = [0u16; 21];
+        z[..20].copy_from_slice(&name);
+        let mut value = [0u16; 8];
+        let n = unsafe { crate::env::GetEnvironmentVariableW(z.as_ptr(), value.as_mut_ptr(), 8) } as usize;
+        if n == 4 && value[..4].iter().map(|&c| c as u8).eq(b"zero".iter().copied()) {
+            unsafe { VeilSysInfo(2, value.as_mut_ptr() as u64, 0) };
+        }
+    }
     1
 }
 

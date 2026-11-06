@@ -181,6 +181,42 @@ fn read_debug_string(ptr: u64) -> alloc::string::String {
     s
 }
 
+/// A program called an import nothing provides. Windows wouldn't have
+/// started it ("entry point not found"); VEILOS starts it, in case it never
+/// makes the call, and ends it with that status if it does, saying which
+/// function on its console, on the desktop and in the log. Answering 0
+/// instead was quiet and sometimes wrong: git saved a corrupt index on
+/// htons's 0, curl believed a CNG 0 meant success. VEILOS_MISSING_CALLS=zero
+/// in a program's environment brings that back, for trying new programs.
+fn missing_call(id: u64) -> u64 {
+    const STATUS_ENTRYPOINT_NOT_FOUND: i32 = 0xC000_0139u32 as i32;
+    let Some(proc) = crate::process::PROCESSOR.lock().get_active() else { return 0 };
+    if proc.missing_calls_return_zero.load(core::sync::atomic::Ordering::Relaxed) {
+        if let Some(name) = crate::modules::unresolved_call(id) {
+            crate::serial_println!("[WIN32] called unresolved import {} (returns 0: VEILOS_MISSING_CALLS=zero)", name);
+        }
+        return 0;
+    }
+    let name = crate::modules::unresolved_name(id).unwrap_or_else(|| alloc::string::String::from("an unknown function"));
+    let program = proc.linker.lock().as_ref().and_then(|l| l.exe_name()).unwrap_or_else(|| alloc::string::String::from(proc.name));
+    crate::serial_println!("[WIN32] pid {} ({}) called {}, which VEILOS doesn't have: ending it", proc.pid, program, name);
+    if let Some(console) = &proc.console {
+        let text = alloc::format!(
+            "\r\nVEILOS: this program called {}, which isn't implemented yet, so it was stopped.\r\n(Set VEILOS_MISSING_CALLS=zero to let missing calls return 0 instead.)\r\n",
+            name
+        );
+        console.write(text.as_bytes());
+    }
+    crate::desktop::notify(
+        crate::desktop::NotifCategory::Error,
+        &alloc::format!("{} stopped", program),
+        &alloc::format!("It called {}, which VEILOS doesn't have yet.", name),
+    );
+    crate::serial_println!("[NT] pid {} exits with code {}", proc.pid, STATUS_ENTRYPOINT_NOT_FOUND);
+    crate::nt_process::kill_process(&proc, STATUS_ENTRYPOINT_NOT_FOUND);
+    unsafe { crate::loader::return_from_usermode() }
+}
+
 impl Subsystem for WindowsSubsystem {
     fn get_type(&self) -> SubsystemType { SubsystemType::WindowsNT }
 
@@ -191,12 +227,9 @@ impl Subsystem for WindowsSubsystem {
             return crate::nt_syscalls::dispatch(id, arg0, arg1, arg2, arg3);
         }
 
-        // ---- An import nothing provides (modules.rs stub): log it once, return 0 ----
+        // ---- An import nothing provides (modules.rs stub) ----
         if (crate::modules::UNRESOLVED_SYSCALL_BASE..crate::modules::UNRESOLVED_SYSCALL_BASE + 0x0100_0000).contains(&id) {
-            if let Some(name) = crate::modules::unresolved_call(id) {
-                crate::serial_println!("[WIN32] called unresolved import {} (returns 0)", name);
-            }
-            return 0;
+            return missing_call(id);
         }
 
         // ---- Anti-Cheat compatibility layer (Phase 14) ----

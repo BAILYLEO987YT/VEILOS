@@ -244,6 +244,12 @@ fn api_set_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
     }
 }
 
+/// Whether a module's ordinals are Windows' own: a program's own DLLs, and
+/// those of ours numbered to match (comctl32, ws2_32).
+fn ordinals_are_windows(m: &Module) -> bool {
+    !m.path.to_ascii_lowercase().starts_with("/system/") || matches!(m.name.as_str(), "comctl32.dll" | "ws2_32.dll")
+}
+
 /// Lower-case, with ".dll" added when there's no extension.
 fn normalize(name: &str) -> String {
     let mut n = name.to_ascii_lowercase();
@@ -427,6 +433,11 @@ impl Linker {
         Ok(base)
     }
 
+    /// The program's own file name ("w1test.exe").
+    pub fn exe_name(&self) -> Option<String> {
+        self.modules.iter().find(|m| m.is_exe).map(|m| m.name.clone())
+    }
+
     fn push_module(&mut self, name: String, path: String, base: u64, size: u64, entry: u64, is_exe: bool, pe: PeFile) -> usize {
         crate::serial_println!("[MODULES] {} at {:#x} ({} KiB)", name, base, size / 1024);
         self.modules.push(Module { name, path, base, size, entry, is_exe, pe, deps: Vec::new(), tls_index: None, tls_callbacks: Vec::new() });
@@ -594,6 +605,10 @@ impl Linker {
             Sym::Name(n) => export_by_name(module.base, module.pe.export_dir, n).or_else(|| {
                 n.strip_prefix("_o_").filter(|_| module.name == "ucrtbase.dll").and_then(|plain| export_by_name(module.base, module.pe.export_dir, plain))
             }),
+            // Our own system DLLs are numbered by the linker, not as Windows
+            // numbers them, except where they say so: an import by number
+            // would land on some unrelated function. It's missing instead.
+            Sym::Ordinal(_) if !ordinals_are_windows(module) => None,
             Sym::Ordinal(o) => export_by_ordinal(module.base, module.pe.export_dir, o),
         };
         let Some(rva) = rva else { return Ok(None) };
@@ -1104,6 +1119,14 @@ pub fn apply_base_relocations(pe: &PeFile, data: &[u8], actual_base: u64) -> usi
 
 /// `dll!name` of unresolved stub `id` for the current process, the first time
 /// it is called (later calls return None, so each is logged once).
+/// The "dll!name" behind a missing import's syscall, whether or not it was
+/// called before.
+pub fn unresolved_name(id: u64) -> Option<String> {
+    let proc = crate::process::PROCESSOR.lock().get_active()?;
+    let names = proc.unresolved_imports.lock();
+    names.get((id - UNRESOLVED_SYSCALL_BASE) as usize).map(|e| e.0.clone())
+}
+
 pub fn unresolved_call(id: u64) -> Option<String> {
     let proc = crate::process::PROCESSOR.lock().get_active()?;
     let mut names = proc.unresolved_imports.lock();

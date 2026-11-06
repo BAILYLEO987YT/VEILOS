@@ -66,6 +66,9 @@ pub struct Process {
     /// "dll!name" of each import nothing provided (modules.rs), and whether
     /// a call to it has been logged yet.
     pub unresolved_imports: Mutex<Vec<(alloc::string::String, bool)>>,
+    /// VEILOS_MISSING_CALLS=zero in its environment: a call to an import
+    /// nothing provides returns 0 (and is logged) instead of ending it.
+    pub missing_calls_return_zero: core::sync::atomic::AtomicBool,
     /// The console of a console-subsystem program (its std handles refer to it).
     pub console: Option<alloc::sync::Arc<crate::console::Console>>,
     /// The module loader, kept for LoadLibrary / GetProcAddress.
@@ -118,6 +121,7 @@ impl Process {
             mapped_pages: Mutex::new(alloc::vec::Vec::new()),
             nt_env:      Mutex::new(crate::loader::NtEnv::default()),
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
+            missing_calls_return_zero: core::sync::atomic::AtomicBool::new(false),
             console:     None,
             linker:      Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
@@ -195,6 +199,7 @@ impl ProcessManager {
             mapped_pages: Mutex::new(alloc::vec::Vec::new()),
             nt_env: Mutex::new(crate::loader::NtEnv::default()),
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
+            missing_calls_return_zero: core::sync::atomic::AtomicBool::new(false),
             console: None,
             linker: Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),

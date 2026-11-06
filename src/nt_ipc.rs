@@ -74,6 +74,14 @@ pub fn sys_info(op: u64, out: u64, size: u64) -> NtStatus {
             }
             status::SUCCESS
         }
+        // Missing calls return 0 for this process (VEILOS_MISSING_CALLS=zero).
+        2 => match crate::process::PROCESSOR.lock().get_active() {
+            Some(p) => {
+                p.missing_calls_return_zero.store(true, core::sync::atomic::Ordering::Relaxed);
+                status::SUCCESS
+            }
+            None => status::INVALID_HANDLE,
+        },
         _ => status::INVALID_PARAMETER,
     }
 }

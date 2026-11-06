@@ -382,6 +382,52 @@ pub extern "system" fn _TrackMouseEvent(tme: *mut u8) -> Bool {
     unsafe { TrackMouseEvent(tme) }
 }
 
+/// An edit control's word breaks for paths: words end at \\, /, :, . and
+/// spaces (EDITWORDBREAKPROCW: WB_LEFT, WB_RIGHT, WB_ISDELIMITER).
+unsafe extern "system" fn path_word_break(text: *const u16, at: i32, len: i32, code: i32) -> i32 {
+    let delimiter = |i: i32| -> bool {
+        if i < 0 || i >= len {
+            return true;
+        }
+        matches!(unsafe { *text.add(i as usize) }, 0x5C | 0x2F | 0x3A | 0x2E | 0x20)
+    };
+    match code {
+        // WB_LEFT: the start of the word before `at`.
+        0 => {
+            let mut i = at - 1;
+            while i > 0 && delimiter(i) {
+                i -= 1;
+            }
+            while i > 0 && !delimiter(i - 1) {
+                i -= 1;
+            }
+            i.max(0)
+        }
+        // WB_RIGHT: the end of the word at or after `at`.
+        1 => {
+            let mut i = at;
+            while i < len && delimiter(i) {
+                i += 1;
+            }
+            while i < len && !delimiter(i) {
+                i += 1;
+            }
+            i
+        }
+        // WB_ISDELIMITER
+        _ => delimiter(at) as i32,
+    }
+}
+
+/// Ordinal 384, unnamed in Windows (Wine calls it SetPathWordBreakProc):
+/// give an edit control path-aware word breaks, or take them back. regedit
+/// does it to its address bar.
+#[no_mangle]
+pub unsafe extern "system" fn SetPathWordBreakProc(hwnd: Hwnd, on: i32) -> i64 {
+    let proc = if on != 0 { path_word_break as usize as i64 } else { 0 };
+    unsafe { SendMessageW(hwnd, 0x00D0, 0, proc) }
+}
+
 /// LIM_SMALL (0): SM_CXSMICON; LIM_LARGE (1): SM_CXICON.
 #[no_mangle]
 pub unsafe extern "system" fn LoadIconMetric(inst: u64, name: *const u16, metric: i32, out: *mut u64) -> i32 {

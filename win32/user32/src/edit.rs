@@ -57,6 +57,9 @@ pub struct Edit {
     /// EM_SETEXTENDEDSTYLE's flags and EM_SETENDOFLINE's line ending.
     pub ex_style: u32,
     pub eol: u32,
+    /// EM_SETWORDBREAKPROC's procedure (0: the default), kept for
+    /// EM_GETWORDBREAKPROC.
+    pub word_break: u64,
 }
 
 fn get<R>(hwnd: Hwnd, f: impl FnOnce(&mut Edit) -> R) -> Option<R> {
@@ -464,7 +467,7 @@ pub unsafe extern "system" fn edit_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) 
             // WM_NCCREATE
             controls::border_to_edge(hwnd);
             let password = if style & ES_PASSWORD != 0 && !multi { b'*' as u16 } else { 0 };
-            controls::add(hwnd, Kind::Edit(Edit { anchor: 0, caret: 0, limit: 0x7FFF_FFFE, modified: false, password, focused: false, scroll_x: 0, top: 0, local: 0, undo: None, ex_style: 0, eol: EC_ENDOFLINE_CRLF }));
+            controls::add(hwnd, Kind::Edit(Edit { anchor: 0, caret: 0, limit: 0x7FFF_FFFE, modified: false, password, focused: false, scroll_x: 0, top: 0, local: 0, undo: None, ex_style: 0, eol: EC_ENDOFLINE_CRLF, word_break: 0 }));
             def_window_proc(hwnd, msg, wp, lp, true)
         }
         0x000F => {
@@ -755,6 +758,12 @@ pub unsafe extern "system" fn edit_proc(hwnd: Hwnd, msg: u32, wp: u64, lp: i64) 
             1
         }
         0x00D2 => get(hwnd, |e| e.password as i64).unwrap_or(0),
+        // EM_SETWORDBREAKPROC, EM_GETWORDBREAKPROC
+        0x00D0 => {
+            get(hwnd, |e| e.word_break = lp as u64);
+            0
+        }
+        0x00D1 => get(hwnd, |e| e.word_break as i64).unwrap_or(0),
         // EM_GETFIRSTVISIBLELINE
         0x00CE => get(hwnd, |e| e.top as i64).unwrap_or(0),
         // EM_SETREADONLY

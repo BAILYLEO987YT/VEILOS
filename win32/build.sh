@@ -85,6 +85,13 @@ fwd_link wldap32.dll
 # iphlpapi.dll: interface names have no numbers here (0 is "not found").
 printf 'LIBRARY iphlpapi.dll\nEXPORTS\n    if_nametoindex=kernel32.VeilCryptUnsupported\n' > target/forwarders/iphlpapi.dll.def
 fwd_link iphlpapi.dll
+# msvcp140.dll: what C++ programs built with /MD take from the C++ library;
+# so far std::uncaught_exceptions, which the C runtime has under another name.
+printf 'LIBRARY msvcp140.dll
+EXPORTS
+    "?uncaught_exceptions@std@@YAHXZ"=ucrtbase.__uncaught_exceptions
+' > target/forwarders/msvcp140.dll.def
+fwd_link msvcp140.dll
 fwd userenv.dll GetUserProfileDirectoryW
 fwd oleaut32.dll SysAllocStringLen SysFreeString SysStringLen GetErrorInfo SetErrorInfo
 fwd ole32.dll CoCreateGuid CoCreateInstance CoInitializeEx CoUninitialize CoTaskMemFree CoCreateFreeThreadedMarshaler
