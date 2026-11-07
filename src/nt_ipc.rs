@@ -423,7 +423,7 @@ pub fn pipe_call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
             if !ptr_ok(a, 8) {
                 return status::ACCESS_VIOLATION;
             }
-            let Some(console) = proc.console.clone() else { return status::INVALID_HANDLE };
+            let Some(console) = proc.current_console() else { return status::INVALID_HANDLE };
             let object = if b == 1 { KernelObjectRef::ConsoleBuffer(console.active()) } else { KernelObjectRef::Console(console) };
             let h = proc.handles.lock().allocate_ref(object, 0x0012_019F, 0);
             unsafe { *(a as *mut u64) = h as u64 };

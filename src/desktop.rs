@@ -420,6 +420,11 @@ impl DesktopWindowManager {
         // A Windows program's window (nt_user): WM_CLOSE, and the program
         // decides; DestroyWindow removes it.
         if crate::nt_user::deliver(id, crate::nt_user::WM_CLOSE, 0, 0) {
+            // If it then has no windows but keeps running, it's ended
+            // (win32_user::check_close_watch).
+            if let Some(win) = self.windows.iter().find(|w| w.id == id) {
+                crate::win32_user::watch_close(win.owner_pid);
+            }
             return;
         }
         if let Some(win) = self.windows.iter().find(|w| w.id == id) {

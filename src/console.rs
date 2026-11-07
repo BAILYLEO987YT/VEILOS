@@ -62,6 +62,13 @@ pub fn key_record(down: bool, vk: u16, ch: u16, state: u32) -> InputRecord {
     r
 }
 
+/// A KEY_EVENT record with its scan code too, as a keyboard makes them.
+pub fn key_record_scan(down: bool, vk: u16, scan: u16, ch: u16, state: u32) -> InputRecord {
+    let mut r = key_record(down, vk, ch, state);
+    r[12..14].copy_from_slice(&scan.to_le_bytes());
+    r
+}
+
 /// A key event's (down, virtual key, character, control state).
 fn key_of(r: &InputRecord) -> Option<(bool, u16, u16, u32)> {
     if u16::from_le_bytes([r[0], r[1]]) != KEY_EVENT {
@@ -94,6 +101,11 @@ impl BufferObj {
                 *console.title.lock() = t;
             }
             if console.is_active(self) {
+                // A pseudo-console's host shows it, not the log or a terminal.
+                if let Some(pty) = console.pty() {
+                    pty.render(&console);
+                    return;
+                }
                 console.to_serial(&String::from_utf16_lossy(units));
                 crate::apps::TERMINAL_OUTPUT.store(true, Ordering::Release);
             }
@@ -123,6 +135,8 @@ pub struct Console {
     editing: Mutex<Vec<u16>>,
     ready: Mutex<VecDeque<u16>>,
     pub title: Mutex<Vec<u16>>,
+    /// A pseudo-console's pipes (pty.rs), if it is one.
+    pty: Mutex<Option<Arc<crate::pty::Pty>>>,
 }
 
 impl Console {
@@ -142,7 +156,65 @@ impl Console {
             editing: Mutex::new(Vec::new()),
             ready: Mutex::new(VecDeque::new()),
             title: Mutex::new(Vec::new()),
+            pty: Mutex::new(None),
         })
+    }
+
+    /// CreatePseudoConsole: a console `width` by `height` (and no history,
+    /// as Windows' are) whose host reads its screen from `output` and types
+    /// into `input`.
+    pub fn new_pty(input: Arc<crate::nt_process::PipeEnd>, output: Arc<crate::nt_process::PipeEnd>, width: usize, height: usize) -> Arc<Self> {
+        let (width, height) = (width.clamp(1, 1000), height.clamp(1, 1000));
+        let c = Self::new(0);
+        *c.active().buf.lock() = ScreenBuffer::new(width, height, height);
+        *c.pty.lock() = Some(crate::pty::Pty::new(input, output, width, height));
+        c
+    }
+
+    pub fn pty(&self) -> Option<Arc<crate::pty::Pty>> {
+        self.pty.lock().clone()
+    }
+
+    /// A pseudo-console's host sees the screen as it is now.
+    pub fn render(&self) {
+        if let Some(pty) = self.pty() {
+            pty.render(self);
+        }
+    }
+
+    /// What a pseudo-console's host has typed, as keys.
+    fn pump(&self) {
+        if let Some(pty) = self.pty() {
+            pty.pump(self);
+        }
+    }
+
+    /// ResizePseudoConsole: the host's terminal is now `width` by `height`.
+    pub fn resize_pty(&self, width: usize, height: usize) {
+        let Some(pty) = self.pty() else { return };
+        let (width, height) = (width.clamp(1, 1000), height.clamp(1, 1000));
+        let a = self.active();
+        let changed = {
+            let mut b = a.buf.lock();
+            let changed = (b.width, b.height) != (width, height);
+            b.resize(width, height);
+            b.window = (0, 0, width, height);
+            changed
+        };
+        pty.resized(width, height);
+        if changed {
+            self.size_event(width, height);
+        }
+        pty.render(self);
+    }
+
+    /// ClosePseudoConsole: the host's reads end once it has the last of the
+    /// screen; the programs on the console end, as on Windows (CTRL_CLOSE_EVENT).
+    pub fn close_pty(&self) {
+        let Some(pty) = self.pty() else { return };
+        pty.render(self);
+        pty.close();
+        self.ctrl_event(2, 0);
     }
 
     pub fn pid(&self) -> u32 {
@@ -163,14 +235,91 @@ impl Console {
         Arc::ptr_eq(&self.active.lock(), b)
     }
 
-    /// CreateConsoleScreenBuffer: the size of the active one.
+    /// CreateConsoleScreenBuffer: the size of the active one's window, no
+    /// history (as Windows makes them).
     pub fn new_buffer(&self) -> Arc<BufferObj> {
-        let (w, h, rows) = {
+        let (w, rows) = {
             let a = self.active();
             let b = a.buf.lock();
-            (b.width, b.height, b.window.3)
+            (b.window.2, b.window.3)
         };
-        Arc::new(BufferObj { buf: Mutex::new(ScreenBuffer::new(w, h, rows)), console: self.me.clone() })
+        Arc::new(BufferObj { buf: Mutex::new(ScreenBuffer::new(w, rows, rows)), console: self.me.clone() })
+    }
+
+    /// A WINDOW_BUFFER_SIZE_EVENT for the program: a buffer is now `w` by `h`.
+    /// Windows sends these whatever ENABLE_WINDOW_INPUT says.
+    pub fn size_event(&self, w: usize, h: usize) {
+        let mut r = [0u8; 20];
+        r[0..2].copy_from_slice(&WINDOW_BUFFER_SIZE_EVENT.to_le_bytes());
+        r[4..6].copy_from_slice(&(w as i16).to_le_bytes());
+        r[6..8].copy_from_slice(&(h.min(i16::MAX as usize) as i16).to_le_bytes());
+        self.input.lock().push_back(r);
+    }
+
+    // -----| control events |-----
+
+    /// The processes on this console (a program and the children sharing it).
+    pub fn processes(&self) -> Vec<Arc<crate::process::Process>> {
+        let me = self.me.as_ptr();
+        crate::process::PROCESSOR
+            .lock()
+            .all()
+            .into_iter()
+            .filter(|p| p.is_alive() && p.current_console().is_some_and(|c| Arc::as_ptr(&c) == me))
+            .collect()
+    }
+
+    /// CTRL_C_EVENT (0), CTRL_BREAK_EVENT (1), ...: each process on the
+    /// console (or only `pid`, if not 0) runs its handlers on a new thread,
+    /// started at kernel32's CtrlRoutine as on Windows. False if `pid` isn't
+    /// on this console.
+    pub fn ctrl_event(&self, event: u32, pid: u32) -> bool {
+        let mut any = false;
+        for p in self.processes() {
+            if pid != 0 && p.pid != pid {
+                continue;
+            }
+            any = true;
+            let routine = p.ctrl_routine.load(Ordering::Acquire);
+            if routine != 0 {
+                let _ = crate::nt_process::spawn_thread(&p, routine, event as u64, 0);
+            }
+        }
+        pid == 0 || any
+    }
+
+    /// Keys typed in the terminal. With processed input, Ctrl+C is a control
+    /// event rather than a key; Ctrl+Break always is. (Keys a program writes
+    /// with WriteConsoleInput stay keys, as on Windows.)
+    pub fn typed(&self, records: &[InputRecord]) {
+        let processed = self.input_mode.load(Ordering::Relaxed) & ENABLE_PROCESSED_INPUT != 0;
+        let mut keep = Vec::new();
+        for r in records {
+            let kind = u16::from_le_bytes([r[0], r[1]]);
+            let down = r[4] != 0;
+            let vk = u16::from_le_bytes([r[10], r[11]]);
+            let ch = u16::from_le_bytes([r[14], r[15]]);
+            if kind == KEY_EVENT && vk == 0x03 {
+                if down {
+                    self.ctrl_event(1, 0);
+                }
+                continue;
+            }
+            if kind == KEY_EVENT && processed && vk == 0x43 && ch == 3 {
+                if down {
+                    self.drop_line();
+                    self.ctrl_event(0, 0);
+                }
+                continue;
+            }
+            keep.push(*r);
+        }
+        self.push_input(&keep);
+    }
+
+    /// Ctrl+C in line mode: the line being typed goes.
+    fn drop_line(&self) {
+        self.editing.lock().clear();
     }
 
     pub fn set_active(&self, b: Arc<BufferObj>) {
@@ -183,37 +332,42 @@ impl Console {
     /// caller also sets that terminal's `console`.
     pub fn attach(&self, slot: usize, columns: usize, rows: usize) {
         self.terminal.store(slot, Ordering::Release);
-        self.resize(columns, rows);
+        // Before the program has looked: no event (Windows sends none at start).
+        self.fit(columns, rows, false);
     }
 
     /// The terminal's size changed: the active buffer follows, and the
     /// program hears of it (WINDOW_BUFFER_SIZE_EVENT).
     pub fn resize(&self, columns: usize, rows: usize) {
+        self.fit(columns, rows, true);
+    }
+
+    fn fit(&self, columns: usize, rows: usize, tell: bool) {
         let (columns, rows) = (columns.max(10), rows.max(2));
         let a = self.active();
         let changed = {
             let mut b = a.buf.lock();
-            let changed = b.width != columns || b.window.3 != rows;
-            if b.width != columns {
-                let h = b.height;
+            // (A change of window alone is news too: programs like node ask
+            // for the window size when they hear of one.)
+            let old = (b.width, b.height, b.window.2, b.window.3);
+            // The buffer takes the terminal's width, and is at least as tall
+            // as the window.
+            let h = b.height.max(rows);
+            if b.width != columns || b.height != h {
                 b.resize(columns, h);
             }
-            let (l, t, _, _) = b.window;
-            let top = t.min(b.height - rows);
-            b.window = (l.min(columns - 1), top, columns.min(b.width), rows.min(b.height));
+            let rows = rows.min(b.height);
+            let (_, t, _, _) = b.window;
+            b.window = (0, t.min(b.height - rows), columns, rows);
             // Keep the cursor in view.
             let (_, y) = b.cursor;
             if y >= b.window.1 + rows {
                 b.window.1 = y + 1 - rows;
             }
-            changed
+            ((b.width, b.height, b.window.2, b.window.3) != old).then_some((b.width, b.height))
         };
-        if changed {
-            let mut r = [0u8; 20];
-            r[0..2].copy_from_slice(&WINDOW_BUFFER_SIZE_EVENT.to_le_bytes());
-            r[4..6].copy_from_slice(&(columns as i16).to_le_bytes());
-            r[6..8].copy_from_slice(&(HISTORY_ROWS as i16).to_le_bytes());
-            self.input.lock().push_back(r);
+        if let Some((w, h)) = changed.filter(|_| tell) {
+            self.size_event(w, h);
         }
     }
 
@@ -232,6 +386,7 @@ impl Console {
     }
 
     pub fn input_count(&self) -> usize {
+        self.pump();
         self.input.lock().len()
     }
 
@@ -243,6 +398,7 @@ impl Console {
 
     /// Up to `max` records, removed unless `peek`.
     pub fn read_input(&self, max: usize, peek: bool) -> Vec<InputRecord> {
+        self.pump();
         let mut q = self.input.lock();
         let n = q.len().min(max);
         if peek {
@@ -255,6 +411,7 @@ impl Console {
     /// Text for ReadConsole/ReadFile, up to `max` units: None while there's
     /// nothing to give yet (the caller waits and asks again).
     pub fn read_text(&self, max: usize) -> Option<Vec<u16>> {
+        self.pump();
         let mode = self.input_mode.load(Ordering::Relaxed);
         let max = max.max(1);
         // A typed line not all read yet comes first.

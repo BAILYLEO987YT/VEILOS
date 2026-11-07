@@ -71,6 +71,9 @@ pub struct Process {
     pub missing_calls_return_zero: core::sync::atomic::AtomicBool,
     /// The console of a console-subsystem program (its std handles refer to it).
     pub console: Option<alloc::sync::Arc<crate::console::Console>>,
+    /// After FreeConsole (Some(None)) or AllocConsole (Some(Some(new))): the
+    /// console the process has now, instead of `console`.
+    pub console_now: Mutex<Option<Option<alloc::sync::Arc<crate::console::Console>>>>,
     /// The module loader, kept for LoadLibrary / GetProcAddress.
     pub linker: Mutex<Option<crate::modules::Linker>>,
     /// ntdll's KiUserExceptionDispatcher, where CPU exceptions in user mode
@@ -78,6 +81,9 @@ pub struct Process {
     pub exception_dispatcher: core::sync::atomic::AtomicU64,
     /// ntdll's RtlUserThreadStart, where threads after the first begin.
     pub thread_entry: core::sync::atomic::AtomicU64,
+    /// kernel32's CtrlRoutine: where a console control event (Ctrl+C,
+    /// Ctrl+Break) starts a thread in this process, as on Windows.
+    pub ctrl_routine: core::sync::atomic::AtomicU64,
     /// Its Windows threads (nt_process.rs); the first is the main thread.
     pub threads: Mutex<alloc::vec::Vec<alloc::sync::Arc<crate::nt_process::ThreadObj>>>,
     /// Threads started and not yet stopped. The last one out ends the process.
@@ -93,6 +99,14 @@ pub struct Process {
 }
 
 impl Process {
+    /// The console the process is attached to now (FreeConsole, AllocConsole).
+    pub fn current_console(&self) -> Option<alloc::sync::Arc<crate::console::Console>> {
+        match &*self.console_now.lock() {
+            Some(now) => now.clone(),
+            None => self.console.clone(),
+        }
+    }
+
     pub fn new(pid: u32, name: &'static str, subsystem: Box<dyn Subsystem>) -> Self {
         // The loader builds every process with its new address space active
         // (address_space::with), so the active CR3 is the process's own.
@@ -126,6 +140,8 @@ impl Process {
             linker:      Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
             thread_entry: core::sync::atomic::AtomicU64::new(0),
+            ctrl_routine: core::sync::atomic::AtomicU64::new(0),
+            console_now: Mutex::new(None),
             threads: Mutex::new(alloc::vec::Vec::new()),
             live_threads: core::sync::atomic::AtomicUsize::new(0),
             dying: core::sync::atomic::AtomicBool::new(false),
@@ -204,6 +220,8 @@ impl ProcessManager {
             linker: Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
             thread_entry: core::sync::atomic::AtomicU64::new(0),
+            ctrl_routine: core::sync::atomic::AtomicU64::new(0),
+            console_now: Mutex::new(None),
             threads: Mutex::new(alloc::vec::Vec::new()),
             live_threads: core::sync::atomic::AtomicUsize::new(0),
             dying: core::sync::atomic::AtomicBool::new(false),
@@ -243,6 +261,11 @@ impl ProcessManager {
             pid => pid,
         };
         self.find(pid)
+    }
+
+    /// Every process there is (the kernel's too).
+    pub fn all(&self) -> alloc::vec::Vec<Arc<Process>> {
+        self.processes.clone()
     }
 
     pub fn find(&self, pid: u32) -> Option<Arc<Process>> {

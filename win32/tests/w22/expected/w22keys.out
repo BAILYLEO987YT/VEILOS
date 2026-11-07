@@ -1,0 +1,27 @@
+reading
+down vk 41 scan 1e char 0061 state 000
+up   vk 41 scan 1e char 0061 state 000
+down vk 10 scan 2a char 0000 state 010
+down vk 41 scan 1e char 0041 state 010
+up   vk 41 scan 1e char 0041 state 010
+up   vk 10 scan 2a char 0000 state 000
+down vk 11 scan 1d char 0000 state 008
+down vk 43 scan 2e char 0003 state 008
+up   vk 43 scan 2e char 0003 state 008
+up   vk 11 scan 1d char 0000 state 000
+down vk 26 scan 48 char 0000 state 100
+up   vk 26 scan 48 char 0000 state 100
+down vk 74 scan 3f char 0000 state 000
+up   vk 74 scan 3f char 0000 state 000
+down vk 2e scan 53 char 0000 state 100
+up   vk 2e scan 53 char 0000 state 100
+down vk 0d scan 1c char 000d state 000
+up   vk 0d scan 1c char 000d state 000
+down vk 12 scan 38 char 0000 state 002
+down vk 58 scan 2d char 0078 state 002
+up   vk 58 scan 2d char 0078 state 002
+up   vk 12 scan 38 char 0000 state 000
+down vk 51 scan 10 char 0071 state 000
+up   vk 51 scan 10 char 0071 state 000
+done
+exit 10

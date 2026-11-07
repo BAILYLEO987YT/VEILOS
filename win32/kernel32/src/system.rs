@@ -803,9 +803,18 @@ pub unsafe extern "system" fn GetLogicalProcessorInformationEx(relation: u32, ou
 }
 
 #[no_mangle]
-pub extern "system" fn ReadProcessMemory(_p: Handle, _addr: usize, _buf: *mut u8, _n: usize, _read: *mut usize) -> Bool {
-    crate::SetLastError(ERROR_ACCESS_DENIED);
-    0
+pub unsafe extern "system" fn ReadProcessMemory(p: Handle, addr: usize, buf: *mut u8, n: usize, read: *mut usize) -> Bool {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtReadVirtualMemory(process: Handle, address: usize, buffer: *mut u8, size: usize, read: *mut usize) -> NtStatus;
+    }
+    let mut done = 0usize;
+    let s = unsafe { NtReadVirtualMemory(p, addr, buf, n, &mut done) };
+    if !read.is_null() {
+        unsafe { *read = done };
+    }
+    // Windows fails a partial read too (ERROR_PARTIAL_COPY), saying how much it got.
+    if s == nt_abi::status::SUCCESS { 1 } else { crate::fail(s) }
 }
 
 #[no_mangle]

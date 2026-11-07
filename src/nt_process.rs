@@ -209,9 +209,23 @@ pub fn create_thread(proc: &Arc<Process>, start: u64, param: u64, flags: u64, re
     if !ptr_ok(result, core::mem::size_of::<ThreadResult>()) {
         return status::ACCESS_VIOLATION;
     }
+    match spawn_thread(proc, start, param, flags) {
+        Ok(t) => {
+            let h = proc.handles.lock().allocate_ref(KernelObjectRef::Thread(t.clone()), 0x001F_FFFF, 0);
+            unsafe { *(result as *mut ThreadResult) = ThreadResult { handle: h as u64, tid: t.tid as u64 } };
+            status::SUCCESS
+        }
+        Err(s) => s,
+    }
+}
+
+/// A new thread in `proc` at `start(param)`, through the process's thread
+/// entry; running unless `flags` says CREATE_SUSPENDED. The kernel starts
+/// threads this way itself too (console control events).
+pub fn spawn_thread(proc: &Arc<Process>, start: u64, param: u64, flags: u64) -> Result<Arc<ThreadObj>, NtStatus> {
     let entry = proc.thread_entry.load(Ordering::Acquire);
     if entry == 0 {
-        return status::PROCEDURE_NOT_FOUND;
+        return Err(status::PROCEDURE_NOT_FOUND);
     }
     let tid = alloc_tid();
     let mut pages = Vec::new();
@@ -220,28 +234,35 @@ pub fn create_thread(proc: &Arc<Process>, start: u64, param: u64, flags: u64, re
     // default, zero pages as they're touched. A gap below it catches overflow.
     let stack_size = ((flags >> 32) * 0x1000).max(THREAD_STACK).next_multiple_of(0x1_0000);
     let stack_base = NEXT_STACK.fetch_add(stack_size + THREAD_STACK, Ordering::Relaxed);
-    crate::nt_demand::add_zero(stack_base, stack_size);
     let stack_top = stack_base + stack_size;
     // As if called: a null return address and home space.
     let rsp = stack_top - 40;
-
-    // TEB: like the first thread's (loader.rs), sharing its PEB.
     let teb = crate::loader::alloc_teb_range(2);
-    if let Err(s) = map_user(teb, 2, false, &mut pages) {
-        free_pages(&mut pages);
-        return s;
-    }
     let peb = proc.nt_env.lock().peb_base;
-    unsafe {
-        use nt_abi::layout::*;
-        let w = |o: usize, v: u64| core::ptr::write_unaligned((teb as usize + o) as *mut u64, v);
-        w(0x00, u64::MAX);
-        w(0x08, stack_top);
-        w(0x10, stack_base);
-        w(0x30, teb);
-        w(TEB_PROCESS_ID, proc.pid as u64);
-        w(TEB_THREAD_ID, tid as u64);
-        w(TEB_PEB, peb);
+
+    // All of this goes into `proc`'s address space, which needn't be the
+    // active one: the kernel starts threads from the terminal (Ctrl+C), and
+    // GenerateConsoleCtrlEvent starts them in other processes.
+    let mapped = crate::address_space::with(proc.cr3, || {
+        crate::nt_demand::add_zero(stack_base, stack_size);
+        // TEB: like the first thread's (loader.rs), sharing its PEB.
+        map_user(teb, 2, false, &mut pages)?;
+        unsafe {
+            use nt_abi::layout::*;
+            let w = |o: usize, v: u64| core::ptr::write_unaligned((teb as usize + o) as *mut u64, v);
+            w(0x00, u64::MAX);
+            w(0x08, stack_top);
+            w(0x10, stack_base);
+            w(0x30, teb);
+            w(TEB_PROCESS_ID, proc.pid as u64);
+            w(TEB_THREAD_ID, tid as u64);
+            w(TEB_PEB, peb);
+        }
+        Ok(())
+    });
+    if let Err(s) = mapped {
+        crate::address_space::with(proc.cr3, || free_pages(&mut pages));
+        return Err(s);
     }
     {
         let mut vad = proc.vad.lock();
@@ -252,13 +273,11 @@ pub fn create_thread(proc: &Arc<Process>, start: u64, param: u64, flags: u64, re
     let suspended = flags as u32 & 4 != 0; // CREATE_SUSPENDED
     let t = Arc::new(ThreadObj::new(proc.pid, tid, Start { rip: entry, rsp, teb, rcx: start, rdx: param }, suspended, pages));
     proc.threads.lock().push(t.clone());
-    let h = proc.handles.lock().allocate_ref(KernelObjectRef::Thread(t.clone()), 0x001F_FFFF, 0);
-    unsafe { *(result as *mut ThreadResult) = ThreadResult { handle: h as u64, tid: tid as u64 } };
     if !suspended {
         proc.live_threads.fetch_add(1, Ordering::AcqRel);
-        start_thread(proc.clone(), t);
+        start_thread(proc.clone(), t.clone());
     }
-    status::SUCCESS
+    Ok(t)
 }
 
 /// NtTerminateThread(handle, code).
@@ -441,6 +460,43 @@ pub fn query_process(proc: &Arc<Process>, h: u64, class: u64, out: u64, length: 
         unsafe { *(ret_len as *mut u32) = 48 };
     }
     status::SUCCESS
+}
+
+/// NtReadVirtualMemory(handle, address, buffer*, size, read*): another
+/// process's memory (cmd.exe reads a child's PE header this way, to know
+/// whether to wait for it). A page at a time through a kernel buffer, with
+/// the target's address space loaded to read; PARTIAL_COPY where it ends.
+pub fn read_memory(proc: &Arc<Process>, h: u64, addr: u64, buf: u64, size: u64) -> NtStatus {
+    let read_out = stack(4).unwrap_or(0);
+    let Some(KernelObjectRef::Process(p)) = object_or_self(proc, h) else { return status::INVALID_HANDLE };
+    if !ptr_ok(buf, size as usize) {
+        return status::ACCESS_VIOLATION;
+    }
+    let mut done = 0u64;
+    let mut page = alloc::vec![0u8; 0x1000];
+    let mut result = status::SUCCESS;
+    while done < size {
+        let at = addr.wrapping_add(done);
+        let n = (0x1000 - (at & 0xFFF)).min(size - done) as usize;
+        let ok = crate::address_space::with(p.cr3, || {
+            if !ptr_ok(at, n) {
+                return false;
+            }
+            unsafe { core::ptr::copy_nonoverlapping(at as *const u8, page.as_mut_ptr(), n) };
+            true
+        });
+        if !ok {
+            result = status::PARTIAL_COPY;
+            break;
+        }
+        // Back in the caller's space (as on entry).
+        unsafe { core::ptr::copy_nonoverlapping(page.as_ptr(), (buf + done) as *mut u8, n) };
+        done += n as u64;
+    }
+    if ptr_ok(read_out, 8) {
+        unsafe { *(read_out as *mut u64) = done };
+    }
+    result
 }
 
 /// NtQueryInformationThread(handle, ThreadBasicInformation, info*, length, return_length*).
@@ -723,12 +779,23 @@ pub fn create_process(proc: &Arc<Process>, params: u64, result: u64) -> NtStatus
         return status::OBJECT_NAME_NOT_FOUND;
     }
 
-    let console = if p.flags & DETACHED_PROCESS != 0 {
+    // A pseudo-console given (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE).
+    let pseudo = if p.console != 0 {
+        match object(proc, p.console) {
+            Some(KernelObjectRef::Console(c)) if c.pty().is_some() => Some(c),
+            _ => return status::INVALID_HANDLE,
+        }
+    } else {
+        None
+    };
+    let console = if let Some(c) = &pseudo {
+        crate::loader::ConsoleChoice::Inherit(c.clone())
+    } else if p.flags & DETACHED_PROCESS != 0 {
         crate::loader::ConsoleChoice::None
     } else if p.flags & CREATE_NEW_CONSOLE != 0 {
         crate::loader::ConsoleChoice::New
     } else {
-        match &proc.console {
+        match &proc.current_console() {
             Some(c) => crate::loader::ConsoleChoice::Inherit(c.clone()),
             None => crate::loader::ConsoleChoice::New,
         }
@@ -736,6 +803,16 @@ pub fn create_process(proc: &Arc<Process>, params: u64, result: u64) -> NtStatus
     let std_objects = (p.use_std_handles != 0).then(|| {
         p.std_handles.map(|h| if h == 0 { None } else { object(proc, h) })
     });
+    // In a pseudo-console, standard handles left empty are its own (as on
+    // Windows, where a host gives none so its own redirected ones don't pass on).
+    let std_objects = match (&pseudo, std_objects) {
+        (Some(c), Some(objects)) => Some([
+            objects[0].clone().or_else(|| Some(KernelObjectRef::Console(c.clone()))),
+            objects[1].clone().or_else(|| Some(KernelObjectRef::ConsoleBuffer(c.active()))),
+            objects[2].clone().or_else(|| Some(KernelObjectRef::ConsoleBuffer(c.active()))),
+        ]),
+        (_, objects) => objects,
+    };
     let runtime_data = if p.runtime_data != 0 && p.runtime_size > 0 && p.runtime_size <= 1024 && ptr_ok(p.runtime_data, p.runtime_size as usize) {
         unsafe { core::slice::from_raw_parts(p.runtime_data as *const u8, p.runtime_size as usize) }.to_vec()
     } else {

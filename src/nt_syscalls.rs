@@ -56,6 +56,7 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::NT_WAIT_FOR_MULTIPLE_OBJECTS => crate::nt_process::wait_multiple(&proc, a0, a1, a2),
         sys::NT_TERMINATE_THREAD => crate::nt_process::terminate_thread(&proc, a0, a1),
         sys::NT_QUERY_INFORMATION_PROCESS => crate::nt_process::query_process(&proc, a0, a1, a2, a3),
+        sys::NT_READ_VIRTUAL_MEMORY => crate::nt_process::read_memory(&proc, a0, a1, a2, a3),
         sys::NT_QUERY_INFORMATION_THREAD => crate::nt_process::query_thread(&proc, a0, a1, a2, a3),
         sys::NT_RESUME_THREAD => crate::nt_process::resume_thread(&proc, a0, a1),
         sys::NT_DUPLICATE_OBJECT => crate::nt_process::duplicate(&proc, a0, a1, a2, a3),

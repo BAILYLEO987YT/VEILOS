@@ -16,6 +16,7 @@ pub mod status {
     pub const SUCCESS: NtStatus = 0;
     pub const TIMEOUT: NtStatus = 0x0000_0102;
     pub const NO_MORE_FILES: NtStatus = 0x8000_0006u32 as i32;
+    pub const PARTIAL_COPY: NtStatus = 0x8000_000Du32 as i32;
     pub const NOT_IMPLEMENTED: NtStatus = 0xC000_0002u32 as i32;
     pub const INVALID_INFO_CLASS: NtStatus = 0xC000_0003u32 as i32;
     pub const ACCESS_VIOLATION: NtStatus = 0xC000_0005u32 as i32;
@@ -172,8 +173,10 @@ pub mod sys {
     pub const VEIL_SOCKET: u32 = BASE + 62;
     /// VEIL_CONSOLE(op, handle, a, b, [c, d]): the console calls (src/nt_console.rs).
     pub const VEIL_CONSOLE: u32 = BASE + 63;
+    /// NtReadVirtualMemory(process, address, buffer*, size, read*).
+    pub const NT_READ_VIRTUAL_MEMORY: u32 = BASE + 64;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 64;
+    pub const END: u32 = BASE + 65;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
@@ -216,6 +219,9 @@ pub struct ProcessParams {
     pub startup_flags: u64,
     pub runtime_data: u64,
     pub runtime_size: u64,
+    /// A pseudo-console (the caller's handle to it, from CreatePseudoConsole;
+    /// 0: none): the program's console, instead of the caller's.
+    pub console: u64,
 }
 
 /// VEIL_USER_CREATE_WINDOW's parameters: the window's title, screen

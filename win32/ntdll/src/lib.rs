@@ -61,6 +61,7 @@ syscall_stubs! {
     NtOpenProcess, ZwOpenProcess => sys::NT_OPEN_PROCESS;
     VeilSocket, ZwVeilSocket => sys::VEIL_SOCKET;
     VeilConsole, ZwVeilConsole => sys::VEIL_CONSOLE;
+    NtReadVirtualMemory, ZwReadVirtualMemory => sys::NT_READ_VIRTUAL_MEMORY;
     NtQueryVolumeInformationFile, ZwQueryVolumeInformationFile => sys::NT_QUERY_VOLUME_INFORMATION_FILE;
     VeilCreateThread, ZwVeilCreateThread => sys::VEIL_CREATE_THREAD;
     VeilCreateProcess, ZwVeilCreateProcess => sys::VEIL_CREATE_PROCESS;
@@ -164,6 +165,7 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
         s if s == 0xC000_0046u32 as NtStatus => 288, // STATUS_MUTANT_NOT_OWNED: ERROR_NOT_OWNER
         s if s == 0xC000_0120u32 as NtStatus => 995, // STATUS_CANCELLED: ERROR_OPERATION_ABORTED
         status::NO_MORE_FILES => 18,            // ERROR_NO_MORE_FILES
+        status::PARTIAL_COPY => 299,            // ERROR_PARTIAL_COPY
         status::NOT_IMPLEMENTED => 1,           // ERROR_INVALID_FUNCTION
         status::INVALID_INFO_CLASS => 87,       // ERROR_INVALID_PARAMETER
         status::INVALID_HANDLE => 6,            // ERROR_INVALID_HANDLE

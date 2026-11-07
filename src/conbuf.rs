@@ -35,6 +35,9 @@ const FG_INTENSITY: u16 = 0x08;
 pub struct Cell {
     pub ch: u16,
     pub attr: u16,
+    /// Bright because of SGR bold, not by colour (a pseudo-console sends it
+    /// on as bold, as Windows' does).
+    pub bold: bool,
 }
 
 /// Where the escape-sequence reader is.
@@ -60,6 +63,9 @@ pub struct ScreenBuffer {
     /// The current attribute, and the one SGR 0 goes back to.
     pub attr: u16,
     pub default_attr: u16,
+    /// Lines the whole buffer has scrolled up since a pseudo-console last
+    /// looked (pty.rs sends them as newlines).
+    pub scrolled: usize,
     /// SGR 1 brightens the foreground, whichever colour comes after; the
     /// colour itself is kept apart so 22 can undo it.
     bold: bool,
@@ -82,7 +88,7 @@ pub struct ScreenBuffer {
 }
 
 fn blank(attr: u16) -> Cell {
-    Cell { ch: b' ' as u16, attr }
+    Cell { ch: b' ' as u16, attr, bold: false }
 }
 
 impl ScreenBuffer {
@@ -97,6 +103,7 @@ impl ScreenBuffer {
             wrap_pending: false,
             attr: 0x07,
             default_attr: 0x07,
+            scrolled: 0,
             bold: false,
             fg: 0x07,
             mode: ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
@@ -160,6 +167,9 @@ impl ScreenBuffer {
     /// Rows `top..=bottom` up by `n` (new rows blank, in the current colours).
     fn scroll_up(&mut self, top: usize, bottom: usize, n: usize) {
         let n = n.min(bottom + 1 - top);
+        if top == 0 && bottom + 1 == self.height {
+            self.scrolled += n;
+        }
         for y in top..=bottom {
             for x in 0..self.width {
                 let c = if y + n <= bottom { self.cell(x, y + n) } else { blank(self.attr) };
@@ -292,7 +302,8 @@ impl ScreenBuffer {
             self.line_feed();
         }
         let (x, y) = self.cursor;
-        self.set(x, y, Cell { ch, attr: self.attr });
+        let bold = self.bold && self.fg & FG_INTENSITY == 0 && self.attr & 0x0F == self.fg | FG_INTENSITY;
+        self.set(x, y, Cell { ch, attr: self.attr, bold });
         if x + 1 < self.width {
             self.cursor.0 += 1;
         } else if wrap {

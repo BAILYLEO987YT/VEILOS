@@ -417,28 +417,85 @@ pub extern "system" fn FlushConsoleInputBuffer(h: Handle) -> Bool {
 
 // -----| the console itself |-----
 
-/// A process keeps the console it started with: FreeConsole lets it go as
-/// far as programs can tell, and AllocConsole takes it back.
-static DETACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const OP_FREE: u64 = 27;
+const OP_ALLOC: u64 = 28;
+const OP_PTY_CREATE: u64 = 29;
+const OP_PTY_RESIZE: u64 = 30;
+const OP_PTY_CLOSE: u64 = 31;
 
+/// Whether `h` is a console handle (input or a screen buffer).
+pub(crate) fn is_console_handle(h: Handle) -> bool {
+    let mut m = 0u32;
+    h != 0 && unsafe { VeilConsole(OP_GET_MODE, h, &mut m as *mut u32 as u64, 0, 0, 0) } == 0
+}
+
+fn hresult(s: i32) -> i32 {
+    match s as u32 {
+        0 => 0,
+        0xC000_000D => 0x8007_0057u32 as i32, // E_INVALIDARG
+        0xC000_0008 => 0x8007_0006u32 as i32, // E_HANDLE
+        _ => 0x8000_4005u32 as i32,           // E_FAIL
+    }
+}
+
+// -----| pseudo-consoles (src/pty.rs) |-----
+
+/// CreatePseudoConsole(size, input pipe's read end, output pipe's write end,
+/// flags, HPCON out*): an HPCON is a handle to the console.
 #[no_mangle]
-pub extern "system" fn FreeConsole() -> Bool {
-    DETACHED.store(true, core::sync::atomic::Ordering::Relaxed);
-    1
+pub unsafe extern "system" fn CreatePseudoConsole(size: u32, input: Handle, output: Handle, _flags: u32, out: *mut Handle) -> i32 {
+    if out.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    let mut h: Handle = 0;
+    let s = unsafe { VeilConsole(OP_PTY_CREATE, input, output, size as u64, &mut h as *mut Handle as u64, 0) };
+    if s == 0 {
+        unsafe { *out = h };
+    }
+    hresult(s)
 }
 
 #[no_mangle]
+pub extern "system" fn ResizePseudoConsole(pc: Handle, size: u32) -> i32 {
+    hresult(unsafe { VeilConsole(OP_PTY_RESIZE, pc, size as u64, 0, 0, 0) })
+}
+
+/// The host's reads end once it has the rest; programs in it end.
+#[no_mangle]
+pub extern "system" fn ClosePseudoConsole(pc: Handle) {
+    unsafe { VeilConsole(OP_PTY_CLOSE, pc, 0, 0, 0, 0) };
+}
+
+#[no_mangle]
+pub extern "system" fn FreeConsole() -> Bool {
+    call(OP_FREE, 0, 0, 0, 0, 0)
+}
+
+/// A console of the process's own, not shown anywhere: standard handles that
+/// were console handles move to it; redirected ones stay (as on Windows).
+#[no_mangle]
 pub extern "system" fn AllocConsole() -> Bool {
-    if !DETACHED.swap(false, core::sync::atomic::Ordering::Relaxed) {
-        crate::SetLastError(5); // ERROR_ACCESS_DENIED: there's one already
-        return 0;
+    let (mut hi, mut ho): (Handle, Handle) = (0, 0);
+    let s = unsafe { VeilConsole(OP_ALLOC, 0, &mut hi as *mut Handle as u64, &mut ho as *mut Handle as u64, 0, 0) };
+    if s != 0 {
+        return fail(s);
+    }
+    for (which, h) in [(-10i32 as u32, hi), (-11i32 as u32, ho), (-12i32 as u32, ho)] {
+        let old = crate::GetStdHandle(which);
+        let mut m = 0u32;
+        let is_console = unsafe { VeilConsole(OP_GET_MODE, old, &mut m as *mut u32 as u64, 0, 0, 0) } == 0;
+        if old == 0 || old == crate::INVALID_HANDLE_VALUE || is_console {
+            crate::SetStdHandle(which, h);
+        }
     }
     1
 }
 
+/// Only back to the console the process started with (the parent's, as a
+/// rule), whichever process is asked for.
 #[no_mangle]
 pub extern "system" fn AttachConsole(_pid: u32) -> Bool {
-    AllocConsole()
+    call(OP_FREE, 0, 1, 0, 0, 0)
 }
 
 /// The console window has no HWND of its own (yet).
@@ -447,10 +504,108 @@ pub extern "system" fn GetConsoleWindow() -> Handle {
     0
 }
 
-/// Ctrl+C handlers: kept nowhere yet; Ctrl+C arrives as a key.
+// -----| Ctrl+C and Ctrl+Break |-----
+
+const OP_SET_CTRL_ROUTINE: u64 = 25;
+const OP_GENERATE_CTRL: u64 = 26;
+
+/// The handlers, oldest first; the newest runs first. A spin lock guards
+/// them: a control event runs them on a thread of its own.
+struct Handlers {
+    list: [usize; 64],
+    count: usize,
+}
+static HANDLERS: SpinCell<Handlers> = SpinCell::new(Handlers { list: [0; 64], count: 0 });
+struct SpinCell<T> {
+    locked: core::sync::atomic::AtomicBool,
+    value: core::cell::UnsafeCell<T>,
+}
+unsafe impl<T> Sync for SpinCell<T> {}
+impl<T> SpinCell<T> {
+    const fn new(value: T) -> Self {
+        SpinCell { locked: core::sync::atomic::AtomicBool::new(false), value: core::cell::UnsafeCell::new(value) }
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        use core::sync::atomic::Ordering;
+        while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        let r = f(unsafe { &mut *self.value.get() });
+        self.locked.store(false, Ordering::Release);
+        r
+    }
+}
+/// SetConsoleCtrlHandler(NULL, TRUE): Ctrl+C runs no handlers.
+static IGNORE_CTRL_C: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 #[no_mangle]
-pub extern "system" fn SetConsoleCtrlHandler(_handler: usize, _add: Bool) -> Bool {
-    1
+pub extern "system" fn SetConsoleCtrlHandler(handler: usize, add: Bool) -> Bool {
+    if handler == 0 {
+        IGNORE_CTRL_C.store(add != 0, core::sync::atomic::Ordering::Relaxed);
+        return 1;
+    }
+    let ok = HANDLERS.with(|h| {
+        if add != 0 {
+            if h.count == h.list.len() {
+                return false;
+            }
+            h.list[h.count] = handler;
+            h.count += 1;
+            true
+        } else {
+            match h.list[..h.count].iter().rposition(|&x| x == handler) {
+                Some(i) => {
+                    h.list.copy_within(i + 1..h.count, i);
+                    h.count -= 1;
+                    true
+                }
+                None => false,
+            }
+        }
+    });
+    if ok {
+        1
+    } else {
+        crate::SetLastError(87); // ERROR_INVALID_PARAMETER
+        0
+    }
+}
+
+/// Where a control event starts: the newest handler first, until one says
+/// it's handled; if none does, the program ends, as on Windows.
+extern "system" fn ctrl_routine(event: usize) -> u32 {
+    let event = event as u32;
+    if event == 0 && IGNORE_CTRL_C.load(core::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    let (list, count) = HANDLERS.with(|h| (h.list, h.count));
+    for &f in list[..count].iter().rev() {
+        let handler: extern "system" fn(u32) -> Bool = unsafe { core::mem::transmute(f) };
+        // Close, logoff, shutdown: the program ends whatever its handler says.
+        if handler(event) != 0 && event < 2 {
+            return 0;
+        }
+    }
+    crate::ExitProcess(0xC000_013A) // STATUS_CONTROL_C_EXIT
+}
+
+/// Tell the kernel where control events go (kernel32's DllMain).
+pub(crate) fn register_ctrl_routine() {
+    unsafe { VeilConsole(OP_SET_CTRL_ROUTINE, 0, ctrl_routine as *const () as u64, 0, 0, 0) };
+}
+
+#[no_mangle]
+pub extern "system" fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> Bool {
+    let s = unsafe { VeilConsole(OP_GENERATE_CTRL, 0, event as u64, group as u64, 0, 0) };
+    match s as u32 {
+        0 => 1,
+        // A group that isn't on this console: Windows says ERROR_BAD_FORMAT.
+        0xC000_000B => {
+            crate::SetLastError(11);
+            0
+        }
+        _ => fail(s),
+    }
 }
 
 #[no_mangle]

@@ -409,6 +409,21 @@ pub unsafe extern "system" fn CreateProcessW(
         ([0; 3], 0)
     };
 
+    // STARTUPINFOEX's attribute list: a pseudo-console to run in.
+    let pseudo = if flags & EXTENDED_STARTUPINFO_PRESENT != 0 && !startup.is_null() {
+        let list = unsafe { *(startup.add(104) as *const *const u8) };
+        unsafe { attribute(list, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE) }.unwrap_or(0)
+    } else {
+        0
+    };
+    // There, the caller's console handles mean nothing: the program gets the
+    // pseudo-console's (redirected ones pass on, as on Windows).
+    let std_handles = if pseudo != 0 && !use_given {
+        std_handles.map(|h| if crate::console::is_console_handle(h) { 0 } else { h })
+    } else {
+        std_handles
+    };
+
     let params = ProcessParams {
         image: image.as_ptr() as u64,
         // As given, however long; `line` holds just the program's own name.
@@ -422,6 +437,7 @@ pub unsafe extern "system" fn CreateProcessW(
         startup_flags: if startup.is_null() { 0 } else { (unsafe { *(startup.add(60) as *const u32) }) as u64 },
         runtime_data: if startup.is_null() { 0 } else { unsafe { *(startup.add(72) as *const u64) } },
         runtime_size: if startup.is_null() { 0 } else { (unsafe { *(startup.add(66) as *const u16) }) as u64 },
+        console: pseudo,
     };
     let mut result = ProcessResult::default();
     let s = unsafe { VeilCreateProcess(&params, &mut result) };
@@ -605,8 +621,24 @@ pub extern "system" fn NeedCurrentDirectoryForExePathA(_name: *const u8) -> Bool
 
 // -----| process/thread attribute lists (STARTUPINFOEX) |-----
 //
-// Accepted and ignored: no attribute (parent process, handle list, ...)
-// changes how VEILOS starts a program yet.
+// Kept as given: a 24-byte header (room, used) and 24 bytes per attribute
+// (number, size, value). Only the pseudo-console changes how VEILOS starts a
+// program; the others (parent process, handle list, ...) are kept and unused.
+
+const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
+
+/// An attribute's value in a list (the pointer-sized value itself).
+unsafe fn attribute(list: *const u8, which: usize) -> Option<u64> {
+    if list.is_null() {
+        return None;
+    }
+    let used = unsafe { *(list.add(4) as *const u32) } as usize;
+    (0..used).find_map(|i| unsafe {
+        let e = list.add(24 + i * 24) as *const u64;
+        (*e as usize == which).then(|| *e.add(2))
+    })
+}
 
 #[no_mangle]
 pub unsafe extern "system" fn InitializeProcThreadAttributeList(list: *mut u8, count: u32, _flags: u32, size: *mut usize) -> Bool {
@@ -617,12 +649,32 @@ pub unsafe extern "system" fn InitializeProcThreadAttributeList(list: *mut u8, c
         crate::SetLastError(122); // ERROR_INSUFFICIENT_BUFFER
         return 0;
     }
-    unsafe { core::ptr::write_bytes(list, 0, need) };
+    unsafe {
+        core::ptr::write_bytes(list, 0, need);
+        *(list as *mut u32) = count;
+    }
     1
 }
 
 #[no_mangle]
-pub extern "system" fn UpdateProcThreadAttribute(_list: *mut u8, _flags: u32, _attribute: usize, _value: *const u8, _size: usize, _previous: *mut u8, _ret: *mut usize) -> Bool {
+pub unsafe extern "system" fn UpdateProcThreadAttribute(list: *mut u8, _flags: u32, which: usize, value: *const u8, size: usize, _previous: *mut u8, _ret: *mut usize) -> Bool {
+    if list.is_null() {
+        crate::SetLastError(87);
+        return 0;
+    }
+    let (room, used) = unsafe { (*(list as *const u32) as usize, *(list.add(4) as *const u32) as usize) };
+    if used >= room {
+        crate::SetLastError(122);
+        return 0;
+    }
+    unsafe {
+        let e = list.add(24 + used * 24) as *mut u64;
+        *e = which as u64;
+        *e.add(1) = size as u64;
+        // lpValue as given: the HPCON itself, or the address of the value.
+        *e.add(2) = value as u64;
+        *(list.add(4) as *mut u32) = used as u32 + 1;
+    }
     1
 }
 

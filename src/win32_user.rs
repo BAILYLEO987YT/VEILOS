@@ -974,7 +974,8 @@ pub fn check_close_watch() {
     if proc.exit_code.lock().is_some() {
         return; // already exiting
     }
-    let has_window = WIN32_USER.try_lock().map_or(true, |s| s.windows.iter().any(|w| w.owning_pid == pid));
+    let has_window = WIN32_USER.try_lock().map_or(true, |s| s.windows.iter().any(|w| w.owning_pid == pid))
+        || crate::nt_user::has_windows(pid);
     if has_window {
         return; // it kept a window open: its choice
     }

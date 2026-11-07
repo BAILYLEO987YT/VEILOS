@@ -336,6 +336,7 @@ pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) ->
     // DLL_PROCESS_ATTACH: VEILOS_MISSING_CALLS=zero asks for missing calls
     // to return 0 rather than end the program (src/subsystem.rs).
     if reason == 1 {
+        console::register_ctrl_routine();
         let name: [u16; 20] = {
             let mut w = [0u16; 20];
             for (i, b) in b"VEILOS_MISSING_CALLS".iter().enumerate() {

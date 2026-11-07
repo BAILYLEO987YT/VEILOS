@@ -1,0 +1,47 @@
+--- handlers
+add first 1
+add second 1
+ctrl+c: generate 1, handled, ran: second(0)
+ctrl+break: generate 1, handled, ran: second(1)
+second passes it on: generate 1, handled, ran: second(0) first(0)
+remove first 1
+remove first again 0 (error 87)
+second alone: generate 1, handled, ran: second(0)
+generate to a bad group 0 (error 11)
+generate a bad event 0 (error 87)
+--- ignoring ctrl+c
+ignore 1
+ctrl+c ignored: generate 1, nothing handled it, ran:
+ctrl+break still: generate 1, handled, ran: second(1)
+stop ignoring 1
+ctrl+c again: generate 1, handled, ran: second(0)
+--- typed
+input mode 1f7
+typed ctrl+c: wrote 4, no handler, ran:
+processed on: 4 waiting
+  key down vk 11 char 0000 state 8
+  key down vk 43 char 0003 state 8
+  key up vk 43 char 0003 state 8
+  key up vk 11 char 0000 state 0
+typed ctrl+c: wrote 4, no handler, ran:
+processed off: 4 waiting
+  key down vk 11 char 0000 state 8
+  key down vk 43 char 0003 state 8
+  key up vk 43 char 0003 state 8
+  key up vk 11 char 0000 state 0
+--- window size events
+new buffer: size 120 x 30, window 0,0-119,29
+after making it active: 0 waiting
+small window 1
+then: size 10 x 5, window 0,0-9,4
+after: 1 waiting
+  window buffer size 10 x 5
+resize without window input 1
+after: 1 waiting
+  window buffer size 50 x 20
+resize with window input 1
+same size again 1
+after: 1 waiting
+  window buffer size 60 x 25
+done
+exit 9

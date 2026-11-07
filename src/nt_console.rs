@@ -43,6 +43,13 @@ pub const OP_SET_TITLE: u64 = 21;
 pub const OP_READ_TEXT: u64 = 22;
 pub const OP_WRITE_BLOCK: u64 = 23;
 pub const OP_READ_BLOCK: u64 = 24;
+pub const OP_SET_CTRL_ROUTINE: u64 = 25;
+pub const OP_GENERATE_CTRL: u64 = 26;
+pub const OP_FREE: u64 = 27;
+pub const OP_ALLOC: u64 = 28;
+pub const OP_PTY_CREATE: u64 = 29;
+pub const OP_PTY_RESIZE: u64 = 30;
+pub const OP_PTY_CLOSE: u64 = 31;
 
 enum End {
     Input(Arc<Console>),
@@ -92,9 +99,23 @@ fn coord(v: u64) -> (usize, usize) {
 pub fn call(proc: &Process, op: u64, h: u64, a: u64, b: u64) -> NtStatus {
     let c = stack(4).unwrap_or(0);
     let d = stack(5).unwrap_or(0);
-    match run(proc, op, h, a, b, c, d) {
+    let r = run(proc, op, h, a, b, c, d);
+    // On a pseudo-console, the host sees whatever that did to the screen.
+    if let Some(con) = proc.current_console() {
+        con.render();
+    }
+    match r {
         Ok(()) => status::SUCCESS,
         Err(s) => s,
+    }
+}
+
+/// A handle to a pipe end, reading or writing.
+fn pipe_end(proc: &Process, h: u64, write: bool) -> Result<Arc<crate::nt_process::PipeEnd>, NtStatus> {
+    match crate::nt_process::object(proc, h) {
+        Some(KernelObjectRef::Pipe(end)) if end.write == write => Ok(end),
+        Some(_) => Err(status::INVALID_PARAMETER),
+        None => Err(status::INVALID_HANDLE),
     }
 }
 
@@ -261,7 +282,14 @@ fn run(proc: &Process, op: u64, h: u64, a: u64, b: u64, c: u64, d: u64) -> Resul
             if w == 0 || hgt == 0 || w < s.window.2 || hgt < s.window.3 {
                 return Err(status::INVALID_PARAMETER);
             }
+            let changed = (s.width, s.height) != (w, hgt);
             s.resize(w, hgt);
+            drop(s);
+            if changed {
+                if let Some(con) = buf.console.upgrade().filter(|c| c.is_active(&buf)) {
+                    con.size_event(w, hgt);
+                }
+            }
             Ok(())
         }
         // (h, absolute, SMALL_RECT*): the window, within the buffer.
@@ -281,14 +309,121 @@ fn run(proc: &Process, op: u64, h: u64, a: u64, b: u64, c: u64, d: u64) -> Resul
             if left < 0 || top < 0 || right < left || bottom < top || right as usize >= s.width || bottom as usize >= s.height {
                 return Err(status::INVALID_PARAMETER);
             }
-            s.window = (left as usize, top as usize, (right - left + 1) as usize, (bottom - top + 1) as usize);
+            let window = (left as usize, top as usize, (right - left + 1) as usize, (bottom - top + 1) as usize);
+            // A buffer just the size of its window, with the window shrinking
+            // from the corner, shrinks with it (as Windows' does).
+            let follows = (s.window.0, s.window.1) == (0, 0) && (s.width, s.height) == (s.window.2, s.window.3)
+                && (window.0, window.1) == (0, 0);
+            s.window = window;
+            if follows && (window.2, window.3) != (s.width, s.height) {
+                s.resize(window.2, window.3);
+                drop(s);
+                if let Some(con) = buf.console.upgrade().filter(|c| c.is_active(&buf)) {
+                    con.size_event(window.2, window.3);
+                }
+            }
             Ok(())
+        }
+        // (_, CtrlRoutine): where control events start a thread in this process.
+        OP_SET_CTRL_ROUTINE => {
+            proc.ctrl_routine.store(a, Ordering::Release);
+            Ok(())
+        }
+        // (_, event, process group): CTRL_C_EVENT or CTRL_BREAK_EVENT to the
+        // processes on the caller's console; a group names one of them.
+        OP_GENERATE_CTRL => {
+            if a > 1 {
+                return Err(status::INVALID_PARAMETER);
+            }
+            let con = proc.current_console().ok_or(status::INVALID_HANDLE)?;
+            if !con.ctrl_event(a as u32, b as u32) {
+                return Err(0xC000_000Bu32 as NtStatus); // STATUS_INVALID_CID
+            }
+            Ok(())
+        }
+        // CreatePseudoConsole (_, input pipe's read end, output pipe's write
+        // end, size coord, HPCON out*): the console, by a handle of the host's.
+        OP_PTY_CREATE => {
+            let (w, hgt) = coord(b);
+            if w == 0 || hgt == 0 {
+                return Err(status::INVALID_PARAMETER);
+            }
+            if !ptr_ok(c, 8) {
+                return Err(status::ACCESS_VIOLATION);
+            }
+            let input = pipe_end(proc, h, false)?;
+            let output = pipe_end(proc, a, true)?;
+            // Ends of its own: the host may close its handles.
+            let con = Console::new_pty(
+                crate::nt_process::PipeEnd::reader(input.pipe.clone()),
+                crate::nt_process::PipeEnd::writer(output.pipe.clone()),
+                w,
+                hgt,
+            );
+            let handle = proc.handles.lock().allocate_ref(KernelObjectRef::Console(con), 0x0012_019F, crate::nt_objects::HANDLE_NO_INHERIT);
+            put(c, handle as u64)
+        }
+        OP_PTY_RESIZE | OP_PTY_CLOSE => {
+            let con = input(proc, h)?;
+            if con.pty().is_none() {
+                return Err(status::INVALID_HANDLE);
+            }
+            if op == OP_PTY_CLOSE {
+                con.close_pty();
+                proc.handles.lock().close(h as u32);
+                return Ok(());
+            }
+            let (w, hgt) = coord(a);
+            if w == 0 || hgt == 0 {
+                return Err(status::INVALID_PARAMETER);
+            }
+            con.resize_pty(w, hgt);
+            Ok(())
+        }
+        // FreeConsole: the process leaves its console (its handles to it
+        // stay). (_, 1): AttachConsole, back to the console it started with.
+        OP_FREE if a == 1 => {
+            if proc.current_console().is_some() {
+                return Err(status::ACCESS_DENIED);
+            }
+            if proc.console.is_none() {
+                return Err(status::INVALID_HANDLE);
+            }
+            *proc.console_now.lock() = None;
+            Ok(())
+        }
+        OP_FREE => {
+            if proc.current_console().is_none() {
+                return Err(status::INVALID_PARAMETER);
+            }
+            *proc.console_now.lock() = Some(None);
+            Ok(())
+        }
+        // AllocConsole (_, input handle out*, output handle out*): a console of
+        // the process's own, not shown in a terminal; only if it has none.
+        OP_ALLOC => {
+            if proc.current_console().is_some() {
+                return Err(status::ACCESS_DENIED);
+            }
+            if !ptr_ok(a, 8) || !ptr_ok(b, 8) {
+                return Err(status::ACCESS_VIOLATION);
+            }
+            let con = Console::new(proc.pid);
+            let (hi, ho) = {
+                let mut handles = proc.handles.lock();
+                let hi = handles.allocate_ref(KernelObjectRef::Console(con.clone()), 0x0012_019F, 0);
+                let ho = handles.allocate_ref(KernelObjectRef::ConsoleBuffer(con.active()), 0x0012_019F, 0);
+                (hi, ho)
+            };
+            *proc.console_now.lock() = Some(Some(con));
+            put(a, hi as u64)?;
+            put(b, ho as u64)
         }
         // (any console handle, out*)
         OP_NEW_BUFFER => {
             let con = match end_of(proc, h) {
                 Some(_) => input(proc, h)?,
-                None => proc.console.clone().ok_or(status::INVALID_HANDLE)?,
+                None => proc.current_console().ok_or(status::INVALID_HANDLE)?,
             };
             let buf = con.new_buffer();
             let handle = proc.handles.lock().allocate_ref(KernelObjectRef::ConsoleBuffer(buf), 0x001F_01FF, 0);
@@ -318,7 +453,7 @@ fn run(proc: &Process, op: u64, h: u64, a: u64, b: u64, c: u64, d: u64) -> Resul
         }
         // (console, out*, capacity, length*)
         OP_GET_TITLE => {
-            let con = proc.console.clone().ok_or(status::INVALID_HANDLE)?;
+            let con = proc.current_console().ok_or(status::INVALID_HANDLE)?;
             let t = con.title.lock().clone();
             let n = t.len().min(b as usize);
             if n > 0 && !ptr_ok(a, n * 2) {
@@ -328,7 +463,7 @@ fn run(proc: &Process, op: u64, h: u64, a: u64, b: u64, c: u64, d: u64) -> Resul
             put(c, t.len() as u32)
         }
         OP_SET_TITLE => {
-            let con = proc.console.clone().ok_or(status::INVALID_HANDLE)?;
+            let con = proc.current_console().ok_or(status::INVALID_HANDLE)?;
             if b > 0 && !ptr_ok(a, b as usize * 2) {
                 return Err(status::ACCESS_VIOLATION);
             }
@@ -377,7 +512,7 @@ fn run(proc: &Process, op: u64, h: u64, a: u64, b: u64, c: u64, d: u64) -> Resul
                         let ch = unsafe { core::ptr::read_unaligned(p) };
                         let attr = unsafe { core::ptr::read_unaligned(p.add(1)) };
                         let w = s.width;
-                        s.cells[y * w + x] = Cell { ch, attr };
+                        s.cells[y * w + x] = Cell { ch, attr, bold: false };
                     } else {
                         let cell = s.cells[y * s.width + x];
                         unsafe {
@@ -406,7 +541,7 @@ fn scroll(s: &mut crate::conbuf::ScreenBuffer, v: [i16; 13]) {
     let src = clamp([v[0] as i64, v[1] as i64, v[2] as i64, v[3] as i64]);
     let clip = if v[4] != 0 { clamp([v[5] as i64, v[6] as i64, v[7] as i64, v[8] as i64]) } else { [0, 0, w - 1, h - 1] };
     let (dx, dy) = (v[9] as i64, v[10] as i64);
-    let fill = Cell { ch: v[11] as u16, attr: v[12] as u16 };
+    let fill = Cell { ch: v[11] as u16, attr: v[12] as u16, bold: false };
     if src[0] > src[2] || src[1] > src[3] {
         return;
     }

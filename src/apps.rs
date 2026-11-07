@@ -1051,6 +1051,11 @@ pub struct TerminalEmulator {
     /// The console of the program running in this terminal: while it runs,
     /// typed lines go to it instead of the command line (console.rs).
     pub console: Option<alloc::sync::Arc<crate::console::Console>>,
+    /// Scrolled back into the console's history: the buffer line at the
+    /// top; None shows the console's window.
+    pub console_view: Option<usize>,
+    /// The grid size the console was last given (the window's, in cells).
+    grid: (usize, usize),
 }
 
 const TERM_ROW_H: i32 = 16;
@@ -1059,13 +1064,38 @@ const TERM_RESERVED_H: u32 = 28;
 
 impl Scrollable for TerminalEmulator {
     fn window_id(&self) -> u32 { self.window_id }
+    // While a console program runs, scrolling is through its buffer: the
+    // lines down to its window's last, its history above.
     fn area(&self, win: Rect) -> ScrollArea {
+        if let Some(c) = self.live_console() {
+            let rows = c.active().buf.lock().window.3.max(1);
+            return ScrollArea { right: win.x + win.w as i32 - 1, y: win.y + 36 + 4, h: (rows as i32 * TERM_ROW_H) as u32, rows };
+        }
         let h = win.h.saturating_sub(38 + TERM_RESERVED_H);
         ScrollArea { right: win.x + win.w as i32 - 1, y: win.y + 36 + 4, h, rows: ((h as i32 / TERM_ROW_H) as usize).max(1) }
     }
-    fn total(&self) -> usize { self.history.len() }
-    fn raw_top(&self) -> usize { self.scroll_anchor.unwrap_or(usize::MAX) }
-    fn set_top(&mut self, top: usize, max: usize) { self.scroll_anchor = if top >= max { None } else { Some(top) }; }
+    fn total(&self) -> usize {
+        match self.live_console() {
+            Some(c) => {
+                let a = c.active();
+                let b = a.buf.lock();
+                b.window.1 + b.window.3
+            }
+            None => self.history.len(),
+        }
+    }
+    fn raw_top(&self) -> usize {
+        let anchor = if self.live_console().is_some() { self.console_view } else { self.scroll_anchor };
+        anchor.unwrap_or(usize::MAX)
+    }
+    fn set_top(&mut self, top: usize, max: usize) {
+        let to = if top >= max { None } else { Some(top) };
+        if self.live_console().is_some() {
+            self.console_view = to;
+        } else {
+            self.scroll_anchor = to;
+        }
+    }
     fn grab(&self) -> Option<i32> { self.thumb_grab }
     fn set_grab(&mut self, grab: Option<i32>) { self.thumb_grab = grab; }
 }
@@ -1085,7 +1115,13 @@ impl TerminalEmulator {
             selection_end: None,
             slot: 0,
             console: None,
+            console_view: None,
+            grid: (0, 0),
         }
+    }
+
+    fn live_console(&self) -> Option<&alloc::sync::Arc<crate::console::Console>> {
+        self.console.as_ref().filter(|c| c.is_live())
     }
 
     /// RUN: start a Windows program. A console program runs in this
@@ -1134,7 +1170,9 @@ impl TerminalEmulator {
     fn paint_console(&self, r: &Renderer, console: &crate::console::Console, cx: i32, cy: i32) {
         let buf = console.active();
         let b = buf.buf.lock();
-        let (l, t, w, h) = b.window;
+        let (l, window_top, w, h) = b.window;
+        // Scrolled back, the history above the window shows instead.
+        let t = self.console_view.map_or(window_top, |v| v.min(window_top));
         let (x0, y0) = (cx + 8, cy + 4);
         for row in 0..h {
             let y = t + row;
@@ -1177,6 +1215,28 @@ impl TerminalEmulator {
             self.cursor_blink = !self.cursor_blink;
             self.blink_tick   = ms;
         }
+        // The window was resized: the console follows (and its program hears
+        // of it, WINDOW_BUFFER_SIZE_EVENT).
+        if let Some(console) = self.live_console().cloned() {
+            if let Some(size) = self.try_grid_size() {
+                if size != self.grid {
+                    self.grid = size;
+                    console.resize(size.0, size.1);
+                    TERMINAL_OUTPUT.store(true, core::sync::atomic::Ordering::Release);
+                }
+            }
+        } else {
+            self.console_view = None;
+        }
+    }
+
+    /// grid_size, without waiting for the window manager.
+    fn try_grid_size(&self) -> Option<(usize, usize)> {
+        let wm = DESKTOP_WM.try_lock()?;
+        let win = wm.windows.iter().find(|w| w.id == self.window_id)?;
+        let cols = (win.rect.w.saturating_sub(2 + 16 + 12) / 8) as usize;
+        let rows = (win.rect.h.saturating_sub(38 + 8) as i32 / TERM_ROW_H) as usize;
+        Some((cols.max(10), rows.max(2)))
     }
 
     pub fn paint(&self) {
@@ -1196,9 +1256,11 @@ impl TerminalEmulator {
 
         r.fill_rect(Rect::new(cx, cy, cw, ch), Color { r: 8, g: 12, b: 8 });
         if let Some(console) = self.console.as_ref().filter(|c| c.is_live()) {
+            let rect = win.rect;
             drop(wm);
             r.fill_rect(Rect::new(cx, cy, cw, ch), Color { r: 12, g: 12, b: 12 });
             self.paint_console(&r, console, cx, cy);
+            self.draw_bar(&r, self.area(rect), Color { r: 24, g: 24, b: 24 }, Color { r: 90, g: 90, b: 90 }, Color { r: 160, g: 160, b: 160 });
             return;
         }
 
@@ -1321,6 +1383,64 @@ pub fn open_terminal(x: i32, y: i32, w: u32, h: u32, z: u32) -> (u32, usize) {
 }
 
 /// Find the pool index whose `window_id` matches `id`, if any.
+/// The last character each key made going down, for its key-up record
+/// (Windows' carry it too).
+static KEY_CHARS: [core::sync::atomic::AtomicU16; 256] = [const { core::sync::atomic::AtomicU16::new(0) }; 256];
+
+/// A key went down or up while a terminal running a console program has the
+/// keyboard: it becomes key events for that console, with the key's VK,
+/// scan code, character and the modifiers held, as a Windows keyboard makes
+/// them. False if no such terminal has the keyboard.
+pub fn console_key(key: pc_keyboard::KeyCode, state: pc_keyboard::KeyState, decoded: Option<char>) -> bool {
+    let Some(id) = crate::desktop::DESKTOP_WM.try_lock().and_then(|wm| wm.focused_id) else { return false };
+    let Some(idx) = terminal_slot_for_window(id) else { return false };
+    let Some(console) = TERMINAL_POOL[idx].lock().console.clone().filter(|c| c.is_live()) else { return false };
+    let Some((vk, scan, ext)) = crate::nt_user::console_key_code(key) else { return true };
+    let mods = crate::nt_user::control_key_state(ext);
+    let ctrl = mods & 0x0C != 0;
+    let alt = mods & 0x03 != 0;
+    let ch: u16 = match vk {
+        0x0D => 0x0D,
+        0x08 => 0x08,
+        0x09 => 0x09,
+        0x1B => 0x1B,
+        0x2E => 0, // Delete makes no character
+        // Ctrl with a letter: the control character (Ctrl+C is 3).
+        0x41..=0x5A if ctrl && !alt => vk - 0x40,
+        // Ctrl+Space, Ctrl+[, ], backslash: NUL, ESC, GS, FS.
+        0x20 if ctrl => 0,
+        0xDB if ctrl => 0x1B,
+        0xDD if ctrl => 0x1D,
+        0xDC if ctrl => 0x1C,
+        _ => match decoded {
+            Some(c) if (c as u32) < 0x10000 && c as u32 != 0x7F => c as u16,
+            _ => 0,
+        },
+    };
+    let mut records = alloc::vec::Vec::new();
+    let mut push = |down: bool| {
+        let c = if down {
+            KEY_CHARS[vk as usize & 0xFF].store(ch, core::sync::atomic::Ordering::Relaxed);
+            ch
+        } else {
+            KEY_CHARS[vk as usize & 0xFF].load(core::sync::atomic::Ordering::Relaxed)
+        };
+        records.push(crate::console::key_record_scan(down, vk, scan, c, mods));
+    };
+    match state {
+        pc_keyboard::KeyState::Down => push(true),
+        pc_keyboard::KeyState::Up => push(false),
+        pc_keyboard::KeyState::SingleShot => {
+            push(true);
+            push(false);
+        }
+    }
+    // Typing brings the program's latest output back into view.
+    TERMINAL_POOL[idx].lock().console_view = None;
+    console.typed(&records);
+    true
+}
+
 pub fn terminal_slot_for_window(id: u32) -> Option<usize> {
     for (idx, slot) in TERMINAL_POOL.iter().enumerate() {
         if let Some(term) = slot.try_lock() {

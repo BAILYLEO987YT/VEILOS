@@ -416,6 +416,18 @@ fn load_and_spawn_pe_inner(
         *(p.add(0x120) as *mut u16) = 19041;           // OSBuildNumber
         *(p.add(0x122) as *mut u16) = 2;               // OSPlatformId = VER_PLATFORM_WIN32_NT
         *(p.add(0xB8) as *mut u32) = crate::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed); // NumberOfProcessors
+        // ImageSubsystem and its version, from the optional header: cmd.exe
+        // reads a child's to decide whether to wait for it (not for GUI ones).
+        let img = mapped_image_base;
+        if crate::memory::user_ptr_ok(img, 0x40) {
+            let nt = img + *((img + 0x3C) as *const u32) as u64;
+            let opt = nt + 0x18;
+            if crate::memory::user_ptr_ok(opt, 0x48) {
+                *(p.add(0x128) as *mut u32) = *((opt + 0x44) as *const u16) as u32; // ImageSubsystem
+                *(p.add(0x12C) as *mut u32) = *((opt + 0x30) as *const u16) as u32; // ImageSubsystemMajorVersion
+                *(p.add(0x130) as *mut u32) = *((opt + 0x32) as *const u16) as u32; // ImageSubsystemMinorVersion
+            }
+        }
     }
 
     // -----| PEB_LDR_DATA |----- (modules.rs fills the lists)

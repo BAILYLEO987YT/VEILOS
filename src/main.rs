@@ -73,6 +73,7 @@ pub mod nt_ipc;
 pub mod nt_socket;
 pub mod conbuf;
 pub mod nt_console;
+pub mod pty;
 pub mod workers;
 pub mod lgpu;
 pub mod virtio_net;
@@ -570,8 +571,19 @@ async fn gui_refresh_task() {
 
                     let maybe_key = {
                         let mut kb_guard = KB.lock();
-                        kb_guard.as_mut().unwrap().process_keyevent(ev)
+                        kb_guard.as_mut().unwrap().process_keyevent(ev.clone())
                     };
+
+                    // A terminal running a console program takes keys whole:
+                    // key events with VK codes and modifiers, down and up.
+                    if !program_key && crate::desktop::DesktopPhase::from_u8(crate::desktop::DESKTOP_PHASE.load(core::sync::atomic::Ordering::Acquire)) == crate::desktop::DesktopPhase::Desktop {
+                        let decoded = match maybe_key { Some(DecodedKey::Unicode(c)) => Some(c), _ => None };
+                        if crate::apps::console_key(ev.code, ev.state, decoded) {
+                            crate::users::SESSION.lock().touch();
+                            ui_dirty = true;
+                            continue;
+                        }
+                    }
 
                     if let Some(key) = maybe_key {
                         ui_dirty = true;

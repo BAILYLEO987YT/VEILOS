@@ -1,0 +1,23 @@
+create: 00000000
+attribute list: 1
+update: 1
+child started: 1
+resize: 00000000
+child exit: 23
+markers seen: 1
+screen (cursor 3,11):
+   0|red plain green|
+   1|name? typed|
+   2|keys?                         placed|
+   3|resize?|
+   4|typed [typed]|
+   5|key vk 26|
+   6|size 40x10 then 50x12|
+   7|line 1|
+   8|line 2|
+   9|line 3|
+  10|line 4|
+  11|end|
+colours:
+   0|1111......22222|
+exit 11

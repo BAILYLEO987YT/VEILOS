@@ -101,6 +101,12 @@ pub fn owns(vid: u32) -> bool {
     WINDOWS.lock().iter().any(|w| w.vid == vid)
 }
 
+/// Has process `pid` a window still? (Yes if the table is busy: the caller
+/// only acts on a no.)
+pub fn has_windows(pid: u32) -> bool {
+    WINDOWS.try_lock().map_or(true, |ws| ws.iter().any(|w| w.pid == pid && w.alive.load(Ordering::Acquire)))
+}
+
 // -----| message queues |-----
 
 struct Timer {
@@ -923,4 +929,28 @@ pub fn query(what: u64, out: u64) -> NtStatus {
     };
     unsafe { *(out as *mut [i32; 2]) = v };
     status::SUCCESS
+}
+
+// -----| keys for consoles |-----
+
+/// A key's virtual-key code, scan code and whether it's extended, for a
+/// console's KEY_EVENT records.
+pub fn console_key_code(key: pc_keyboard::KeyCode) -> Option<(u16, u16, bool)> {
+    vk_of(key).map(|(vk, _, scan, ext)| (vk as u16, scan as u16, ext))
+}
+
+/// KEY_EVENT_RECORD's dwControlKeyState, from the keys held and toggled now.
+pub fn control_key_state(extended: bool) -> u32 {
+    let toggled = |vk: usize| KEYS[vk].load(Ordering::Relaxed) & 2 != 0;
+    let mut s = 0;
+    if key_down(0xA5) { s |= 0x01; } // RIGHT_ALT_PRESSED
+    if key_down(0xA4) { s |= 0x02; } // LEFT_ALT_PRESSED
+    if key_down(0xA3) { s |= 0x04; } // RIGHT_CTRL_PRESSED
+    if key_down(0xA2) { s |= 0x08; } // LEFT_CTRL_PRESSED
+    if key_down(VK_SHIFT) { s |= 0x10; } // SHIFT_PRESSED
+    if toggled(0x90) { s |= 0x20; } // NUMLOCK_ON
+    if toggled(0x91) { s |= 0x40; } // SCROLLLOCK_ON
+    if toggled(0x14) { s |= 0x80; } // CAPSLOCK_ON
+    if extended { s |= 0x100; } // ENHANCED_KEY
+    s
 }
