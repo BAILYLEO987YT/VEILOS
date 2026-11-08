@@ -69,6 +69,11 @@ pub struct Process {
     /// VEILOS_MISSING_CALLS=zero in its environment: a call to an import
     /// nothing provides returns 0 (and is logged) instead of ending it.
     pub missing_calls_return_zero: core::sync::atomic::AtomicBool,
+    /// VEILOS_TRACE_SYSCALLS=1 in its environment: its system calls are logged.
+    pub trace_syscalls: core::sync::atomic::AtomicBool,
+    /// VEILOS_TRACE_NET=1: only its socket calls and waits (quiet enough to
+    /// leave a race as it was).
+    pub trace_net: core::sync::atomic::AtomicBool,
     /// The console of a console-subsystem program (its std handles refer to it).
     pub console: Option<alloc::sync::Arc<crate::console::Console>>,
     /// After FreeConsole (Some(None)) or AllocConsole (Some(Some(new))): the
@@ -136,6 +141,8 @@ impl Process {
             nt_env:      Mutex::new(crate::loader::NtEnv::default()),
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             missing_calls_return_zero: core::sync::atomic::AtomicBool::new(false),
+            trace_syscalls: core::sync::atomic::AtomicBool::new(false),
+            trace_net: core::sync::atomic::AtomicBool::new(false),
             console:     None,
             linker:      Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),
@@ -216,6 +223,8 @@ impl ProcessManager {
             nt_env: Mutex::new(crate::loader::NtEnv::default()),
             unresolved_imports: Mutex::new(alloc::vec::Vec::new()),
             missing_calls_return_zero: core::sync::atomic::AtomicBool::new(false),
+            trace_syscalls: core::sync::atomic::AtomicBool::new(false),
+            trace_net: core::sync::atomic::AtomicBool::new(false),
             console: None,
             linker: Mutex::new(None),
             exception_dispatcher: core::sync::atomic::AtomicU64::new(0),

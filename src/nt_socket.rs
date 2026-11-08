@@ -686,6 +686,9 @@ fn recv(s: &SocketObj, buf: u64, len: usize, flags: u32, from: Option<u64>) -> R
         return Err(WSAEFAULT);
     }
     let nonblocking = s.nonblocking.load(Ordering::Relaxed);
+    if len == 0 && s.kind == KIND_TCP {
+        return empty_recv(s, nonblocking);
+    }
     let deadline = s.deadline(false);
     let mut got = vec![0u8; len.min(1 << 20)];
     let mut peer = None;
@@ -760,6 +763,29 @@ fn recv(s: &SocketObj, buf: u64, len: usize, flags: u32, from: Option<u64>) -> R
         write_sockaddr(sa, p);
     }
     Ok(n)
+}
+
+/// A receive of nothing asks how the connection is, and doesn't wait for data.
+/// (Bun does this once a connect looks finished, to catch one that failed.)
+fn empty_recv(s: &SocketObj, nonblocking: bool) -> Res<usize> {
+    let st = s.state.lock();
+    let live = match &st.conn {
+        Conn::Loop { .. } => true,
+        Conn::Tcp(h) => {
+            let h = *h;
+            match net(|n| n.sockets.get::<tcp::Socket>(h).state())? {
+                tcp::State::Closed => return Err(WSAECONNRESET),
+                tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Listen => false,
+                _ => true,
+            }
+        }
+        _ => false,
+    };
+    match (live, nonblocking) {
+        (false, _) => Err(WSAENOTCONN),
+        (true, true) => Err(WSAEWOULDBLOCK),
+        (true, false) => Ok(0),
+    }
 }
 
 fn shutdown(s: &SocketObj, how: u32) -> Res<()> {

@@ -200,6 +200,32 @@ pub fn enable_sse() {
         );
         core::arch::asm!("fninit", options(nostack, nomem));
     }
+    enable_xsave_query();
+}
+
+/// CR4.OSXSAVE (bit 18), where the CPU has XSAVE, with XCR0 = x87 + SSE:
+/// the state the kernel already saves with FXSAVE. Programs may then ask
+/// with XGETBV which state the OS manages (Cygwin's signal code does, and
+/// XGETBV is #UD without OSXSAVE); AVX stays off, so they don't use it.
+fn enable_xsave_query() {
+    let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
+    if ecx & (1 << 26) == 0 {
+        return; // no XSAVE
+    }
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            "or  rax, {bit}",
+            "mov cr4, rax",
+            "xor ecx, ecx",
+            "mov eax, 3",
+            "xor edx, edx",
+            "xsetbv",
+            bit = const 1u64 << 18,
+            out("rax") _, out("rcx") _, out("rdx") _,
+            options(nostack),
+        );
+    }
 }
 
 /// IA32_PAT with entry 1 changed from write-through to write-combining:

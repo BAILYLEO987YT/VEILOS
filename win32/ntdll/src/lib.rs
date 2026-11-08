@@ -11,6 +11,7 @@
 mod exception;
 mod heap;
 mod rtl;
+mod sec;
 mod thread;
 
 use core::arch::naked_asm;
@@ -40,7 +41,7 @@ syscall_stubs! {
     NtDelayExecution, ZwDelayExecution => sys::NT_DELAY_EXECUTION;
     NtProtectVirtualMemory, ZwProtectVirtualMemory => sys::NT_PROTECT_VIRTUAL_MEMORY;
     NtQueryVirtualMemory, ZwQueryVirtualMemory => sys::NT_QUERY_VIRTUAL_MEMORY;
-    NtCreateFile, ZwCreateFile => sys::NT_CREATE_FILE;
+    VeilNtCreateFileRaw, ZwVeilNtCreateFileRaw => sys::NT_CREATE_FILE;
     NtQueryInformationFile, ZwQueryInformationFile => sys::NT_QUERY_INFORMATION_FILE;
     NtSetInformationFile, ZwSetInformationFile => sys::NT_SET_INFORMATION_FILE;
     NtQueryDirectoryFile, ZwQueryDirectoryFile => sys::NT_QUERY_DIRECTORY_FILE;
@@ -62,6 +63,27 @@ syscall_stubs! {
     VeilSocket, ZwVeilSocket => sys::VEIL_SOCKET;
     VeilConsole, ZwVeilConsole => sys::VEIL_CONSOLE;
     NtReadVirtualMemory, ZwReadVirtualMemory => sys::NT_READ_VIRTUAL_MEMORY;
+    NtWriteVirtualMemory, ZwWriteVirtualMemory => sys::NT_WRITE_VIRTUAL_MEMORY;
+    NtCreateSection, ZwCreateSection => sys::NT_CREATE_SECTION;
+    NtMapViewOfSection, ZwMapViewOfSection => sys::NT_MAP_VIEW_OF_SECTION;
+    NtUnmapViewOfSection, ZwUnmapViewOfSection => sys::NT_UNMAP_VIEW_OF_SECTION;
+    NtCreateMutant, ZwCreateMutant => sys::NT_CREATE_MUTANT;
+    NtCreateDirectoryObject, ZwCreateDirectoryObject => sys::NT_CREATE_DIRECTORY_OBJECT;
+    NtOpenEvent, ZwOpenEvent => sys::NT_OPEN_EVENT;
+    NtOpenMutant, ZwOpenMutant => sys::NT_OPEN_MUTANT;
+    NtOpenSemaphore, ZwOpenSemaphore => sys::NT_OPEN_SEMAPHORE;
+    NtOpenSection, ZwOpenSection => sys::NT_OPEN_SECTION;
+    NtOpenDirectoryObject, ZwOpenDirectoryObject => sys::NT_OPEN_DIRECTORY_OBJECT;
+    NtQueryEvent, ZwQueryEvent => sys::NT_QUERY_EVENT;
+    NtQuerySemaphore, ZwQuerySemaphore => sys::NT_QUERY_SEMAPHORE;
+    NtCreateTimer, ZwCreateTimer => sys::NT_CREATE_TIMER;
+    NtSetTimer, ZwSetTimer => sys::NT_SET_TIMER;
+    NtCancelTimer, ZwCancelTimer => sys::NT_CANCEL_TIMER;
+    NtQueryTimer, ZwQueryTimer => sys::NT_QUERY_TIMER;
+    NtAllocateVirtualMemoryEx, ZwAllocateVirtualMemoryEx => sys::NT_ALLOCATE_VIRTUAL_MEMORY_EX;
+    NtCreateSymbolicLinkObject, ZwCreateSymbolicLinkObject => sys::NT_CREATE_SYMBOLIC_LINK_OBJECT;
+    NtOpenSymbolicLinkObject, ZwOpenSymbolicLinkObject => sys::NT_OPEN_SYMBOLIC_LINK_OBJECT;
+    NtQuerySymbolicLinkObject, ZwQuerySymbolicLinkObject => sys::NT_QUERY_SYMBOLIC_LINK_OBJECT;
     NtQueryVolumeInformationFile, ZwQueryVolumeInformationFile => sys::NT_QUERY_VOLUME_INFORMATION_FILE;
     VeilCreateThread, ZwVeilCreateThread => sys::VEIL_CREATE_THREAD;
     VeilCreateProcess, ZwVeilCreateProcess => sys::VEIL_CREATE_PROCESS;
@@ -265,6 +287,8 @@ pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) ->
         unsafe {
             let peb = *(teb().add(layout::TEB_PEB) as *const *mut u8);
             *(peb.add(layout::PEB_PROCESS_HEAP) as *mut *mut Heap) = Heap::create();
+            // PEB.FastPebLock: ntdll's own, as on Windows (sec.rs).
+            *(peb.add(0x38) as *mut *mut u8) = sec::fast_peb_lock();
         }
     }
     1

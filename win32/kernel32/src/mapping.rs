@@ -7,10 +7,49 @@
 //!
 //! The mapping handle is a kernel event, so CloseHandle and DuplicateHandle
 //! work on it; this table says what it maps.
+//!
+//! Memory backed by the paging file is a real section instead (NtCreateSection):
+//! named ones are shared between processes, and views can be placed where the
+//! program asks, as the MSYS2/Cygwin runtime's shared regions need.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Bool, Handle, INVALID_HANDLE_VALUE};
+use nt_abi::status;
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn NtCreateSection(out: *mut Handle, access: u32, attrs: *const u8, size: *const i64, protect: u32, alloc: u32, file: Handle) -> i32;
+    fn NtOpenSection(out: *mut Handle, access: u32, attrs: *const u8) -> i32;
+    fn NtMapViewOfSection(section: Handle, process: Handle, base: *mut usize, zero_bits: usize, commit: usize, offset: *const i64, size: *mut usize, inherit: u32, alloc: u32, protect: u32) -> i32;
+    fn NtUnmapViewOfSection(process: Handle, base: usize) -> i32;
+}
+
+const SECTION_ALL_ACCESS: u32 = 0x000F_001F;
+const OBJ_OPENIF: u32 = 0x80;
+const STATUS_OBJECT_NAME_EXISTS: i32 = 0x4000_0000;
+
+/// OBJECT_ATTRIBUTES naming `name` (a Win32 name; the kernel reads Global\
+/// and Local\ itself), with the UNICODE_STRING it points at.
+struct Attrs {
+    us: [u64; 2],
+    oa: [u64; 6],
+}
+
+impl Attrs {
+    fn new(name: *const u16, flags: u32) -> Option<Self> {
+        if name.is_null() {
+            return None;
+        }
+        let n = unsafe { crate::util::wlen(name) };
+        Some(Self { us: [((n * 2) as u64) | ((n * 2 + 2) as u64) << 16, name as u64], oa: [48, 0, 0, flags as u64, 0, 0] })
+    }
+
+    fn ptr(&mut self) -> *const u8 {
+        self.oa[2] = self.us.as_ptr() as u64;
+        self.oa.as_ptr() as *const u8
+    }
+}
 
 const PAGE_READWRITE: u32 = 0x04;
 const PAGE_WRITECOPY: u32 = 0x08;
@@ -69,6 +108,20 @@ pub unsafe extern "system" fn CreateFileMappingW(file: Handle, _sa: usize, prote
             return 0;
         }
     }
+    if paged {
+        // A section of its own: shared with whoever opens the name.
+        let mut attrs = Attrs::new(_name, OBJ_OPENIF);
+        let size = requested as i64;
+        let mut h: Handle = 0;
+        let prot = protect & 0xFF;
+        let s = unsafe { NtCreateSection(&mut h, SECTION_ALL_ACCESS, attrs.as_mut().map_or(core::ptr::null(), |a| a.ptr()), &size, prot, 0x0800_0000, 0) };
+        if !status::is_success(s) {
+            crate::fail(s);
+            return 0;
+        }
+        crate::SetLastError(if s == STATUS_OBJECT_NAME_EXISTS { 183 } else { 0 }); // ERROR_ALREADY_EXISTS
+        return h;
+    }
     let size = if requested != 0 { requested } else { file_size(own) };
     if size == 0 {
         crate::SetLastError(ERROR_FILE_INVALID);
@@ -97,15 +150,64 @@ pub unsafe extern "system" fn CreateFileMappingW(file: Handle, _sa: usize, prote
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn CreateFileMappingA(file: Handle, sa: usize, protect: u32, hi: u32, lo: u32, _name: *const u8) -> Handle {
-    unsafe { CreateFileMappingW(file, sa, protect, hi, lo, core::ptr::null()) }
+pub unsafe extern "system" fn CreateFileMappingA(file: Handle, sa: usize, protect: u32, hi: u32, lo: u32, name: *const u8) -> Handle {
+    if name.is_null() {
+        return unsafe { CreateFileMappingW(file, sa, protect, hi, lo, core::ptr::null()) };
+    }
+    let w = unsafe { crate::util::widen(name) };
+    unsafe { CreateFileMappingW(file, sa, protect, hi, lo, w.as_ptr()) }
 }
 
-/// Named mappings aren't kept: opening one finds nothing.
+/// Named mappings are sections (paging-file ones; named file mappings
+/// aren't kept).
 #[no_mangle]
-pub extern "system" fn OpenFileMappingW(_access: u32, _inherit: Bool, _name: *const u16) -> Handle {
-    crate::SetLastError(2);
-    0
+pub unsafe extern "system" fn OpenFileMappingW(_access: u32, _inherit: Bool, name: *const u16) -> Handle {
+    let Some(mut attrs) = Attrs::new(name, 0) else {
+        crate::SetLastError(87);
+        return 0;
+    };
+    let mut h: Handle = 0;
+    let s = unsafe { NtOpenSection(&mut h, SECTION_ALL_ACCESS, attrs.ptr()) };
+    if !status::is_success(s) {
+        crate::fail(s);
+        return 0;
+    }
+    h
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn OpenFileMappingA(access: u32, inherit: Bool, name: *const u8) -> Handle {
+    if name.is_null() {
+        crate::SetLastError(87);
+        return 0;
+    }
+    let w = unsafe { crate::util::widen(name) };
+    unsafe { OpenFileMappingW(access, inherit, w.as_ptr()) }
+}
+
+/// A view of a section (what isn't one of this table's mappings).
+fn section_view(h: Handle, access: u32, offset: u64, bytes: usize, at: usize) -> Option<usize> {
+    const FILE_MAP_COPY: u32 = 1;
+    const FILE_MAP_EXECUTE: u32 = 0x20;
+    let mut protect = if access & FILE_MAP_COPY != 0 && access & FILE_MAP_WRITE == 0 {
+        PAGE_WRITECOPY
+    } else if access & FILE_MAP_WRITE != 0 {
+        PAGE_READWRITE
+    } else {
+        0x02 // PAGE_READONLY
+    };
+    if access & FILE_MAP_EXECUTE != 0 {
+        protect <<= 4; // the PAGE_EXECUTE_* of each
+    }
+    let mut base = at;
+    let mut size = bytes;
+    let off = offset as i64;
+    let s = unsafe { NtMapViewOfSection(h, u64::MAX, &mut base, 0, 0, &off, &mut size, 1, 0, protect) };
+    if !status::is_success(s) {
+        crate::fail(s);
+        return None;
+    }
+    Some(base)
 }
 
 /// The mapping's contents, read the first time a view asks.
@@ -137,10 +239,9 @@ fn contents(i: usize) -> Option<usize> {
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn MapViewOfFileEx(h: Handle, access: u32, hi: u32, lo: u32, bytes: usize, _at: usize) -> usize {
+pub unsafe extern "system" fn MapViewOfFileEx(h: Handle, access: u32, hi: u32, lo: u32, bytes: usize, at: usize) -> usize {
     let Some(i) = with(|t| t.iter().position(|m| m.handle == h && h != 0)) else {
-        crate::SetLastError(6);
-        return 0;
+        return section_view(h, access, (hi as u64) << 32 | lo as u64, bytes, at).unwrap_or(0);
     };
     let m = with(|t| t[i]);
     let offset = (hi as u64) << 32 | lo as u64;
@@ -217,6 +318,9 @@ pub extern "system" fn FlushViewOfFile(addr: usize, _bytes: usize) -> Bool {
 #[no_mangle]
 pub extern "system" fn UnmapViewOfFile(addr: usize) -> Bool {
     if unsafe { crate::VeilUnmapView(addr as u64) } == 0 {
+        return 1;
+    }
+    if unsafe { NtUnmapViewOfSection(u64::MAX, addr) } == 0 {
         return 1;
     }
     let Some(i) = holding(addr) else {

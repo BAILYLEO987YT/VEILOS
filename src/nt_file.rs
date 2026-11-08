@@ -187,7 +187,7 @@ fn read_unicode(us: u64) -> Option<String> {
 }
 
 /// The name in OBJECT_ATTRIBUTES at `oa` (user memory).
-fn read_object_name(oa: u64) -> Option<String> {
+pub fn read_object_name(oa: u64) -> Option<String> {
     if !ptr_ok(oa, core::mem::size_of::<ObjectAttributes>()) {
         return None;
     }
@@ -438,67 +438,115 @@ fn put_basic(out: u64, is_dir: bool, t: i64) {
     }
 }
 
+/// An access mask as Windows keeps it: generic rights mapped to the file
+/// rights they stand for (MSYS2 checks FILE_WRITE_DATA on its std handles).
+fn specific_access(access: u32) -> u32 {
+    let mut a = access & 0x00FF_FFFF;
+    if access & 0x8000_0000 != 0 { a |= 0x0012_0089; } // GENERIC_READ
+    if access & 0x4000_0000 != 0 { a |= 0x0012_0116; } // GENERIC_WRITE
+    if access & 0x2000_0000 != 0 { a |= 0x0012_00A0; } // GENERIC_EXECUTE
+    if access & 0x1200_0000 != 0 { a |= 0x001F_01FF; } // GENERIC_ALL, MAXIMUM_ALLOWED
+    a
+}
+
 /// NtQueryInformationFile(FileHandle, IoStatusBlock*, FileInformation*, Length, Class).
+/// Basic, standard, internal, EA, access, name, position, mode, alignment,
+/// all of those at once (FileAllInformation), network-open and
+/// attribute-tag information.
 pub fn query_information(f: &FileObject, iosb: u64, out: u64, length: usize, class: u32) -> NtStatus {
-    let need = match class {
-        file::BASIC_INFORMATION => 40,
-        file::STANDARD_INFORMATION => 24,
-        file::POSITION_INFORMATION => 8,
-        file::INTERNAL_INFORMATION => 8,
-        // FileNameLength, then the name.
-        file::NAME_INFORMATION => {
-            if length < 4 || !ptr_ok(out, length) {
-                return status::BUFFER_TOO_SMALL;
-            }
-            let path = f.current_path();
-            let units: Vec<u16> = path.chars().map(|c| if c == '/' { '\\' } else { c }).collect::<String>().encode_utf16().collect();
-            let bytes = (units.len() * 2).min(length - 4);
-            unsafe {
-                core::ptr::write_unaligned(out as *mut u32, (units.len() * 2) as u32);
-                core::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, (out + 4) as *mut u8, bytes);
-            }
-            write_iosb(iosb, status::SUCCESS, 4 + bytes as u64);
-            return status::SUCCESS;
-        }
-        _ => return status::INVALID_INFO_CLASS,
-    };
-    if length < need {
-        return status::BUFFER_TOO_SMALL;
-    }
-    if !ptr_ok(out, need) {
-        return status::ACCESS_VIOLATION;
-    }
+    const EA: u32 = 7;
+    const ACCESS: u32 = 8;
+    const MODE: u32 = 16;
+    const ALIGNMENT: u32 = 17;
+    const ALL: u32 = 18;
+    const NETWORK_OPEN: u32 = 34;
+    const ATTRIBUTE_TAG: u32 = 35;
+    const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005u32 as NtStatus;
+
     let size = f.file().map_or(0, |s| s.file.len());
     let mtime = match f.file() {
         Some(s) if s.file.mtime() != 0 => s.file.mtime(),
         Some(_) => now_filetime(),
         None => mtime_of(&f.path.lock()),
     };
-    unsafe {
-        match class {
-            file::BASIC_INFORMATION => put_basic(out, f.is_dir, mtime),
-            file::STANDARD_INFORMATION => {
-                core::ptr::write_unaligned(out as *mut u64, (size + 4095) & !4095); // AllocationSize
-                core::ptr::write_unaligned((out + 8) as *mut u64, size); // EndOfFile
-                core::ptr::write_unaligned((out + 16) as *mut u32, 1); // NumberOfLinks
-                let pending = f.delete_on_close.load(Ordering::Relaxed) || f.file().is_some_and(|s| s.delete_pending.load(Ordering::Relaxed));
-                *((out + 20) as *mut u8) = pending as u8;
-                *((out + 21) as *mut u8) = f.is_dir as u8;
-                core::ptr::write_unaligned((out + 22) as *mut u16, 0);
-            }
-            // A number for the file: its path, which is what two opens share.
-            file::INTERNAL_INFORMATION => {
-                let mut h = 0xCBF2_9CE4_8422_2325u64;
-                for b in open_key(&f.current_path()).bytes() {
-                    h = (h ^ b as u64).wrapping_mul(0x0100_0000_01B3);
-                }
-                core::ptr::write_unaligned(out as *mut u64, h);
-            }
-            _ => core::ptr::write_unaligned(out as *mut u64, *f.position.lock()),
+    let pending = f.delete_on_close.load(Ordering::Relaxed) || f.file().is_some_and(|s| s.delete_pending.load(Ordering::Relaxed));
+    // A number for the file: its path, which is what two opens share.
+    let id = {
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        for b in open_key(&f.current_path()).bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01B3);
         }
+        h
+    };
+    let mut basic = [0u8; 40];
+    put_basic(basic.as_mut_ptr() as u64, f.is_dir, mtime);
+    let mut standard = [0u8; 24];
+    standard[0..8].copy_from_slice(&((size + 4095) & !4095).to_le_bytes()); // AllocationSize
+    standard[8..16].copy_from_slice(&size.to_le_bytes()); // EndOfFile
+    standard[16..20].copy_from_slice(&1u32.to_le_bytes()); // NumberOfLinks
+    standard[20] = pending as u8;
+    standard[21] = f.is_dir as u8;
+    let position = (*f.position.lock()).to_le_bytes();
+
+    let mut info: Vec<u8> = Vec::new();
+    let mut with_name = false;
+    match class {
+        file::BASIC_INFORMATION => info.extend_from_slice(&basic),
+        file::STANDARD_INFORMATION => info.extend_from_slice(&standard),
+        file::INTERNAL_INFORMATION => info.extend_from_slice(&id.to_le_bytes()),
+        EA | MODE | ALIGNMENT => info.extend_from_slice(&0u32.to_le_bytes()),
+        ACCESS => info.extend_from_slice(&specific_access(f.access).to_le_bytes()),
+        file::POSITION_INFORMATION => info.extend_from_slice(&position),
+        file::NAME_INFORMATION => with_name = true,
+        ALL => {
+            info.extend_from_slice(&basic);
+            info.extend_from_slice(&standard);
+            info.extend_from_slice(&id.to_le_bytes());
+            info.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            info.extend_from_slice(&specific_access(f.access).to_le_bytes());
+            info.extend_from_slice(&position);
+            info.extend_from_slice(&0u32.to_le_bytes()); // Mode
+            info.extend_from_slice(&0u32.to_le_bytes()); // AlignmentRequirement
+            with_name = true;
+        }
+        NETWORK_OPEN => {
+            info.extend_from_slice(&basic[..32]); // the four times
+            info.extend_from_slice(&standard[..16]); // AllocationSize, EndOfFile
+            info.extend_from_slice(&basic[32..36]); // FileAttributes
+            info.extend_from_slice(&0u32.to_le_bytes());
+        }
+        ATTRIBUTE_TAG => {
+            info.extend_from_slice(&basic[32..36]);
+            info.extend_from_slice(&0u32.to_le_bytes()); // ReparseTag
+        }
+        _ => return status::INVALID_INFO_CLASS,
     }
-    write_iosb(iosb, status::SUCCESS, need as u64);
-    status::SUCCESS
+    let mut st = status::SUCCESS;
+    if with_name {
+        // FileNameLength, then the name (as much as fits: STATUS_BUFFER_OVERFLOW).
+        let path = f.current_path();
+        let units: Vec<u16> = path.chars().map(|c| if c == '/' { '\\' } else { c }).collect::<String>().encode_utf16().collect();
+        info.extend_from_slice(&((units.len() * 2) as u32).to_le_bytes());
+        let fixed = info.len();
+        if length < fixed {
+            return status::BUFFER_TOO_SMALL;
+        }
+        for u in &units {
+            info.extend_from_slice(&u.to_le_bytes());
+        }
+        if info.len() > length {
+            info.truncate(length);
+            st = STATUS_BUFFER_OVERFLOW;
+        }
+    } else if length < info.len() {
+        return status::BUFFER_TOO_SMALL;
+    }
+    if !ptr_ok(out, info.len()) {
+        return status::ACCESS_VIOLATION;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), out as *mut u8, info.len()) };
+    write_iosb(iosb, st, info.len() as u64);
+    st
 }
 
 /// NtSetInformationFile(FileHandle, IoStatusBlock*, FileInformation*, Length, Class).

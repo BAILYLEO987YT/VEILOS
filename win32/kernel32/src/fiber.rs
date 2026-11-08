@@ -266,8 +266,10 @@ const ERROR_PIPE_CONNECTED: u32 = 535;
 
 /// What follows "\\.\pipe\", if `name` is a pipe's name.
 pub fn pipe_name(name: &[u16]) -> bool {
+    // "\\.\pipe\" or "\\?\pipe\": libuv names its stdio pipes the second way.
     const PREFIX: &[u8] = b"\\\\.\\pipe\\";
-    name.len() > PREFIX.len() && name.iter().zip(PREFIX).all(|(&u, &b)| u < 0x80 && (u as u8).eq_ignore_ascii_case(&b))
+    name.len() > PREFIX.len()
+        && name.iter().zip(PREFIX).enumerate().all(|(i, (&u, &b))| u < 0x80 && ((i == 2 && u == b'?' as u16) || (u as u8).eq_ignore_ascii_case(&b)))
 }
 
 /// CreateFile on a pipe's name: a client end.
@@ -304,17 +306,28 @@ pub unsafe extern "system" fn CreateNamedPipeA(name: *const u8, open: u32, mode:
     unsafe { CreateNamedPipeW(w.as_ptr(), open, mode, max, out_size, in_size, timeout, sa) }
 }
 
-/// Every operation finishes before it returns, so an OVERLAPPED needs only its
-/// event set.
+/// With an OVERLAPPED and no client yet, a worker waits and the call says
+/// ERROR_IO_PENDING (iocp.rs), as a pipe server built on a completion port
+/// expects; without one, it waits here.
 #[no_mangle]
 pub unsafe extern "system" fn ConnectNamedPipe(h: Handle, overlapped: *mut u64) -> Bool {
-    let s = unsafe { crate::VeilPipe(2, h, 0, 0) };
     if !overlapped.is_null() {
+        const STATUS_PIPE_LISTENING: i32 = 0xC000_00B3u32 as i32;
+        let s = unsafe { crate::VeilPipe(9, h, 0, 0) };
+        if s == STATUS_PIPE_LISTENING {
+            return crate::iocp::connect_pending(h, overlapped as usize);
+        }
+        if s != STATUS_PIPE_CONNECTED {
+            return crate::fail(s);
+        }
         let event = unsafe { *overlapped.add(3) } & !1;
         if event != 0 {
             crate::sync::SetEvent(event);
         }
+        crate::SetLastError(ERROR_PIPE_CONNECTED);
+        return 0;
     }
+    let s = unsafe { crate::VeilPipe(2, h, 0, 0) };
     if s == STATUS_PIPE_CONNECTED {
         crate::SetLastError(ERROR_PIPE_CONNECTED);
         return 0;

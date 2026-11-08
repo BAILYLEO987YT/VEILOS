@@ -7,9 +7,9 @@ use nt_abi::{layout, status, NtStatus};
 
 #[repr(C)]
 pub struct UnicodeString {
-    length: u16,
-    maximum_length: u16,
-    buffer: *mut u16,
+    pub(crate) length: u16,
+    pub(crate) maximum_length: u16,
+    pub(crate) buffer: *mut u16,
 }
 
 fn heap() -> *mut crate::heap::Heap {
@@ -162,7 +162,7 @@ const SLASH: u16 = b'\\' as u16;
 
 /// `dos` made absolute and normalised ("C:\dir\file"), in `out`. Returns
 /// the length and where the last component starts.
-fn full_dos_path(dos: &[u16], out: &mut [u16; 1024]) -> Option<(usize, usize)> {
+pub(crate) fn full_dos_path(dos: &[u16], out: &mut [u16; 1024]) -> Option<(usize, usize)> {
     let mut n = 0;
     fn push(out: &mut [u16; 1024], u: u16, n: &mut usize) {
         if *n < out.len() - 1 {
@@ -306,6 +306,27 @@ pub unsafe extern "system" fn RtlGetFullPathName_U(dos: *const u16, size: u32, o
 
 type CreateFile = unsafe extern "system" fn(*mut u64, u32, *const u8, *mut u8, *const i64, u32, u32, u32, u32, *const u8, u32) -> NtStatus;
 
+/// NtCreateFile: pipes by name (and the pipe folder) here, everything else
+/// in the kernel.
+#[no_mangle]
+pub unsafe extern "system" fn NtCreateFile(handle: *mut u64, access: u32, attrs: *const u8, iosb: *mut u8, size: *const i64, file_attrs: u32, share: u32, disposition: u32, options: u32, ea: *const u8, ea_len: u32) -> NtStatus {
+    if !attrs.is_null() {
+        if let Some(s) = unsafe { open_pipe(handle, attrs) } {
+            if s == 0 {
+                unsafe { apply_inherit(handle, attrs) };
+            }
+            return s;
+        }
+    }
+    let raw: CreateFile = unsafe { core::mem::transmute(crate::VeilNtCreateFileRaw as *const ()) };
+    unsafe { raw(handle, access, attrs, iosb, size, file_attrs, share, disposition, options, ea, ea_len) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ZwCreateFile(handle: *mut u64, access: u32, attrs: *const u8, iosb: *mut u8, size: *const i64, file_attrs: u32, share: u32, disposition: u32, options: u32, ea: *const u8, ea_len: u32) -> NtStatus {
+    unsafe { NtCreateFile(handle, access, attrs, iosb, size, file_attrs, share, disposition, options, ea, ea_len) }
+}
+
 /// NtOpenFile: NtCreateFile with FILE_OPEN.
 #[no_mangle]
 pub unsafe extern "system" fn NtOpenFile(handle: *mut u64, access: u32, attrs: *const u8, iosb: *mut u8, share: u32, options: u32) -> NtStatus {
@@ -316,7 +337,7 @@ pub unsafe extern "system" fn NtOpenFile(handle: *mut u64, access: u32, attrs: *
         }
         return s;
     }
-    let create: CreateFile = unsafe { core::mem::transmute(crate::NtCreateFile as *const ()) };
+    let create: CreateFile = unsafe { core::mem::transmute(crate::VeilNtCreateFileRaw as *const ()) };
     unsafe { create(handle, access, attrs, iosb, core::ptr::null(), 0, share, 1, options, core::ptr::null(), 0) }
 }
 
@@ -344,6 +365,40 @@ fn is_pipe_folder(name: &[u16]) -> bool {
     name.len() == FOLDER.len() && name.iter().zip(FOLDER).all(|(&u, &b)| u < 0x80 && (u as u8).eq_ignore_ascii_case(&b))
 }
 
+/// Handles this process holds that stand for the pipe folder (an event
+/// each): names relative to them are pipes.
+static PIPE_FOLDERS: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+
+fn is_folder_handle(h: u64) -> bool {
+    h != 0 && PIPE_FOLDERS.iter().any(|f| f.load(core::sync::atomic::Ordering::Relaxed) == h)
+}
+
+/// The kernel's name for a pipe, "\\.\pipe\NAME" and a NUL, if `name` (under
+/// `root`) is one: relative to a pipe-folder handle, or under
+/// \Device\NamedPipe\ or \??\pipe\.
+fn pipe_full_name(root: u64, name: &[u16]) -> Option<[u16; 300]> {
+    fn strip<'a>(n: &'a [u16], prefix: &[u8]) -> Option<&'a [u16]> {
+        (n.len() > prefix.len() && n.iter().zip(prefix).all(|(&u, &b)| u < 0x80 && (u as u8).eq_ignore_ascii_case(&b))).then(|| &n[prefix.len()..])
+    }
+    let rest = if is_folder_handle(root) {
+        name
+    } else if root == 0 {
+        strip(name, b"\\Device\\NamedPipe\\").or_else(|| strip(name, b"\\??\\pipe\\"))?
+    } else {
+        return None;
+    };
+    if rest.is_empty() || rest.len() > 280 {
+        return None;
+    }
+    let mut out = [0u16; 300];
+    let prefix = b"\\\\.\\pipe\\";
+    for (o, &b) in out.iter_mut().zip(prefix) {
+        *o = b as u16;
+    }
+    out[prefix.len()..prefix.len() + rest.len()].copy_from_slice(rest);
+    Some(out)
+}
+
 fn veil_pipe() -> unsafe extern "system" fn(u64, u64, u64, u64) -> NtStatus {
     unsafe { core::mem::transmute(crate::VeilPipe as *const ()) }
 }
@@ -361,11 +416,26 @@ unsafe fn apply_inherit(handle: *mut u64, attrs: *const u8) {
 
 unsafe fn open_pipe(handle: *mut u64, attrs: *const u8) -> Option<NtStatus> {
     let (root, name) = unsafe { pipe_attrs(attrs) };
+    const NULL_DEVICE: &[u8] = b"\\Device\\Null";
+    if root == 0 && name.len() == NULL_DEVICE.len() && name.iter().zip(NULL_DEVICE).all(|(&u, &b)| u < 0x80 && (u as u8).eq_ignore_ascii_case(&b)) {
+        return Some(unsafe { veil_pipe()(7, handle as u64, 0, 0) });
+    }
     if is_pipe_folder(name) {
         // Nothing to open: an event stands for the folder.
         type CreateEvent = unsafe extern "system" fn(*mut u64, u32, *const u8, u32, u8) -> NtStatus;
         let create: CreateEvent = unsafe { core::mem::transmute(crate::NtCreateEvent as *const ()) };
-        return Some(unsafe { create(handle, 0x1F0003, core::ptr::null(), 0, 0) });
+        let s = unsafe { create(handle, 0x1F0003, core::ptr::null(), 0, 0) };
+        if s == 0 {
+            let h = unsafe { *handle };
+            if let Some(slot) = PIPE_FOLDERS.iter().find(|f| f.load(core::sync::atomic::Ordering::Relaxed) == 0) {
+                slot.store(h, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        return Some(s);
+    }
+    // A named pipe's client end.
+    if let Some(full) = pipe_full_name(root, name) {
+        return Some(unsafe { veil_pipe()(1, full.as_ptr() as u64, handle as u64, 0) });
     }
     if root != 0 && name.is_empty() {
         let s = unsafe { veil_pipe()(6, root, handle as u64, 0) };
@@ -382,7 +452,12 @@ unsafe fn open_pipe(handle: *mut u64, attrs: *const u8) -> Option<NtStatus> {
 /// offered here: CreateNamedPipe is how those are made.
 #[no_mangle]
 pub unsafe extern "system" fn NtCreateNamedPipeFile(handle: *mut u64, _access: u32, attrs: *const u8, iosb: *mut u64, _share: u32, _disposition: u32, _options: u32, _pipe_type: u32, _read_mode: u32, _completion: u32, _max: u32, inbound: u32, outbound: u32, _timeout: *const i64) -> NtStatus {
-    let s = unsafe { veil_pipe()(0, 0, handle as u64, inbound.max(outbound) as u64) };
+    // Named (under the pipe folder, as the MSYS2 runtime makes its pipes) or
+    // nameless.
+    let (root, name) = if attrs.is_null() { (0, &[][..]) } else { unsafe { pipe_attrs(attrs) } };
+    let full = pipe_full_name(root, name);
+    let name_ptr = full.as_ref().map_or(0, |f| f.as_ptr() as u64);
+    let s = unsafe { veil_pipe()(0, name_ptr, handle as u64, inbound.max(outbound) as u64) };
     if s == 0 {
         unsafe { apply_inherit(handle, attrs) };
     }
@@ -405,7 +480,7 @@ const STATUS_NO_TOKEN: NtStatus = 0xC000_007Cu32 as i32;
 const STATUS_INVALID_DEVICE_REQUEST: NtStatus = 0xC000_0010u32 as i32;
 const STATUS_NOT_FOUND: NtStatus = 0xC000_0225u32 as i32;
 
-/// No security tokens yet: threads have none, processes can't be opened for one.
+/// Threads don't impersonate, so they have no token.
 #[no_mangle]
 pub extern "system" fn NtOpenThreadToken(_thread: u64, _access: u32, _as_self: u8, token: *mut u64) -> NtStatus {
     if !token.is_null() {
@@ -419,12 +494,29 @@ pub extern "system" fn NtOpenThreadTokenEx(thread: u64, access: u32, as_self: u8
     NtOpenThreadToken(thread, access, as_self, token)
 }
 
+// -----| the token: one user, the same everywhere |-----
+//
+// The process token is a pseudo handle (-5), as kernel32's OpenProcessToken
+// gives; every token call answers for the one user, S-1-5-21-1000-1000-1000-1001,
+// whose primary group is ...-513, at medium integrity.
+
+const TOKEN: u64 = (-5i64) as u64;
+const STATUS_BUFFER_TOO_SMALL_: NtStatus = 0xC000_0023u32 as i32;
+
+const USER_SID: [u8; 28] = [1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 0xE8, 3, 0, 0, 0xE8, 3, 0, 0, 0xE8, 3, 0, 0, 0xE9, 3, 0, 0];
+const GROUP_SID: [u8; 28] = [1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 0xE8, 3, 0, 0, 0xE8, 3, 0, 0, 0xE8, 3, 0, 0, 0x01, 2, 0, 0];
+const EVERYONE_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+const USERS_SID: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0];
+const AUTH_USERS_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0];
+const MEDIUM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 16, 0, 0x20, 0, 0];
+
 #[no_mangle]
 pub extern "system" fn NtOpenProcessToken(_process: u64, _access: u32, token: *mut u64) -> NtStatus {
-    if !token.is_null() {
-        unsafe { *token = 0 };
+    if token.is_null() {
+        return status::ACCESS_VIOLATION;
     }
-    status::ACCESS_DENIED
+    unsafe { *token = TOKEN };
+    status::SUCCESS
 }
 
 #[no_mangle]
@@ -432,9 +524,122 @@ pub extern "system" fn NtOpenProcessTokenEx(process: u64, access: u32, _attrs: u
     NtOpenProcessToken(process, access, token)
 }
 
+/// A token answer: fixed part, then SIDs it points at (offsets from the
+/// start become pointers once it's in the caller's buffer).
+struct Answer {
+    buf: [u8; 256],
+    len: usize,
+    /// Where a pointer goes, and the offset it points at.
+    ptrs: [(usize, usize); 8],
+    n_ptrs: usize,
+}
+
+impl Answer {
+    fn new(fixed: usize) -> Self {
+        Self { buf: [0; 256], len: fixed, ptrs: [(0, 0); 8], n_ptrs: 0 }
+    }
+    fn u32_at(&mut self, at: usize, v: u32) {
+        self.buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    /// Append a SID; the pointer at `ptr_at` will point at it.
+    fn sid(&mut self, ptr_at: usize, sid: &[u8]) {
+        let at = self.len.next_multiple_of(4);
+        self.buf[at..at + sid.len()].copy_from_slice(sid);
+        self.len = at + sid.len();
+        self.ptrs[self.n_ptrs] = (ptr_at, at);
+        self.n_ptrs += 1;
+    }
+}
+
 #[no_mangle]
-pub extern "system" fn NtQueryInformationToken(_token: u64, _class: u32, _info: *mut u8, _len: u32, _ret: *mut u32) -> NtStatus {
-    status::INVALID_HANDLE
+pub unsafe extern "system" fn NtQueryInformationToken(token: u64, class: u32, info: *mut u8, len: u32, ret: *mut u32) -> NtStatus {
+    if token != TOKEN {
+        return status::INVALID_HANDLE;
+    }
+    let a = match class {
+        // TokenUser, TokenIntegrityLevel: a SID_AND_ATTRIBUTES.
+        1 | 25 => {
+            let mut a = Answer::new(16);
+            if class == 25 {
+                a.u32_at(8, 0x20); // SE_GROUP_INTEGRITY
+                a.sid(0, &MEDIUM_SID);
+            } else {
+                a.sid(0, &USER_SID);
+            }
+            a
+        }
+        // TokenGroups: the primary group, Everyone, Users, Authenticated Users.
+        2 => {
+            let groups: [&[u8]; 4] = [&GROUP_SID, &EVERYONE_SID, &USERS_SID, &AUTH_USERS_SID];
+            let mut a = Answer::new(8 + 16 * groups.len());
+            a.u32_at(0, groups.len() as u32);
+            for (i, g) in groups.iter().enumerate() {
+                a.u32_at(8 + 16 * i + 8, 7); // mandatory, enabled by default, enabled
+                a.sid(8 + 16 * i, g);
+            }
+            a
+        }
+        // TokenPrivileges: none listed.
+        3 => Answer::new(4),
+        // TokenOwner, TokenPrimaryGroup: a pointer to a SID.
+        4 | 5 => {
+            let mut a = Answer::new(8);
+            a.sid(0, if class == 4 { &USER_SID } else { &GROUP_SID });
+            a
+        }
+        // TokenDefaultDacl: none (a NULL ACL pointer).
+        6 => Answer::new(8),
+        // TokenSource: "User32  " and a LUID.
+        7 => {
+            let mut a = Answer::new(16);
+            a.buf[..8].copy_from_slice(b"User32  ");
+            a
+        }
+        // TokenType: primary.
+        8 => {
+            let mut a = Answer::new(4);
+            a.u32_at(0, 1);
+            a
+        }
+        // TokenStatistics: ids, type primary, the group count.
+        10 => {
+            let mut a = Answer::new(56);
+            a.u32_at(0, 0x1000);
+            a.u32_at(8, 0x3E7);
+            a.buf[16..24].copy_from_slice(&i64::MAX.to_le_bytes());
+            a.u32_at(24, 1);
+            a.u32_at(40, 4);
+            a
+        }
+        // TokenSessionId: 1.
+        12 => {
+            let mut a = Answer::new(4);
+            a.u32_at(0, 1);
+            a
+        }
+        // TokenElevationType: default.
+        18 => {
+            let mut a = Answer::new(4);
+            a.u32_at(0, 1);
+            a
+        }
+        // TokenElevation: not elevated; TokenIsAppContainer: no.
+        20 | 29 => Answer::new(4),
+        _ => return status::INVALID_INFO_CLASS,
+    };
+    unsafe {
+        if !ret.is_null() {
+            *ret = a.len as u32;
+        }
+        if (len as usize) < a.len || info.is_null() {
+            return STATUS_BUFFER_TOO_SMALL_;
+        }
+        core::ptr::copy_nonoverlapping(a.buf.as_ptr(), info, a.len);
+        for &(at, target) in &a.ptrs[..a.n_ptrs] {
+            core::ptr::write_unaligned(info.add(at) as *mut u64, info.add(target) as u64);
+        }
+    }
+    status::SUCCESS
 }
 
 /// Process settings (priority, error mode, ...) are accepted.
@@ -451,4 +656,143 @@ pub extern "system" fn NtFsControlFile(_h: u64, _ev: u64, _apc: usize, _ctx: usi
 #[no_mangle]
 pub extern "system" fn NtCancelSynchronousIoFile(_thread: u64, _request: *mut u8, _iosb: *mut u8) -> NtStatus {
     STATUS_NOT_FOUND
+}
+
+// -----| what Bun-built programs (claude.exe) reach for |-----
+
+const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004u32 as i32;
+
+fn peb_u32(offset: u64) -> u32 {
+    let peb: u64;
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, readonly));
+        read_unaligned((peb + offset) as *const u32)
+    }
+}
+
+/// The address a syscall stub (crate root) is at, as a typed function.
+macro_rules! stub {
+    ($name:ident : $ty:ty) => {
+        unsafe { core::mem::transmute::<*const (), $ty>(crate::$name as *const ()) }
+    };
+}
+
+/// NtQuerySystemInformation: basic information (0) and per-processor times
+/// (8, all zero: no accounting yet). Other classes aren't kept.
+#[no_mangle]
+pub unsafe extern "system" fn NtQuerySystemInformation(class: u32, info: *mut u8, length: u32, ret: *mut u32) -> NtStatus {
+    let cpus = peb_u32(0xB8).max(1);
+    let need = match class {
+        0 => 64,
+        8 => 48 * cpus,
+        _ => return status::INVALID_INFO_CLASS,
+    };
+    if !ret.is_null() {
+        unsafe { *ret = need };
+    }
+    if length < need || info.is_null() {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    unsafe { core::ptr::write_bytes(info, 0, need as usize) };
+    if class == 0 {
+        let mut mem = [0u64; 2];
+        let sysinfo = stub!(VeilSysInfo: unsafe extern "system" fn(u64, *mut u64, u64) -> NtStatus);
+        unsafe { sysinfo(1, mem.as_mut_ptr(), 16) };
+        let w32 = |o: usize, v: u32| unsafe { core::ptr::write_unaligned(info.add(o) as *mut u32, v) };
+        let w64 = |o: usize, v: u64| unsafe { core::ptr::write_unaligned(info.add(o) as *mut u64, v) };
+        w32(4, 156_250); // TimerResolution (100 ns units): 15.625 ms
+        w32(8, 4096);
+        w32(12, (mem[0] / 4096) as u32);
+        w32(16, 1);
+        w32(20, (mem[0] / 4096) as u32);
+        w32(24, 0x1_0000);
+        w64(32, 0x1_0000);
+        w64(40, 0x7FFF_FFFE_FFFF);
+        w64(48, if cpus >= 64 { u64::MAX } else { (1u64 << cpus) - 1 });
+        unsafe { *info.add(56) = cpus as u8 };
+    }
+    status::SUCCESS
+}
+
+/// RtlWaitOnAddress(address, compare, size, timeout*): timeout in 100 ns
+/// units, negative for relative (the only kind kept), null for forever.
+#[no_mangle]
+pub unsafe extern "system" fn RtlWaitOnAddress(addr: *const u8, compare: *const u8, size: usize, timeout: *const i64) -> NtStatus {
+    let ms = if timeout.is_null() {
+        u64::MAX
+    } else {
+        let t = unsafe { read_unaligned(timeout) };
+        if t < 0 { (-t) as u64 / 10_000 } else { 0 }
+    };
+    let wait = stub!(VeilWaitAddress: unsafe extern "system" fn(u64, u64, u64, u64) -> NtStatus);
+    unsafe { wait(addr as u64, compare as u64, size as u64, ms) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn RtlWakeAddressAll(addr: *const u8) {
+    let wake = stub!(VeilWakeAddress: unsafe extern "system" fn(u64) -> NtStatus);
+    unsafe { wake(addr as u64) };
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn RtlWakeAddressSingle(addr: *const u8) {
+    let wake = stub!(VeilWakeAddress: unsafe extern "system" fn(u64) -> NtStatus);
+    unsafe { wake(addr as u64) };
+}
+
+/// RtlExitUserProcess: the process ends with `code` (no DLL detach yet).
+#[no_mangle]
+pub unsafe extern "system" fn RtlExitUserProcess(code: u32) -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("syscall", in("r10") u64::MAX, in("rdx") code as u64,
+                inlateout("rax") nt_abi::sys::NT_TERMINATE_PROCESS as u64 => _, lateout("rcx") _, lateout("r11") _)
+        };
+    }
+}
+
+/// RtlFillMemory(destination, length, fill): note the order.
+#[no_mangle]
+pub unsafe extern "system" fn RtlFillMemory(dst: *mut u8, length: usize, fill: u8) {
+    unsafe { core::ptr::write_bytes(dst, fill, length) };
+}
+
+/// VerSetConditionMask: three bits of condition for each VER_* type bit.
+#[no_mangle]
+pub extern "system" fn VerSetConditionMask(mask: u64, type_mask: u32, condition: u8) -> u64 {
+    let mut m = mask;
+    for i in 0..8 {
+        if type_mask & (1 << i) != 0 {
+            m |= ((condition & 7) as u64) << (i * 3);
+        }
+    }
+    m
+}
+
+/// RtlAddGrowableFunctionTable: JIT code's unwind data. Kept nowhere yet
+/// (exceptions don't unwind through JIT frames), so accepted and dropped.
+#[no_mangle]
+pub unsafe extern "system" fn RtlAddGrowableFunctionTable(table: *mut u64, _entries: *const u8, _count: u32, _max: u32, _base: u64, _end: u64) -> NtStatus {
+    if !table.is_null() {
+        unsafe { *table = 1 };
+    }
+    status::SUCCESS
+}
+
+#[no_mangle]
+pub extern "system" fn RtlGrowFunctionTable(_table: u64, _count: u32) {}
+
+#[no_mangle]
+pub extern "system" fn RtlDeleteGrowableFunctionTable(_table: u64) {}
+
+/// Security descriptors aren't kept.
+
+#[no_mangle]
+pub extern "system" fn NtQuerySecurityObject(_h: u64, _info: u32, _sd: *mut u8, _length: u32, _ret: *mut u32) -> NtStatus {
+    status::NOT_IMPLEMENTED
+}
+
+#[no_mangle]
+pub extern "system" fn NtSetSecurityObject(_h: u64, _info: u32, _sd: *const u8) -> NtStatus {
+    status::SUCCESS // accepted; nothing enforces security descriptors
 }

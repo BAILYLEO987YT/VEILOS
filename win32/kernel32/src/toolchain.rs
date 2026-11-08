@@ -242,6 +242,19 @@ pub extern "system" fn CryptDestroyKey(_key: usize) -> i32 {
     VeilCryptUnsupported() as i32
 }
 
+/// Calls that answer a Win32 error number (the firewall's Fwpm*, netapi32's
+/// Net*): ERROR_NOT_SUPPORTED.
+#[no_mangle]
+pub extern "system" fn VeilErrorNotSupported() -> u32 {
+    50
+}
+
+/// Freeing what a call that isn't supported never handed out: nothing to do.
+#[no_mangle]
+pub extern "system" fn VeilNothingToFree() -> u32 {
+    0
+}
+
 /// LDAP calls that answer an error number: LDAP_NOT_SUPPORTED.
 #[no_mangle]
 pub extern "system" fn VeilLdapUnsupported() -> u32 {
@@ -455,5 +468,119 @@ pub unsafe extern "system" fn GetErrorInfo(_reserved: u32, out: *mut usize) -> i
 
 #[no_mangle]
 pub extern "system" fn SetErrorInfo(_reserved: u32, _info: usize) -> i32 {
+    0
+}
+
+/// VARIANT: its type (vt) first; nothing in it yet.
+#[no_mangle]
+pub unsafe extern "system" fn VariantInit(v: *mut u8) {
+    if !v.is_null() {
+        unsafe { core::ptr::write_bytes(v, 0, 8) };
+    }
+}
+
+/// Frees what a VARIANT holds (a BSTR is the only kind made here) and
+/// leaves it empty.
+#[no_mangle]
+pub unsafe extern "system" fn VariantClear(v: *mut u8) -> i32 {
+    if v.is_null() {
+        return 0x8007_0057u32 as i32; // E_INVALIDARG
+    }
+    unsafe {
+        if *(v as *const u16) == 8 {
+            // VT_BSTR
+            SysFreeString(*(v.add(8) as *const *mut u16));
+        }
+        core::ptr::write_bytes(v, 0, 8);
+    }
+    0
+}
+
+/// Winsock calls not offered: SOCKET_ERROR, WSAEOPNOTSUPP.
+#[no_mangle]
+pub extern "system" fn VeilSocketUnsupported() -> i32 {
+    crate::SetLastError(10045);
+    -1
+}
+
+/// LSA calls answer an NTSTATUS; this turns one into a Win32 error.
+#[no_mangle]
+pub extern "system" fn LsaNtStatusToWinError(status: i32) -> u32 {
+    unsafe { crate::RtlNtStatusToDosError(status) }
+}
+
+// -----| LSA: a standalone machine, VEILOS, whose domain is the user's |-----
+
+const LSA_HANDLE: usize = 0x4C5341; // "LSA": a pseudo handle
+
+#[no_mangle]
+pub unsafe extern "system" fn LsaOpenPolicy(_system: *const u8, _attrs: *const u8, _access: u32, out: *mut usize) -> i32 {
+    if out.is_null() {
+        return 0xC000_000Du32 as i32;
+    }
+    unsafe { *out = LSA_HANDLE };
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn LsaClose(_h: usize) -> i32 {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn LsaFreeMemory(p: *mut u8) -> i32 {
+    crate::mem::LocalFree(p);
+    0
+}
+
+/// PolicyAccountDomainInformation (5): "VEILOS", S-1-5-21-1000-1000-1000.
+/// PolicyPrimaryDomainInformation (3) and PolicyDnsDomainInformation (12):
+/// in no domain, as a workgroup machine answers (WORKGROUP, empty DNS
+/// names, no SID; strings are never NULL). One LocalAlloc block each.
+#[no_mangle]
+pub unsafe extern "system" fn LsaQueryInformationPolicy(h: usize, class: u32, out: *mut *mut u8) -> i32 {
+    if h != LSA_HANDLE || out.is_null() {
+        return 0xC000_0008u32 as i32;
+    }
+    const DOMAIN_SID: [u8; 24] = [1, 4, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 0xE8, 3, 0, 0, 0xE8, 3, 0, 0, 0xE8, 3, 0, 0];
+    fn wide<const N: usize>(s: &[u8; N]) -> [u16; N] {
+        let mut w = [0u16; N];
+        for (o, &b) in w.iter_mut().zip(s) {
+            *o = b as u16;
+        }
+        w
+    }
+    let veilos = wide(b"VEILOS\0");
+    let workgroup = wide(b"WORKGROUP\0");
+    // Where each UNICODE_STRING (16 bytes) sits, and the SID pointer.
+    let (fixed, strings, sid_at): (usize, &[(usize, &[u16])], Option<usize>) = match class {
+        5 => (24, &[(0, &veilos[..])], Some(16)),
+        3 => (24, &[(0, &workgroup[..])], None),
+        12 => (72, &[(0, &workgroup[..]), (16, &[0u16][..]), (32, &[0u16][..])], None),
+        _ => return 0xC000_0003u32 as i32, // STATUS_INVALID_INFO_CLASS
+    };
+    let text: usize = strings.iter().map(|(_, s)| s.len() * 2).sum();
+    let size = fixed + text + 8 + DOMAIN_SID.len();
+    let p = crate::mem::LocalAlloc(0x40, size);
+    if p.is_null() {
+        return 0xC000_0017u32 as i32;
+    }
+    unsafe {
+        let mut at = fixed;
+        for &(field, s) in strings {
+            let buf = p.add(at);
+            core::ptr::copy_nonoverlapping(s.as_ptr() as *const u8, buf, s.len() * 2);
+            core::ptr::write_unaligned(p.add(field) as *mut u16, ((s.len() - 1) * 2) as u16);
+            core::ptr::write_unaligned(p.add(field + 2) as *mut u16, (s.len() * 2) as u16);
+            core::ptr::write_unaligned(p.add(field + 8) as *mut u64, buf as u64);
+            at += s.len() * 2;
+        }
+        if let Some(field) = sid_at {
+            let sid = p.add(at.next_multiple_of(8));
+            core::ptr::copy_nonoverlapping(DOMAIN_SID.as_ptr(), sid, DOMAIN_SID.len());
+            core::ptr::write_unaligned(p.add(field) as *mut u64, sid as u64);
+        }
+        *out = p;
+    }
     0
 }

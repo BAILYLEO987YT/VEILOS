@@ -171,7 +171,10 @@ pub unsafe extern "system" fn GetProcessTimes(p: Handle, created: *mut u64, exit
 // -----| waiting |-----
 
 #[no_mangle]
-pub unsafe extern "system" fn WaitForMultipleObjectsEx(count: u32, handles: *const Handle, all: Bool, ms: u32, _alertable: Bool) -> u32 {
+pub unsafe extern "system" fn WaitForMultipleObjectsEx(count: u32, handles: *const Handle, all: Bool, ms: u32, alertable: Bool) -> u32 {
+    if alertable != 0 {
+        return crate::apc::alertable(ms, |t| unsafe { WaitForMultipleObjectsEx(count, handles, all, t, 0) });
+    }
     let timeout: i64 = -(ms as i64) * 10_000;
     let t = if ms == u32::MAX { core::ptr::null() } else { &timeout as *const i64 };
     let s = unsafe { NtWaitForMultipleObjects(count, handles, if all != 0 { 0 } else { 1 }, 0, t) };

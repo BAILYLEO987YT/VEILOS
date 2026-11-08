@@ -190,6 +190,9 @@ pub struct Linker {
     modules: Vec<Module>,
     exe_dir: String,
     dll_next: u64,
+    /// Ranges the process already uses besides modules (its VAD, for loads
+    /// at run time): a DLL's preferred base must be clear of them too.
+    pub taken: Vec<(u64, u64)>,
     init: Bump,
     thunks: Bump,
     unresolved_slots: Bump,
@@ -245,9 +248,10 @@ fn api_set_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
 }
 
 /// Whether a module's ordinals are Windows' own: a program's own DLLs, and
-/// those of ours numbered to match (comctl32, ws2_32).
+/// those of ours numbered to match (comctl32, ws2_32, wsock32, oleaut32).
 fn ordinals_are_windows(m: &Module) -> bool {
-    !m.path.to_ascii_lowercase().starts_with("/system/") || matches!(m.name.as_str(), "comctl32.dll" | "ws2_32.dll")
+    !m.path.to_ascii_lowercase().starts_with("/system/")
+        || matches!(m.name.as_str(), "comctl32.dll" | "ws2_32.dll" | "wsock32.dll" | "oleaut32.dll")
 }
 
 /// Lower-case, with ".dll" added when there's no extension.
@@ -375,6 +379,7 @@ impl Linker {
             modules: Vec::new(),
             exe_dir,
             dll_next: DLL_REGION,
+            taken: Vec::new(),
             init: Bump::new(INIT_ENTRY, INIT_ENTRY + INIT_REGION_SIZE),
             thunks: Bump::new(THUNK_REGION, UNRESOLVED_REGION),
             unresolved_slots: Bump::new(UNRESOLVED_REGION, LOADER_DATA_REGION),
@@ -505,8 +510,16 @@ impl Linker {
                 return Ok(None);
             }
             lo
+        } else if self.base_free(pe.image_base, size) {
+            // Its preferred base, as Windows does when it's free: then a DLL
+            // is at the same address in every process (the MSYS2 runtime's
+            // heap, handed from parent to child, holds pointers into it).
+            pe.image_base
         } else {
-            let b = (self.dll_next + 0xFFFF) & !0xFFFF;
+            let mut b = (self.dll_next + 0xFFFF) & !0xFFFF;
+            while !self.base_free(b, size) {
+                b = (b + 0x1_0000) & !0xFFFF;
+            }
             self.dll_next = b + size;
             b
         };
@@ -516,6 +529,35 @@ impl Linker {
         // Registered before its imports bind, so an import cycle ends here.
         self.bind_imports(mem, idx)?;
         Ok(Some(idx))
+    }
+
+    /// Can an image of `size` go at `base`? Not below 4 GiB, nor in the
+    /// loader's own regions or the top of the address space, nor over a
+    /// module, a range the process uses, or a slot shared with the kernel.
+    fn base_free(&self, base: u64, size: u64) -> bool {
+        let end = match base.checked_add(size) {
+            Some(e) => e,
+            None => return false,
+        };
+        let overlaps = |lo: u64, hi: u64| base < hi && lo < end;
+        if base < 0x1_0000_0000 || base & 0xFFFF != 0 || end > 0x7F00_0000_0000 {
+            return false;
+        }
+        // INIT_ENTRY..LOADER_DATA_REGION's end: startup code, thunks, stubs, loader data.
+        if overlaps(INIT_ENTRY, LOADER_DATA_REGION + 0x1_0000_0000) {
+            return false;
+        }
+        if self.modules.iter().any(|m| overlaps(m.base, m.base + m.size)) || self.taken.iter().any(|&(lo, hi)| overlaps(lo, hi)) {
+            return false;
+        }
+        let mut p = base & !0x3FFF_FFFF;
+        while p < end {
+            if crate::address_space::is_kernel_slot(p) {
+                return false;
+            }
+            p += 0x4000_0000;
+        }
+        true
     }
 
     /// Where symbols imported from `requested` come from.
@@ -797,12 +839,23 @@ impl Linker {
                 code.extend_from_slice(&m.base.to_le_bytes());
                 code.extend_from_slice(&[0xBA]); // mov edx, imm32 (reason)
                 code.extend_from_slice(&(DLL_PROCESS_ATTACH as u32).to_le_bytes());
-                code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+                // lpReserved: non-NULL for DLLs loaded with the process, as
+                // on Windows (Cygwin's DllMain tells static from dynamic
+                // loading by it). Programs only test it, so: the PEB.
+                code.extend_from_slice(&[0x49, 0xB8]); // mov r8, imm64
+                code.extend_from_slice(&peb.to_le_bytes());
                 code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
                 code.extend_from_slice(&t.to_le_bytes());
                 code.extend_from_slice(&[0xFF, 0xD0]); // call rax
                 calls += 1;
             }
+        }
+        // APCs queued during the DllMains run now, before the entry point, as
+        // Windows' loader runs them (Cygwin starts its signal thread so).
+        if let Some(run_apcs) = self.module_export(mem, "kernel32.dll", "VeilRunApcs") {
+            code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+            code.extend_from_slice(&run_apcs.to_le_bytes());
+            code.extend_from_slice(&[0xFF, 0xD0]); // call rax
         }
         let exe = self.modules.iter().find(|m| m.is_exe).ok_or("no EXE module")?;
         code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (PEB)

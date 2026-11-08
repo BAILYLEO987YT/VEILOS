@@ -245,8 +245,8 @@ pub unsafe extern "system" fn WSASocketW(af: i32, kind: i32, protocol: i32, info
     let (af, kind, protocol) = if info.is_null() {
         (af, kind, protocol)
     } else {
-        // WSAPROTOCOL_INFOW: iAddressFamily at 48, iSocketType at 64, iProtocol at 68.
-        unsafe { (*(info.add(48) as *const i32), *(info.add(64) as *const i32), *(info.add(68) as *const i32)) }
+        // WSAPROTOCOL_INFOW: iAddressFamily at 76, iSocketType at 88, iProtocol at 92.
+        unsafe { (*(info.add(76) as *const i32), *(info.add(88) as *const i32), *(info.add(92) as *const i32)) }
     };
     make_socket(af, kind, protocol, flags & WSA_FLAG_NO_HANDLE_INHERIT == 0)
 }
@@ -520,6 +520,9 @@ const SO_SNDTIMEO: i32 = 0x1005;
 const SO_RCVTIMEO: i32 = 0x1006;
 const SO_ERROR: i32 = 0x1007;
 const SO_TYPE: i32 = 0x1008;
+const SO_PROTOCOL_INFOW: i32 = 0x2005;
+/// sizeof(WSAPROTOCOL_INFOW).
+const PROTOCOL_INFO_SIZE: i32 = 628;
 const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
 const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 const TCP_NODELAY: i32 = 1;
@@ -611,6 +614,27 @@ pub unsafe extern "system" fn getsockopt(s: Socket, level: i32, name: i32, val: 
             };
         }
         (IPPROTO_TCP, TCP_NODELAY) => get_opt(s, OPT_NODELAY),
+        // The provider's GUID stays zero: this isn't Microsoft's MSAFD, so a
+        // program looks for no AFD device behind the socket.
+        (SOL_SOCKET, SO_PROTOCOL_INFOW) => {
+            if unsafe { *len } < PROTOCOL_INFO_SIZE {
+                unsafe { *len = PROTOCOL_INFO_SIZE };
+                return fail(WSAEFAULT);
+            }
+            let kind = match get_opt(s, OPT_TYPE) {
+                Ok(k) => k as i32,
+                Err(_) => return SOCKET_ERROR,
+            };
+            unsafe {
+                core::ptr::write_bytes(val, 0, PROTOCOL_INFO_SIZE as usize);
+                let (socket_type, protocol) = if kind == 2 { (2, 17) } else { (1, 6) };
+                for (off, v) in [(76, 2), (80, 16), (84, 16), (88, socket_type), (92, protocol)] {
+                    (val.add(off) as *mut i32).write_unaligned(v);
+                }
+                *len = PROTOCOL_INFO_SIZE;
+            }
+            return 0;
+        }
         _ => return fail(WSAENOPROTOOPT),
     };
     match v {
@@ -658,6 +682,11 @@ pub unsafe extern "system" fn ioctlsocket(s: Socket, cmd: i32, arg: *mut u32) ->
 
 /// FIONBIO and FIONREAD as WSAIoctl. Extension functions (AcceptEx,
 /// ConnectEx) aren't offered yet: asking for them fails, saying so.
+const SIO_BASE_HANDLE: i32 = 0x4800_0022;
+const SIO_BSP_HANDLE_POLL: i32 = 0x4800_001D;
+/// Fails in the kernel, leaving the number in a syscall trace.
+const OP_UNKNOWN: u64 = 99;
+
 #[no_mangle]
 pub unsafe extern "system" fn WSAIoctl(s: Socket, code: u32, input: *const u8, in_len: u32, output: *mut u8, out_len: u32, returned: *mut u32, _overlapped: *mut u8, _routine: usize) -> i32 {
     match code as i32 {
@@ -672,7 +701,29 @@ pub unsafe extern "system" fn WSAIoctl(s: Socket, code: u32, input: *const u8, i
             }
             r
         }
-        _ => fail(WSAEOPNOTSUPP),
+        // No layered providers here: a socket is its own base.
+        SIO_BASE_HANDLE | SIO_BSP_HANDLE_POLL if out_len >= 8 && !output.is_null() => {
+            if let Err(_) = get_opt(s, OPT_TYPE) {
+                return SOCKET_ERROR;
+            }
+            // Only an event loop asks this, and it reads whenever a poll says
+            // it may: a stale answer must not stop the loop in recv. libuv
+            // makes the socket non-blocking at this same point.
+            if set_opt(s, OPT_NONBLOCKING, 1).is_err() {
+                return SOCKET_ERROR;
+            }
+            unsafe {
+                (output as *mut u64).write_unaligned(s);
+                if !returned.is_null() {
+                    *returned = 8;
+                }
+            }
+            0
+        }
+        _ => {
+            let _ = sys(OP_UNKNOWN, s, code as u64, 0, 0, 0);
+            fail(WSAEOPNOTSUPP)
+        }
     }
 }
 

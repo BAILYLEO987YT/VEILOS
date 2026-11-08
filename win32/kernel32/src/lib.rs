@@ -15,7 +15,9 @@
 
 #![no_std]
 
+mod apc;
 mod atom;
+mod bun;
 mod com;
 mod crypt;
 mod console;
@@ -33,6 +35,7 @@ mod module;
 mod pool;
 mod process;
 mod profile;
+mod rare;
 mod registry;
 mod resource;
 mod support;
@@ -40,6 +43,7 @@ mod system;
 mod sync;
 mod time;
 mod util;
+mod wait;
 
 use core::arch::asm;
 use nt_abi::{layout, status, IoStatusBlock, NtStatus, ObjectAttributes, CURRENT_PROCESS};
@@ -334,25 +338,32 @@ pub extern "system" fn ExitProcess(code: u32) -> ! {
 #[no_mangle]
 pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) -> i32 {
     // DLL_PROCESS_ATTACH: VEILOS_MISSING_CALLS=zero asks for missing calls
-    // to return 0 rather than end the program (src/subsystem.rs).
+    // to return 0 rather than end the program (src/subsystem.rs);
+    // VEILOS_TRACE_SYSCALLS=1 logs this process's system calls.
     if reason == 1 {
         console::register_ctrl_routine();
-        let name: [u16; 20] = {
-            let mut w = [0u16; 20];
-            for (i, b) in b"VEILOS_MISSING_CALLS".iter().enumerate() {
-                w[i] = *b as u16;
-            }
-            w
-        };
-        let mut z = [0u16; 21];
-        z[..20].copy_from_slice(&name);
-        let mut value = [0u16; 8];
-        let n = unsafe { crate::env::GetEnvironmentVariableW(z.as_ptr(), value.as_mut_ptr(), 8) } as usize;
-        if n == 4 && value[..4].iter().map(|&c| c as u8).eq(b"zero".iter().copied()) {
-            unsafe { VeilSysInfo(2, value.as_mut_ptr() as u64, 0) };
+        if env_is(b"VEILOS_MISSING_CALLS", b"zero") {
+            unsafe { VeilSysInfo(2, 0, 0) };
+        }
+        if env_is(b"VEILOS_TRACE_SYSCALLS", b"1") {
+            unsafe { VeilSysInfo(3, 0, 0) };
+        }
+        if env_is(b"VEILOS_TRACE_NET", b"1") {
+            unsafe { VeilSysInfo(4, 0, 0) };
         }
     }
     1
+}
+
+/// Is environment variable `name` set to exactly `value`? (ASCII, short.)
+fn env_is(name: &[u8], value: &[u8]) -> bool {
+    let mut w = [0u16; 32];
+    for (i, b) in name.iter().enumerate().take(31) {
+        w[i] = *b as u16;
+    }
+    let mut got = [0u16; 8];
+    let n = unsafe { crate::env::GetEnvironmentVariableW(w.as_ptr(), got.as_mut_ptr(), 8) } as usize;
+    n == value.len() && got[..n].iter().map(|&c| c as u8).eq(value.iter().copied())
 }
 
 /// Stack probe (normally from the MSVC C runtime), called with the frame

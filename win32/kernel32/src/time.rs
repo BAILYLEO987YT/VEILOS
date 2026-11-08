@@ -167,7 +167,15 @@ pub extern "system" fn Sleep(ms: u32) {
 }
 
 #[no_mangle]
-pub extern "system" fn SleepEx(ms: u32, _alertable: Bool) -> u32 {
+pub extern "system" fn SleepEx(ms: u32, alertable: Bool) -> u32 {
+    if alertable != 0 {
+        // WAIT_IO_COMPLETION if an APC ran, else 0 once the time is up.
+        let r = crate::apc::alertable(ms, |t| {
+            SleepEx(t, 0);
+            258
+        });
+        return if r == crate::apc::WAIT_IO_COMPLETION { r } else { 0 };
+    }
     // INFINITE: the longest the interval can say.
     let interval: i64 = if ms == u32::MAX { i64::MIN + 1 } else { -(ms as i64) * 10_000 };
     unsafe { crate::NtDelayExecution(0, &interval) };

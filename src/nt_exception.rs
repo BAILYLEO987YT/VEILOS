@@ -218,6 +218,14 @@ extern "C" fn deliver(fx: &[u8; 512], t: &mut Trap) {
         return;
     }
     let proc = crate::process::PROCESSOR.lock().get_active();
+    // A thread's stack growing past what's committed: commit down to it.
+    if t.vector == 14 && t.error & 1 == 0 {
+        if let Some(p) = &proc {
+            if grow_stack(p, x86_64::registers::control::Cr2::read_raw()) {
+                return;
+            }
+        }
+    }
     let dispatcher = proc.as_ref().map_or(0, |p| p.exception_dispatcher.load(Ordering::Acquire));
     let (code, address, params, nparams) = describe(t, fx);
     let pid = proc.as_ref().map_or(0, |p| p.pid);
@@ -237,8 +245,8 @@ extern "C" fn deliver(fx: &[u8; 512], t: &mut Trap) {
     crate::serial_println!("[EXCEPTION] pid {} {:#010x} at {:#x} -> dispatcher", pid, code, address);
     let top = if crate::memory::user_ptr_ok(t.rsp, 8) { unsafe { *(t.rsp as *const u64) } } else { 0 };
     crate::serial_println!(
-        "[EXCEPTION]   data {:#x} rsp {:#x} [rsp] {:#x} rax {:#x} rcx {:#x} rdx {:#x} r8 {:#x} r11 {:#x}",
-        params[1], t.rsp, top, t.rax, t.rcx, t.rdx, t.r8, t.r11
+        "[EXCEPTION]   data {:#x} error {:#x} rsp {:#x} [rsp] {:#x} rax {:#x} rcx {:#x} rdx {:#x} r8 {:#x} r11 {:#x}",
+        params[1], t.error, t.rsp, top, t.rax, t.rcx, t.rdx, t.r8, t.r11
     );
     // Likely return addresses (in an image) further up the stack.
     {
@@ -253,6 +261,23 @@ extern "C" fn deliver(fx: &[u8; 512], t: &mut Trap) {
             }
         }
         crate::serial_println!("[EXCEPTION]   stack:{}", trail);
+        crate::serial_println!(
+            "[EXCEPTION]   rbx {:#x} rbp {:#x} rsi {:#x} rdi {:#x} r9 {:#x} r10 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
+            t.rbx, t.rbp, t.rsi, t.rdi, t.r9, t.r10, t.r12, t.r13, t.r14, t.r15
+        );
+        // The words at rsp as they are, for what the trail leaves out.
+        let mut raw = alloc::string::String::new();
+        for i in 0..24 {
+            if !crate::memory::user_ptr_ok(t.rsp + i * 8, 8) {
+                break;
+            }
+            raw.push_str(&alloc::format!(" {:x}", unsafe { *((t.rsp + i * 8) as *const u64) }));
+        }
+        crate::serial_println!("[EXCEPTION]   raw:{}", raw);
+        if crate::memory::user_ptr_ok(t.rip, 16) {
+            let code = unsafe { core::slice::from_raw_parts(t.rip as *const u8, 16) };
+            crate::serial_println!("[EXCEPTION]   code at rip: {:02x?}", code);
+        }
     }
 
     unsafe {
@@ -291,4 +316,35 @@ extern "C" fn deliver(fx: &[u8; 512], t: &mut Trap) {
     t.rip = dispatcher;
     t.rsp = base;
     t.rflags &= !0x100;
+}
+
+/// Windows grows a thread's stack as it's touched: its reservation runs from
+/// TEB.DeallocationStack up to TEB.StackBase, and a touch below what's
+/// committed (TEB.StackLimit) commits the pages down to it. Programs that
+/// make their own stacks (Cygwin moves its main thread to one) rely on it.
+/// True if `addr` was in the running thread's stack and is now there.
+fn grow_stack(proc: &alloc::sync::Arc<crate::process::Process>, addr: u64) -> bool {
+    let tid = unsafe { (*crate::kthread::current_user()).tid };
+    let teb = proc
+        .threads
+        .lock()
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.teb)
+        .unwrap_or_else(|| proc.nt_env.lock().teb_base);
+    if teb == 0 || !crate::memory::user_ptr_ok(teb, 0x1480) {
+        return false;
+    }
+    let read = |o: u64| unsafe { core::ptr::read_volatile((teb + o) as *const u64) };
+    let (base, limit, dealloc) = (read(0x08), read(0x10), read(0x1478));
+    if dealloc == 0 || addr < dealloc || addr >= limit || limit > base {
+        return false;
+    }
+    let first = addr & !0xFFF;
+    let size = limit - first;
+    let committed = proc.vad.lock().virtual_alloc(first, size as usize, 0x1000, 0x04).is_ok();
+    if committed {
+        unsafe { core::ptr::write_volatile((teb + 0x10) as *mut u64, first) };
+    }
+    committed
 }

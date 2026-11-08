@@ -70,6 +70,7 @@ pub mod nt_user;
 pub mod nt_registry;
 pub mod nt_demand;
 pub mod nt_ipc;
+pub mod nt_section;
 pub mod nt_socket;
 pub mod conbuf;
 pub mod nt_console;

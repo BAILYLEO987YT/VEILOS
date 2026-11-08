@@ -3,6 +3,9 @@
 fn main() {
     println!("cargo:rustc-cdylib-link-arg=/NODEFAULTLIB");
     println!("cargo:rustc-cdylib-link-arg=/ENTRY:DllMain");
+    // Its own preferred base (win32/build.sh lists them all): the same
+    // address in every process, as Windows' system DLLs are.
+    println!("cargo:rustc-cdylib-link-arg=/BASE:0x7e0009000000");
     let ordinals = [
         ("accept", 1), ("bind", 2), ("closesocket", 3), ("connect", 4), ("getpeername", 5), ("getsockname", 6),
         ("getsockopt", 7), ("htonl", 8), ("htons", 9), ("ioctlsocket", 10), ("inet_addr", 11), ("inet_ntoa", 12),
@@ -15,4 +18,7 @@ fn main() {
     for (name, n) in ordinals {
         println!("cargo:rustc-cdylib-link-arg=/EXPORT:{name},@{n}");
     }
+    // Not offered yet: sharing a socket with another process, overlapped results.
+    println!("cargo:rustc-cdylib-link-arg=/EXPORT:WSADuplicateSocketW=kernel32.VeilSocketUnsupported");
+    println!("cargo:rustc-cdylib-link-arg=/EXPORT:WSAGetOverlappedResult=kernel32.VeilCryptUnsupported");
 }

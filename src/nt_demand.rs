@@ -62,6 +62,14 @@ enum Backing {
     },
     /// Pages of zeros.
     Zero,
+    /// A view of a section (nt_section.rs): `offset` into it. Shared views
+    /// map the section's own pages; private ones (copy-on-write) get a copy.
+    Section {
+        section: Arc<crate::nt_objects::SectionObject>,
+        offset: u64,
+        flags: PageTableFlags,
+        private: bool,
+    },
 }
 
 struct Region {
@@ -120,6 +128,37 @@ pub fn add_view(base: u64, size: u64, file: Arc<SharedFile>, offset: u64, writab
     space(crate::address_space::active()).regions.lock().push(Arc::new(r));
 }
 
+/// A view of `section` at `base` (in the active address space).
+pub fn add_section_view(base: u64, size: u64, section: Arc<crate::nt_objects::SectionObject>, offset: u64, flags: PageTableFlags, private: bool) {
+    let r = Region { base, size, backing: Backing::Section { section, offset, flags, private } };
+    space(crate::address_space::active()).regions.lock().push(Arc::new(r));
+}
+
+/// Take away the section view at `base`: its pages are unmapped (a private
+/// copy freed, the section's own left to it). Its size.
+pub fn remove_section_view(base: u64) -> Option<u64> {
+    let s = current()?;
+    let r = {
+        let mut regions = s.regions.lock();
+        let at = regions.iter().position(|r| matches!(r.backing, Backing::Section { .. }) && r.base == base)?;
+        regions.remove(at)
+    };
+    let mut mapper = unsafe { memory::get_mapper() };
+    let mut touched = s.touched.lock();
+    let mut p = r.base;
+    while p < r.base + r.size {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(p));
+        if let Some(i) = touched.iter().position(|&t| t == p) {
+            touched.swap_remove(i);
+            let _ = memory::unmap_and_free_page(page, &mut mapper);
+        } else if let Ok((_, flush)) = x86_64::structures::paging::Mapper::unmap(&mut mapper, page) {
+            flush.flush();
+        }
+        p += PAGE;
+    }
+    Some(r.size)
+}
+
 /// Zero pages at `base`, as they're touched.
 pub fn add_zero(base: u64, size: u64) {
     let r = Region { base, size, backing: Backing::Zero };
@@ -174,6 +213,16 @@ pub fn fault_in(addr: u64) -> bool {
     if mapper.translate_addr(VirtAddr::new(page)).is_some() {
         return true; // Another thread got here first; callers only ask about pages that weren't there.
     }
+    if let Backing::Section { section, offset, flags, private: false } = &r.backing {
+        let index = ((offset + (page - r.base)) / PAGE) as usize;
+        let Some(phys) = section.frame(index) else { return false };
+        let frame = x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(phys));
+        let _guard = s.touched.lock(); // one thread maps it
+        if mapper.translate_addr(VirtAddr::new(page)).is_some() {
+            return true;
+        }
+        return memory::map_page_checked(Page::<Size4KiB>::containing_address(VirtAddr::new(page)), frame, *flags, &mut mapper, &mut GlobalFrameAllocator).is_ok();
+    }
     let Some(frame) = memory::allocate_frame() else {
         crate::serial_println!("[DEMAND] out of memory bringing in {:#x}", page);
         return false;
@@ -200,6 +249,13 @@ pub fn fault_in(addr: u64) -> bool {
 fn fill(r: &Region, page: u64, bytes: &mut [u8]) -> PageTableFlags {
     match &r.backing {
         Backing::Zero => USER | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        Backing::Section { section, offset, flags, .. } => {
+            if let Some(phys) = section.frame(((offset + (page - r.base)) / PAGE) as usize) {
+                let src = unsafe { core::slice::from_raw_parts((memory::get_phys_mem_offset().as_u64() + phys) as *const u8, PAGE as usize) };
+                bytes.copy_from_slice(src);
+            }
+            *flags
+        }
         Backing::View { file, offset, flags } => {
             let _ = file.read_at(offset + (page - r.base), bytes);
             *flags
@@ -207,19 +263,17 @@ fn fill(r: &Region, page: u64, bytes: &mut [u8]) -> PageTableFlags {
         Backing::Image { hold, headers, sections, delta, relocs, linked } => {
             let file = hold.file();
             let rva = (page - r.base) as u32;
+            let flags = image_flags(sections, rva, linked.load(Ordering::Acquire));
             if rva < *headers {
                 let n = (*headers - rva).min(PAGE as u32) as usize;
                 let _ = file.read_at(rva as u64, &mut bytes[..n]);
             }
-            let (mut w, mut x) = (false, false);
             for s in sections {
                 let span = s.vsize.max(s.raw_size);
                 let (lo, hi) = (s.va, s.va.saturating_add(span));
                 if rva + PAGE as u32 <= lo || rva >= (hi as u64).next_multiple_of(PAGE) as u32 {
                     continue;
                 }
-                w |= s.chars & SCN_MEM_WRITE != 0;
-                x |= s.chars & (SCN_MEM_EXECUTE | SCN_CNT_CODE) != 0;
                 // Only what's in the file; the rest stays zero.
                 let raw = if s.vsize != 0 { s.raw_size.min(s.vsize) } else { s.raw_size };
                 let start = lo.max(rva);
@@ -233,19 +287,53 @@ fn fill(r: &Region, page: u64, bytes: &mut [u8]) -> PageTableFlags {
             if *delta != 0 {
                 apply_relocs(file, sections, relocs, *delta, rva, bytes);
             }
-            if !linked.load(Ordering::Acquire) {
-                return USER | PageTableFlags::WRITABLE;
-            }
-            let mut flags = USER;
-            if w {
-                flags |= PageTableFlags::WRITABLE;
-            }
-            if !x {
-                flags |= PageTableFlags::NO_EXECUTE;
-            }
             flags
         }
     }
+}
+
+/// An image page's protection, from the sections it holds (read-write
+/// until the image is linked).
+fn image_flags(sections: &[Sec], rva: u32, linked: bool) -> PageTableFlags {
+    if !linked {
+        return USER | PageTableFlags::WRITABLE;
+    }
+    let (mut w, mut x) = (false, false);
+    for s in sections {
+        let span = s.vsize.max(s.raw_size);
+        let (lo, hi) = (s.va, s.va.saturating_add(span));
+        if rva + PAGE as u32 <= lo || rva >= (hi as u64).next_multiple_of(PAGE) as u32 {
+            continue;
+        }
+        w |= s.chars & SCN_MEM_WRITE != 0;
+        x |= s.chars & (SCN_MEM_EXECUTE | SCN_CNT_CODE) != 0;
+    }
+    let mut flags = USER;
+    if w {
+        flags |= PageTableFlags::WRITABLE;
+    }
+    if !x {
+        flags |= PageTableFlags::NO_EXECUTE;
+    }
+    flags
+}
+
+/// The protection the page at `addr` has (in the active address space), or
+/// will have when it's brought in. None: nothing is there.
+pub fn page_flags(addr: u64) -> Option<PageTableFlags> {
+    use x86_64::structures::paging::mapper::TranslateResult;
+    let page = addr & !(PAGE - 1);
+    let mapper = unsafe { memory::get_mapper() };
+    if let TranslateResult::Mapped { flags, .. } = mapper.translate(VirtAddr::new(page)) {
+        return Some(flags);
+    }
+    let s = current()?;
+    let r = s.regions.lock().iter().find(|r| page >= r.base && page < r.base + r.size).cloned()?;
+    Some(match &r.backing {
+        Backing::Zero => USER | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        Backing::View { flags, .. } | Backing::Section { flags, .. } => *flags,
+        Backing::Image { sections, linked, .. } => image_flags(sections, (page - r.base) as u32, linked.load(Ordering::Acquire)),
+    })
 }
 
 fn rva_to_file(sections: &[Sec], rva: u32) -> Option<u64> {

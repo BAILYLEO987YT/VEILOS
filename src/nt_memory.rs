@@ -217,6 +217,11 @@ impl VadSpace {
         Some(base)
     }
 
+    /// Every range in use, as (start, end).
+    pub fn ranges(&self) -> Vec<(u64, u64)> {
+        self.entries.iter().map(|e| (e.base, e.end())).collect()
+    }
+
     /// Forget the region at `base`, whose pages are already gone.
     pub fn forget(&mut self, base: u64) {
         self.entries.retain(|e| e.base != base);
@@ -257,6 +262,52 @@ impl VadSpace {
         }
     }
 
+    /// A free stretch of `size` bytes inside [low, high), starting on a multiple
+    /// of `align` (MEM_ADDRESS_REQUIREMENTS). 0s mean no limit and the 64 KiB
+    /// granularity. With no lower limit the search starts above the loader's
+    /// regions, which grow as DLLs load.
+    pub fn find_free_within(&self, low: u64, high: u64, align: u64, size: usize, top_down: bool) -> Option<u64> {
+        const ABOVE_LOADER: u64 = 0x7_0000_0000;
+        let size = align_up(size, 0x1000) as u64;
+        let align = align.max(GRANULARITY);
+        if !align.is_power_of_two() {
+            return None;
+        }
+        let lowest = if low == 0 { ABOVE_LOADER } else { low.max(USER_SPACE_START) };
+        // HighestEndingAddress is inclusive.
+        let limit = if high == 0 { USER_SPACE_END } else { high.saturating_add(1).min(USER_SPACE_END) };
+        if limit < size {
+            return None;
+        }
+        let kernel = |base: u64| {
+            let mut p = base & !0x3FFF_FFFF;
+            while p < base + size {
+                if crate::address_space::is_kernel_slot(p) {
+                    return true;
+                }
+                p += 0x4000_0000;
+            }
+            false
+        };
+        let mut at = if top_down { (limit - size) & !(align - 1) } else { align_up_u64(lowest, align) };
+        loop {
+            if at < lowest || at + size > limit {
+                return None;
+            }
+            if self.is_free(at, size as usize) && !kernel(at) {
+                return Some(at);
+            }
+            let blockers = self.entries.iter().filter(|e| e.overlaps(at, size as usize));
+            if top_down {
+                let next = blockers.map(|e| e.base).min().unwrap_or(at).saturating_sub(size) & !(align - 1);
+                at = if next < at { next } else { at.checked_sub(align.max(0x4000_0000))? };
+            } else {
+                let next = align_up_u64(blockers.map(|e| e.end()).max().unwrap_or(at), align);
+                at = if next > at { next } else { at + align.max(0x4000_0000) };
+            }
+        }
+    }
+
     // ----- VirtualAlloc -----
 
     pub fn virtual_alloc(
@@ -267,6 +318,12 @@ impl VadSpace {
         protect: u32,
     ) -> Result<u64, u64> {
         if size == 0 { return Err(STATUS_INVALID_PARAMETER); }
+        // MEM_RESET / MEM_RESET_UNDO: the contents may be dropped, or are
+        // wanted again. Nothing is ever swapped, so keeping them does for both.
+        const MEM_RESET_UNDO: u32 = 0x0100_0000;
+        if alloc_type & (MEM_RESET | MEM_RESET_UNDO) != 0 {
+            return Ok(addr_hint);
+        }
         let size = align_up(size, 0x1000);
 
         // ---- MEM_RESERVE (or MEM_COMMIT with no address: Windows reserves
@@ -413,11 +470,16 @@ impl VadSpace {
         let vad = self.find_mut(addr).ok_or(STATUS_INVALID_PARAMETER)?;
         if vad.state != VadState::Committed { return Err(STATUS_INVALID_PARAMETER); }
 
-        let old_protect = vad.protect;
+        let mut mapper = unsafe { memory::get_mapper() };
+        // The old protection is the first page's own: one VAD entry covers a
+        // whole image, whose sections differ (MinGW's pseudo-relocations
+        // restore what this returns on .data pages).
+        // The old protection is the first page's own: one VAD entry covers a
+        // whole image, whose sections differ.
+        let old_protect = crate::nt_demand::page_flags(addr).map_or(vad.protect, flags_to_protect);
         vad.protect = new_protect;
 
         let new_flags = nt_protect_to_page_flags(new_protect);
-        let mut mapper = unsafe { memory::get_mapper() };
         let num_pages  = size / 0x1000;
 
         for i in 0..num_pages {
@@ -436,8 +498,39 @@ impl VadSpace {
 
     // ----- VirtualQuery -----
 
+    /// For a committed image or view: the run of pages around `addr` with the
+    /// same protection (Windows reports regions that way; MinGW's runtime
+    /// restores a region's protection after patching it). Must run in the
+    /// address space this VAD describes.
+    fn protection_run(vad: &VadEntry, addr: u64) -> Option<(u64, u64, u32)> {
+        let page = align_down(addr, 0x1000);
+        let flags = crate::nt_demand::page_flags(page)?;
+        let same = |p: u64| crate::nt_demand::page_flags(p).map(|f| f & PROT_BITS) == Some(flags & PROT_BITS);
+        let (mut lo, mut hi) = (page, page + 0x1000);
+        while lo > vad.base && same(lo - 0x1000) {
+            lo -= 0x1000;
+        }
+        while hi < vad.end() && same(hi) {
+            hi += 0x1000;
+        }
+        Some((lo, hi - lo, flags_to_protect(flags)))
+    }
+
     pub fn virtual_query(&self, addr: u64) -> MemoryBasicInformation {
         if let Some(vad) = self.find(addr) {
+            if vad.state == VadState::Committed && vad.vad_type != VadType::Private {
+                if let Some((base, size, protect)) = Self::protection_run(vad, addr) {
+                    return MemoryBasicInformation {
+                        base_address: base,
+                        allocation_base: vad.base,
+                        allocation_protect: if vad.vad_type == VadType::Image { PAGE_EXECUTE_WRITECOPY } else { vad.alloc_protect },
+                        region_size: size as usize,
+                        state: MEM_COMMIT,
+                        protect,
+                        region_type: if vad.vad_type == VadType::Image { MEM_IMAGE } else { MEM_MAPPED },
+                    };
+                }
+            }
             MemoryBasicInformation {
                 base_address:       vad.base,
                 allocation_base:    vad.base,
@@ -468,84 +561,25 @@ impl VadSpace {
         }
     }
 
-    // ----- MapViewOfSection -----
+    // ----- Section views -----
     //
-    // Maps `size` bytes from `section` starting at `section_offset` into
-    // this process's address space at `addr_hint`.
-    // If the section is writable this sets up copy-on-write semantics:
-    // the pages are initially mapped read-only; writes trigger CoW faults.
+    // Views of sections are nt_demand regions (nt_section.rs); this only
+    // keeps their address range out of VirtualAlloc's way.
 
-    pub fn map_view_of_section(
-        &mut self,
-        section: Arc<SectionObject>,
-        addr_hint: u64,
-        size: usize,
-        section_offset: u64,
-        protect: u32,
-    ) -> Result<u64, u64> {
+    /// Record a section view at `base` (which must be free) or anywhere.
+    pub fn record_view(&mut self, base: u64, size: usize, protect: u32, section: Arc<SectionObject>, offset: u64) -> Result<u64, u64> {
         let size = align_up(size, 0x1000);
-        if section_offset as usize + size > section.size { return Err(STATUS_INVALID_PARAMETER); }
-
-        let base = self.find_free_region(addr_hint, size)
-            .ok_or(STATUS_NO_MEMORY)?;
-
-        // Map the backing bytes directly into the virtual address space.
-        // We copy section bytes into fresh frames (true shared-memory DMA mapping
-        // requires IOMMU support — full implementation in Phase 6).
-        let mut mapper   = unsafe { memory::get_mapper() };
-        let data_guard   = section.data.lock();
-        let src_bytes    = &data_guard[section_offset as usize .. section_offset as usize + size];
-
-        // Use CoW-initial protection: writable sections start read-only.
-        let initial_protect = if section.page_protection == PAGE_READONLY {
-            PAGE_READONLY
+        let base = if base != 0 {
+            if base & 0xFFF != 0 || !self.is_free(base, size) { return Err(0xC000_0018); } // STATUS_CONFLICTING_ADDRESSES
+            base
         } else {
-            PAGE_WRITECOPY  // Will trigger fault → private copy on write
+            self.find_free_region(0, size).ok_or(STATUS_NO_MEMORY)?
         };
-        let flags = nt_protect_to_page_flags(initial_protect);
-
-        let num_pages = size / 0x1000;
-        for i in 0..num_pages {
-            let vaddr  = VirtAddr::new(base + (i as u64 * 0x1000));
-            let page   = Page::<Size4KiB>::containing_address(vaddr);
-            let frame  = memory::allocate_frame().ok_or(STATUS_NO_MEMORY)?;
-
-            memory::map_page(page, frame, flags, &mut mapper, &mut GlobalFrameAllocator);
-
-            // Copy section data into the fresh frame.
-            let page_offset = i * 0x1000;
-            let copy_len    = core::cmp::min(0x1000, size - page_offset);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src_bytes[page_offset..].as_ptr(),
-                    vaddr.as_mut_ptr::<u8>(),
-                    copy_len,
-                );
-                // Zero-pad remainder of the page.
-                if copy_len < 0x1000 {
-                    core::ptr::write_bytes(
-                        vaddr.as_mut_ptr::<u8>().add(copy_len),
-                        0,
-                        0x1000 - copy_len,
-                    );
-                }
-            }
-        }
-        drop(data_guard);
-
-        // Record the VAD.
         self.entries.push(VadEntry {
-            base, size,
-            state:          VadState::Committed,
-            vad_type:       VadType::Mapped,
-            protect:        initial_protect,
-            alloc_protect:  protect,
-            section:        Some(section),
-            section_offset,
+            base, size, state: VadState::Committed, vad_type: VadType::Mapped,
+            protect, alloc_protect: protect, section: Some(section), section_offset: offset,
         });
         self.entries.sort_by_key(|e| e.base);
-
-        println!("[NTMEM] MapViewOfSection: mapped {} bytes at {:#X}", size, base);
         Ok(base)
     }
 
@@ -555,9 +589,8 @@ impl VadSpace {
         let addr  = align_down(addr, 0x1000);
         let idx   = self.entries.iter().position(|e| e.base == addr && e.vad_type == VadType::Mapped)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-        let vad   = self.entries.remove(idx);
-        self.decommit_range(vad.base, vad.size);
-        println!("[NTMEM] UnmapViewOfSection: freed {:#X}", addr);
+        // Its pages belong to the section; nt_section unmaps them.
+        self.entries.remove(idx);
         Ok(())
     }
 
@@ -644,6 +677,26 @@ impl VadSpace {
 // =====================================================================
 // -----| NT protect flags → x86_64 PageTableFlags |-----
 // =====================================================================
+
+/// The page-table bits that make a protection.
+const PROT_BITS: PageTableFlags = PageTableFlags::PRESENT
+    .union(PageTableFlags::WRITABLE)
+    .union(PageTableFlags::NO_EXECUTE);
+
+/// A PAGE_* protection for page-table flags.
+pub fn flags_to_protect(flags: PageTableFlags) -> u32 {
+    if !flags.contains(PageTableFlags::PRESENT) {
+        return PAGE_NOACCESS;
+    }
+    let w = flags.contains(PageTableFlags::WRITABLE);
+    let x = !flags.contains(PageTableFlags::NO_EXECUTE);
+    match (w, x) {
+        (true, true) => PAGE_EXECUTE_RW,
+        (true, false) => PAGE_READWRITE,
+        (false, true) => PAGE_EXECUTE_READ,
+        (false, false) => PAGE_READONLY,
+    }
+}
 
 pub fn nt_protect_to_page_flags(protect: u32) -> PageTableFlags {
     let core_protect = protect & 0xFF; // Strip modifier flags
@@ -752,28 +805,8 @@ pub fn dispatch_nt_memory_syscall(syscall_id: u64, arg0: u64, arg1: u64, arg2: u
             STATUS_SUCCESS
         }
 
-        // NtMapViewOfSection (0x28)
-        // arg0=section_handle, arg1=addr_hint, arg2=size, arg3=protect
-        0x0028 => {
-            let section_handle = arg0 as crate::nt_objects::Handle;
-            let addr_hint      = arg1;
-            let size           = arg2 as usize;
-            let protect        = arg3 as u32;
-
-            let section_arc = process.handles.lock().as_section(section_handle);
-            match section_arc {
-                None => {
-                    println!("[NTMEM] NtMapViewOfSection: invalid section handle {}", section_handle);
-                    STATUS_INVALID_HANDLE
-                }
-                Some(sec) => {
-                    match process.vad.lock().map_view_of_section(sec, addr_hint, size, 0, protect) {
-                        Ok(addr) => addr,
-                        Err(e)   => e,
-                    }
-                }
-            }
-        }
+        // NtMapViewOfSection (0x28): the NT call is nt_section.rs now.
+        0x0028 => crate::nt_objects::STATUS_NOT_IMPLEMENTED,
 
         // NtUnmapViewOfSection (0x2A)
         // arg0=addr

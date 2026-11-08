@@ -253,6 +253,7 @@ pub fn spawn_thread(proc: &Arc<Process>, start: u64, param: u64, flags: u64) -> 
             w(0x00, u64::MAX);
             w(0x08, stack_top);
             w(0x10, stack_base);
+            w(0x1478, stack_base);
             w(0x30, teb);
             w(TEB_PROCESS_ID, proc.pid as u64);
             w(TEB_THREAD_ID, tid as u64);
@@ -337,7 +338,7 @@ pub fn object(proc: &Process, handle: u64) -> Option<KernelObjectRef> {
 }
 
 /// A handle, or one of the pseudo handles for this process and thread.
-fn object_or_self(proc: &Arc<Process>, handle: u64) -> Option<KernelObjectRef> {
+pub fn object_or_self(proc: &Arc<Process>, handle: u64) -> Option<KernelObjectRef> {
     match handle {
         CURRENT_PROCESS => Some(KernelObjectRef::Process(proc.clone())),
         CURRENT_THREAD => current_thread(proc).map(KernelObjectRef::Thread),
@@ -372,6 +373,9 @@ fn signalled(obj: &KernelObjectRef, take: bool) -> bool {
         }
         KernelObjectRef::Process(p) => p.ended.load(Ordering::Acquire),
         KernelObjectRef::Thread(t) => t.done.load(Ordering::Acquire),
+        KernelObjectRef::Timer(t) => if take { t.take() } else { t.check() },
+        // A console's input handle: signalled while input is waiting.
+        KernelObjectRef::Console(c) => c.input_count() > 0,
         _ => true,
     }
 }
@@ -560,13 +564,18 @@ pub fn open_process(proc: &Arc<Process>, out: u64, attributes: u64, client_id: u
 pub fn duplicate(proc: &Arc<Process>, src_proc: u64, src: u64, dst_proc: u64, out: u64) -> NtStatus {
     let attributes = stack(5).unwrap_or(0) as u32;
     let options = stack(6).unwrap_or(0) as u32;
-    if src_proc != CURRENT_PROCESS {
+    // From this process, or another this one has a handle to (a forked MSYS2
+    // child takes its handles from its parent so).
+    let source = if src_proc == CURRENT_PROCESS {
+        proc.clone()
+    } else {
         match object(proc, src_proc) {
-            Some(KernelObjectRef::Process(p)) if p.pid == proc.pid => {}
-            _ => return status::ACCESS_DENIED,
+            Some(KernelObjectRef::Process(p)) => p,
+            Some(_) => return status::OBJECT_TYPE_MISMATCH,
+            None => return status::INVALID_HANDLE,
         }
-    }
-    let Some(obj) = object_or_self(proc, src) else { return status::INVALID_HANDLE };
+    };
+    let Some(obj) = object_or_self(&source, src) else { return status::INVALID_HANDLE };
     let target = if dst_proc == CURRENT_PROCESS {
         proc.clone()
     } else {
@@ -577,7 +586,7 @@ pub fn duplicate(proc: &Arc<Process>, src_proc: u64, src: u64, dst_proc: u64, ou
     };
     // DUPLICATE_SAME_ATTRIBUTES keeps the source's; otherwise OBJ_INHERIT says.
     let inherit = if options & 4 != 0 {
-        proc.handles.lock().inheritable(src as u32).unwrap_or(false)
+        source.handles.lock().inheritable(src as u32).unwrap_or(false)
     } else {
         attributes & 2 != 0
     };
@@ -585,7 +594,7 @@ pub fn duplicate(proc: &Arc<Process>, src_proc: u64, src: u64, dst_proc: u64, ou
     let h = target.handles.lock().allocate_ref(obj, 0x001F_FFFF, kept);
     if options & 1 != 0 && src != CURRENT_PROCESS && src != CURRENT_THREAD {
         // DUPLICATE_CLOSE_SOURCE
-        proc.handles.lock().close(src as u32);
+        source.handles.lock().close(src as u32);
     }
     if ptr_ok(out, 8) {
         unsafe { *(out as *mut u64) = h as u64 };
@@ -600,6 +609,18 @@ pub struct Pipe {
     readers: AtomicUsize,
     writers: AtomicUsize,
     capacity: usize,
+}
+
+impl Pipe {
+    /// Bytes waiting in it, and how many it holds.
+    pub fn fill(&self) -> (usize, usize) {
+        (self.data.lock().len(), self.capacity)
+    }
+
+    /// Has one side no handles left (so the other sees it closing)?
+    pub fn one_side_gone(&self) -> bool {
+        self.readers.load(Ordering::Acquire) == 0 || self.writers.load(Ordering::Acquire) == 0
+    }
 }
 
 /// One end of a pipe; the pipe breaks when all handles to an end are gone.
@@ -853,15 +874,15 @@ pub fn create_process(proc: &Arc<Process>, params: u64, result: u64) -> NtStatus
 /// NtQueryVolumeInformationFile(handle, iosb*, info*, length, class):
 /// FileFsDeviceInformation (the device type GetFileType reports).
 pub fn query_volume(proc: &Arc<Process>, h: u64, iosb: u64, out: u64, length: u64) -> NtStatus {
+    const VOLUME: u32 = 1;
+    const SIZE: u32 = 3;
+    const DEVICE: u32 = 4;
+    const ATTRIBUTE: u32 = 5;
+    const FULL_SIZE: u32 = 7;
     let class = stack(4).unwrap_or(0) as u32;
-    let length = length as u32;
-    if class != 4 {
-        return status::INVALID_INFO_CLASS;
-    }
-    if length < 8 || !ptr_ok(out, 8) {
-        return status::BUFFER_TOO_SMALL;
-    }
-    let device: u32 = match object(proc, h) {
+    let length = length as usize;
+    let obj = object(proc, h);
+    let device: u32 = match &obj {
         Some(KernelObjectRef::Duplex(_)) => 0x11,  // FILE_DEVICE_NAMED_PIPE
         Some(KernelObjectRef::Null) => 0x15,       // FILE_DEVICE_NULL
         Some(KernelObjectRef::File(_)) => 0x07,    // FILE_DEVICE_DISK
@@ -870,12 +891,66 @@ pub fn query_volume(proc: &Arc<Process>, h: u64, iosb: u64, out: u64, length: u6
         Some(_) => 0x22,                           // FILE_DEVICE_UNKNOWN
         None => return status::INVALID_HANDLE,
     };
-    unsafe {
-        *(out as *mut u32) = device;
-        *((out + 4) as *mut u32) = 0;
+    let is_file = matches!(obj, Some(KernelObjectRef::File(_)));
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
+    // The disk's figures: 4 KiB units, 4 GiB of them, half free.
+    let (units, free) = (0x10_0000u64, 0x8_0000u64);
+    let mut info: Vec<u8> = Vec::new();
+    match class {
+        DEVICE => {
+            info.extend_from_slice(&device.to_le_bytes());
+            info.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // A volume label and serial number; the label at offset 18.
+        VOLUME if is_file => {
+            let label = utf16("VEILOS");
+            info.extend_from_slice(&0i64.to_le_bytes());
+            info.extend_from_slice(&0x5645_494Cu32.to_le_bytes());
+            info.extend_from_slice(&(label.len() as u32).to_le_bytes());
+            info.extend_from_slice(&[0, 0]);
+            info.extend_from_slice(&label);
+        }
+        // FAT32, case-preserving, Unicode names (so the MSYS2 runtime keeps
+        // permissions itself instead of asking for ACLs, which aren't kept).
+        ATTRIBUTE if is_file => {
+            let name = utf16("FAT32");
+            info.extend_from_slice(&(0x2u32 | 0x4).to_le_bytes());
+            info.extend_from_slice(&255i32.to_le_bytes());
+            info.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            info.extend_from_slice(&name);
+        }
+        SIZE if is_file => {
+            info.extend_from_slice(&units.to_le_bytes());
+            info.extend_from_slice(&free.to_le_bytes());
+            info.extend_from_slice(&8u32.to_le_bytes());
+            info.extend_from_slice(&512u32.to_le_bytes());
+        }
+        FULL_SIZE if is_file => {
+            info.extend_from_slice(&units.to_le_bytes());
+            info.extend_from_slice(&free.to_le_bytes());
+            info.extend_from_slice(&free.to_le_bytes());
+            info.extend_from_slice(&8u32.to_le_bytes());
+            info.extend_from_slice(&512u32.to_le_bytes());
+        }
+        VOLUME | ATTRIBUTE | SIZE | FULL_SIZE => return 0xC000_0010u32 as NtStatus, // STATUS_INVALID_DEVICE_REQUEST
+        _ => return status::INVALID_INFO_CLASS,
     }
+    let mut st = status::SUCCESS;
+    if length < info.len() {
+        // Variable-length answers say as much as fits.
+        if matches!(class, VOLUME | ATTRIBUTE) && length >= 12 {
+            info.truncate(length);
+            st = 0x8000_0005u32 as NtStatus; // STATUS_BUFFER_OVERFLOW
+        } else {
+            return status::BUFFER_TOO_SMALL;
+        }
+    }
+    if !ptr_ok(out, info.len()) {
+        return status::ACCESS_VIOLATION;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), out as *mut u8, info.len()) };
     if ptr_ok(iosb, 16) {
-        unsafe { *(iosb as *mut nt_abi::IoStatusBlock) = nt_abi::IoStatusBlock { status: 0, information: 8 } };
+        unsafe { *(iosb as *mut nt_abi::IoStatusBlock) = nt_abi::IoStatusBlock { status: st as u32 as u64, information: info.len() as u64 } };
     }
-    status::SUCCESS
+    st
 }

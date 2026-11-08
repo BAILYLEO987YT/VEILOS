@@ -82,6 +82,22 @@ pub fn sys_info(op: u64, out: u64, size: u64) -> NtStatus {
             }
             None => status::INVALID_HANDLE,
         },
+        // Log this process's system calls (VEILOS_TRACE_SYSCALLS=1).
+        3 => match crate::process::PROCESSOR.lock().get_active() {
+            Some(p) => {
+                p.trace_syscalls.store(true, core::sync::atomic::Ordering::Relaxed);
+                status::SUCCESS
+            }
+            None => status::INVALID_HANDLE,
+        },
+        // Log only its socket calls and waits (VEILOS_TRACE_NET=1).
+        4 => match crate::process::PROCESSOR.lock().get_active() {
+            Some(p) => {
+                p.trace_net.store(true, core::sync::atomic::Ordering::Relaxed);
+                status::SUCCESS
+            }
+            None => status::INVALID_HANDLE,
+        },
         _ => status::INVALID_PARAMETER,
     }
 }
@@ -115,13 +131,237 @@ fn still_held(o: &KernelObjectRef) -> bool {
         KernelObjectRef::Event(a) => Arc::strong_count(a) > 1,
         KernelObjectRef::Semaphore(a) => Arc::strong_count(a) > 1,
         KernelObjectRef::Mutex(a) => Arc::strong_count(a) > 1,
+        KernelObjectRef::Section(a) => Arc::strong_count(a) > 1,
+        KernelObjectRef::Directory(a) => Arc::strong_count(a) > 1,
+        KernelObjectRef::Timer(a) => Arc::strong_count(a) > 1,
+        KernelObjectRef::Link(a) => Arc::strong_count(a) > 1,
         _ => false,
     }
 }
 
+// Kinds in the table (kernel32 uses the first three by number).
+pub const KIND_EVENT: u32 = 1;
+pub const KIND_MUTEX: u32 = 2;
+pub const KIND_SEMAPHORE: u32 = 3;
+pub const KIND_SECTION: u32 = 4;
+pub const KIND_DIRECTORY: u32 = 5;
+pub const KIND_TIMER: u32 = 6;
+pub const KIND_LINK: u32 = 7;
+
+const STATUS_OBJECT_NAME_EXISTS: NtStatus = 0x4000_0000;
+const STATUS_OBJECT_NAME_COLLISION: NtStatus = 0xC000_0035u32 as NtStatus;
+const OBJ_OPENIF: u32 = 0x80;
+
+/// One namespace, one session: Win32's Global\ and Local\, NT's
+/// \BaseNamedObjects and each session's, and \Sessions\BNOLINKS\N all lead
+/// to the same place. The name without any of them.
+pub fn canonical(name: &str) -> String {
+    fn strip<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        (s.len() >= prefix.len() && s.is_char_boundary(prefix.len()) && s[..prefix.len()].eq_ignore_ascii_case(prefix)).then(|| &s[prefix.len()..])
+    }
+    fn digits(s: &str) -> &str {
+        s.trim_start_matches(|c: char| c.is_ascii_digit())
+    }
+    let mut n = name;
+    loop {
+        let before = n.len();
+        if let Some(r) = strip(n, "\\Sessions\\BNOLINKS\\") {
+            n = digits(r);
+        } else if let Some(r) = strip(n, "\\Sessions\\") {
+            let r = digits(r);
+            n = strip(r, "\\BaseNamedObjects").unwrap_or(r);
+        } else if let Some(r) = strip(n, "\\BaseNamedObjects") {
+            n = r;
+        } else if let Some(r) = strip(n, "Global\\").or_else(|| strip(n, "Local\\")) {
+            n = r;
+        }
+        n = n.trim_start_matches('\\');
+        if n.len() == before {
+            return String::from(n);
+        }
+    }
+}
+
+/// A UNICODE_STRING (Length, MaximumLength, Buffer at 8) from the caller.
+fn read_unicode_string(us: u64) -> Option<String> {
+    if !ptr_ok(us, 16) {
+        return None;
+    }
+    let len = unsafe { core::ptr::read_unaligned(us as *const u16) } as usize / 2;
+    let buf = unsafe { core::ptr::read_unaligned((us + 8) as *const u64) };
+    if len > NAME_MAX || (len > 0 && !ptr_ok(buf, len * 2)) {
+        return None;
+    }
+    let units = unsafe { core::slice::from_raw_parts(buf as *const u16, len) };
+    Some(char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or('?')).collect())
+}
+
+/// The name OBJECT_ATTRIBUTES give (ObjectName under RootDirectory, if a
+/// directory object), canonical; and its Attributes. None: no name.
+pub fn attr_name(proc: &Process, attrs: u64) -> Result<(Option<String>, u32), NtStatus> {
+    if attrs == 0 {
+        return Ok((None, 0));
+    }
+    if !ptr_ok(attrs, 48) {
+        return Err(status::ACCESS_VIOLATION);
+    }
+    let (root, name_ptr, flags) = unsafe {
+        (
+            core::ptr::read_unaligned((attrs + 8) as *const u64),
+            core::ptr::read_unaligned((attrs + 16) as *const u64),
+            core::ptr::read_unaligned((attrs + 24) as *const u32),
+        )
+    };
+    if name_ptr == 0 {
+        return Ok((None, flags));
+    }
+    let name = read_unicode_string(name_ptr).ok_or(status::ACCESS_VIOLATION)?;
+    let full = if root != 0 {
+        match crate::nt_process::object(proc, root) {
+            Some(KernelObjectRef::Directory(d)) if d.name.is_empty() => name,
+            Some(KernelObjectRef::Directory(d)) => alloc::format!("{}\\{}", d.name, name.trim_start_matches('\\')),
+            Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            None => return Err(status::INVALID_HANDLE),
+        }
+    } else {
+        name
+    };
+    Ok((Some(canonical(&full)), flags))
+}
+
+/// Create an object of `kind` (made by `make`), named as `attrs` say. A name
+/// in use: with OBJ_OPENIF the object there (STATUS_OBJECT_NAME_EXISTS),
+/// otherwise STATUS_OBJECT_NAME_COLLISION.
+pub fn create_named(proc: &Process, out: u64, access: u64, attrs: u64, kind: u32, make: impl FnOnce() -> KernelObjectRef) -> NtStatus {
+    if !ptr_ok(out, 8) {
+        return status::ACCESS_VIOLATION;
+    }
+    let (name, flags) = match attr_name(proc, attrs) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let mut table = NAMED.lock();
+    let (obj, st) = match name {
+        Some(name) if !name.is_empty() => {
+            table.retain(|_, (_, o)| still_held(o));
+            match table.get(&name) {
+                Some((k, o)) if *k == kind && flags & OBJ_OPENIF != 0 => (o.clone(), STATUS_OBJECT_NAME_EXISTS),
+                Some(_) => return STATUS_OBJECT_NAME_COLLISION,
+                None => {
+                    let o = make();
+                    table.insert(name, (kind, o.clone()));
+                    (o, status::SUCCESS)
+                }
+            }
+        }
+        _ => (make(), status::SUCCESS),
+    };
+    drop(table);
+    let h = proc.handles.lock().allocate_ref(obj, access as u32, 0);
+    unsafe { *(out as *mut u64) = h as u64 };
+    if proc.trace_syscalls.load(Ordering::Relaxed) {
+        let name = attr_name(proc, attrs).ok().and_then(|(n, _)| n).unwrap_or_default();
+        // Who asked: code addresses among the caller's first stack words.
+        let rsp = crate::smp::current_syscall_user_rsp();
+        let mut trail = String::new();
+        for i in 0..40u64 {
+            let a = rsp + i * 8;
+            if !ptr_ok(a, 8) {
+                break;
+            }
+            let v = unsafe { core::ptr::read_unaligned(a as *const u64) };
+            if (0x1_0000_0000..0x3_0000_0000).contains(&v) {
+                trail.push_str(&alloc::format!(" {:x}", v));
+            }
+        }
+        crate::serial_println!("[OBJ] pid {}: kind {} {:#x} {:?} -> {:#x} from{}", proc.pid, kind, h, name, st as u32, trail);
+    }
+    st
+}
+
+/// NtOpen{Event,Mutant,Semaphore,Section,DirectoryObject}(out*, access, attrs*).
+/// The namespace's root directory always exists.
+pub fn open_by_attrs(proc: &Process, out: u64, access: u64, attrs: u64, kind: u32) -> NtStatus {
+    if !ptr_ok(out, 8) {
+        return status::ACCESS_VIOLATION;
+    }
+    let name = match attr_name(proc, attrs) {
+        Ok((Some(n), _)) => n,
+        Ok((None, _)) => return 0xC000_0033u32 as NtStatus, // STATUS_OBJECT_NAME_INVALID
+        Err(s) => return s,
+    };
+    // A device, not a link: how Cygwin finds out that a device exists.
+    if kind == KIND_LINK && name.eq_ignore_ascii_case("Device\\Null") {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    let obj = if kind == KIND_DIRECTORY && name.is_empty() {
+        KernelObjectRef::Directory(Arc::new(crate::nt_objects::DirectoryObject { name }))
+    } else {
+        let mut table = NAMED.lock();
+        table.retain(|_, (_, o)| still_held(o));
+        match table.get(&name) {
+            None => return STATUS_OBJECT_NAME_NOT_FOUND,
+            Some((k, _)) if *k != kind => return STATUS_OBJECT_TYPE_MISMATCH,
+            Some((_, o)) => o.clone(),
+        }
+    };
+    let h = proc.handles.lock().allocate_ref(obj, access as u32, 0);
+    unsafe { *(out as *mut u64) = h as u64 };
+    status::SUCCESS
+}
+
+/// NtCreateSymbolicLinkObject(out*, access, attrs*, target*).
+pub fn create_link(proc: &Process, out: u64, access: u64, attrs: u64, target: u64) -> NtStatus {
+    if !ptr_ok(target, 16) {
+        return status::ACCESS_VIOLATION;
+    }
+    let len = unsafe { core::ptr::read_unaligned(target as *const u16) } as usize / 2;
+    let buf = unsafe { core::ptr::read_unaligned((target + 8) as *const u64) };
+    if len > NAME_MAX || (len > 0 && !ptr_ok(buf, len * 2)) {
+        return status::ACCESS_VIOLATION;
+    }
+    let units = unsafe { core::slice::from_raw_parts(buf as *const u16, len) }.to_vec();
+    create_named(proc, out, access, attrs, KIND_LINK, move || {
+        KernelObjectRef::Link(Arc::new(crate::nt_objects::LinkObject { target: units }))
+    })
+}
+
+/// NtQuerySymbolicLinkObject(link, target* (a UNICODE_STRING to fill), length*).
+pub fn query_link(proc: &Process, h: u64, target: u64, ret: u64) -> NtStatus {
+    let Some(KernelObjectRef::Link(link)) = crate::nt_process::object(proc, h) else { return status::INVALID_HANDLE };
+    if !ptr_ok(target, 16) {
+        return status::ACCESS_VIOLATION;
+    }
+    let bytes = link.target.len() * 2;
+    if ptr_ok(ret, 4) {
+        unsafe { core::ptr::write_unaligned(ret as *mut u32, bytes as u32) };
+    }
+    let max = unsafe { core::ptr::read_unaligned((target + 2) as *const u16) } as usize;
+    let buf = unsafe { core::ptr::read_unaligned((target + 8) as *const u64) };
+    if max < bytes || !ptr_ok(buf, bytes) {
+        return status::BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(link.target.as_ptr(), buf as *mut u16, link.target.len());
+        core::ptr::write_unaligned(target as *mut u16, bytes as u16);
+    }
+    status::SUCCESS
+}
+
+/// NtCreateDirectoryObject(out*, access, attrs*).
+pub fn create_directory(proc: &Process, out: u64, access: u64, attrs: u64) -> NtStatus {
+    let name = match attr_name(proc, attrs) {
+        Ok((n, _)) => n.unwrap_or_default(),
+        Err(s) => return s,
+    };
+    create_named(proc, out, access, attrs, KIND_DIRECTORY, move || {
+        KernelObjectRef::Directory(Arc::new(crate::nt_objects::DirectoryObject { name }))
+    })
+}
+
 /// VEIL_NAME_OBJECT(handle, name*, kind): give the object at `handle` a name.
 pub fn name_object(proc: &Process, h: u64, name: u64, kind: u64) -> NtStatus {
-    let Some(name) = read_name(name) else { return status::ACCESS_VIOLATION };
+    let Some(name) = read_name(name).map(|n| canonical(&n)) else { return status::ACCESS_VIOLATION };
     let Some(obj) = crate::nt_process::object(proc, h) else { return status::INVALID_HANDLE };
     let mut table = NAMED.lock();
     table.retain(|_, (_, o)| still_held(o));
@@ -135,7 +375,7 @@ pub fn open_named(proc: &Process, name: u64, kind: u64, out: u64) -> NtStatus {
     if !ptr_ok(out, 8) {
         return status::ACCESS_VIOLATION;
     }
-    let Some(name) = read_name(name) else { return status::ACCESS_VIOLATION };
+    let Some(name) = read_name(name).map(|n| canonical(&n)) else { return status::ACCESS_VIOLATION };
     let found = {
         let mut table = NAMED.lock();
         table.retain(|_, (_, o)| still_held(o));
@@ -150,6 +390,152 @@ pub fn open_named(proc: &Process, name: u64, kind: u64, out: u64) -> NtStatus {
             status::SUCCESS
         }
     }
+}
+
+// -----| NT-style creation, queries and timers |-----
+
+/// NtCreateMutant(out*, access, attrs*, initially_owned).
+pub fn create_mutant(proc: &Process, out: u64, access: u64, attrs: u64, owned: u64) -> NtStatus {
+    use crate::nt_objects::MutexObject;
+    crate::nt_ipc::create_named(proc, out, access, attrs, KIND_MUTEX, || {
+        let m = Arc::new(MutexObject::new(None, false));
+        if owned as u8 != 0 {
+            m.try_acquire(MutexObject::current_owner());
+        }
+        KernelObjectRef::Mutex(m)
+    })
+}
+
+/// NtCreateEvent(out*, access, attrs*, type, initial): type 0 notification
+/// (manual reset), 1 synchronization.
+pub fn create_event(proc: &Process, out: u64, access: u64, attrs: u64, kind: u64, initial: u64) -> NtStatus {
+    create_named(proc, out, access, attrs, KIND_EVENT, || {
+        KernelObjectRef::Event(Arc::new(crate::nt_objects::EventObject::new(None, kind as u32 == 1, initial as u8 != 0)))
+    })
+}
+
+/// NtCreateSemaphore(out*, access, attrs*, initial, maximum).
+pub fn create_semaphore(proc: &Process, out: u64, access: u64, attrs: u64, initial: i32, max: i32) -> NtStatus {
+    if max <= 0 || initial < 0 || initial > max {
+        return status::INVALID_PARAMETER;
+    }
+    create_named(proc, out, access, attrs, KIND_SEMAPHORE, || {
+        KernelObjectRef::Semaphore(Arc::new(crate::nt_objects::SemaphoreObject::new(None, initial, max)))
+    })
+}
+
+/// Write an 8-byte basic-information answer (two i32s) for a query.
+fn answer(out: u64, length: u64, ret: u64, a: i32, b: i32) -> NtStatus {
+    if length < 8 {
+        return 0xC000_0004u32 as NtStatus; // STATUS_INFO_LENGTH_MISMATCH
+    }
+    if !ptr_ok(out, 8) {
+        return status::ACCESS_VIOLATION;
+    }
+    unsafe {
+        core::ptr::write_unaligned(out as *mut i32, a);
+        core::ptr::write_unaligned((out + 4) as *mut i32, b);
+    }
+    if ptr_ok(ret, 4) {
+        unsafe { core::ptr::write_unaligned(ret as *mut u32, 8) };
+    }
+    status::SUCCESS
+}
+
+/// NtQueryEvent(h, EventBasicInformation, info*, length, ret*): type, state.
+pub fn query_event(proc: &Process, h: u64, class: u64, out: u64, length: u64, ret: u64) -> NtStatus {
+    let Some(KernelObjectRef::Event(e)) = crate::nt_process::object(proc, h) else { return status::INVALID_HANDLE };
+    if class != 0 {
+        return status::INVALID_INFO_CLASS;
+    }
+    answer(out, length, ret, e.auto_reset as i32, e.signaled.load(Ordering::Acquire) as i32)
+}
+
+/// NtQuerySemaphore(h, SemaphoreBasicInformation, info*, length, ret*): count, maximum.
+pub fn query_semaphore(proc: &Process, h: u64, class: u64, out: u64, length: u64, ret: u64) -> NtStatus {
+    let Some(KernelObjectRef::Semaphore(sem)) = crate::nt_process::object(proc, h) else { return status::INVALID_HANDLE };
+    if class != 0 {
+        return status::INVALID_INFO_CLASS;
+    }
+    answer(out, length, ret, sem.current_count(), sem.max_count)
+}
+
+/// NtCreateTimer(out*, access, attrs*, type): 0 notification, 1 synchronization.
+pub fn create_timer(proc: &Process, out: u64, access: u64, attrs: u64, kind: u64) -> NtStatus {
+    create_named(proc, out, access, attrs, KIND_TIMER, || {
+        KernelObjectRef::Timer(Arc::new(crate::nt_objects::TimerObject::new(kind as u32 == 0)))
+    })
+}
+
+fn timer(proc: &Process, h: u64) -> Option<Arc<crate::nt_objects::TimerObject>> {
+    match crate::nt_process::object(proc, h)? {
+        KernelObjectRef::Timer(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// NtSetTimer(h, due*, apc, context, resume, period_ms, previous*). Due
+/// times in 100 ns units, negative relative, else a FILETIME. APC routines
+/// aren't run.
+pub fn set_timer(proc: &Process, h: u64, due: u64) -> NtStatus {
+    let period = crate::interrupts::syscall_stack_arg(5).unwrap_or(0) as u32 as i32;
+    let prev = crate::interrupts::syscall_stack_arg(6).unwrap_or(0);
+    let Some(t) = timer(proc, h) else { return status::INVALID_HANDLE };
+    if !ptr_ok(due, 8) {
+        return status::ACCESS_VIOLATION;
+    }
+    let d = unsafe { core::ptr::read_unaligned(due as *const i64) };
+    let now = crate::interrupts::TICKS.load(Ordering::Relaxed);
+    let ms = if d < 0 {
+        d.unsigned_abs().div_ceil(10_000)
+    } else {
+        (d as u64).saturating_sub(crate::kusd::system_time()).div_ceil(10_000)
+    };
+    let was = t.fired.swap(false, Ordering::AcqRel);
+    t.period.store(period.max(0) as u32, Ordering::Release);
+    t.due.store((now + ms).max(1), Ordering::Release);
+    if ptr_ok(prev, 1) {
+        unsafe { *(prev as *mut u8) = was as u8 };
+    }
+    status::SUCCESS
+}
+
+/// NtCancelTimer(h, current*).
+pub fn cancel_timer(proc: &Process, h: u64, current: u64) -> NtStatus {
+    let Some(t) = timer(proc, h) else { return status::INVALID_HANDLE };
+    let was = t.check();
+    t.due.store(0, Ordering::Release);
+    if ptr_ok(current, 1) {
+        unsafe { *(current as *mut u8) = was as u8 };
+    }
+    status::SUCCESS
+}
+
+/// NtQueryTimer(h, TimerBasicInformation, info*, length, ret*): the time
+/// left (100 ns units), and whether it's signalled.
+pub fn query_timer(proc: &Process, h: u64, class: u64, out: u64, length: u64, ret: u64) -> NtStatus {
+    let Some(t) = timer(proc, h) else { return status::INVALID_HANDLE };
+    if class != 0 {
+        return status::INVALID_INFO_CLASS;
+    }
+    if length < 16 {
+        return 0xC000_0004u32 as NtStatus;
+    }
+    if !ptr_ok(out, 16) {
+        return status::ACCESS_VIOLATION;
+    }
+    let state = t.check();
+    let due = t.due.load(Ordering::Acquire);
+    let now = crate::interrupts::TICKS.load(Ordering::Relaxed);
+    let left = if due > now { (due - now) as i64 * 10_000 } else { 0 };
+    unsafe {
+        core::ptr::write_unaligned(out as *mut i64, left);
+        core::ptr::write_unaligned((out + 8) as *mut u8, state as u8);
+    }
+    if ptr_ok(ret, 4) {
+        unsafe { core::ptr::write_unaligned(ret as *mut u32, 16) };
+    }
+    status::SUCCESS
 }
 
 /// VEIL_MUTEX(op, a, b). Op 0, create: initially owned, out*. Op 1, release: handle.
@@ -312,6 +698,74 @@ fn put_end(proc: &Process, end: DuplexEnd, out: u64) {
     unsafe { *(out as *mut u64) = h as u64 };
 }
 
+/// NtQueryInformationFile on a pipe end (named or anonymous): pipe
+/// information (23), local pipe information (24: quotas, data waiting, free
+/// space; the MSYS2 runtime checks its signal pipe's space so), access (8)
+/// and standard information (5). None: not a pipe.
+pub fn pipe_query(proc: &Process, h: u64, iosb: u64, out: u64, length: usize, class: u32) -> Option<NtStatus> {
+    // (bytes to read, read capacity, bytes queued to write, write capacity, server?, connected?, readable, writable)
+    // ..., and whether the other end is gone (FILE_PIPE_CLOSING_STATE).
+    let (avail, rcap, queued, wcap, server, connected, readable, writable, closing) = match crate::nt_process::object(proc, h)? {
+        KernelObjectRef::Duplex(d) => {
+            let (r, w) = { let e = d.ends.lock(); (e.0.clone(), e.1.clone()) };
+            let (a, rc) = r.pipe.fill();
+            let (q, wc) = w.pipe.fill();
+            let closing = r.pipe.one_side_gone() || w.pipe.one_side_gone();
+            (a, rc, q, wc, d.is_server, d.instance.state.load(Ordering::Acquire) == CONNECTED, true, true, closing)
+        }
+        KernelObjectRef::Pipe(end) => {
+            let (n, cap) = end.pipe.fill();
+            let closing = end.pipe.one_side_gone();
+            if end.write { (0, cap, n, cap, false, true, false, true, closing) } else { (n, cap, 0, cap, true, true, true, false, closing) }
+        }
+        _ => return None,
+    };
+    let mut info: Vec<u8> = Vec::new();
+    let mut put = |v: u32| info.extend_from_slice(&v.to_le_bytes());
+    match class {
+        23 => {
+            put(0); // ReadMode: byte stream
+            put(0); // CompletionMode: queue operation
+        }
+        24 => {
+            put(0); // NamedPipeType: byte stream
+            put(2); // NamedPipeConfiguration: full duplex
+            put(1); // MaximumInstances
+            put(1); // CurrentInstances
+            put(rcap as u32); // InboundQuota
+            put(avail as u32); // ReadDataAvailable
+            put(wcap as u32); // OutboundQuota
+            put(wcap.saturating_sub(queued) as u32); // WriteQuotaAvailable
+            put(if closing { 4 } else if connected { 3 } else { 2 }); // NamedPipeState: closing / connected / listening
+            put(server as u32); // NamedPipeEnd
+        }
+        8 => {
+            let mut a = 0x0010_0000u32 | 0x0002_0000; // SYNCHRONIZE | READ_CONTROL
+            if readable { a |= 0x0012_0089; }
+            if writable { a |= 0x0012_0116; }
+            put(a);
+        }
+        5 => {
+            info.extend_from_slice(&(rcap as u64).to_le_bytes()); // AllocationSize
+            info.extend_from_slice(&(avail as u64).to_le_bytes()); // EndOfFile
+            info.extend_from_slice(&1u32.to_le_bytes()); // NumberOfLinks
+            info.extend_from_slice(&[0, 0, 0, 0]); // DeletePending, Directory
+        }
+        _ => return Some(status::INVALID_INFO_CLASS),
+    }
+    if length < info.len() {
+        return Some(status::BUFFER_TOO_SMALL);
+    }
+    if !ptr_ok(out, info.len()) {
+        return Some(status::ACCESS_VIOLATION);
+    }
+    unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), out as *mut u8, info.len()) };
+    if ptr_ok(iosb, 16) {
+        unsafe { *(iosb as *mut nt_abi::IoStatusBlock) = nt_abi::IoStatusBlock { status: 0, information: info.len() as u64 } };
+    }
+    Some(status::SUCCESS)
+}
+
 fn duplex(proc: &Process, h: u64) -> Option<Arc<DuplexEnd>> {
     match crate::nt_process::object(proc, h) {
         Some(KernelObjectRef::Duplex(d)) => Some(d),
@@ -371,6 +825,12 @@ pub fn pipe_call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 crate::nt_syscalls::wait_a_little();
             }
             status::SUCCESS
+        }
+        // ConnectNamedPipe without the wait: has a client come?
+        9 => {
+            let Some(d) = duplex(proc, a) else { return status::INVALID_HANDLE };
+            let _ = d.instance.state.compare_exchange(DISCONNECTED, LISTENING, Ordering::AcqRel, Ordering::Acquire);
+            if d.instance.state.load(Ordering::Acquire) == CONNECTED { STATUS_PIPE_CONNECTED } else { STATUS_PIPE_LISTENING }
         }
         // DisconnectNamedPipe(server): new streams; no client until ConnectNamedPipe.
         3 => {

@@ -1059,6 +1059,8 @@ pub struct TerminalEmulator {
 }
 
 const TERM_ROW_H: i32 = 16;
+/// A console cell's width: draw_text's pen moves 9 pixels a character.
+const TERM_CELL_W: i32 = 9;
 /// The prompt's line and the margins round the output.
 const TERM_RESERVED_H: u32 = 28;
 
@@ -1160,7 +1162,7 @@ impl TerminalEmulator {
         let Some(win) = wm.windows.iter().find(|w| w.id == self.window_id) else {
             return (crate::console::DEFAULT_COLUMNS, crate::console::DEFAULT_ROWS);
         };
-        let cols = (win.rect.w.saturating_sub(2 + 16 + 12) / 8) as usize;
+        let cols = (win.rect.w.saturating_sub(2 + 16 + 12) / TERM_CELL_W as u32) as usize;
         let rows = (win.rect.h.saturating_sub(38 + 8) as i32 / TERM_ROW_H) as usize;
         (cols.max(10), rows.max(2))
     }
@@ -1192,11 +1194,11 @@ impl TerminalEmulator {
                 }
                 let (fg, bg) = console_colours(attr);
                 if attr & 0xF0 != 0 || attr & 0x4000 != 0 {
-                    r.fill_rect(Rect::new(x0 + x as i32 * 8, py, ((end - x) * 8) as u32, TERM_ROW_H as u32), bg);
+                    r.fill_rect(Rect::new(x0 + x as i32 * TERM_CELL_W, py, (end - x) as u32 * TERM_CELL_W as u32, TERM_ROW_H as u32), bg);
                 }
-                r.draw_text(&text, x0 + x as i32 * 8, py + 2, fg);
+                r.draw_text(&text, x0 + x as i32 * TERM_CELL_W, py + 2, fg);
                 if attr & 0x8000 != 0 {
-                    r.fill_rect(Rect::new(x0 + x as i32 * 8, py + TERM_ROW_H - 2, ((end - x) * 8) as u32, 1), fg);
+                    r.fill_rect(Rect::new(x0 + x as i32 * TERM_CELL_W, py + TERM_ROW_H - 2, (end - x) as u32 * TERM_CELL_W as u32, 1), fg);
                 }
                 x = end;
             }
@@ -1204,9 +1206,9 @@ impl TerminalEmulator {
         let (cx_, cy_) = b.cursor;
         if b.cursor_visible && self.cursor_blink && cx_ >= l && cx_ < l + w && cy_ >= t && cy_ < t + h {
             let (fg, _) = console_colours(b.attr);
-            let px = x0 + (cx_ - l) as i32 * 8;
+            let px = x0 + (cx_ - l) as i32 * TERM_CELL_W;
             let py = y0 + (cy_ - t) as i32 * TERM_ROW_H;
-            r.fill_rect(Rect::new(px, py + TERM_ROW_H - 4, 8, 2), fg);
+            r.fill_rect(Rect::new(px, py + TERM_ROW_H - 4, TERM_CELL_W as u32, 2), fg);
         }
     }
 
@@ -1234,7 +1236,7 @@ impl TerminalEmulator {
     fn try_grid_size(&self) -> Option<(usize, usize)> {
         let wm = DESKTOP_WM.try_lock()?;
         let win = wm.windows.iter().find(|w| w.id == self.window_id)?;
-        let cols = (win.rect.w.saturating_sub(2 + 16 + 12) / 8) as usize;
+        let cols = (win.rect.w.saturating_sub(2 + 16 + 12) / TERM_CELL_W as u32) as usize;
         let rows = (win.rect.h.saturating_sub(38 + 8) as i32 / TERM_ROW_H) as usize;
         Some((cols.max(10), rows.max(2)))
     }
@@ -1281,7 +1283,7 @@ impl TerminalEmulator {
         r.draw_text(&self.input_buf, cx + 24, prompt_y + 2, Color { r: 255, g: 255, b: 255 });
 
         if self.cursor_blink {
-            let cursor_x = cx + 24 + self.input_buf.len() as i32 * 8;
+            let cursor_x = cx + 24 + self.input_buf.len() as i32 * TERM_CELL_W;
             r.fill_rect(Rect::new(cursor_x, prompt_y + 2, 6, 12), text_c);
         }
         let _ = p; // suppress unused warning
@@ -1392,8 +1394,10 @@ static KEY_CHARS: [core::sync::atomic::AtomicU16; 256] = [const { core::sync::at
 /// scan code, character and the modifiers held, as a Windows keyboard makes
 /// them. False if no such terminal has the keyboard.
 pub fn console_key(key: pc_keyboard::KeyCode, state: pc_keyboard::KeyState, decoded: Option<char>) -> bool {
-    let Some(id) = crate::desktop::DESKTOP_WM.try_lock().and_then(|wm| wm.focused_id) else { return false };
-    let Some(idx) = terminal_slot_for_window(id) else { return false };
+    // These wait rather than try: a program drawing holds the terminal's lock
+    // often, and a key that doesn't get through here is lost.
+    let Some(id) = crate::desktop::DESKTOP_WM.lock().focused_id else { return false };
+    let Some(idx) = TERMINAL_POOL.iter().position(|slot| slot.lock().window_id == id) else { return false };
     let Some(console) = TERMINAL_POOL[idx].lock().console.clone().filter(|c| c.is_live()) else { return false };
     let Some((vk, scan, ext)) = crate::nt_user::console_key_code(key) else { return true };
     let mods = crate::nt_user::control_key_state(ext);
@@ -1412,6 +1416,8 @@ pub fn console_key(key: pc_keyboard::KeyCode, state: pc_keyboard::KeyState, deco
         0xDB if ctrl => 0x1B,
         0xDD if ctrl => 0x1D,
         0xDC if ctrl => 0x1C,
+        // pc-keyboard leaves this key undecoded (see main.rs).
+        0xDC if decoded.is_none() => if mods & 0x10 != 0 { b'|' as u16 } else { b'\\' as u16 },
         _ => match decoded {
             Some(c) if (c as u32) < 0x10000 && c as u32 != 0x7F => c as u16,
             _ => 0,

@@ -234,37 +234,108 @@ impl KernelObject for SemaphoreObject {
 // -----| Section Object (Shared Memory / Memory-Mapped File) |-----
 // =====================================================================
 //
-// NT Section objects are the primitive behind CreateFileMapping / MapViewOfFile.
-// Here we model them as a named byte buffer; memory-mapping into process address
-// space is handled by the Windows Memory Manager Personality (future phase).
+// What CreateFileMapping and NtCreateSection make: pages that belong to the
+// section itself, so every view of it, in any process, maps the same
+// physical memory (nt_demand.rs, nt_section.rs). A page is allocated the
+// first time a view touches it: zeros, or the file's bytes for a section
+// over a file (whose writes aren't carried back to the file). The pages go
+// when the last handle and view do.
 
 pub struct SectionObject {
     pub name: Option<String>,
-    pub size: usize,
+    pub size: u64,
     pub page_protection: u32, // PAGE_READONLY (0x02), PAGE_READWRITE (0x04), etc.
-    pub data: Mutex<Vec<u8>>,
+    /// Each page's physical address once touched (0: not yet).
+    frames: Mutex<Vec<u64>>,
+    /// Where the pages come from the first time; zeros if none.
+    pub file: Option<Arc<crate::nt_file::SharedFile>>,
 }
 
 impl SectionObject {
-    pub fn new(name: Option<String>, size: usize, page_protection: u32) -> Self {
-        let mut backing = Vec::new();
-        backing.resize(size, 0u8);
-        Self { name, size, page_protection, data: Mutex::new(backing) }
+    pub fn new(size: u64, page_protection: u32, file: Option<Arc<crate::nt_file::SharedFile>>) -> Self {
+        let pages = size.div_ceil(4096) as usize;
+        Self { name: None, size, page_protection, frames: Mutex::new(alloc::vec![0; pages]), file }
     }
 
-    pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), &'static str> {
-        let data = self.data.lock();
-        if offset + buf.len() > data.len() { return Err("Section read out of bounds"); }
-        buf.copy_from_slice(&data[offset..offset + buf.len()]);
-        Ok(())
+    /// The physical page behind page `index`, brought in if it's the first time.
+    pub fn frame(&self, index: usize) -> Option<u64> {
+        let mut frames = self.frames.lock();
+        let slot = frames.get_mut(index)?;
+        if *slot == 0 {
+            let f = crate::memory::allocate_frame()?;
+            let phys = f.start_address().as_u64();
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut((crate::memory::get_phys_mem_offset().as_u64() + phys) as *mut u8, 4096)
+            };
+            bytes.fill(0);
+            if let Some(file) = &self.file {
+                let _ = file.read_at(index as u64 * 4096, bytes);
+            }
+            *slot = phys;
+        }
+        Some(*slot)
+    }
+}
+
+impl Drop for SectionObject {
+    fn drop(&mut self) {
+        for &phys in self.frames.get_mut().iter().filter(|&&p| p != 0) {
+            crate::memory::deallocate_frame(x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(phys)));
+        }
+    }
+}
+
+// =====================================================================
+// -----| Directory, Timer |-----
+// =====================================================================
+
+/// A symbolic link object (NtCreateSymbolicLinkObject): a name for a target
+/// string. Nothing follows links when opening other objects; programs read
+/// them (Cygwin keeps "winpid.N" links whose target is its own PID).
+pub struct LinkObject {
+    pub target: alloc::vec::Vec<u16>,
+}
+
+/// An object directory (NtCreateDirectoryObject): only a name, which objects
+/// created relative to it are named under (nt_ipc.rs).
+pub struct DirectoryObject {
+    pub name: String,
+}
+
+/// An NT timer: signalled once its due time (in ticks) has passed; a
+/// synchronization timer resets when a wait takes it, a periodic one is
+/// due again `period` ms later.
+pub struct TimerObject {
+    pub manual: bool,
+    pub due: core::sync::atomic::AtomicU64,
+    pub period: AtomicU32,
+    pub fired: AtomicBool,
+}
+
+impl TimerObject {
+    pub fn new(manual: bool) -> Self {
+        Self { manual, due: core::sync::atomic::AtomicU64::new(0), period: AtomicU32::new(0), fired: AtomicBool::new(false) }
     }
 
-    pub fn write_bytes(&self, offset: usize, src: &[u8]) -> Result<(), &'static str> {
-        if self.page_protection == PAGE_READONLY { return Err("Section is read-only"); }
-        let mut data = self.data.lock();
-        if offset + src.len() > data.len() { return Err("Section write out of bounds"); }
-        data[offset..offset + src.len()].copy_from_slice(src);
-        Ok(())
+    /// Has it come due? (Fires it, and sets the next due time if periodic.)
+    pub fn check(&self) -> bool {
+        let due = self.due.load(Ordering::Acquire);
+        if due != 0 && crate::interrupts::TICKS.load(Ordering::Relaxed) >= due {
+            let period = self.period.load(Ordering::Acquire) as u64;
+            let next = if period > 0 { due + period } else { 0 };
+            if self.due.compare_exchange(due, next, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                self.fired.store(true, Ordering::Release);
+            }
+        }
+        self.fired.load(Ordering::Acquire)
+    }
+
+    /// A wait takes it: a synchronization timer is reset.
+    pub fn take(&self) -> bool {
+        if !self.check() {
+            return false;
+        }
+        self.manual || self.fired.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -312,6 +383,9 @@ pub enum KernelObjectRef {
     Socket(Arc<crate::nt_socket::SocketObj>),
     /// A console screen buffer: a console's output side (console.rs).
     ConsoleBuffer(Arc<crate::console::BufferObj>),
+    Directory(Arc<DirectoryObject>),
+    Timer(Arc<TimerObject>),
+    Link(Arc<LinkObject>),
 }
 
 impl KernelObjectRef {
@@ -330,6 +404,9 @@ impl KernelObjectRef {
             Self::Null         => ObjectType::File,
             Self::Socket(_)    => ObjectType::File,
             Self::ConsoleBuffer(_) => ObjectType::Console,
+            Self::Directory(_) => ObjectType::Directory,
+            Self::Timer(_)     => ObjectType::Event,
+            Self::Link(_)      => ObjectType::Directory,
         }
     }
 }
@@ -697,7 +774,7 @@ impl ObjectManager {
         size: usize,
         page_protection: u32,
     ) -> Arc<SectionObject> {
-        let obj = Arc::new(SectionObject::new(name.map(String::from), size, page_protection));
+        let obj = Arc::new(SectionObject::new(size as u64, page_protection, None));
         if let Some(n) = name {
             let path = alloc::format!("\\BaseNamedObjects\\{}", n);
             let _ = self.namespace.insert(&path);

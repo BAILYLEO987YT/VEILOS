@@ -97,50 +97,30 @@ const USER_SID: [u8; 28] = [1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 0xE8, 3, 0, 0, 
 /// Medium integrity: S-1-16-8192.
 const MEDIUM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 16, 0, 0x20, 0, 0];
 
+/// What ntdll says about the token (one user, the same everywhere).
 #[no_mangle]
-pub unsafe extern "system" fn GetTokenInformation(_token: Handle, class: u32, out: *mut u8, size: u32, needed: *mut u32) -> Bool {
-    // (TOKEN_USER / TOKEN_MANDATORY_LABEL: a SID_AND_ATTRIBUTES, then the SID.)
-    let mut buf = [0u8; 64];
-    let n = match class {
-        1 | 25 => {
-            let sid: &[u8] = if class == 1 { &USER_SID } else { &MEDIUM_SID };
-            buf[16..16 + sid.len()].copy_from_slice(sid);
-            if class == 25 {
-                buf[8..12].copy_from_slice(&0x20u32.to_le_bytes()); // SE_GROUP_INTEGRITY
-            }
-            16 + sid.len()
-        }
-        // TokenElevationType: default; TokenElevation: not elevated.
-        18 => {
-            buf[..4].copy_from_slice(&1u32.to_le_bytes());
-            4
-        }
-        20 => 4,
-        // TokenIsAppContainer
-        29 => 4,
-        // TokenSessionId
-        12 => {
-            buf[..4].copy_from_slice(&1u32.to_le_bytes());
-            4
-        }
-        _ => {
-            crate::SetLastError(ERROR_INVALID_PARAMETER);
-            return 0;
-        }
-    };
+pub unsafe extern "system" fn GetTokenInformation(token: Handle, class: u32, out: *mut u8, size: u32, needed: *mut u32) -> Bool {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtQueryInformationToken(token: Handle, class: u32, info: *mut u8, len: u32, ret: *mut u32) -> i32;
+    }
+    let mut n = 0u32;
+    let s = unsafe { NtQueryInformationToken(token, class, out, size, &mut n) };
     if !needed.is_null() {
-        unsafe { *needed = n as u32 };
+        unsafe { *needed = n };
     }
-    if out.is_null() || (size as usize) < n {
-        crate::SetLastError(ERROR_INSUFFICIENT_BUFFER);
-        return 0;
+    match s {
+        0 => 1,
+        st if st == 0xC000_0023u32 as i32 => {
+            crate::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            0
+        }
+        st if st == 0xC000_0003u32 as i32 => {
+            crate::SetLastError(ERROR_INVALID_PARAMETER);
+            0
+        }
+        st => crate::fail(st),
     }
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), out, n) };
-    if matches!(class, 1 | 25) {
-        // The SID pointer.
-        unsafe { *(out as *mut u64) = out.add(16) as u64 };
-    }
-    1
 }
 
 #[no_mangle]

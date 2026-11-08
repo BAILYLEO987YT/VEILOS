@@ -51,12 +51,22 @@ struct Bound {
     modes: u8,
 }
 
+/// A worker hasn't reached its blocking call yet.
+const STARTING: u8 = 0;
+/// It's in the blocking call: the only place it's safe to stop it.
+const BLOCKED: u8 = 1;
+/// CancelIo took the request: the worker must do nothing more with it.
+const CANCELLED: u8 = 2;
+
 #[derive(Clone, Copy)]
 struct Pending {
     file: Handle,
     overlapped: usize,
     thread: Handle,
+    state: u8,
 }
+
+const NO_PENDING: Pending = Pending { file: 0, overlapped: 0, thread: 0, state: STARTING };
 
 struct Tables {
     ports: [Port; MAX_PORTS],
@@ -67,7 +77,7 @@ struct Tables {
 static mut TABLES: Tables = Tables {
     ports: [Port { handle: 0, queue: [NO_PACKET; MAX_QUEUED], head: 0, len: 0 }; MAX_PORTS],
     bound: [Bound { file: 0, port: 0, key: 0, modes: 0 }; MAX_BOUND],
-    pending: [Pending { file: 0, overlapped: 0, thread: 0 }; MAX_PENDING],
+    pending: [NO_PENDING; MAX_PENDING],
 };
 static LOCK: AtomicBool = AtomicBool::new(false);
 
@@ -163,26 +173,64 @@ struct ReadJob {
     buffer: *mut u8,
     length: u32,
     overlapped: usize,
+    /// A ConnectNamedPipe, not a read.
+    connect: bool,
+    /// Its entry in `pending`.
+    slot: usize,
 }
 
 unsafe extern "system" fn read_worker(job: *mut ReadJob) -> u32 {
     let j = unsafe { core::ptr::read(job) };
     unsafe { crate::mem::HeapFree(crate::mem::GetProcessHeap(), 0, job as *mut u8) };
-    let mut iosb = IoStatusBlock::default();
-    let s = unsafe { crate::NtReadFile(j.file, 0, 0, 0, &mut iosb, j.buffer, j.length, core::ptr::null(), core::ptr::null()) };
-    // Gone from the table first: once complete, the caller may reuse it all.
-    let thread = with(|t| {
-        t.pending.iter_mut().find(|p| p.overlapped == j.overlapped && p.file == j.file).map(|p| {
+    // Cancelled while starting: nothing was begun, and the entry is ours to free.
+    let early = with(|t| {
+        let p = &mut t.pending[j.slot];
+        if p.state == CANCELLED {
             let th = p.thread;
-            *p = Pending { file: 0, overlapped: 0, thread: 0 };
-            th
-        })
+            *p = NO_PENDING;
+            Some(th)
+        } else {
+            p.state = BLOCKED;
+            None
+        }
     });
-    complete(j.file, j.overlapped, s, iosb.information, false);
-    if let Some(th) = thread {
+    if let Some(th) = early {
         if th != 0 {
             crate::CloseHandle(th);
         }
+        return 0;
+    }
+    let mut iosb = IoStatusBlock::default();
+    let s = if j.connect {
+        // STATUS_PIPE_CONNECTED counts as connecting: a client came.
+        match unsafe { crate::VeilPipe(2, j.file, 0, 0) } {
+            s if s == 0xC000_00B2u32 as NtStatus => status::SUCCESS,
+            s => s,
+        }
+    } else {
+        unsafe { crate::NtReadFile(j.file, 0, 0, 0, &mut iosb, j.buffer, j.length, core::ptr::null(), core::ptr::null()) }
+    };
+    // Gone from the table first: once complete, the caller may reuse it all.
+    let thread = with(|t| {
+        let p = &mut t.pending[j.slot];
+        if p.state == CANCELLED {
+            None
+        } else {
+            let th = p.thread;
+            *p = NO_PENDING;
+            Some(th)
+        }
+    });
+    // Cancelled just as it finished: it's being stopped, so it holds nothing
+    // and touches nothing until then.
+    let Some(th) = thread else {
+        loop {
+            crate::sync::SwitchToThread();
+        }
+    };
+    complete(j.file, j.overlapped, s, iosb.information, false);
+    if th != 0 {
+        crate::CloseHandle(th);
     }
     0
 }
@@ -197,38 +245,50 @@ pub fn read_pending(file: Handle, buffer: *mut u8, length: u32, overlapped: usiz
     if unsafe { crate::VeilPipe(4, file, &mut avail as *mut u32 as u64, 0) } != 0 || avail != 0 {
         return None;
     }
+    Some(start_worker(ReadJob { file, buffer, length, overlapped, connect: false, slot: 0 }))
+}
+
+/// ConnectNamedPipe with an OVERLAPPED and no client yet: a worker waits for one.
+pub fn connect_pending(file: Handle, overlapped: usize) -> Bool {
+    start_worker(ReadJob { file, buffer: core::ptr::null_mut(), length: 0, overlapped, connect: true, slot: 0 })
+}
+
+/// Hand `work` to a worker thread; FALSE with ERROR_IO_PENDING once it's going.
+fn start_worker(mut work: ReadJob) -> Bool {
+    let (file, overlapped) = (work.file, work.overlapped);
     let job = unsafe { crate::mem::HeapAlloc(crate::mem::GetProcessHeap(), 0, core::mem::size_of::<ReadJob>()) } as *mut ReadJob;
     if job.is_null() {
         crate::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return Some(0);
-    }
-    unsafe {
-        core::ptr::write(job, ReadJob { file, buffer, length, overlapped });
-        *(overlapped as *mut u64) = STATUS_PENDING as u32 as u64;
-        *(overlapped as *mut u64).add(1) = 0;
+        return 0;
     }
     // Reserved before the thread starts, so it always finds its entry.
     let slot = with(|t| {
         t.pending.iter().position(|p| p.overlapped == 0).inspect(|&i| {
-            t.pending[i] = Pending { file, overlapped, thread: 0 };
+            t.pending[i] = Pending { file, overlapped, thread: 0, state: STARTING };
         })
     });
     let Some(slot) = slot else {
         unsafe { crate::mem::HeapFree(crate::mem::GetProcessHeap(), 0, job as *mut u8) };
         crate::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return Some(0);
+        return 0;
     };
+    work.slot = slot;
+    unsafe {
+        core::ptr::write(job, work);
+        *(overlapped as *mut u64) = STATUS_PENDING as u32 as u64;
+        *(overlapped as *mut u64).add(1) = 0;
+    }
     // Suspended until the table has its handle, so a fast read can't miss it.
     let th = unsafe { crate::process::CreateThread(0, 64 << 10, read_worker as *const () as u64, job as u64, 4, core::ptr::null_mut()) };
     if th == 0 {
-        with(|t| t.pending[slot] = Pending { file: 0, overlapped: 0, thread: 0 });
+        with(|t| t.pending[slot] = NO_PENDING);
         unsafe { crate::mem::HeapFree(crate::mem::GetProcessHeap(), 0, job as *mut u8) };
-        return Some(0);
+        return 0;
     }
     with(|t| t.pending[slot].thread = th);
     unsafe { crate::process::ResumeThread(th) };
     crate::SetLastError(ERROR_IO_PENDING);
-    Some(0)
+    0
 }
 
 #[no_mangle]
@@ -264,22 +324,29 @@ fn cancel(file: Handle, only: usize) -> bool {
     let mut any = false;
     for i in 0..MAX_PENDING {
         let taken = with(|t| {
-            let p = t.pending[i];
-            if p.overlapped != 0 && p.file == file && (only == 0 || p.overlapped == only) {
-                t.pending[i] = Pending { file: 0, overlapped: 0, thread: 0 };
-                Some(p)
+            let p = &mut t.pending[i];
+            if p.overlapped != 0 && p.file == file && p.state != CANCELLED && (only == 0 || p.overlapped == only) {
+                let was = *p;
+                p.state = CANCELLED;
+                Some(was)
             } else {
                 None
             }
         });
         let Some(p) = taken else { continue };
         any = true;
-        if p.thread != 0 {
-            unsafe {
-                crate::process::TerminateThread(p.thread, 0);
-                crate::sync::WaitForSingleObject(p.thread, 1000);
-                crate::CloseHandle(p.thread);
+        // Stopped only in its blocking call. A thread stopped anywhere else
+        // could be holding the heap's lock or the loader's, for good. One
+        // still starting sees CANCELLED, and ends by itself.
+        if p.state == BLOCKED {
+            if p.thread != 0 {
+                unsafe {
+                    crate::process::TerminateThread(p.thread, 0);
+                    crate::sync::WaitForSingleObject(p.thread, 1000);
+                    crate::CloseHandle(p.thread);
+                }
             }
+            with(|t| t.pending[i] = NO_PENDING);
         }
         complete(file, p.overlapped, STATUS_CANCELLED, 0, false);
     }

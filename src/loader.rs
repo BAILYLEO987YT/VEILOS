@@ -204,12 +204,21 @@ fn load_and_spawn_pe_inner(
         core::sync::atomic::AtomicU64::new(0);
     let proc_idx = PROC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     
-    // 1 MiB, Windows' default reserve (committed up front).
-    const STACK_PAGES: u64 = 256;
-    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x200000);
-    let stack_size = STACK_PAGES * 4096;
+    // What the EXE reserves (SizeOfStackReserve; MSYS2 programs ask for 2 MiB),
+    // at least Windows' default 1 MiB, at most 64 MiB. The top 64 KiB is
+    // committed up front; the rest comes in as zero pages when touched.
+    let reserve = {
+        let opt = u32::from_le_bytes(data[0x3C..0x40].try_into().map_err(|_| "truncated PE")?) as usize + 24;
+        let pe32plus = data.get(opt..opt + 2) == Some(&[0x0B, 0x02][..]);
+        let r = if pe32plus { data.get(opt + 72..opt + 80).map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0) } else { 0 };
+        r.clamp(0x10_0000, 0x400_0000).next_multiple_of(0x1_0000)
+    };
+    const COMMITTED_PAGES: u64 = 16;
+    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x1000_0000);
+    let stack_size = reserve;
+    crate::nt_demand::add_zero(stack_base, stack_size - COMMITTED_PAGES * 4096);
 
-    for i in 0..STACK_PAGES {
+    for i in (stack_size / 4096 - COMMITTED_PAGES)..stack_size / 4096 {
         let page = Page::containing_address(VirtAddr::new(stack_base + (i as u64 * 4096)));
         let stack_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let frame = memory::allocate_frame().ok_or("No frames for stack")?;
@@ -396,6 +405,7 @@ fn load_and_spawn_pe_inner(
         w(0x00, u64::MAX);                  // ExceptionList: end of chain
         w(0x08, stack_top);                 // StackBase (high)
         w(0x10, stack_base);                // StackLimit (low)
+        w(0x1478, stack_base);              // DeallocationStack: the whole reserve
         w(0x30, teb_base);                  // Self
         w(TEB_PROCESS_ID, pid as u64);      // ClientId.UniqueProcess
         w(TEB_THREAD_ID, main_tid as u64); // ClientId.UniqueThread
@@ -408,6 +418,13 @@ fn load_and_spawn_pe_inner(
         use nt_abi::layout::*;
         let p = peb_base as *mut u8;
         *(p.add(0x08) as *mut u64) = u64::MAX;          // Mutant
+        // FastPebLock: a CRITICAL_SECTION (kernel32's layout) in the PEB's own
+        // page, past the PEB. Programs lock it to change the current
+        // directory in the process parameters (Cygwin does).
+        let lock = peb_base + 0xF00;
+        core::ptr::write_bytes(lock as *mut u8, 0, 40);
+        *((lock + 8) as *mut i32) = -1;                  // LockCount
+        *(p.add(0x38) as *mut u64) = lock;
         *(p.add(PEB_IMAGE_BASE) as *mut u64) = mapped_image_base;
         *(p.add(PEB_LDR) as *mut u64) = ldr_base;
         *(p.add(PEB_PROCESS_PARAMETERS) as *mut u64) = params_base;
@@ -516,6 +533,13 @@ fn load_and_spawn_pe_inner(
             *at = 0;
             *at.add(1) = 0;
         } else {
+            // TEMP and USERPROFILE name folders: they have to be there
+            // (Cygwin mounts /tmp on TEMP). Already there is fine.
+            for dir in ["/tmp", "/home"] {
+                if crate::vfs::VFS.list_dir(dir).is_err() {
+                    let _ = crate::vfs::VFS.create_dir(dir);
+                }
+            }
             for v in vars.iter() {
                 for u in v.encode_utf16() {
                     *at = u;
@@ -818,7 +842,10 @@ pub fn on_process_exit(process: &Arc<Process>) {
     if let Some(console) = process.console.as_ref().filter(|c| c.pid() == process.pid) {
         console.finish(*process.exit_code.lock());
     }
-    if let Some(mut h) = process.handles.try_lock() { h.close_all(); }
+    match process.handles.try_lock() {
+        Some(mut h) => { h.close_all(); }
+        None => crate::serial_println!("[EXIT] pid {}: handle table busy, handles left open", process.pid),
+    }
     if let Some(mut vad) = process.vad.try_lock() { vad.release_all(); }
     process.linker.lock().take();
 

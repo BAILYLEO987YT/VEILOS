@@ -390,14 +390,6 @@ extern "C" fn syscall_dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u
     // passes through here. This lets us see exactly what the EXE is calling
     // and in what order — including the early MSVC CRT NT calls that happen
     // before any Win32 API (CreateWindow etc.) is ever reached.
-    let trace = syscall_trace();
-    if trace {
-        crate::serial_println!(
-            "[SYSCALL] id={:#08x}  a0={:#010x}  a1={:#010x}  a2={:#010x}  a3={:#010x}",
-            id, a0, a1, a2, a3
-        );
-    }
-
     // !! CRITICAL: Clone the Arc BEFORE releasing the lock. !!
     //
     // In Rust, temporaries in an `if let` scrutinee (e.g.
@@ -411,11 +403,25 @@ extern "C" fn syscall_dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u
         let guard = crate::process::PROCESSOR.lock();
         guard.get_active() // clones the Arc<Process> — guard drops at end of block
     };
+    let trace = syscall_trace()
+        || proc_opt.as_ref().is_some_and(|p| {
+            use core::sync::atomic::Ordering::Relaxed;
+            p.trace_syscalls.load(Relaxed) || (p.trace_net.load(Relaxed) && matches!(id, 0x200_0013 | 0x200_0014 | 0x200_001D | 0x200_0038 | 0x200_003E))
+        });
+    if trace {
+        let tid = unsafe { (*crate::kthread::current_user()).tid };
+        crate::serial_println!(
+            "[SYSCALL] pid {} tid {} id={:#08x}  a0={:#010x}  a1={:#010x}  a2={:#010x}  a3={:#010x}",
+            proc_opt.as_ref().map_or(0, |p| p.pid), tid, id, a0, a1, a2, a3
+        );
+    }
 
     if let Some(proc) = proc_opt {
+        let pid = proc.pid;
         let result = proc.handle_syscall(id, a0, a1, a2, a3);
         if trace {
-            crate::serial_println!("[SYSCALL] id={:#08x}  -> ret={:#010x}", id, result);
+            let tid = unsafe { (*crate::kthread::current_user()).tid };
+            crate::serial_println!("[SYSCALL] pid {} tid {} id={:#08x}  -> ret={:#010x}", pid, tid, id, result);
         }
         result
     } else {

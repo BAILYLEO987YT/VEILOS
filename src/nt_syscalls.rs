@@ -36,20 +36,37 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::NT_DELAY_EXECUTION => delay_execution(a1),
         sys::NT_ALLOCATE_VIRTUAL_MEMORY => allocate_vm(&proc, a0, a1, a3),
         sys::NT_FREE_VIRTUAL_MEMORY => free_vm(&proc, a0, a1, a2, a3),
+        sys::NT_ALLOCATE_VIRTUAL_MEMORY_EX => allocate_vm_ex(&proc, a0, a1, a2, a3),
         sys::NT_PROTECT_VIRTUAL_MEMORY => protect_vm(&proc, a0, a1, a2, a3),
         sys::NT_QUERY_VIRTUAL_MEMORY => query_vm(&proc, a0, a1, a2, a3),
-        sys::NT_CREATE_FILE => crate::nt_file::create_file(&proc, a0, a1, a2, a3),
-        sys::NT_QUERY_INFORMATION_FILE => with_file(&proc, a0, |f| {
-            crate::nt_file::query_information(f, a1, a2, a3 as u32 as usize, stack(4).unwrap_or(0) as u32)
-        }),
+        sys::NT_CREATE_FILE => {
+            let r = crate::nt_file::create_file(&proc, a0, a1, a2, a3);
+            trace_name(&proc, "open", a2, r);
+            r
+        }
+        sys::NT_QUERY_INFORMATION_FILE => {
+            let class = stack(4).unwrap_or(0) as u32;
+            let r = match crate::nt_ipc::pipe_query(&proc, a0, a1, a2, a3 as u32 as usize, class) {
+                Some(r) => r,
+                None => with_file(&proc, a0, |f| crate::nt_file::query_information(f, a1, a2, a3 as u32 as usize, class)),
+            };
+            if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+                crate::serial_println!("[FILE] pid {}: query {:#x} class {} -> {:#x}", proc.pid, a0, class, r as u32);
+            }
+            r
+        }
         sys::NT_SET_INFORMATION_FILE => with_file(&proc, a0, |f| {
             crate::nt_file::set_information(f, a1, a2, a3 as u32 as usize, stack(4).unwrap_or(0) as u32)
         }),
         sys::NT_QUERY_DIRECTORY_FILE => with_file(&proc, a0, crate::nt_file::query_directory),
-        sys::NT_QUERY_ATTRIBUTES_FILE => crate::nt_file::query_attributes(a0, a1),
+        sys::NT_QUERY_ATTRIBUTES_FILE => {
+            let r = crate::nt_file::query_attributes(a0, a1);
+            trace_name(&proc, "attributes", a0, r);
+            r
+        }
         sys::NT_DELETE_FILE => crate::nt_file::delete(a0),
         sys::NT_FLUSH_BUFFERS_FILE => with_file(&proc, a0, |f| crate::nt_file::flush(f, a1)),
-        sys::NT_CREATE_EVENT => create_event(&proc, a0, a1, a3, stack(4).unwrap_or(0)),
+        sys::NT_CREATE_EVENT => crate::nt_ipc::create_event(&proc, a0, a1, a2, a3, stack(4).unwrap_or(0)),
         sys::NT_SET_EVENT => set_event(&proc, a0, a1, true),
         sys::NT_RESET_EVENT => set_event(&proc, a0, a1, false),
         sys::NT_WAIT_FOR_SINGLE_OBJECT => crate::nt_process::wait_single(&proc, a0, a2),
@@ -57,6 +74,26 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::NT_TERMINATE_THREAD => crate::nt_process::terminate_thread(&proc, a0, a1),
         sys::NT_QUERY_INFORMATION_PROCESS => crate::nt_process::query_process(&proc, a0, a1, a2, a3),
         sys::NT_READ_VIRTUAL_MEMORY => crate::nt_process::read_memory(&proc, a0, a1, a2, a3),
+        sys::NT_WRITE_VIRTUAL_MEMORY => crate::nt_section::write_memory(&proc, a0, a1, a2, a3),
+        sys::NT_CREATE_SECTION => crate::nt_section::create_section(&proc, a0, a1, a2, a3),
+        sys::NT_MAP_VIEW_OF_SECTION => crate::nt_section::map_view(&proc, a0, a1, a2),
+        sys::NT_UNMAP_VIEW_OF_SECTION => crate::nt_section::unmap_view(&proc, a0, a1),
+        sys::NT_CREATE_MUTANT => crate::nt_ipc::create_mutant(&proc, a0, a1, a2, a3),
+        sys::NT_CREATE_DIRECTORY_OBJECT => crate::nt_ipc::create_directory(&proc, a0, a1, a2),
+        sys::NT_OPEN_EVENT => crate::nt_ipc::open_by_attrs(&proc, a0, a1, a2, crate::nt_ipc::KIND_EVENT),
+        sys::NT_OPEN_MUTANT => crate::nt_ipc::open_by_attrs(&proc, a0, a1, a2, crate::nt_ipc::KIND_MUTEX),
+        sys::NT_OPEN_SEMAPHORE => crate::nt_ipc::open_by_attrs(&proc, a0, a1, a2, crate::nt_ipc::KIND_SEMAPHORE),
+        sys::NT_OPEN_SECTION => crate::nt_ipc::open_by_attrs(&proc, a0, a1, a2, crate::nt_ipc::KIND_SECTION),
+        sys::NT_OPEN_DIRECTORY_OBJECT => crate::nt_ipc::open_by_attrs(&proc, a0, a1, a2, crate::nt_ipc::KIND_DIRECTORY),
+        sys::NT_QUERY_EVENT => crate::nt_ipc::query_event(&proc, a0, a1, a2, a3, stack(4).unwrap_or(0)),
+        sys::NT_QUERY_SEMAPHORE => crate::nt_ipc::query_semaphore(&proc, a0, a1, a2, a3, stack(4).unwrap_or(0)),
+        sys::NT_CREATE_TIMER => crate::nt_ipc::create_timer(&proc, a0, a1, a2, a3),
+        sys::NT_SET_TIMER => crate::nt_ipc::set_timer(&proc, a0, a1),
+        sys::NT_CANCEL_TIMER => crate::nt_ipc::cancel_timer(&proc, a0, a1),
+        sys::NT_CREATE_SYMBOLIC_LINK_OBJECT => crate::nt_ipc::create_link(&proc, a0, a1, a2, a3),
+        sys::NT_OPEN_SYMBOLIC_LINK_OBJECT => crate::nt_ipc::open_by_attrs(&proc, a0, a1, a2, crate::nt_ipc::KIND_LINK),
+        sys::NT_QUERY_SYMBOLIC_LINK_OBJECT => crate::nt_ipc::query_link(&proc, a0, a1, a2),
+        sys::NT_QUERY_TIMER => crate::nt_ipc::query_timer(&proc, a0, a1, a2, a3, stack(4).unwrap_or(0)),
         sys::NT_QUERY_INFORMATION_THREAD => crate::nt_process::query_thread(&proc, a0, a1, a2, a3),
         sys::NT_RESUME_THREAD => crate::nt_process::resume_thread(&proc, a0, a1),
         sys::NT_DUPLICATE_OBJECT => crate::nt_process::duplicate(&proc, a0, a1, a2, a3),
@@ -80,18 +117,7 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         sys::NT_CREATE_SEMAPHORE => {
-            let max = stack(4).unwrap_or(1) as u32 as i32;
-            let initial = a3 as u32 as i32;
-            if !ptr_ok(a0, 8) {
-                status::ACCESS_VIOLATION
-            } else if max <= 0 || initial < 0 || initial > max {
-                status::INVALID_PARAMETER
-            } else {
-                let sem = Arc::new(crate::nt_objects::SemaphoreObject::new(None, initial, max));
-                let h = proc.handles.lock().allocate_semaphore(sem, a1 as u32);
-                unsafe { *(a0 as *mut u64) = h as u64 };
-                status::SUCCESS
-            }
+            crate::nt_ipc::create_semaphore(&proc, a0, a1, a2, a3 as u32 as i32, stack(4).unwrap_or(1) as u32 as i32)
         }
         sys::NT_RELEASE_SEMAPHORE => match object(&proc, a0) {
             Some(KernelObjectRef::Semaphore(sem)) => match sem.release(a1 as u32 as i32) {
@@ -222,6 +248,13 @@ fn io(proc: &Process, handle: u64, writing: bool) -> NtStatus {
     let length = length as u32 as usize;
     if !ptr_ok(buffer, length) || !ptr_ok(iosb, core::mem::size_of::<IoStatusBlock>()) {
         return status::ACCESS_VIOLATION;
+    }
+    if writing && proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+        let at = if ptr_ok(offset, 8) { unsafe { *(offset as *const i64) } } else { -99 };
+        let n = length.min(40);
+        let text: alloc::string::String = unsafe { core::slice::from_raw_parts(buffer as *const u8, n) }
+            .iter().map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }).collect();
+        crate::serial_println!("[IO] pid {}: write {:#x} {} bytes at {} {:?}", proc.pid, handle, length, at, text);
     }
     match object(proc, handle) {
         Some(KernelObjectRef::File(f)) if writing => crate::nt_file::write(&f, iosb, buffer, length, offset),
@@ -381,15 +414,80 @@ fn write_u64(p: u64, v: u64) {
     }
 }
 
+/// The process a memory call is about: this one, or another by handle
+/// (Cygwin's fork prepares its child's memory). Its work runs with that
+/// process's address space loaded; the caller's own pointers are read and
+/// written outside it.
+fn vm_target(proc: &Arc<Process>, h: u64) -> Option<Arc<Process>> {
+    match crate::nt_process::object_or_self(proc, h)? {
+        KernelObjectRef::Process(p) => Some(p),
+        _ => None,
+    }
+}
+
 /// NtAllocateVirtualMemory(ProcessHandle, BaseAddress*, ZeroBits,
 /// RegionSize*, AllocationType, Protect).
-fn allocate_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64) -> NtStatus {
-    if h != CURRENT_PROCESS {
-        return status::INVALID_HANDLE;
-    }
+fn allocate_vm(proc: &Arc<Process>, h: u64, base_ptr: u64, size_ptr: u64) -> NtStatus {
+    let Some(target) = vm_target(proc, h) else { return status::INVALID_HANDLE };
     let (Some(alloc_type), Some(protect)) = (stack(4), stack(5)) else { return status::ACCESS_VIOLATION };
     let (Some(base), Some(size)) = (read_u64(base_ptr), read_u64(size_ptr)) else { return status::ACCESS_VIOLATION };
-    match proc.vad.lock().virtual_alloc(base, size as usize, alloc_type as u32, protect as u32) {
+    let r = crate::address_space::with(target.cr3, || target.vad.lock().virtual_alloc(base, size as usize, alloc_type as u32, protect as u32));
+    if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::serial_println!("[VM] pid {}: alloc {:#x}+{:#x} type {:#x} protect {:#x} -> {:x?}", target.pid, base, size, alloc_type, protect, r);
+    }
+    match r {
+        Ok(addr) => {
+            let end = (base.max(addr) + size + 0xFFF) & !0xFFF;
+            write_u64(base_ptr, addr);
+            write_u64(size_ptr, end - addr);
+            status::SUCCESS
+        }
+        Err(e) => st(e),
+    }
+}
+
+/// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*,
+/// count): MemExtendedParameterAddressRequirements says where (the lowest
+/// and highest address, and the alignment); other parameters aren't kept.
+fn allocate_vm_ex(proc: &Arc<Process>, h: u64, base_ptr: u64, size_ptr: u64, alloc_type: u64) -> NtStatus {
+    const MEM_TOP_DOWN: u32 = 0x10_0000;
+    const REQUIREMENTS: u64 = 1;
+    let Some(target) = vm_target(proc, h) else { return status::INVALID_HANDLE };
+    let (Some(protect), Some(params), Some(count)) = (stack(4), stack(5), stack(6)) else { return status::ACCESS_VIOLATION };
+    let (protect, alloc_type, count) = (protect as u32, alloc_type as u32, count as u32 as usize);
+    let (Some(mut base), Some(size)) = (read_u64(base_ptr), read_u64(size_ptr)) else { return status::ACCESS_VIOLATION };
+    if count > 16 || (count != 0 && !ptr_ok(params, count * 16)) {
+        return status::INVALID_PARAMETER;
+    }
+    let mut wanted = None;
+    for i in 0..count as u64 {
+        // MEM_EXTENDED_PARAMETER: its type in the low 8 bits, then a pointer or value.
+        let (kind, value) = unsafe {
+            (core::ptr::read_unaligned((params + i * 16) as *const u64) & 0xFF, core::ptr::read_unaligned((params + i * 16 + 8) as *const u64))
+        };
+        if kind == REQUIREMENTS {
+            if !ptr_ok(value, 24) {
+                return status::ACCESS_VIOLATION;
+            }
+            wanted = Some(unsafe {
+                (core::ptr::read_unaligned(value as *const u64), core::ptr::read_unaligned((value + 8) as *const u64), core::ptr::read_unaligned((value + 16) as *const u64))
+            });
+        }
+    }
+    let r = crate::address_space::with(target.cr3, || {
+        let mut vad = target.vad.lock();
+        if let (0, Some((low, high, align))) = (base, wanted) {
+            match vad.find_free_within(low, high, align, size as usize, alloc_type & MEM_TOP_DOWN != 0) {
+                Some(at) => base = at,
+                None => return Err(status::NO_MEMORY as u32 as u64),
+            }
+        }
+        vad.virtual_alloc(base, size as usize, alloc_type, protect)
+    });
+    if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::serial_println!("[VM] pid {}: alloc-ex {:#x}+{:#x} type {:#x} protect {:#x} wanted {:x?} -> {:x?}", target.pid, base, size, alloc_type, protect, wanted, r);
+    }
+    match r {
         Ok(addr) => {
             let end = (base.max(addr) + size + 0xFFF) & !0xFFF;
             write_u64(base_ptr, addr);
@@ -401,12 +499,14 @@ fn allocate_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64) -> NtStatus
 }
 
 /// NtFreeVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*, FreeType).
-fn free_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64, free_type: u64) -> NtStatus {
-    if h != CURRENT_PROCESS {
-        return status::INVALID_HANDLE;
-    }
+fn free_vm(proc: &Arc<Process>, h: u64, base_ptr: u64, size_ptr: u64, free_type: u64) -> NtStatus {
+    let Some(target) = vm_target(proc, h) else { return status::INVALID_HANDLE };
     let (Some(base), Some(size)) = (read_u64(base_ptr), read_u64(size_ptr)) else { return status::ACCESS_VIOLATION };
-    match proc.vad.lock().virtual_free(base, size as usize, free_type as u32) {
+    let r = crate::address_space::with(target.cr3, || target.vad.lock().virtual_free(base, size as usize, free_type as u32));
+    if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::serial_println!("[VM] pid {}: free {:#x}+{:#x} type {:#x} -> {:x?}", target.pid, base, size, free_type, r);
+    }
+    match r {
         Ok(()) => status::SUCCESS,
         Err(e) => st(e),
     }
@@ -414,6 +514,14 @@ fn free_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64, free_type: u64)
 
 /// NtProtectVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
 /// NewProtect, OldProtect*).
+/// For a traced process: the object name an OBJECT_ATTRIBUTES gives, and what came of it.
+fn trace_name(proc: &Process, what: &str, oa: u64, r: NtStatus) {
+    if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+        let name = crate::nt_file::read_object_name(oa).unwrap_or_default();
+        crate::serial_println!("[FILE] pid {}: {} {:?} -> {:#x}", proc.pid, what, name, r as u32);
+    }
+}
+
 /// VEIL_MAP_VIEW(file, offset, size, flags | out*): flags on the stack.
 fn map_view(proc: &Process, file: u64, offset: u64, size: u64, out: u64) -> NtStatus {
     let flags = stack(4).unwrap_or(0);
@@ -442,15 +550,19 @@ fn unmap_view(proc: &Process, addr: u64) -> NtStatus {
     }
 }
 
-fn protect_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64, new: u64) -> NtStatus {
-    if h != CURRENT_PROCESS {
-        return status::INVALID_HANDLE;
-    }
+fn protect_vm(proc: &Arc<Process>, h: u64, base_ptr: u64, size_ptr: u64, new: u64) -> NtStatus {
+    let Some(target) = vm_target(proc, h) else { return status::INVALID_HANDLE };
     let old_ptr = stack(4).unwrap_or(0);
     let (Some(base), Some(size)) = (read_u64(base_ptr), read_u64(size_ptr)) else { return status::ACCESS_VIOLATION };
-    // Pages not read from their file yet would lose the new protection.
-    crate::nt_demand::fault_range(base, size);
-    match proc.vad.lock().virtual_protect(base, size as usize, new as u32) {
+    let r = crate::address_space::with(target.cr3, || {
+        // Pages not read from their file yet would lose the new protection.
+        crate::nt_demand::fault_range(base, size);
+        target.vad.lock().virtual_protect(base, size as usize, new as u32)
+    });
+    if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::serial_println!("[VM] pid {}: protect {:#x}+{:#x} to {:#x} -> {:x?}", target.pid, base, size, new, r);
+    }
+    match r {
         Ok(old) => {
             if ptr_ok(old_ptr, 4) {
                 unsafe { *(old_ptr as *mut u32) = old };
@@ -463,10 +575,8 @@ fn protect_vm(proc: &Process, h: u64, base_ptr: u64, size_ptr: u64, new: u64) ->
 
 /// NtQueryVirtualMemory(ProcessHandle, BaseAddress, MemoryInformationClass,
 /// MemoryInformation*, Length, ReturnLength*): MemoryBasicInformation only.
-fn query_vm(proc: &Process, h: u64, addr: u64, class: u64, out: u64) -> NtStatus {
-    if h != CURRENT_PROCESS {
-        return status::INVALID_HANDLE;
-    }
+fn query_vm(proc: &Arc<Process>, h: u64, addr: u64, class: u64, out: u64) -> NtStatus {
+    let Some(target) = vm_target(proc, h) else { return status::INVALID_HANDLE };
     let (length, ret_len) = (stack(4).unwrap_or(0) as usize, stack(5).unwrap_or(0));
     if class != 0 {
         return status::INVALID_INFO_CLASS;
@@ -477,7 +587,7 @@ fn query_vm(proc: &Process, h: u64, addr: u64, class: u64, out: u64) -> NtStatus
     if !ptr_ok(out, 48) {
         return status::ACCESS_VIOLATION;
     }
-    let m = proc.vad.lock().virtual_query(addr);
+    let m = crate::address_space::with(target.cr3, || target.vad.lock().virtual_query(addr));
     unsafe {
         let p = out as *mut u8;
         core::ptr::write_bytes(p, 0, 48);
@@ -497,16 +607,6 @@ fn query_vm(proc: &Process, h: u64, addr: u64, class: u64, out: u64) -> NtStatus
 
 /// NtCreateEvent(EventHandle*, DesiredAccess, ObjectAttributes*, EventType
 /// (0 = manual reset, 1 = auto reset), InitialState). Names are ignored.
-fn create_event(proc: &Process, out: u64, access: u64, kind: u64, initial: u64) -> NtStatus {
-    if !ptr_ok(out, 8) {
-        return status::ACCESS_VIOLATION;
-    }
-    let ev = Arc::new(crate::nt_objects::EventObject::new(None, kind as u32 == 1, initial as u8 != 0));
-    let h = proc.handles.lock().allocate_event(ev, access as u32);
-    unsafe { *(out as *mut u64) = h as u64 };
-    status::SUCCESS
-}
-
 /// NtSetEvent / NtResetEvent(EventHandle, PreviousState*).
 fn set_event(proc: &Process, h: u64, prev: u64, set: bool) -> NtStatus {
     let Some(KernelObjectRef::Event(ev)) = object(proc, h) else { return status::INVALID_HANDLE };
@@ -535,9 +635,14 @@ fn load_dll(proc: &Process, name: u64, chars: u64, base_out: u64, inits: u64) ->
     let mut fa = crate::memory::GlobalFrameAllocator;
     let mut pages = proc.mapped_pages.lock();
     let mut mem = crate::modules::Mem { mapper: &mut mapper, fa: &mut fa, pages: &mut pages };
+    // What the process already uses, so a DLL's preferred base isn't taken over it.
+    linker.taken = proc.vad.lock().ranges();
     let (base, calls) = match linker.load_at_runtime(&mut mem, &name) {
         Ok(r) => r,
-        Err(s) => return s,
+        Err(s) => {
+            crate::serial_println!("[MODULES] pid {}: LoadLibrary({}) failed: {:#x}", proc.pid, name, s as u32);
+            return s;
+        }
     };
     let n = calls.len().min(capacity as usize);
     if n > 0 && !ptr_ok(inits, n * core::mem::size_of::<nt_abi::InitCall>()) {
@@ -581,9 +686,19 @@ fn get_proc_address(proc: &Process, base: u64, name: u64, out: u64) -> NtStatus 
     let mut mem = crate::modules::Mem { mapper: &mut mapper, fa: &mut fa, pages: &mut pages };
     match linker.proc_address(&mut mem, base, symbol.as_deref(), name as u16) {
         Some(addr) => {
+            if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
+                crate::serial_println!("[MODULES] pid {}: GetProcAddress({:#x}, {}) = {:#x}", proc.pid, base, symbol.as_deref().unwrap_or("#"), addr);
+            }
             unsafe { *(out as *mut u64) = addr };
             status::SUCCESS
         }
-        None => status::PROCEDURE_NOT_FOUND,
+        None => {
+            // Rare, and the name is what's needed to add it.
+            crate::serial_println!(
+                "[MODULES] pid {}: GetProcAddress({:#x}, {}) not found",
+                proc.pid, base, symbol.as_deref().map_or(alloc::format!("#{}", name), |s| alloc::string::String::from(s))
+            );
+            status::PROCEDURE_NOT_FOUND
+        }
     }
 }

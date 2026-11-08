@@ -175,8 +175,45 @@ pub mod sys {
     pub const VEIL_CONSOLE: u32 = BASE + 63;
     /// NtReadVirtualMemory(process, address, buffer*, size, read*).
     pub const NT_READ_VIRTUAL_MEMORY: u32 = BASE + 64;
+    /// NtWriteVirtualMemory(process, address, buffer*, size, written*).
+    pub const NT_WRITE_VIRTUAL_MEMORY: u32 = BASE + 65;
+    /// NtCreateSection(out*, access, attrs*, max_size*, protect, alloc_attrs, file).
+    pub const NT_CREATE_SECTION: u32 = BASE + 66;
+    /// NtMapViewOfSection(section, process, base*, zero_bits, commit, offset*, view_size*, inherit, alloc_type, protect).
+    pub const NT_MAP_VIEW_OF_SECTION: u32 = BASE + 67;
+    /// NtUnmapViewOfSection(process, base).
+    pub const NT_UNMAP_VIEW_OF_SECTION: u32 = BASE + 68;
+    /// NtCreateMutant(out*, access, attrs*, initially_owned).
+    pub const NT_CREATE_MUTANT: u32 = BASE + 69;
+    /// NtCreateDirectoryObject(out*, access, attrs*).
+    pub const NT_CREATE_DIRECTORY_OBJECT: u32 = BASE + 70;
+    /// NtOpen{Event,Mutant,Semaphore,Section,DirectoryObject}(out*, access, attrs*).
+    pub const NT_OPEN_EVENT: u32 = BASE + 71;
+    pub const NT_OPEN_MUTANT: u32 = BASE + 72;
+    pub const NT_OPEN_SEMAPHORE: u32 = BASE + 73;
+    pub const NT_OPEN_SECTION: u32 = BASE + 74;
+    pub const NT_OPEN_DIRECTORY_OBJECT: u32 = BASE + 75;
+    /// NtQuery{Event,Semaphore}(h, class, info*, length, ret*).
+    pub const NT_QUERY_EVENT: u32 = BASE + 76;
+    pub const NT_QUERY_SEMAPHORE: u32 = BASE + 77;
+    /// NtCreateTimer(out*, access, attrs*, type).
+    pub const NT_CREATE_TIMER: u32 = BASE + 78;
+    /// NtSetTimer(h, due*, apc, context, resume, period, previous*).
+    pub const NT_SET_TIMER: u32 = BASE + 79;
+    /// NtCancelTimer(h, current*).
+    pub const NT_CANCEL_TIMER: u32 = BASE + 80;
+    /// NtQueryTimer(h, class, info*, length, ret*).
+    pub const NT_QUERY_TIMER: u32 = BASE + 81;
+    /// NtCreateSymbolicLinkObject(out*, access, attrs*, target*).
+    pub const NT_CREATE_SYMBOLIC_LINK_OBJECT: u32 = BASE + 82;
+    /// NtOpenSymbolicLinkObject(out*, access, attrs*).
+    pub const NT_OPEN_SYMBOLIC_LINK_OBJECT: u32 = BASE + 83;
+    /// NtQuerySymbolicLinkObject(link, target*, length*).
+    pub const NT_QUERY_SYMBOLIC_LINK_OBJECT: u32 = BASE + 84;
+    /// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*, count).
+    pub const NT_ALLOCATE_VIRTUAL_MEMORY_EX: u32 = BASE + 85;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 65;
+    pub const END: u32 = BASE + 86;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).

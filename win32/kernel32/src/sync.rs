@@ -298,7 +298,10 @@ pub extern "system" fn ResetEvent(h: Handle) -> Bool {
 }
 
 #[no_mangle]
-pub extern "system" fn WaitForSingleObjectEx(h: Handle, ms: u32, _alertable: Bool) -> u32 {
+pub extern "system" fn WaitForSingleObjectEx(h: Handle, ms: u32, alertable: Bool) -> u32 {
+    if alertable != 0 {
+        return crate::apc::alertable(ms, |t| WaitForSingleObjectEx(h, t, 0));
+    }
     let timeout: i64 = -(ms as i64) * 10_000;
     let t = if ms == u32::MAX { core::ptr::null() } else { &timeout as *const i64 };
     match unsafe { crate::NtWaitForSingleObject(h, 0, t) } {

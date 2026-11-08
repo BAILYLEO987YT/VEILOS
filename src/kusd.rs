@@ -41,6 +41,21 @@ pub fn days_since_1601(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468 + 134_774
 }
 
+/// The time now, as a FILETIME (what the page's SystemTime says).
+pub fn system_time() -> u64 {
+    let Some(p) = page() else { return 0 };
+    loop {
+        unsafe {
+            let high1 = core::ptr::read_volatile(p.add(0x18) as *const u32);
+            let low = core::ptr::read_volatile(p.add(0x14) as *const u32);
+            let high2 = core::ptr::read_volatile(p.add(0x1C) as *const u32);
+            if high1 == high2 {
+                return (high1 as u64) << 32 | low as u64;
+            }
+        }
+    }
+}
+
 fn write_ksystem_time(p: *mut u8, offset: usize, value: u64) {
     // Readers loop until High1Time == High2Time, so High2 goes first.
     unsafe {
