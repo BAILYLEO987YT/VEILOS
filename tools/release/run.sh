@@ -10,8 +10,9 @@ QEMU=$(command -v qemu-system-x86_64) || {
 }
 
 # KVM makes it much faster on Linux when this user may use it; otherwise emulate.
+# VEILOS_ACCEL=tcg sh run.sh  forces emulation (if VEILOS hangs under KVM).
 ACCEL="-accel tcg,thread=multi"
-if [ "$(uname -s)" = Linux ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+if [ "${VEILOS_ACCEL:-}" != tcg ] && [ "$(uname -s)" = Linux ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL="-accel kvm $ACCEL"
 fi
 

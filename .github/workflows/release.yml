@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src,llvm-tools-preview
@@ -54,30 +54,17 @@ jobs:
       - name: Boot test
         run: |
           # On a copy: booting writes to the storage disk, and the zip ships it fresh.
+          # KVM first, as run.sh uses it on Linux; then plain emulation, as on Windows.
           cp -r dist/VEILOS "$RUNNER_TEMP/boot-test"
-          cd "$RUNNER_TEMP/boot-test"
-          sh run.sh -display none > qemu.out 2>&1 &
-          qemu=$!
-          booted=
-          for _ in $(seq 1 60); do
-            sleep 5
-            if grep -q 'KERNEL PANIC' serial.log 2>/dev/null; then break; fi
-            if grep -q 'gui_refresh_task started' serial.log 2>/dev/null; then booted=1; break; fi
-          done
-          kill "$qemu" 2>/dev/null || true
-          cat qemu.out
-          grep -E '^\[(BOOT|FAT|GRAPHICS|GUI)\]' serial.log | head -20 || true
-          if [ -z "$booted" ]; then
-            echo "::error::VEILOS didn't reach the desktop. The end of the serial log:"
-            tail -40 serial.log
-            exit 1
-          fi
-          grep -q '^\[FAT\] FAT32' serial.log || { echo "::error::The storage disk wasn't mounted."; exit 1; }
-          echo "VEILOS booted to the desktop."
+          bash tools/boot_test.sh "$RUNNER_TEMP/boot-test" kvm && exit 0
+          cp dist/VEILOS/veilos-storage.img "$RUNNER_TEMP/boot-test/"
+          bash tools/boot_test.sh "$RUNNER_TEMP/boot-test" tcg && exit 0
+          echo "::error::VEILOS didn't reach the desktop under KVM or emulation; the warnings above have the serial logs."
+          exit 1
 
       - name: Upload the boot log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: boot-test-serial-log
           path: ${{ runner.temp }}/boot-test/serial.log
