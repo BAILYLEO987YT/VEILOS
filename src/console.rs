@@ -118,8 +118,13 @@ impl BufferObj {
     }
 }
 
+/// Console numbers, for the window value GetConsoleWindow gives.
+static NEXT_CONSOLE_ID: AtomicU32 = AtomicU32::new(1);
+
 pub struct Console {
     pid: u32,
+    /// This console's number: the same in every process using it.
+    pub id: u32,
     /// TERMINAL_POOL slot showing this console.
     terminal: AtomicUsize,
     /// The serial log's unfinished line.
@@ -143,6 +148,7 @@ impl Console {
     pub fn new(pid: u32) -> Arc<Self> {
         Arc::new_cyclic(|me: &Weak<Console>| Console {
             pid,
+            id: NEXT_CONSOLE_ID.fetch_add(1, Ordering::Relaxed),
             terminal: AtomicUsize::new(NO_TERMINAL),
             serial_line: Mutex::new(String::new()),
             finished: AtomicBool::new(false),

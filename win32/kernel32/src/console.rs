@@ -498,10 +498,17 @@ pub extern "system" fn AttachConsole(_pid: u32) -> Bool {
     call(OP_FREE, 0, 1, 0, 0, 0)
 }
 
-/// The console window has no HWND of its own (yet).
+const OP_WINDOW: u64 = 32;
+
+/// The console's window: no real window, but a value that stands for the
+/// console, the same in every process on it. 0 without a console.
 #[no_mangle]
 pub extern "system" fn GetConsoleWindow() -> Handle {
-    0
+    let mut w: u64 = 0;
+    if unsafe { VeilConsole(OP_WINDOW, 0, &mut w as *mut u64 as u64, 0, 0, 0) } != 0 {
+        return 0;
+    }
+    w as Handle
 }
 
 // -----| Ctrl+C and Ctrl+Break |-----

@@ -50,6 +50,13 @@ pub const OP_ALLOC: u64 = 28;
 pub const OP_PTY_CREATE: u64 = 29;
 pub const OP_PTY_RESIZE: u64 = 30;
 pub const OP_PTY_CLOSE: u64 = 31;
+pub const OP_WINDOW: u64 = 32;
+
+/// GetConsoleWindow's value for console `id`: the same in every process on
+/// that console, and apart from user32's window handles (0x10010 up).
+pub fn console_window(id: u32) -> u64 {
+    0x7F00_0000 + id as u64 * 4
+}
 
 enum End {
     Input(Arc<Console>),
@@ -380,6 +387,12 @@ fn run(proc: &Process, op: u64, h: u64, a: u64, b: u64, c: u64, d: u64) -> Resul
             con.resize_pty(w, hgt);
             Ok(())
         }
+        // GetConsoleWindow (_, out*): a value standing for the process's
+        // console (Cygwin keys its console's shared state on it).
+        OP_WINDOW => match proc.current_console() {
+            Some(con) => put(a, console_window(con.id)),
+            None => Err(status::INVALID_HANDLE),
+        },
         // FreeConsole: the process leaves its console (its handles to it
         // stay). (_, 1): AttachConsole, back to the console it started with.
         OP_FREE if a == 1 => {

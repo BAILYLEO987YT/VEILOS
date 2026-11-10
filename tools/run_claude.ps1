@@ -48,9 +48,10 @@ foreach ($try in 1..60) {
     Start-Sleep -Seconds 8
     if ($p.HasExited) { throw 'QEMU stopped at once. Is another VEILOS VM still running?' }
     if ((Get-LogLength) -gt 0) {
-        Write-Host "Booted (try $try). Log in, open MENU > Terminal, then type:"
+        Write-Host "Booted (try $try). Log in, open MENU > Terminal, then type one of:"
         Write-Host ''
-        Write-Host '    run /cmd.exe /c \claude.cmd'
+        Write-Host '    run /cmd.exe /c \claude.cmd     (Claude Code)'
+        Write-Host '    run /cmd.exe /c \bash.cmd       (Git Bash)'
         Write-Host ''
         Write-Host 'claude.exe takes about two minutes to start. Click only inside the Terminal.'
         return

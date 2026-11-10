@@ -84,6 +84,7 @@ syscall_stubs! {
     NtCreateSymbolicLinkObject, ZwCreateSymbolicLinkObject => sys::NT_CREATE_SYMBOLIC_LINK_OBJECT;
     NtOpenSymbolicLinkObject, ZwOpenSymbolicLinkObject => sys::NT_OPEN_SYMBOLIC_LINK_OBJECT;
     NtQuerySymbolicLinkObject, ZwQuerySymbolicLinkObject => sys::NT_QUERY_SYMBOLIC_LINK_OBJECT;
+    NtQueryDirectoryObject, ZwQueryDirectoryObject => sys::NT_QUERY_DIRECTORY_OBJECT;
     NtQueryVolumeInformationFile, ZwQueryVolumeInformationFile => sys::NT_QUERY_VOLUME_INFORMATION_FILE;
     VeilCreateThread, ZwVeilCreateThread => sys::VEIL_CREATE_THREAD;
     VeilCreateProcess, ZwVeilCreateProcess => sys::VEIL_CREATE_PROCESS;

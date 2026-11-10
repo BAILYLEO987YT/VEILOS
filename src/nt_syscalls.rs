@@ -93,6 +93,9 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::NT_CREATE_SYMBOLIC_LINK_OBJECT => crate::nt_ipc::create_link(&proc, a0, a1, a2, a3),
         sys::NT_OPEN_SYMBOLIC_LINK_OBJECT => crate::nt_ipc::open_by_attrs(&proc, a0, a1, a2, crate::nt_ipc::KIND_LINK),
         sys::NT_QUERY_SYMBOLIC_LINK_OBJECT => crate::nt_ipc::query_link(&proc, a0, a1, a2),
+        sys::NT_QUERY_DIRECTORY_OBJECT => crate::nt_ipc::query_directory(
+            &proc, a0, a1, a2, a3, stack(4).unwrap_or(0), stack(5).unwrap_or(0), stack(6).unwrap_or(0),
+        ),
         sys::NT_QUERY_TIMER => crate::nt_ipc::query_timer(&proc, a0, a1, a2, a3, stack(4).unwrap_or(0)),
         sys::NT_QUERY_INFORMATION_THREAD => crate::nt_process::query_thread(&proc, a0, a1, a2, a3),
         sys::NT_RESUME_THREAD => crate::nt_process::resume_thread(&proc, a0, a1),

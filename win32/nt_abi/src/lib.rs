@@ -213,7 +213,9 @@ pub mod sys {
     /// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*, count).
     pub const NT_ALLOCATE_VIRTUAL_MEMORY_EX: u32 = BASE + 85;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 86;
+    /// NtQueryDirectoryObject(dir, buffer*, length, single, restart, context*, returned*).
+    pub const NT_QUERY_DIRECTORY_OBJECT: u32 = BASE + 86;
+    pub const END: u32 = BASE + 87;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).
