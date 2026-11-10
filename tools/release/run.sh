@@ -9,10 +9,11 @@ QEMU=$(command -v qemu-system-x86_64) || {
     exit 1
 }
 
-# KVM makes it much faster on Linux when this user may use it; otherwise emulate.
-# VEILOS_ACCEL=tcg sh run.sh  forces emulation (if VEILOS hangs under KVM).
+# Emulated by default: VEILOS currently hangs before the kernel starts under
+# KVM (as it sometimes does under Windows' WHPX). To try KVM on Linux anyway:
+#   VEILOS_ACCEL=kvm sh run.sh
 ACCEL="-accel tcg,thread=multi"
-if [ "${VEILOS_ACCEL:-}" != tcg ] && [ "$(uname -s)" = Linux ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+if [ "${VEILOS_ACCEL:-}" = kvm ] && [ "$(uname -s)" = Linux ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL="-accel kvm $ACCEL"
 fi
 

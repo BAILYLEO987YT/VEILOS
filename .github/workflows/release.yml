@@ -54,12 +54,11 @@ jobs:
       - name: Boot test
         run: |
           # On a copy: booting writes to the storage disk, and the zip ships it fresh.
-          # KVM first, as run.sh uses it on Linux; then plain emulation, as on Windows.
+          # Emulated, as both launch scripts run it. (Under KVM VEILOS hangs before
+          # the kernel starts; `bash tools/boot_test.sh DIR kvm` checks that again.)
           cp -r dist/VEILOS "$RUNNER_TEMP/boot-test"
-          bash tools/boot_test.sh "$RUNNER_TEMP/boot-test" kvm && exit 0
-          cp dist/VEILOS/veilos-storage.img "$RUNNER_TEMP/boot-test/"
           bash tools/boot_test.sh "$RUNNER_TEMP/boot-test" tcg && exit 0
-          echo "::error::VEILOS didn't reach the desktop under KVM or emulation; the warnings above have the serial logs."
+          echo "::error::VEILOS didn't reach the desktop; the warning above has the serial log."
           exit 1
 
       - name: Upload the boot log

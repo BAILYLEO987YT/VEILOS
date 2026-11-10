@@ -9,7 +9,7 @@ mode=${2:-kvm}
 cd "$dir" || exit 2
 rm -f serial.log qemu.out
 
-if [ "$mode" = tcg ]; then export VEILOS_ACCEL=tcg; fi
+export VEILOS_ACCEL="$mode"
 sh run.sh -display none > qemu.out 2>&1 &
 qemu=$!
 
