@@ -1,0 +1,101 @@
+# Build VEILOS on every push to main and publish it as the "latest" release:
+#   https://github.com/BAILYLEO987YT/VEILOS/releases/latest
+# The zip always has the same link, so it can be shared once:
+#   https://github.com/BAILYLEO987YT/VEILOS/releases/latest/download/VEILOS.zip
+# Before publishing, the build is booted in QEMU; if it doesn't reach the
+# desktop, the previous release stays up. Run it by hand from the Actions tab
+# (Build and release > Run workflow).
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # to create the release
+
+concurrency:
+  group: release
+  cancel-in-progress: true # a newer push replaces a build still running
+
+env:
+  # The nightly VEILOS is developed on. rust-toolchain.toml just says "nightly",
+  # so when you update yours locally (`rustc -V` shows its date), change this too.
+  RUSTUP_TOOLCHAIN: nightly-2026-05-11
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src,llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bootimage
+        run: cargo install bootimage --locked # skipped when the cache already has it
+
+      - name: Build VEILOS.zip
+        run: bash tools/package_release.sh
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86
+          # Let this user use KVM, as run.sh does when it can.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Boot test
+        run: |
+          # On a copy: booting writes to the storage disk, and the zip ships it fresh.
+          cp -r dist/VEILOS "$RUNNER_TEMP/boot-test"
+          cd "$RUNNER_TEMP/boot-test"
+          sh run.sh -display none > qemu.out 2>&1 &
+          qemu=$!
+          booted=
+          for _ in $(seq 1 60); do
+            sleep 5
+            if grep -q 'KERNEL PANIC' serial.log 2>/dev/null; then break; fi
+            if grep -q 'gui_refresh_task started' serial.log 2>/dev/null; then booted=1; break; fi
+          done
+          kill "$qemu" 2>/dev/null || true
+          cat qemu.out
+          grep -E '^\[(BOOT|FAT|GRAPHICS|GUI)\]' serial.log | head -20 || true
+          if [ -z "$booted" ]; then
+            echo "::error::VEILOS didn't reach the desktop. The end of the serial log:"
+            tail -40 serial.log
+            exit 1
+          fi
+          grep -q '^\[FAT\] FAT32' serial.log || { echo "::error::The storage disk wasn't mounted."; exit 1; }
+          echo "VEILOS booted to the desktop."
+
+      - name: Upload the boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-test-serial-log
+          path: ${{ runner.temp }}/boot-test/serial.log
+          if-no-files-found: ignore
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short=$(git rev-parse --short HEAD)
+          {
+            echo "Built from [\`$short\`](https://github.com/${{ github.repository }}/commit/$GITHUB_SHA): $(git log -1 --format=%s)"
+            echo
+            echo "**To try it:** download **VEILOS.zip** below, unzip it, install [QEMU](https://www.qemu.org/download/), then run \`run-windows.bat\` (Windows) or \`sh run.sh\` (macOS / Linux). Log in as \`admin\` / \`veilos\`. README.txt in the zip has the details."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest dist/VEILOS.zip \
+            --title "VEILOS latest build ($short)" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --target "$GITHUB_SHA" \
+            --latest
