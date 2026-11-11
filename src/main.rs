@@ -77,6 +77,8 @@ pub mod nt_console;
 pub mod pty;
 pub mod workers;
 pub mod lgpu;
+pub mod raster3d;
+pub mod nt_gpu3d;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;

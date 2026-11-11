@@ -23,6 +23,7 @@ mod draw;
 #[allow(dead_code)]
 mod font;
 mod font_data;
+mod pixfmt;
 mod render2d;
 mod text;
 mod ttf;

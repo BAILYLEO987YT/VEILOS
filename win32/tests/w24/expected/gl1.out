@@ -1,0 +1,16 @@
+pixel format: set
+draws to a bitmap: yes, depth bits at least 16: yes
+context: created, made current: yes
+current: yes
+errors while drawing: 0x0
+glReadPixels matches the bitmap: yes
+bad enum: 0x500
+popping the last matrix: 0x504
+glClear inside glBegin: 0x502
+no error left: 0x0
+panel 0 (shading): ok
+panel 1 (depth and culling): ok
+panel 2 (textures): ok
+panel 3 (blending and arrays): ok
+deleted: yes, current after: none
+exit 0

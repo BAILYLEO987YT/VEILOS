@@ -23,6 +23,11 @@
 // `ui::painter_ptr_flushed` or `ShapeOffload::sync`, which render everything
 // recorded so far first, so drawing order is never changed. The back-buffer
 // -> framebuffer flush and `gpu_driver` command batches are direct `execute`s.
+//
+// 3D (WIN32_DESIGN.md G5): `execute_3d` renders a batch of window-space
+// triangles (raster3d.rs) into a colour and depth buffer the same way, in
+// bands of rows on every CPU; opengl32.dll's batches arrive through
+// VEIL_GPU3D (nt_gpu3d.rs).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -270,6 +275,50 @@ pub fn execute(ops: &[Op], target: &Surface) {
         let y1 = (y0 + per_band).min(area.y1);
         if y0 < y1 {
             backend.render(ops, target, Rect::new(area.x0, y0, area.x1, y1));
+        }
+    });
+}
+
+// -----| 3D (raster3d.rs, WIN32_DESIGN.md G5) |-----
+
+/// Pixels (roughly) in a 3D batch below which it stays on one CPU.
+const MIN_PARALLEL_3D_PIXELS: usize = 16 * 1024;
+
+/// Draw a 3D batch into `buf`, split over every CPU in bands of rows. Each
+/// band runs every pass's triangles in order, clipped to its rows, so the
+/// result is the same as a serial render.
+pub fn execute_3d(buf: crate::raster3d::Buffers, tris: &[crate::raster3d::Tri], passes: &[crate::raster3d::Pass]) {
+    // The rows the batch can touch, and roughly how many pixels.
+    let (mut y0, mut y1, mut pixels) = (i32::MAX, i32::MIN, 0usize);
+    for p in passes {
+        let first = (p.g.first as usize).min(tris.len());
+        let end = (first + p.g.count as usize).min(tris.len());
+        for t in &tris[first..end] {
+            let (a, b) = crate::raster3d::tri_rows(t);
+            y0 = y0.min(a.max(p.g.scissor[1]));
+            y1 = y1.max(b.min(p.g.scissor[3]));
+            let (mx0, mx1) = (t.v.iter().map(|v| v.x).min().unwrap(), t.v.iter().map(|v| v.x).max().unwrap());
+            pixels += ((mx1 - mx0) as usize / crate::raster3d::SUB as usize + 1) * ((b - a).max(0) as usize) / 2;
+        }
+    }
+    let y0 = y0.max(0);
+    let y1 = y1.min(buf.h as i32);
+    if y0 >= y1 {
+        return;
+    }
+    let rows = (y1 - y0) as usize;
+    let cpus = (crate::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize).max(1);
+    let bands = if cpus == 1 || pixels < MIN_PARALLEL_3D_PIXELS { 1 } else { (cpus * BANDS_PER_CPU).min(rows / 8).max(1) };
+    if bands == 1 {
+        crate::raster3d::render_band(buf, tris, passes, y0, y1);
+        return;
+    }
+    let per_band = rows.div_ceil(bands) as i32;
+    workers::for_each(bands, &|i| {
+        let b0 = y0 + i as i32 * per_band;
+        let b1 = (b0 + per_band).min(y1);
+        if b0 < b1 {
+            crate::raster3d::render_band(buf, tris, passes, b0, b1);
         }
     });
 }

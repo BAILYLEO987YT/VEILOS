@@ -1,0 +1,12 @@
+[package]
+name = "opengl32"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS opengl32.dll: OpenGL 1.1 fixed function over the kernel's 3D rasterizer"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Run on Windows itself, for comparing with its OpenGL (src/host.rs).
+host = []

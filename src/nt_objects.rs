@@ -386,6 +386,8 @@ pub enum KernelObjectRef {
     Directory(Arc<DirectoryObject>),
     Timer(Arc<TimerObject>),
     Link(Arc<LinkObject>),
+    /// A 3D render target or texture (nt_gpu3d.rs).
+    Gpu3d(Arc<crate::nt_gpu3d::Gpu3d>),
 }
 
 impl KernelObjectRef {
@@ -407,6 +409,7 @@ impl KernelObjectRef {
             Self::Directory(_) => ObjectType::Directory,
             Self::Timer(_)     => ObjectType::Event,
             Self::Link(_)      => ObjectType::Directory,
+            Self::Gpu3d(_)     => ObjectType::File,
         }
     }
 }
