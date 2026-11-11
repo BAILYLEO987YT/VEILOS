@@ -294,7 +294,7 @@ pub fn execute_3d(buf: crate::raster3d::Buffers, tris: &[crate::raster3d::Tri], 
         let first = (p.g.first as usize).min(tris.len());
         let end = (first + p.g.count as usize).min(tris.len());
         for t in &tris[first..end] {
-            let (a, b) = crate::raster3d::tri_rows(t);
+            let (a, b) = crate::raster3d::prim_rows(t, &p.g);
             y0 = y0.min(a.max(p.g.scissor[1]));
             y1 = y1.max(b.min(p.g.scissor[3]));
             let (mx0, mx1) = (t.v.iter().map(|v| v.x).min().unwrap(), t.v.iter().map(|v| v.x).max().unwrap());

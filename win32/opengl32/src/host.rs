@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use raster3d::*;
 
 enum Obj {
-    Target { w: usize, h: usize, color: Vec<u32>, depth: Vec<u32> },
+    Target { w: usize, h: usize, color: Vec<u32>, depth: Vec<u32>, stencil: Vec<u8> },
     Texture(Arc<Texture>),
 }
 
@@ -40,11 +40,11 @@ pub unsafe extern "system" fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 
         0 => {
             drop(l);
             let n = (a * b) as usize;
-            add(Obj::Target { w: a as usize, h: b as usize, color: vec![0; n], depth: vec![DEPTH_MAX; n] }, c)
+            add(Obj::Target { w: a as usize, h: b as usize, color: vec![0; n], depth: vec![DEPTH_MAX; n], stencil: vec![0; n] }, c)
         }
         1 | 2 | 3 => {
-            let Some(Some(Obj::Target { w, h, color, depth })) = l.get_mut(a as usize - 1) else { return -1 };
-            let buf = Buffers { color: color.as_mut_ptr(), depth: depth.as_mut_ptr(), w: *w, h: *h };
+            let Some(Some(Obj::Target { w, h, color, depth, stencil })) = l.get_mut(a as usize - 1) else { return -1 };
+            let buf = Buffers { color: color.as_mut_ptr(), depth: depth.as_mut_ptr(), stencil: stencil.as_mut_ptr(), w: *w, h: *h };
             match op {
                 1 => clear(buf, unsafe { &*(b as *const ClearArgs) }),
                 2 => {
@@ -96,7 +96,7 @@ pub unsafe extern "system" fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 
         }
         4 => {
             let ta = unsafe { &*(b as *const TexArgs) };
-            let texels = unsafe { core::slice::from_raw_parts(ta.texels as *const u32, (ta.w * ta.h) as usize) }.to_vec();
+            let texels = unsafe { core::slice::from_raw_parts(ta.texels as *const u32, texel_count(ta)) }.to_vec();
             let t = Arc::new(texture(ta, texels));
             if a == 0 {
                 drop(l);
@@ -174,6 +174,7 @@ pub unsafe extern "system" fn DescribePixelFormat(_hdc: u64, n: i32, size: u32, 
             d[9] = 32;
             (d[10], d[11], d[12], d[13], d[14], d[15]) = (8, 16, 8, 8, 8, 0);
             d[23] = 24;
+            d[24] = 8;
             unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), out, 40) };
         }
     }

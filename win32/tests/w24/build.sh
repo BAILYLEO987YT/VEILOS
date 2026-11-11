@@ -1,8 +1,8 @@
 #!/bin/sh
-# Build the W24 (G5) OpenGL test (MSVC, /MD) against the real import
-# libraries, copy it to storage/tests/, and record on Windows what Windows'
-# software OpenGL draws (expected/gl1.ref, a PPM) and what the test prints
-# against it (expected/gl1.out). Run from anywhere: sh win32/tests/w24/build.sh
+# Build the W24 (G5) OpenGL tests (MSVC, /MD) against the real import
+# libraries, copy them to storage/tests/, and record on Windows what Windows'
+# software OpenGL draws (expected/glN.ref, a PPM) and what each test prints
+# against it (expected/glN.out). Run from anywhere: sh win32/tests/w24/build.sh
 set -e
 # Git Bash would rewrite /flags as paths.
 export MSYS_NO_PATHCONV=1
@@ -14,7 +14,7 @@ VC="C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36
 OUT=../../../storage/tests
 mkdir -p build expected "$OUT"
 
-for t in gl1; do
+for t in gl1 gl2; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \
         $t.c /Fobuild/$t.obj
@@ -25,8 +25,10 @@ for t in gl1; do
 done
 
 # On Windows: the reference pixels, then the run that compares with them.
-(cd build && ./gl1.exe record ../expected/gl1.ref >/dev/null)
-cp expected/gl1.ref build/gl1.ref
-cp expected/gl1.ref "$OUT/gl1.ref"
-(cd build && ./gl1.exe >../expected/gl1.out 2>&1; echo "exit $?" >>../expected/gl1.out) || true
-echo "built: gl1.exe"
+for t in gl1 gl2; do
+    (cd build && ./$t.exe record ../expected/$t.ref >/dev/null)
+    cp expected/$t.ref build/$t.ref
+    cp expected/$t.ref "$OUT/$t.ref"
+    (cd build && ./$t.exe >../expected/$t.out 2>&1; echo "exit $?" >>../expected/$t.out) || true
+done
+echo "built: gl1.exe gl2.exe"

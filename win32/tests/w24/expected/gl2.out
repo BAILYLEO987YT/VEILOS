@@ -1,0 +1,20 @@
+pixel format: set
+context: current
+stencil bits: at least 8
+lists: generated, known
+errors while drawing: 0x0
+list 0: 0x501
+a list inside a list: 0x502
+glEndList without a list: 0x502
+a spot cutoff of 120: 0x501
+a bad stencil operation: 0x500
+a line width of 0: 0x501
+a bad fog mode: 0x500
+deleted lists: gone
+panel 0 (lighting): ok
+panel 1 (fog): ok
+panel 2 (lines and points): ok
+panel 3 (stencil): ok
+panel 4 (mipmaps and display lists): ok
+panel 5 (two-sided lighting): ok
+exit 0

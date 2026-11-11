@@ -1,8 +1,8 @@
 // -----| 3D targets and textures for Win32 programs |-----
 //
 // VEIL_GPU3D(op, a, b, c): what opengl32.dll stands on (WIN32_DESIGN.md
-// G5). Render targets (a colour and a depth buffer) and textures are kernel
-// objects in the process's handle table; batches of window-space triangles
+// G5). Render targets (colour, depth and stencil buffers) and textures are kernel
+// objects in the process's handle table; batches of window-space primitives
 // are copied in and filled by raster3d.rs on every CPU (`lgpu::execute_3d`),
 // and pixels are read back out. Kept in kernel memory because the CPUs that
 // render can't see the calling process's memory.
@@ -19,12 +19,20 @@ use crate::nt_objects::KernelObjectRef;
 use crate::process::Process;
 use crate::raster3d::*;
 
-/// A colour buffer (0x00RRGGBB, top row first) and a depth buffer.
+/// A colour buffer (0x00RRGGBB, top row first), a depth buffer and an
+/// 8-bit stencil buffer.
 pub struct Target {
     pub w: usize,
     pub h: usize,
     pub color: Vec<u32>,
     pub depth: Vec<u32>,
+    pub stencil: Vec<u8>,
+}
+
+impl Target {
+    fn buffers(&mut self) -> Buffers {
+        Buffers { color: self.color.as_mut_ptr(), depth: self.depth.as_mut_ptr(), stencil: self.stencil.as_mut_ptr(), w: self.w, h: self.h }
+    }
 }
 
 pub enum Gpu3d {
@@ -66,7 +74,7 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 return status::INVALID_PARAMETER;
             }
             let n = w as usize * h as usize;
-            let t = Target { w: w as usize, h: h as usize, color: vec![0; n], depth: vec![DEPTH_MAX; n] };
+            let t = Target { w: w as usize, h: h as usize, color: vec![0; n], depth: vec![DEPTH_MAX; n], stencil: vec![0; n] };
             new_handle(proc, Gpu3d::Target(Mutex::new(t)), c)
         }
         // Clear: a = target, b = ClearArgs*.
@@ -74,9 +82,7 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
             let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
             let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
             let Some(args) = read::<ClearArgs>(b) else { return status::ACCESS_VIOLATION };
-            let mut t = t.lock();
-            let buf = Buffers { color: t.color.as_mut_ptr(), depth: t.depth.as_mut_ptr(), w: t.w, h: t.h };
-            clear(buf, &args);
+            clear(t.lock().buffers(), &args);
             status::SUCCESS
         }
         // Draw: a = target, b = DrawArgs*.
@@ -117,8 +123,7 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 Pass { g, tex: tx.as_deref() }
             }).collect();
             let mut t = t.lock();
-            let buf = Buffers { color: t.color.as_mut_ptr(), depth: t.depth.as_mut_ptr(), w: t.w, h: t.h };
-            crate::lgpu::execute_3d(buf, &tris, &passes);
+            crate::lgpu::execute_3d(t.buffers(), &tris, &passes);
             status::SUCCESS
         }
         // Read pixels: a = target, b = ReadArgs*.
@@ -150,10 +155,10 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
         // contents: b = TexArgs*.
         4 => {
             let Some(ta) = read::<TexArgs>(b) else { return status::ACCESS_VIOLATION };
-            if ta.w == 0 || ta.h == 0 || ta.w > MAX_SIDE || ta.h > MAX_SIDE {
+            if ta.w == 0 || ta.h == 0 || ta.w > MAX_SIDE || ta.h > MAX_SIDE || ta.levels > 16 {
                 return status::INVALID_PARAMETER;
             }
-            let n = ta.w as usize * ta.h as usize;
+            let n = texel_count(&ta);
             if !ptr_ok(ta.texels, n * 4) {
                 return status::ACCESS_VIOLATION;
             }

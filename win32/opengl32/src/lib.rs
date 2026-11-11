@@ -9,10 +9,12 @@
 //! SetDIBitsToDevice: at SwapBuffers for a double-buffered window, at
 //! glFlush/glFinish for a single-buffered one (a DIB section included).
 //!
-//!   lib.rs   contexts, wgl*, state, the vertex stage and the gl* exports
+//!   lib.rs     contexts, wgl*, state, the vertex stage and the gl* exports
+//!   light.rs   lighting and fog
+//!   lists.rs   display lists
 //!
-//! Not here yet (later G5 slices): lighting, fog, points and lines, stencil,
-//! display lists, mipmaps beyond level 0, accumulation.
+//! Not here yet: polygon stipple, line stipple, accumulation, selection and
+//! feedback, colour index mode, evaluators.
 
 #![no_std]
 #![allow(non_snake_case, clippy::missing_safety_doc)]
@@ -21,6 +23,10 @@ extern crate alloc;
 
 #[path = "../../dllrt.rs"]
 mod dllrt;
+mod light;
+mod lists;
+
+use lists::rec;
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -80,6 +86,7 @@ struct KVert {
     g: i64,
     b: i64,
     a: i64,
+    f: i64,
 }
 
 #[repr(C)]
@@ -94,6 +101,8 @@ struct KGroup {
     first: u32,
     count: u32,
     flags: u32,
+    kind: u32,
+    size: i32,
     depth_func: u32,
     alpha_func: u32,
     alpha_ref: u32,
@@ -101,8 +110,16 @@ struct KGroup {
     dst_blend: u32,
     tex_env: u32,
     color_mask: u32,
+    fog_color: u32,
+    stencil_func: u32,
+    stencil_ref: u32,
+    stencil_mask: u32,
+    stencil_write: u32,
+    stencil_ops: [u32; 3],
     texture: u64,
     scissor: [i32; 4],
+    fog_mode: u32,
+    fog_params: [i64; 2],
 }
 
 #[repr(C)]
@@ -120,6 +137,8 @@ struct ClearArgs {
     depth: u32,
     color_mask: u32,
     scissor: [i32; 4],
+    stencil: u32,
+    stencil_write: u32,
 }
 
 #[repr(C)]
@@ -141,6 +160,7 @@ struct TexArgs {
     mag_filter: u32,
     wrap_s: u32,
     wrap_t: u32,
+    levels: u32,
 }
 
 const F_DEPTH_TEST: u32 = 1;
@@ -148,6 +168,11 @@ const F_DEPTH_WRITE: u32 = 2;
 const F_BLEND: u32 = 4;
 const F_TEXTURE: u32 = 8;
 const F_ALPHA_TEST: u32 = 16;
+const F_FOG: u32 = 32;
+const F_STENCIL: u32 = 64;
+const KIND_TRIANGLES: u32 = 0;
+const KIND_LINES: u32 = 1;
+const KIND_POINTS: u32 = 2;
 const DEPTH_MAX: f64 = 16777215.0;
 /// Subpixel steps per pixel (raster3d::SUB).
 const SUB: f64 = 256.0;
@@ -156,13 +181,17 @@ const FX: f64 = 4294967296.0;
 // -----| GL constants |-----
 
 const GL_NO_ERROR: u32 = 0;
-const GL_INVALID_ENUM: u32 = 0x500;
-const GL_INVALID_VALUE: u32 = 0x501;
-const GL_INVALID_OPERATION: u32 = 0x502;
+pub(crate) const GL_INVALID_ENUM: u32 = 0x500;
+pub(crate) const GL_INVALID_VALUE: u32 = 0x501;
+pub(crate) const GL_INVALID_OPERATION: u32 = 0x502;
 const GL_STACK_OVERFLOW: u32 = 0x503;
 const GL_STACK_UNDERFLOW: u32 = 0x504;
 
 
+const GL_POINTS: u32 = 0;
+const GL_LINES: u32 = 1;
+const GL_LINE_LOOP: u32 = 2;
+const GL_LINE_STRIP: u32 = 3;
 const GL_TRIANGLES: u32 = 4;
 const GL_TRIANGLE_STRIP: u32 = 5;
 const GL_TRIANGLE_FAN: u32 = 6;
@@ -181,10 +210,50 @@ const GL_BLEND: u32 = 0x0BE2;
 const GL_DITHER: u32 = 0x0BD0;
 const GL_SCISSOR_TEST: u32 = 0x0C11;
 const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_LIGHTING: u32 = 0x0B50;
+const GL_LIGHT0: u32 = 0x4000;
+const GL_COLOR_MATERIAL: u32 = 0x0B57;
+const GL_NORMALIZE: u32 = 0x0BA1;
+const GL_FOG: u32 = 0x0B60;
+const GL_STENCIL_TEST: u32 = 0x0B90;
 
-const GL_FRONT: u32 = 0x404;
+pub(crate) const GL_AMBIENT: u32 = 0x1200;
+pub(crate) const GL_DIFFUSE: u32 = 0x1201;
+pub(crate) const GL_SPECULAR: u32 = 0x1202;
+const GL_POSITION: u32 = 0x1203;
+const GL_SPOT_DIRECTION: u32 = 0x1204;
+const GL_SPOT_EXPONENT: u32 = 0x1205;
+const GL_SPOT_CUTOFF: u32 = 0x1206;
+const GL_CONSTANT_ATTENUATION: u32 = 0x1207;
+const GL_LINEAR_ATTENUATION: u32 = 0x1208;
+const GL_QUADRATIC_ATTENUATION: u32 = 0x1209;
+pub(crate) const GL_EMISSION: u32 = 0x1600;
+const GL_SHININESS: u32 = 0x1601;
+pub(crate) const GL_AMBIENT_AND_DIFFUSE: u32 = 0x1602;
+const GL_LIGHT_MODEL_LOCAL_VIEWER: u32 = 0x0B51;
+const GL_LIGHT_MODEL_TWO_SIDE: u32 = 0x0B52;
+const GL_LIGHT_MODEL_AMBIENT: u32 = 0x0B53;
+const GL_FOG_DENSITY: u32 = 0x0B62;
+const GL_FOG_START: u32 = 0x0B63;
+const GL_FOG_END: u32 = 0x0B64;
+const GL_FOG_MODE: u32 = 0x0B65;
+const GL_FOG_COLOR: u32 = 0x0B66;
+pub(crate) const GL_EXP: u32 = 0x0800;
+pub(crate) const GL_EXP2: u32 = 0x0801;
+/// GL_LINEAR as a fog mode.
+pub(crate) const GL_LINEAR_FOG: u32 = 0x2601;
+const GL_KEEP: u32 = 0x1E00;
+const GL_INCR: u32 = 0x1E02;
+const GL_DECR: u32 = 0x1E03;
+const GL_INVERT: u32 = 0x150A;
+const GL_STENCIL_BUFFER_BIT: u32 = 0x400;
+const GL_POINT: u32 = 0x1B00;
+const GL_LINE: u32 = 0x1B01;
+const GL_FILL: u32 = 0x1B02;
+
+pub(crate) const GL_FRONT: u32 = 0x404;
 const GL_BACK: u32 = 0x405;
-const GL_FRONT_AND_BACK: u32 = 0x408;
+pub(crate) const GL_FRONT_AND_BACK: u32 = 0x408;
 const GL_CW: u32 = 0x900;
 const GL_CCW: u32 = 0x901;
 const GL_FLAT: u32 = 0x1D00;
@@ -270,13 +339,13 @@ fn xform(m: &Mat, v: [f32; 4]) -> [f32; 4] {
     r
 }
 
-fn sqrt(x: f64) -> f64 {
+pub(crate) fn sqrt(x: f64) -> f64 {
     use core::arch::x86_64::*;
     unsafe { _mm_cvtsd_f64(_mm_sqrt_sd(_mm_set_sd(x), _mm_set_sd(x))) }
 }
 
 /// sin and cos of `x` radians.
-fn sin_cos(x: f64) -> (f64, f64) {
+pub(crate) fn sin_cos(x: f64) -> (f64, f64) {
     const PI: f64 = core::f64::consts::PI;
     // Down to [-pi/4, pi/4] and a quadrant.
     let k = round(x / (PI / 2.0));
@@ -300,13 +369,44 @@ fn clamp01(x: f32) -> f32 {
     if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) }
 }
 
+/// What normals are multiplied by: the inverse transpose of the upper 3x3
+/// of `m` (column-major), as rows.
+fn normal_matrix(m: &Mat) -> [[f32; 3]; 3] {
+    let a = |r: usize, c: usize| m[c * 4 + r] as f64;
+    let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
+        + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+    if det == 0.0 {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    // (M^-1)^T = cofactor matrix / det.
+    let cof = |r: usize, c: usize| {
+        let (r0, r1) = ([1, 0, 0][r], [2, 2, 1][r]);
+        let (c0, c1) = ([1, 0, 0][c], [2, 2, 1][c]);
+        let v = a(r0, c0) * a(r1, c1) - a(r0, c1) * a(r1, c0);
+        if (r + c) % 2 == 0 { v } else { -v }
+    };
+    core::array::from_fn(|r| core::array::from_fn(|c| (cof(r, c) / det) as f32))
+}
+
 // -----| contexts |-----
 
 #[derive(Clone, Copy)]
 struct Vtx {
     clip: [f32; 4],
+    /// The colour, lit for the front face if lighting is on.
     col: [f32; 4],
+    /// Lit for the back face (two-sided lighting), else `col`.
+    back: [f32; 4],
     tc: [f32; 4],
+    /// Eye distance, for fog.
+    dist: f32,
+}
+
+impl Vtx {
+    fn lerp(&self, b: &Vtx, t: f32) -> Vtx {
+        let l = |x: [f32; 4], y: [f32; 4]| core::array::from_fn(|k| x[k] + (y[k] - x[k]) * t);
+        Vtx { clip: l(self.clip, b.clip), col: l(self.col, b.col), back: l(self.back, b.back), tc: l(self.tc, b.tc), dist: self.dist + (b.dist - self.dist) * t }
+    }
 }
 
 struct Tex {
@@ -314,10 +414,9 @@ struct Tex {
     handle: u64,
     w: u32,
     h: u32,
-    /// Level 0, 0xAARRGGBB, top row (t = 0) first.
-    texels: Vec<u32>,
-    /// Which mipmap levels have been given (bit n: level n).
-    levels: u32,
+    /// Each level's texels, 0xAARRGGBB, top row (t = 0) first; empty for a
+    /// level not given (or given at the wrong size).
+    mips: Vec<Vec<u32>>,
     min: u32,
     mag: u32,
     wrap_s: u32,
@@ -327,20 +426,34 @@ struct Tex {
 
 impl Tex {
     fn new() -> Tex {
-        Tex { handle: 0, w: 0, h: 0, texels: Vec::new(), levels: 0, min: GL_NEAREST_MIPMAP_LINEAR, mag: GL_LINEAR, wrap_s: GL_REPEAT, wrap_t: GL_REPEAT, dirty: false }
+        Tex { handle: 0, w: 0, h: 0, mips: Vec::new(), min: GL_NEAREST_MIPMAP_LINEAR, mag: GL_LINEAR, wrap_s: GL_REPEAT, wrap_t: GL_REPEAT, dirty: false }
+    }
+
+    /// Level `l`'s size.
+    fn level_size(&self, l: usize) -> (u32, u32) {
+        ((self.w >> l).max(1), (self.h >> l).max(1))
+    }
+
+    /// How many levels a full chain has (down to 1x1).
+    fn chain(&self) -> usize {
+        (32 - self.w.max(self.h).leading_zeros()) as usize
+    }
+
+    /// Levels given, in a row from 0, at the right sizes.
+    fn given(&self) -> usize {
+        (0..self.chain()).take_while(|&l| {
+            let (w, h) = self.level_size(l);
+            self.mips.get(l).is_some_and(|m| m.len() == (w * h) as usize)
+        }).count()
     }
 
     /// Usable for texturing: level 0 given, and every level if the
     /// minification filter uses mipmaps.
     fn complete(&self) -> bool {
-        if self.w == 0 || self.h == 0 {
+        if self.w == 0 || self.h == 0 || self.given() == 0 {
             return false;
         }
-        if self.min == GL_NEAREST || self.min == GL_LINEAR {
-            return true;
-        }
-        let n = 32 - self.w.max(self.h).leading_zeros();
-        self.levels & ((1u32 << n) - 1) == (1u32 << n) - 1
+        self.min == GL_NEAREST || self.min == GL_LINEAR || self.given() == self.chain()
     }
 }
 
@@ -421,10 +534,25 @@ struct Ctx {
     bound: u32,
     tex_env: u32,
     /// GL_PERSPECTIVE_CORRECTION_HINT is GL_NICEST. Only kept for glGet:
-    /// colours and textures are always perspective-correct. (Windows'
-    /// software OpenGL does colours so always, textures only with GL_NICEST;
-    /// below that it approximates.)
+    /// textures are always perspective-correct (Windows' software OpenGL
+    /// approximates below GL_NICEST), colours always linear in the window.
     perspective: bool,
+    /// GL_FOG_HINT is GL_NICEST. Only kept for glGet: fog is always worked
+    /// out per pixel, from the eye distance interpolated linearly in the
+    /// window, as Windows' software OpenGL does at GL_NICEST (below it,
+    /// Windows approximates differently).
+    fog_nicest: bool,
+
+    light: light::Lighting,
+    fog: light::Fog,
+    line_width: f32,
+    point_size: f32,
+    /// Front and back: GL_FILL, GL_LINE or GL_POINT.
+    polygon_mode: [u32; 2],
+    /// Function, reference, mask, write mask, and the three operations.
+    stencil: [u32; 7],
+    clear_stencil: u32,
+    lists: lists::Lists,
 
     prim: Option<u32>,
     verts: Vec<Vtx>,
@@ -526,14 +654,18 @@ impl Ctx {
             return None;
         }
         if t.handle == 0 || t.dirty {
+            // Every level given, one after the other.
+            let n = if t.min == GL_NEAREST || t.min == GL_LINEAR { 1 } else { t.given() };
+            let texels: Vec<u32> = t.mips[..n].concat();
             let args = TexArgs {
                 w: t.w,
                 h: t.h,
-                texels: t.texels.as_ptr() as u64,
+                texels: texels.as_ptr() as u64,
                 min_filter: t.min,
                 mag_filter: t.mag,
                 wrap_s: t.wrap_s,
                 wrap_t: t.wrap_t,
+                levels: n as u32,
             };
             let mut h = t.handle;
             unsafe { VeilGpu3d(4, t.handle, &args as *const _ as u64, &mut h as *mut u64 as u64) };
@@ -543,7 +675,7 @@ impl Ctx {
         Some((t.handle, t.w, t.h))
     }
 
-    fn state(&mut self) -> (KGroup, Option<(u32, u32)>) {
+    fn state(&mut self, kind: u32, size: f32) -> (KGroup, Option<(u32, u32)>) {
         let tex = self.texture_for_draw();
         let mut flags = 0;
         if self.on(GL_DEPTH_TEST) {
@@ -561,10 +693,38 @@ impl Ctx {
         if self.on(GL_ALPHA_TEST) {
             flags |= F_ALPHA_TEST;
         }
+        if self.on(GL_FOG) {
+            flags |= F_FOG;
+        }
+        if self.on(GL_STENCIL_TEST) {
+            flags |= F_STENCIL;
+        }
+        let ch = |v: f32| (clamp01(v) * 255.0 + 0.5) as u32;
+        let s = self.stencil;
         let g = KGroup {
             first: 0,
             count: 0,
             flags,
+            kind,
+            size: (size.max(1.0) * SUB as f32) as i32,
+            fog_color: ch(self.fog.color[0]) << 16 | ch(self.fog.color[1]) << 8 | ch(self.fog.color[2]),
+            stencil_func: s[0],
+            stencil_ref: s[1].min(255),
+            stencil_mask: s[2] & 0xFF,
+            stencil_write: s[3] & 0xFF,
+            stencil_ops: [s[4], s[5], s[6]],
+            fog_mode: self.fog.mode,
+            fog_params: {
+                let f = &self.fog;
+                let p = if f.mode == GL_LINEAR_FOG && f.end != f.start {
+                    [-1.0 / (f.end - f.start) as f64, f.end as f64 / (f.end - f.start) as f64]
+                } else if f.mode == GL_LINEAR_FOG {
+                    [0.0, 1.0]
+                } else {
+                    [f.density as f64, 0.0]
+                };
+                [(p[0] * FX) as i64, (p[1] * FX) as i64]
+            },
             depth_func: self.depth_func,
             alpha_func: self.alpha_func,
             alpha_ref: (clamp01(self.alpha_ref) * 510.0 + 0.5) as u32,
@@ -597,10 +757,121 @@ impl Ctx {
     // -----| the vertex stage |-----
 
     fn vertex(&mut self, obj: [f32; 4]) {
-        let eye = xform(&self.stacks[0].last().copied().unwrap(), obj);
+        let mv = self.stacks[0].last().copied().unwrap();
+        let eye = xform(&mv, obj);
         let clip = xform(&self.stacks[1].last().copied().unwrap(), eye);
         let tc = xform(&self.stacks[2].last().copied().unwrap(), self.tc);
-        self.verts.push(Vtx { clip, col: self.color, tc });
+        let (col, back) = if self.on(GL_LIGHTING) {
+            if self.on(GL_COLOR_MATERIAL) {
+                self.light.color_material(self.color);
+            }
+            let nm = normal_matrix(&mv);
+            let n = self.normal;
+            let mut ne = [0.0f32; 3];
+            for (r, o) in ne.iter_mut().enumerate() {
+                *o = nm[r][0] * n[0] + nm[r][1] * n[1] + nm[r][2] * n[2];
+            }
+            if self.on(GL_NORMALIZE) {
+                ne = light::normalize(ne);
+            }
+            let front = self.light.shade(eye, ne, 0);
+            (front, if self.light.two_side { self.light.shade(eye, ne, 1) } else { front })
+        } else {
+            (self.color, self.color)
+        };
+        // Fog by eye distance along z.
+        let dist = if eye[3] != 0.0 { (eye[2] / eye[3]).abs() } else { eye[2].abs() };
+        self.verts.push(Vtx { clip, col, back, tc, dist });
+    }
+
+    /// Window coordinates (y upwards, as GL has them), depth and 1/w.
+    fn window(&self, v: &Vtx) -> [f64; 4] {
+        let [vx, vy, vw, vh] = self.viewport;
+        let (n, f) = (self.depth_range[0] as f64, self.depth_range[1] as f64);
+        let iw = 1.0 / v.clip[3] as f64;
+        [
+            (v.clip[0] as f64 * iw + 1.0) * vw as f64 / 2.0 + vx as f64,
+            (v.clip[1] as f64 * iw + 1.0) * vh as f64 / 2.0 + vy as f64,
+            (v.clip[2] as f64 * iw) * (f - n) / 2.0 + (f + n) / 2.0,
+            iw,
+        ]
+    }
+
+    /// The kernel's vertices for one primitive (`back`: its back face's
+    /// colours), with a texture of `tw` x `th` texels.
+    fn kverts(&self, poly: &[Vtx], win: &[[f64; 4]], back: bool, tw: f64, th: f64) -> Vec<KVert> {
+        let qmax = win.iter().map(|w| w[3]).fold(0.0f64, f64::max);
+        poly.iter()
+            .zip(win.iter())
+            .map(|(v, w)| {
+                let q = if qmax > 0.0 { w[3] / qmax } else { 1.0 };
+                let col = |c: f32| (clamp01(c) as f64 * 255.0 * FX) as i64;
+                let c = if back { v.back } else { v.col };
+                KVert {
+                    x: round(w[0] * SUB) as i32,
+                    y: round((self.h as f64 - w[1]) * SUB) as i32,
+                    z: (w[2].clamp(0.0, 1.0) * DEPTH_MAX * FX) as i64,
+                    q: (q * FX) as i64,
+                    uq: (v.tc[0] as f64 / v.tc[3] as f64 * tw * q * FX) as i64,
+                    vq: (v.tc[1] as f64 / v.tc[3] as f64 * th * q * FX) as i64,
+                    r: col(c[0]),
+                    g: col(c[1]),
+                    b: col(c[2]),
+                    a: col(c[3]),
+                    // Fog per pixel from this, linear in the window.
+                    f: (v.dist as f64 * FX) as i64,
+                }
+            })
+            .collect()
+    }
+
+    /// Clip a line to the view volume and draw it.
+    fn line(&mut self, a: Vtx, b: Vtx) {
+        let mut b = b;
+        let mut a = a;
+        if self.shade_model == GL_FLAT {
+            a.col = b.col;
+            a.back = b.back;
+        }
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        for plane in 0..6 {
+            let d = |v: &Vtx| {
+                let (axis, sign) = (plane / 2, if plane % 2 == 0 { 1.0 } else { -1.0 });
+                v.clip[3] + sign * v.clip[axis]
+            };
+            let (da, db) = (d(&a), d(&b));
+            if da < 0.0 && db < 0.0 {
+                return;
+            }
+            if da < 0.0 {
+                t0 = t0.max(da / (da - db));
+            } else if db < 0.0 {
+                t1 = t1.min(da / (da - db));
+            }
+        }
+        if t0 > t1 {
+            return;
+        }
+        let (na, nb) = (a.lerp(&b, t0), a.lerp(&b, t1));
+        a = na;
+        b = nb;
+        let (g, tex) = self.state(KIND_LINES, self.line_width);
+        let (tw, th) = tex.map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
+        let win = [self.window(&a), self.window(&b)];
+        let kv = self.kverts(&[a, b], &win, false, tw, th);
+        self.push_tri(&g, KTri { v: [kv[0], kv[1], kv[1]] });
+    }
+
+    fn point(&mut self, v: Vtx) {
+        let c = v.clip;
+        if (0..3).any(|k| c[k] < -c[3] || c[k] > c[3]) {
+            return;
+        }
+        let (g, tex) = self.state(KIND_POINTS, self.point_size);
+        let (tw, th) = tex.map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
+        let win = [self.window(&v)];
+        let kv = self.kverts(&[v], &win, false, tw, th);
+        self.push_tri(&g, KTri { v: [kv[0], kv[0], kv[0]] });
     }
 
     /// Turn the vertices of one primitive (`mode`) into polygons and draw them.
@@ -642,7 +913,24 @@ impl Ctx {
                     self.polygon(v, 0);
                 }
             }
-            // Points and lines aren't drawn yet.
+            GL_POINTS => {
+                for p in v {
+                    self.point(*p);
+                }
+            }
+            GL_LINES => {
+                for i in (0..n / 2).map(|i| i * 2) {
+                    self.line(v[i], v[i + 1]);
+                }
+            }
+            GL_LINE_STRIP | GL_LINE_LOOP => {
+                for i in 0..n.saturating_sub(1) {
+                    self.line(v[i], v[i + 1]);
+                }
+                if mode == GL_LINE_LOOP && n >= 2 {
+                    self.line(v[n - 1], v[0]);
+                }
+            }
             _ => {}
         }
         if self.tris.len() >= BATCH_TRIS {
@@ -655,9 +943,10 @@ impl Ctx {
     fn polygon(&mut self, input: &[Vtx], provoking: usize) {
         let mut poly: Vec<Vtx> = input.to_vec();
         if self.shade_model == GL_FLAT {
-            let c = input[provoking].col;
+            let (c, b) = (input[provoking].col, input[provoking].back);
             for p in &mut poly {
                 p.col = c;
+                p.back = b;
             }
         }
         // Against the six planes of the view volume, in clip space.
@@ -679,9 +968,7 @@ impl Ctx {
                 let b = poly[i];
                 let (da, db) = (d(&a), d(&b));
                 if (da >= 0.0) != (db >= 0.0) {
-                    let t = da / (da - db);
-                    let lerp = |x: [f32; 4], y: [f32; 4]| core::array::from_fn(|k| x[k] + (y[k] - x[k]) * t);
-                    out.push(Vtx { clip: lerp(a.clip, b.clip), col: lerp(a.col, b.col), tc: lerp(a.tc, b.tc) });
+                    out.push(a.lerp(&b, da / (da - db)));
                 }
                 if db >= 0.0 {
                     out.push(b);
@@ -693,21 +980,7 @@ impl Ctx {
             }
         }
         // To the window (y upwards here, as GL has it).
-        let [vx, vy, vw, vh] = self.viewport;
-        let (n, f) = (self.depth_range[0] as f64, self.depth_range[1] as f64);
-        let win: Vec<[f64; 4]> = poly
-            .iter()
-            .map(|v| {
-                let w = v.clip[3] as f64;
-                let iw = 1.0 / w;
-                [
-                    (v.clip[0] as f64 * iw + 1.0) * vw as f64 / 2.0 + vx as f64,
-                    (v.clip[1] as f64 * iw + 1.0) * vh as f64 / 2.0 + vy as f64,
-                    (v.clip[2] as f64 * iw) * (f - n) / 2.0 + (f + n) / 2.0,
-                    iw,
-                ]
-            })
-            .collect();
+        let win: Vec<[f64; 4]> = poly.iter().map(|v| self.window(v)).collect();
         // Facing: counter-clockwise in the window is positive area.
         let mut area = 0.0;
         for i in 0..win.len() {
@@ -728,29 +1001,42 @@ impl Ctx {
                 return;
             }
         }
-        let (g, tex) = self.state();
-        let (tw, th) = tex.map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
-        let qmax = win.iter().map(|w| w[3]).fold(0.0f64, f64::max);
-        let kv: Vec<KVert> = poly
-            .iter()
-            .zip(win.iter())
-            .map(|(v, w)| {
-                let q = if qmax > 0.0 { w[3] / qmax } else { 1.0 };
-                let col = |c: f32| (clamp01(c) as f64 * 255.0 * FX) as i64;
-                KVert {
-                    x: round(w[0] * SUB) as i32,
-                    y: round((self.h as f64 - w[1]) * SUB) as i32,
-                    z: (w[2].clamp(0.0, 1.0) * DEPTH_MAX * FX) as i64,
-                    q: (q * FX) as i64,
-                    uq: (v.tc[0] as f64 / v.tc[3] as f64 * tw * q * FX) as i64,
-                    vq: (v.tc[1] as f64 / v.tc[3] as f64 * th * q * FX) as i64,
-                    r: col(v.col[0]),
-                    g: col(v.col[1]),
-                    b: col(v.col[2]),
-                    a: col(v.col[3]),
+        // Two-sided lighting: a back face takes its back colours.
+        let back = !front && self.on(GL_LIGHTING) && self.light.two_side;
+        // glPolygonMode: outlines or corners instead of filling.
+        match self.polygon_mode[!front as usize] {
+            GL_LINE => {
+                for i in 0..input.len() {
+                    let (mut a, mut b) = (input[i], input[(i + 1) % input.len()]);
+                    if back {
+                        a.col = a.back;
+                        b.col = b.back;
+                    }
+                    let flat = core::mem::replace(&mut self.shade_model, GL_SMOOTH);
+                    if flat == GL_FLAT {
+                        a.col = poly[0].col;
+                        b.col = poly[0].col;
+                    }
+                    self.line(a, b);
+                    self.shade_model = flat;
                 }
-            })
-            .collect();
+                return;
+            }
+            GL_POINT => {
+                for v in input {
+                    let mut v = *v;
+                    if back {
+                        v.col = v.back;
+                    }
+                    self.point(v);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let (g, tex) = self.state(KIND_TRIANGLES, 1.0);
+        let (tw, th) = tex.map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
+        let kv = self.kverts(&poly, &win, back, tw, th);
         for i in 1..kv.len() - 1 {
             self.push_tri(&g, KTri { v: [kv[0], kv[i], kv[i + 1]] });
         }
@@ -898,6 +1184,15 @@ pub extern "system" fn wglCreateContext(hdc: u64) -> u64 {
         bound: 0,
         tex_env: GL_MODULATE,
         perspective: false,
+        fog_nicest: false,
+        light: light::Lighting::new(),
+        fog: light::Fog::new(),
+        line_width: 1.0,
+        point_size: 1.0,
+        polygon_mode: [GL_FILL, GL_FILL],
+        stencil: [GL_ALWAYS, 0, 0xFF, 0xFF, GL_KEEP, GL_KEEP, GL_KEEP],
+        clear_stencil: 0,
+        lists: lists::Lists::default(),
         prim: None,
         verts: Vec::new(),
         arrays: [Array::default(); 4],
@@ -1042,7 +1337,11 @@ pub extern "system" fn glGetString(name: u32) -> *const u8 {
 }
 
 fn set_cap(cap: u32, on: bool) {
+    rec!(set_cap(cap, on));
     outside(|c| {
+        if (GL_LIGHT0..GL_LIGHT0 + 8).contains(&cap) {
+            c.light.lights[(cap - GL_LIGHT0) as usize].on = on;
+        }
         if on != c.on(cap) {
             if on {
                 c.caps.push(cap);
@@ -1070,39 +1369,49 @@ pub extern "system" fn glIsEnabled(cap: u32) -> u8 {
 
 #[no_mangle]
 pub extern "system" fn glHint(target: u32, mode: u32) {
+    rec!(glHint(target, mode));
     // GL_PERSPECTIVE_CORRECTION_HINT, GL_NICEST.
     outside(|c| {
         if target == 0x0C50 {
             c.perspective = mode == 0x1102;
+        }
+        // GL_FOG_HINT.
+        if target == 0x0C54 {
+            c.fog_nicest = mode == 0x1102;
         }
     })
 }
 
 #[no_mangle]
 pub extern "system" fn glClearColor(r: f32, g: f32, b: f32, a: f32) {
+    rec!(glClearColor(r, g, b, a));
     outside(|c| c.clear_color = [clamp01(r), clamp01(g), clamp01(b), clamp01(a)])
 }
 
 #[no_mangle]
 pub extern "system" fn glClearDepth(d: f64) {
+    rec!(glClearDepth(d));
     outside(|c| c.clear_depth = clamp01(d as f32))
 }
 
 #[no_mangle]
 pub extern "system" fn glClear(mask: u32) {
+    rec!(glClear(mask));
     outside(|c| {
-        if mask & !(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | 0x200 | 0x400) != 0 {
+        if mask & !(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | 0x200 | GL_STENCIL_BUFFER_BIT) != 0 {
             c.err(GL_INVALID_VALUE);
             return;
         }
         c.flush();
         let ch = |v: f32| (v * 255.0 + 0.5) as u32;
         let args = ClearArgs {
-            mask: mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT),
+            mask: mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT),
             color: ch(c.clear_color[0]) << 16 | ch(c.clear_color[1]) << 8 | ch(c.clear_color[2]),
             depth: (c.clear_depth as f64 * DEPTH_MAX + 0.5) as u32,
             color_mask: c.mask_bits(),
             scissor: c.scissor_box(),
+            stencil: c.clear_stencil & 0xFF,
+            stencil_write: c.stencil[3] & 0xFF,
         };
         unsafe { VeilGpu3d(1, c.target, &args as *const _ as u64, 0) };
     })
@@ -1110,6 +1419,7 @@ pub extern "system" fn glClear(mask: u32) {
 
 #[no_mangle]
 pub extern "system" fn glViewport(x: i32, y: i32, w: i32, h: i32) {
+    rec!(glViewport(x, y, w, h));
     outside(|c| {
         if w < 0 || h < 0 {
             c.err(GL_INVALID_VALUE);
@@ -1121,11 +1431,13 @@ pub extern "system" fn glViewport(x: i32, y: i32, w: i32, h: i32) {
 
 #[no_mangle]
 pub extern "system" fn glDepthRange(n: f64, f: f64) {
+    rec!(glDepthRange(n, f));
     outside(|c| c.depth_range = [clamp01(n as f32), clamp01(f as f32)])
 }
 
 #[no_mangle]
 pub extern "system" fn glScissor(x: i32, y: i32, w: i32, h: i32) {
+    rec!(glScissor(x, y, w, h));
     outside(|c| {
         if w < 0 || h < 0 {
             c.err(GL_INVALID_VALUE);
@@ -1141,16 +1453,19 @@ fn is_func(f: u32) -> bool {
 
 #[no_mangle]
 pub extern "system" fn glDepthFunc(f: u32) {
+    rec!(glDepthFunc(f));
     outside(|c| if is_func(f) { c.depth_func = f } else { c.err(GL_INVALID_ENUM) })
 }
 
 #[no_mangle]
 pub extern "system" fn glDepthMask(on: u8) {
+    rec!(glDepthMask(on));
     outside(|c| c.depth_mask = on != 0)
 }
 
 #[no_mangle]
 pub extern "system" fn glAlphaFunc(f: u32, r: f32) {
+    rec!(glAlphaFunc(f, r));
     outside(|c| {
         if is_func(f) {
             c.alpha_func = f;
@@ -1163,6 +1478,7 @@ pub extern "system" fn glAlphaFunc(f: u32, r: f32) {
 
 #[no_mangle]
 pub extern "system" fn glBlendFunc(s: u32, d: u32) {
+    rec!(glBlendFunc(s, d));
     let ok = |f: u32| f <= 1 || (0x300..=0x308).contains(&f);
     outside(|c| {
         // GL_SRC_ALPHA_SATURATE is a source factor only; SRC_COLOR and its
@@ -1178,21 +1494,25 @@ pub extern "system" fn glBlendFunc(s: u32, d: u32) {
 
 #[no_mangle]
 pub extern "system" fn glCullFace(m: u32) {
+    rec!(glCullFace(m));
     outside(|c| if matches!(m, GL_FRONT | GL_BACK | GL_FRONT_AND_BACK) { c.cull_mode = m } else { c.err(GL_INVALID_ENUM) })
 }
 
 #[no_mangle]
 pub extern "system" fn glFrontFace(m: u32) {
+    rec!(glFrontFace(m));
     outside(|c| if m == GL_CW || m == GL_CCW { c.front_face = m } else { c.err(GL_INVALID_ENUM) })
 }
 
 #[no_mangle]
 pub extern "system" fn glShadeModel(m: u32) {
+    rec!(glShadeModel(m));
     outside(|c| if m == GL_FLAT || m == GL_SMOOTH { c.shade_model = m } else { c.err(GL_INVALID_ENUM) })
 }
 
 #[no_mangle]
 pub extern "system" fn glColorMask(r: u8, g: u8, b: u8, a: u8) {
+    rec!(glColorMask(r, g, b, a));
     outside(|c| c.color_mask = [r != 0, g != 0, b != 0, a != 0])
 }
 
@@ -1295,13 +1615,18 @@ fn get(name: u32, out: &mut [f64; 16]) -> usize {
             0x0D52..=0x0D54 => one(out, 8.0),
             0x0D55 => one(out, 0.0),
             0x0D56 => one(out, 24.0),
-            0x0D57 => one(out, 0.0),
+            0x0D57 => one(out, 8.0),
+            0x0B21 => one(out, c.line_width as f64),
+            0x0B11 => one(out, c.point_size as f64),
+            0x0B32 => one(out, c.lists.base as f64),
+            0x0D31 => one(out, 8.0),
             0x0D3A => {
                 out[0] = MAX_TEXTURE_SIZE as f64;
                 out[1] = MAX_TEXTURE_SIZE as f64;
                 2
             }
             0x8069 => one(out, c.bound as f64),
+            0x0C54 => one(out, if c.fog_nicest { 0x1102 as f64 } else { 0x1100 as f64 }),
             0x0C50 => one(out, if c.perspective { 0x1102 as f64 } else { 0x1100 as f64 }),
             0x0C32 => one(out, c.double as u32 as f64),
             0x0B74 => one(out, c.depth_func as f64),
@@ -1333,40 +1658,44 @@ fn get(name: u32, out: &mut [f64; 16]) -> usize {
 
 #[no_mangle]
 pub extern "system" fn glMatrixMode(m: u32) {
+    rec!(glMatrixMode(m));
     outside(|c| if matches!(m, GL_MODELVIEW | GL_PROJECTION | GL_TEXTURE) { c.matrix_mode = m } else { c.err(GL_INVALID_ENUM) })
 }
 
 #[no_mangle]
 pub extern "system" fn glLoadIdentity() {
+    rec!(glLoadIdentity());
     outside(|c| *c.top() = IDENTITY)
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn glLoadMatrixf(m: *const f32) {
-    let m: Mat = core::array::from_fn(|i| unsafe { *m.add(i) });
-    outside(|c| *c.top() = m)
+    load_matrix(core::array::from_fn(|i| unsafe { *m.add(i) }), false)
+}
+
+fn load_matrix(m: Mat, mult: bool) {
+    rec!(load_matrix(m, mult));
+    outside(|c| if mult { c.mult(&m) } else { *c.top() = m })
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn glLoadMatrixd(m: *const f64) {
-    let m: Mat = core::array::from_fn(|i| unsafe { *m.add(i) } as f32);
-    outside(|c| *c.top() = m)
+    load_matrix(core::array::from_fn(|i| unsafe { *m.add(i) } as f32), false)
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn glMultMatrixf(m: *const f32) {
-    let m: Mat = core::array::from_fn(|i| unsafe { *m.add(i) });
-    outside(|c| c.mult(&m))
+    load_matrix(core::array::from_fn(|i| unsafe { *m.add(i) }), true)
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn glMultMatrixd(m: *const f64) {
-    let m: Mat = core::array::from_fn(|i| unsafe { *m.add(i) } as f32);
-    outside(|c| c.mult(&m))
+    load_matrix(core::array::from_fn(|i| unsafe { *m.add(i) } as f32), true)
 }
 
 #[no_mangle]
 pub extern "system" fn glPushMatrix() {
+    rec!(glPushMatrix());
     outside(|c| {
         let i = match c.matrix_mode { GL_PROJECTION => 1, GL_TEXTURE => 2, _ => 0 };
         if c.stacks[i].len() >= STACK_DEPTH {
@@ -1380,6 +1709,7 @@ pub extern "system" fn glPushMatrix() {
 
 #[no_mangle]
 pub extern "system" fn glPopMatrix() {
+    rec!(glPopMatrix());
     outside(|c| {
         let i = match c.matrix_mode { GL_PROJECTION => 1, GL_TEXTURE => 2, _ => 0 };
         if c.stacks[i].len() <= 1 {
@@ -1392,6 +1722,7 @@ pub extern "system" fn glPopMatrix() {
 
 #[no_mangle]
 pub extern "system" fn glTranslatef(x: f32, y: f32, z: f32) {
+    rec!(glTranslatef(x, y, z));
     let mut m = IDENTITY;
     m[12] = x;
     m[13] = y;
@@ -1406,6 +1737,7 @@ pub extern "system" fn glTranslated(x: f64, y: f64, z: f64) {
 
 #[no_mangle]
 pub extern "system" fn glScalef(x: f32, y: f32, z: f32) {
+    rec!(glScalef(x, y, z));
     let mut m = IDENTITY;
     m[0] = x;
     m[5] = y;
@@ -1420,6 +1752,7 @@ pub extern "system" fn glScaled(x: f64, y: f64, z: f64) {
 
 #[no_mangle]
 pub extern "system" fn glRotatef(angle: f32, x: f32, y: f32, z: f32) {
+    rec!(glRotatef(angle, x, y, z));
     let len = sqrt((x * x + y * y + z * z) as f64);
     if len == 0.0 {
         return;
@@ -1444,6 +1777,7 @@ pub extern "system" fn glRotated(angle: f64, x: f64, y: f64, z: f64) {
 
 #[no_mangle]
 pub extern "system" fn glOrtho(l: f64, r: f64, b: f64, t: f64, n: f64, f: f64) {
+    rec!(glOrtho(l, r, b, t, n, f));
     outside(|c| {
         if l == r || b == t || n == f {
             c.err(GL_INVALID_VALUE);
@@ -1462,6 +1796,7 @@ pub extern "system" fn glOrtho(l: f64, r: f64, b: f64, t: f64, n: f64, f: f64) {
 
 #[no_mangle]
 pub extern "system" fn glFrustum(l: f64, r: f64, b: f64, t: f64, n: f64, f: f64) {
+    rec!(glFrustum(l, r, b, t, n, f));
     outside(|c| {
         if n <= 0.0 || f <= 0.0 || l == r || b == t || n == f {
             c.err(GL_INVALID_VALUE);
@@ -1483,6 +1818,7 @@ pub extern "system" fn glFrustum(l: f64, r: f64, b: f64, t: f64, n: f64, f: f64)
 
 #[no_mangle]
 pub extern "system" fn glBegin(mode: u32) {
+    rec!(glBegin(mode));
     with(|c| {
         if c.prim.is_some() {
             c.err(GL_INVALID_OPERATION);
@@ -1497,6 +1833,7 @@ pub extern "system" fn glBegin(mode: u32) {
 
 #[no_mangle]
 pub extern "system" fn glEnd() {
+    rec!(glEnd());
     with(|c| {
         let Some(mode) = c.prim.take() else {
             c.err(GL_INVALID_OPERATION);
@@ -1509,6 +1846,7 @@ pub extern "system" fn glEnd() {
 }
 
 fn vertex(x: f32, y: f32, z: f32, w: f32) {
+    rec!(vertex(x, y, z, w));
     with(|c| {
         if c.prim.is_some() {
             c.vertex([x, y, z, w]);
@@ -1535,6 +1873,7 @@ fn vertex(x: f32, y: f32, z: f32, w: f32) {
 #[no_mangle] pub unsafe extern "system" fn glVertex4fv(v: *const f32) { unsafe { vertex(*v, *v.add(1), *v.add(2), *v.add(3)) } }
 
 fn color(r: f32, g: f32, b: f32, a: f32) {
+    rec!(color(r, g, b, a));
     with(|c| c.color = [r, g, b, a])
 }
 
@@ -1554,6 +1893,7 @@ fn ub(x: u8) -> f32 {
 #[no_mangle] pub unsafe extern "system" fn glColor4ubv(v: *const u8) { unsafe { color(ub(*v), ub(*v.add(1)), ub(*v.add(2)), ub(*v.add(3))) } }
 
 fn texcoord(s: f32, t: f32, r: f32, q: f32) {
+    rec!(texcoord(s, t, r, q));
     with(|c| c.tc = [s, t, r, q])
 }
 
@@ -1566,6 +1906,7 @@ fn texcoord(s: f32, t: f32, r: f32, q: f32) {
 
 #[no_mangle]
 pub extern "system" fn glNormal3f(x: f32, y: f32, z: f32) {
+    rec!(glNormal3f(x, y, z));
     with(|c| c.normal = [x, y, z])
 }
 
@@ -1581,6 +1922,7 @@ pub extern "system" fn glNormal3d(x: f64, y: f64, z: f64) {
 
 /// glRect*: a polygon in the z = 0 plane.
 fn rect(x1: f32, y1: f32, x2: f32, y2: f32) {
+    rec!(rect(x1, y1, x2, y2));
     outside(|c| {
         c.verts.clear();
         for (x, y) in [(x1, y1), (x2, y1), (x2, y2), (x1, y2)] {
@@ -1683,6 +2025,35 @@ impl Ctx {
         if !self.arrays[A_VERTEX].on {
             return;
         }
+        if self.lists.compiling.is_some() && self.lists.replaying == 0 {
+            // A list keeps what the arrays hold now.
+            let a = self.arrays;
+            let els: Vec<Element> = idx.map(|i| unsafe {
+                Element {
+                    color: a[A_COLOR].on.then(|| {
+                        let mut c = a[A_COLOR].get(i, true);
+                        if a[A_COLOR].size == 3 {
+                            c[3] = 1.0;
+                        }
+                        c
+                    }),
+                    tc: a[A_TEXCOORD].on.then(|| a[A_TEXCOORD].get(i, false)),
+                    normal: a[A_NORMAL].on.then(|| a[A_NORMAL].get(i, true)),
+                    pos: {
+                        let mut p = a[A_VERTEX].get(i, false);
+                        if a[A_VERTEX].size < 3 {
+                            p[2] = 0.0;
+                        }
+                        if a[A_VERTEX].size < 4 {
+                            p[3] = 1.0;
+                        }
+                        p
+                    },
+                }
+            }).collect();
+            let _ = lists::record(alloc::boxed::Box::new(move || draw_recorded(mode, &els)));
+            return;
+        }
         let saved = core::mem::take(&mut self.verts);
         for i in idx {
             self.element(i);
@@ -1690,6 +2061,35 @@ impl Ctx {
         let v = core::mem::replace(&mut self.verts, saved);
         self.assemble(mode, &v);
     }
+}
+
+/// One vertex from the arrays, as a display list keeps it.
+#[derive(Clone, Copy)]
+struct Element {
+    color: Option<[f32; 4]>,
+    tc: Option<[f32; 4]>,
+    normal: Option<[f32; 4]>,
+    pos: [f32; 4],
+}
+
+fn draw_recorded(mode: u32, els: &[Element]) {
+    outside(|c| {
+        let saved = core::mem::take(&mut c.verts);
+        for e in els {
+            if let Some(col) = e.color {
+                c.color = col;
+            }
+            if let Some(t) = e.tc {
+                c.tc = t;
+            }
+            if let Some(n) = e.normal {
+                c.normal = [n[0], n[1], n[2]];
+            }
+            c.vertex(e.pos);
+        }
+        let v = core::mem::replace(&mut c.verts, saved);
+        c.assemble(mode, &v);
+    })
 }
 
 #[no_mangle]
@@ -1779,6 +2179,7 @@ pub extern "system" fn glIsTexture(name: u32) -> u8 {
 
 #[no_mangle]
 pub extern "system" fn glBindTexture(target: u32, name: u32) {
+    rec!(glBindTexture(target, name));
     outside(|c| {
         if target != GL_TEXTURE_2D {
             if target != 0x0DE0 {
@@ -1864,18 +2265,38 @@ pub unsafe extern "system" fn glTexImage2D(target: u32, level: i32, ifmt: i32, w
             c.err(GL_INVALID_ENUM);
             return;
         };
-        c.flush();
-        let t = c.bound_tex();
-        if level == 0 {
-            t.w = w as u32;
-            t.h = h as u32;
-            t.texels = texels.into_iter().map(|p| internal(ifmt, p)).collect();
-            t.levels = 1;
-            t.dirty = true;
-        } else if level < 32 {
-            t.levels |= 1 << level;
+        let texels: Vec<u32> = texels.into_iter().map(|p| internal(ifmt, p)).collect();
+        if c.lists.compiling.is_some() && c.lists.replaying == 0 {
+            let _ = lists::record(alloc::boxed::Box::new(move || tex_image(level, w, h, texels.clone())));
+            return;
         }
+        tex_image_in(c, level, w, h, texels);
     })
+}
+
+/// A level's texels, already converted (from a display list).
+fn tex_image(level: i32, w: i32, h: i32, texels: Vec<u32>) {
+    outside(|c| tex_image_in(c, level, w, h, texels))
+}
+
+fn tex_image_in(c: &mut Ctx, level: i32, w: i32, h: i32, texels: Vec<u32>) {
+    c.flush();
+    let t = c.bound_tex();
+    if level == 0 {
+        t.w = w as u32;
+        t.h = h as u32;
+        t.mips.clear();
+    }
+    let l = level as usize;
+    if l < 16 {
+        if t.mips.len() <= l {
+            t.mips.resize(l + 1, Vec::new());
+        }
+        // A level of the wrong size for level 0 leaves the texture
+        // incomplete, as GL has it.
+        t.mips[l] = if t.level_size(l) == (w as u32, h as u32) { texels } else { Vec::new() };
+    }
+    t.dirty = true;
 }
 
 #[no_mangle]
@@ -1889,28 +2310,48 @@ pub unsafe extern "system" fn glTexSubImage2D(target: u32, level: i32, x: i32, y
             c.err(GL_INVALID_ENUM);
             return;
         };
-        c.flush();
-        let t = c.bound_tex();
-        if level != 0 {
+        if c.lists.compiling.is_some() && c.lists.replaying == 0 {
+            let _ = lists::record(alloc::boxed::Box::new(move || {
+                let src = src.clone();
+                outside(|c| sub_image(c, level, x, y, w, h, format, &src))
+            }));
             return;
         }
-        if x < 0 || y < 0 || x + w > t.w as i32 || y + h > t.h as i32 {
-            c.err(GL_INVALID_VALUE);
-            return;
-        }
-        for row in 0..h as usize {
-            for col in 0..w as usize {
-                let p = src[row * w as usize + col];
-                let at = (y as usize + row) * t.w as usize + x as usize + col;
-                // Formats without alpha keep it opaque, as the image has it.
-                t.texels[at] = if t.texels[at] >> 24 == 0xFF && format != GL_RGBA && format != GL_BGRA_EXT { p | 0xFF00_0000 } else { p };
-            }
-        }
-        t.dirty = true;
+        sub_image(c, level, x, y, w, h, format, &src);
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn sub_image(c: &mut Ctx, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, src: &[u32]) {
+    {
+        c.flush();
+        let t = c.bound_tex();
+        let l = level.max(0) as usize;
+        let (lw, lh) = t.level_size(l);
+        if t.mips.get(l).is_none_or(|m| m.len() != (lw * lh) as usize) {
+            c.err(GL_INVALID_OPERATION);
+            return;
+        }
+        if level < 0 || x < 0 || y < 0 || x + w > lw as i32 || y + h > lh as i32 {
+            c.err(GL_INVALID_VALUE);
+            return;
+        }
+        let t = c.bound_tex();
+        let m = &mut t.mips[l];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let p = src[row * w as usize + col];
+                let at = (y as usize + row) * lw as usize + x as usize + col;
+                // Formats without alpha keep it opaque, as the image has it.
+                m[at] = if m[at] >> 24 == 0xFF && format != GL_RGBA && format != GL_BGRA_EXT { p | 0xFF00_0000 } else { p };
+            }
+        }
+        t.dirty = true;
+    }
+}
+
 fn tex_param(target: u32, name: u32, v: u32) {
+    rec!(tex_param(target, name, v));
     outside(|c| {
         if target != GL_TEXTURE_2D {
             c.err(GL_INVALID_ENUM);
@@ -1945,6 +2386,7 @@ fn tex_param(target: u32, name: u32, v: u32) {
 #[no_mangle] pub unsafe extern "system" fn glTexParameterfv(t: u32, n: u32, v: *const f32) { tex_param(t, n, unsafe { *v } as u32) }
 
 fn tex_env(target: u32, name: u32, v: u32) {
+    rec!(tex_env(target, name, v));
     outside(|c| {
         if target != GL_TEXTURE_ENV {
             c.err(GL_INVALID_ENUM);
@@ -1964,6 +2406,231 @@ fn tex_env(target: u32, name: u32, v: u32) {
 #[no_mangle] pub extern "system" fn glTexEnvf(t: u32, n: u32, v: f32) { tex_env(t, n, v as u32) }
 #[no_mangle] pub unsafe extern "system" fn glTexEnviv(t: u32, n: u32, v: *const i32) { tex_env(t, n, unsafe { *v } as u32) }
 #[no_mangle] pub unsafe extern "system" fn glTexEnvfv(t: u32, n: u32, v: *const f32) { tex_env(t, n, unsafe { *v } as u32) }
+
+// -----| lighting and materials |-----
+
+/// glLight*: `v` holds as many values as the parameter takes.
+fn light(n: u32, name: u32, v: [f32; 4]) {
+    rec!(light(n, name, v));
+    outside(|c| {
+        if !(GL_LIGHT0..GL_LIGHT0 + 8).contains(&n) {
+            c.err(GL_INVALID_ENUM);
+            return;
+        }
+        let mv = *c.stacks[0].last().unwrap();
+        let l = &mut c.light.lights[(n - GL_LIGHT0) as usize];
+        match name {
+            GL_AMBIENT => l.ambient = v,
+            GL_DIFFUSE => l.diffuse = v,
+            GL_SPECULAR => l.specular = v,
+            // Kept in eye coordinates, transformed by the modelview now.
+            GL_POSITION => l.position = xform(&mv, v),
+            GL_SPOT_DIRECTION => {
+                let d = xform(&mv, [v[0], v[1], v[2], 0.0]);
+                l.spot_dir = [d[0], d[1], d[2]];
+            }
+            GL_SPOT_EXPONENT if (0.0..=128.0).contains(&v[0]) => l.spot_exp = v[0],
+            GL_SPOT_CUTOFF if (0.0..=90.0).contains(&v[0]) || v[0] == 180.0 => l.spot_cutoff = v[0],
+            GL_CONSTANT_ATTENUATION if v[0] >= 0.0 => l.atten[0] = v[0],
+            GL_LINEAR_ATTENUATION if v[0] >= 0.0 => l.atten[1] = v[0],
+            GL_QUADRATIC_ATTENUATION if v[0] >= 0.0 => l.atten[2] = v[0],
+            GL_SPOT_EXPONENT | GL_SPOT_CUTOFF | GL_CONSTANT_ATTENUATION | GL_LINEAR_ATTENUATION | GL_QUADRATIC_ATTENUATION => c.err(GL_INVALID_VALUE),
+            _ => c.err(GL_INVALID_ENUM),
+        }
+    })
+}
+
+/// How many values a light, material or light-model parameter takes.
+fn count(name: u32) -> usize {
+    match name {
+        GL_AMBIENT | GL_DIFFUSE | GL_SPECULAR | GL_POSITION | GL_EMISSION | GL_AMBIENT_AND_DIFFUSE | GL_LIGHT_MODEL_AMBIENT | GL_FOG_COLOR => 4,
+        GL_SPOT_DIRECTION => 3,
+        _ => 1,
+    }
+}
+
+unsafe fn floats<T: Copy + Into<f64>>(name: u32, v: *const T, ints_are_colors: bool) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    for (i, o) in out.iter_mut().enumerate().take(count(name)) {
+        let x: f64 = unsafe { *v.add(i) }.into();
+        // Integer colours map their range onto -1 ..= 1.
+        *o = if ints_are_colors && count(name) == 4 && name != GL_POSITION { (x / 2147483647.0) as f32 } else { x as f32 };
+    }
+    out
+}
+
+#[no_mangle] pub extern "system" fn glLightf(n: u32, name: u32, v: f32) { light(n, name, [v, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub extern "system" fn glLighti(n: u32, name: u32, v: i32) { light(n, name, [v as f32, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub unsafe extern "system" fn glLightfv(n: u32, name: u32, v: *const f32) { light(n, name, unsafe { floats(name, v, false) }) }
+#[no_mangle] pub unsafe extern "system" fn glLightiv(n: u32, name: u32, v: *const i32) { light(n, name, unsafe { floats(name, v, true) }) }
+
+fn light_model(name: u32, v: [f32; 4]) {
+    rec!(light_model(name, v));
+    outside(|c| match name {
+        GL_LIGHT_MODEL_AMBIENT => c.light.model_ambient = v,
+        GL_LIGHT_MODEL_LOCAL_VIEWER => c.light.local_viewer = v[0] != 0.0,
+        GL_LIGHT_MODEL_TWO_SIDE => c.light.two_side = v[0] != 0.0,
+        _ => c.err(GL_INVALID_ENUM),
+    })
+}
+
+#[no_mangle] pub extern "system" fn glLightModelf(name: u32, v: f32) { light_model(name, [v, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub extern "system" fn glLightModeli(name: u32, v: i32) { light_model(name, [v as f32, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub unsafe extern "system" fn glLightModelfv(name: u32, v: *const f32) { light_model(name, unsafe { floats(name, v, false) }) }
+#[no_mangle] pub unsafe extern "system" fn glLightModeliv(name: u32, v: *const i32) { light_model(name, unsafe { floats(name, v, true) }) }
+
+/// glMaterial*. (Allowed between glBegin and glEnd.)
+fn material(face: u32, name: u32, v: [f32; 4]) {
+    rec!(material(face, name, v));
+    with(|c| {
+        let faces: &[usize] = match face {
+            GL_FRONT => &[0],
+            GL_BACK => &[1],
+            GL_FRONT_AND_BACK => &[0, 1],
+            _ => {
+                c.err(GL_INVALID_ENUM);
+                return;
+            }
+        };
+        for &f in faces {
+            let m = &mut c.light.mat[f];
+            match name {
+                GL_AMBIENT => m.ambient = v,
+                GL_DIFFUSE => m.diffuse = v,
+                GL_SPECULAR => m.specular = v,
+                GL_EMISSION => m.emission = v,
+                GL_SHININESS if (0.0..=128.0).contains(&v[0]) => m.shininess = v[0],
+                GL_SHININESS => c.err(GL_INVALID_VALUE),
+                GL_AMBIENT_AND_DIFFUSE => {
+                    m.ambient = v;
+                    m.diffuse = v;
+                }
+                _ => c.err(GL_INVALID_ENUM),
+            }
+        }
+    })
+}
+
+#[no_mangle] pub extern "system" fn glMaterialf(face: u32, name: u32, v: f32) { material(face, name, [v, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub extern "system" fn glMateriali(face: u32, name: u32, v: i32) { material(face, name, [v as f32, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub unsafe extern "system" fn glMaterialfv(face: u32, name: u32, v: *const f32) { material(face, name, unsafe { floats(name, v, false) }) }
+#[no_mangle] pub unsafe extern "system" fn glMaterialiv(face: u32, name: u32, v: *const i32) { material(face, name, unsafe { floats(name, v, true) }) }
+
+#[no_mangle]
+pub extern "system" fn glColorMaterial(face: u32, mode: u32) {
+    rec!(glColorMaterial(face, mode));
+    outside(|c| {
+        if !matches!(face, GL_FRONT | GL_BACK | GL_FRONT_AND_BACK) || !matches!(mode, GL_AMBIENT | GL_DIFFUSE | GL_SPECULAR | GL_EMISSION | GL_AMBIENT_AND_DIFFUSE) {
+            c.err(GL_INVALID_ENUM);
+        } else {
+            c.light.cm_face = face;
+            c.light.cm_mode = mode;
+        }
+    })
+}
+
+// -----| fog |-----
+
+fn fog(name: u32, v: [f32; 4]) {
+    rec!(fog(name, v));
+    outside(|c| match name {
+        GL_FOG_MODE => {
+            let m = v[0] as u32;
+            if matches!(m, GL_EXP | GL_EXP2 | GL_LINEAR_FOG) {
+                c.fog.mode = m;
+            } else {
+                c.err(GL_INVALID_ENUM);
+            }
+        }
+        GL_FOG_DENSITY if v[0] >= 0.0 => c.fog.density = v[0],
+        GL_FOG_DENSITY => c.err(GL_INVALID_VALUE),
+        GL_FOG_START => c.fog.start = v[0],
+        GL_FOG_END => c.fog.end = v[0],
+        GL_FOG_COLOR => c.fog.color = v.map(clamp01),
+        // GL_FOG_INDEX: colour index mode isn't kept.
+        0x0B61 => {}
+        _ => c.err(GL_INVALID_ENUM),
+    })
+}
+
+#[no_mangle] pub extern "system" fn glFogf(name: u32, v: f32) { fog(name, [v, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub extern "system" fn glFogi(name: u32, v: i32) { fog(name, [v as f32, 0.0, 0.0, 0.0]) }
+#[no_mangle] pub unsafe extern "system" fn glFogfv(name: u32, v: *const f32) { fog(name, unsafe { floats(name, v, false) }) }
+#[no_mangle] pub unsafe extern "system" fn glFogiv(name: u32, v: *const i32) { fog(name, unsafe { floats(name, v, true) }) }
+
+// -----| lines, points, polygon modes |-----
+
+#[no_mangle]
+pub extern "system" fn glLineWidth(w: f32) {
+    rec!(glLineWidth(w));
+    outside(|c| if w > 0.0 { c.line_width = w.min(10.0) } else { c.err(GL_INVALID_VALUE) })
+}
+
+#[no_mangle]
+pub extern "system" fn glPointSize(s: f32) {
+    rec!(glPointSize(s));
+    outside(|c| if s > 0.0 { c.point_size = s.min(10.0) } else { c.err(GL_INVALID_VALUE) })
+}
+
+#[no_mangle]
+pub extern "system" fn glPolygonMode(face: u32, mode: u32) {
+    rec!(glPolygonMode(face, mode));
+    outside(|c| {
+        if !matches!(mode, GL_POINT | GL_LINE | GL_FILL) {
+            c.err(GL_INVALID_ENUM);
+            return;
+        }
+        match face {
+            GL_FRONT => c.polygon_mode[0] = mode,
+            GL_BACK => c.polygon_mode[1] = mode,
+            GL_FRONT_AND_BACK => c.polygon_mode = [mode, mode],
+            _ => c.err(GL_INVALID_ENUM),
+        }
+    })
+}
+
+// -----| the stencil buffer |-----
+
+#[no_mangle]
+pub extern "system" fn glStencilFunc(func: u32, r: i32, mask: u32) {
+    rec!(glStencilFunc(func, r, mask));
+    outside(|c| {
+        if is_func(func) {
+            c.stencil[0] = func;
+            c.stencil[1] = r.clamp(0, 255) as u32;
+            c.stencil[2] = mask;
+        } else {
+            c.err(GL_INVALID_ENUM);
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn glStencilOp(fail: u32, zfail: u32, zpass: u32) {
+    rec!(glStencilOp(fail, zfail, zpass));
+    let ok = |o: u32| matches!(o, GL_KEEP | GL_ZERO | GL_REPLACE | GL_INCR | GL_DECR | GL_INVERT);
+    outside(|c| {
+        if ok(fail) && ok(zfail) && ok(zpass) {
+            c.stencil[4] = fail;
+            c.stencil[5] = zfail;
+            c.stencil[6] = zpass;
+        } else {
+            c.err(GL_INVALID_ENUM);
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn glStencilMask(mask: u32) {
+    rec!(glStencilMask(mask));
+    outside(|c| c.stencil[3] = mask)
+}
+
+#[no_mangle]
+pub extern "system" fn glClearStencil(s: i32) {
+    rec!(glClearStencil(s));
+    outside(|c| c.clear_stencil = s as u32)
+}
 
 // -----| reading pixels |-----
 
