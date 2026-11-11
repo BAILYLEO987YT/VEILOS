@@ -1,3 +1,5 @@
 # Launch scripts shipped in the release zip keep their platform line endings.
 *.bat text eol=crlf
 *.sh text eol=lf
+# Test reference images (PPM): bytes, never line endings.
+*.ref binary
