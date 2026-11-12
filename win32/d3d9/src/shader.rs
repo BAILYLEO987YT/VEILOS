@@ -847,14 +847,15 @@ pub unsafe extern "system" fn Dev_CreateVertexShader(this: *mut Com, code: *cons
     }
 }
 
-/// ps_2_0 and later: made into the kernel's program (ps_1_x is G5e3).
+/// Made into the kernel's program: ps_2_0 and later as they are, ps_1_x
+/// expanded (`ps1_to_kernel`).
 pub unsafe extern "system" fn Dev_CreatePixelShader(this: *mut Com, code: *const u32, out: *mut *mut Com) -> i32 {
     if code.is_null() || out.is_null() {
         return D3DERR_INVALIDCALL;
     }
     let tokens = unsafe { core::slice::from_raw_parts(code, length(code)) };
-    let Some(mut s) = parse(tokens).filter(|s| s.pixel && s.major >= 2) else { return D3DERR_INVALIDCALL };
-    let Some((ins, varyings)) = to_kernel(&s) else { return D3DERR_INVALIDCALL };
+    let Some(mut s) = parse(tokens).filter(|s| s.pixel) else { return D3DERR_INVALIDCALL };
+    let Some((ins, varyings)) = (if s.major == 1 { ps1_to_kernel(&s) } else { to_kernel(&s) }) else { return D3DERR_INVALIDCALL };
     let args = PsArgs { code: ins.as_ptr() as u64, count: ins.len() as u32, inputs: varyings.len() as u32 };
     let mut h = 0u64;
     if gfx3d::gpu3d(7, 0, &args as *const _ as u64, &mut h as *mut u64 as u64) != 0 {
@@ -1040,4 +1041,182 @@ pub fn of<'a>(p: *mut Com) -> Option<&'a Shader> {
         Some(Com { body: Body::Shader(s), .. }) => Some(s),
         _ => None,
     }
+}
+
+// -----| ps_1_x |-----
+//
+// ps_1_1 to ps_1_3: t0-t3 are what the texture instructions leave (kept in
+// temporaries 8-11), the coordinates they read are texture coordinate
+// inputs; ps_1_4: texld and texcrd read texture coordinates (tN) or
+// registers (rN) into r0-r5. Each texture instruction becomes the kernel's
+// arithmetic and a TEX; r0 is the colour at the end. Internal constants
+// (the draw puts them in the block): c200+n each stage's bump matrix
+// (00, 01, 10, 11), c204+n its luminance scale and offset, c208 ones,
+// c209 zeros. Temporaries 29 and 30 are scratch.
+
+pub const C_BUMP: u32 = 200;
+pub const C_LUM: u32 = 204;
+pub const C_ONE: u32 = 208;
+pub const C_ZERO: u32 = 209;
+
+const SW_ID: u32 = 0xE4;
+
+fn ps1_to_kernel(s: &Shader) -> Option<(Vec<PsIns>, Vec<(u8, u8)>)> {
+    let v14 = s.minor >= 4;
+    let mut varyings: Vec<(u8, u8)> = Vec::new();
+    let mut input = |usage: u8, index: u8| -> Option<u32> {
+        if let Some(i) = varyings.iter().position(|v| *v == (usage, index)) {
+            return Some(i as u32);
+        }
+        if varyings.len() == PS_INPUTS {
+            return None;
+        }
+        varyings.push((usage, index));
+        Some(varyings.len() as u32 - 1)
+    };
+    let op = |file: u32, idx: u32, sw: u32, m: u32| file | idx << 4 | sw << 16 | m << 24;
+    let dmask = |file: u32, idx: u32, mask: u32| file | idx << 4 | mask << 16;
+    let tc = |input: &mut dyn FnMut(u8, u8) -> Option<u32>, n: u16, sw: u32| -> Option<u32> { Some(op(pf::INPUT, input(U_TEXCOORD, n as u8)?, sw, 0)) };
+    let mut out: Vec<PsIns> = Vec::new();
+    let ins = |o: u16, dst: u32, src: [u32; 3], sampler: u8| PsIns { op: o, ctrl: 0, sampler, dst, src, pred: 0, jump: 0 };
+    let mut pads = 0u32;
+    for x in &s.ins {
+        // An operand of an arithmetic instruction.
+        let src = |input: &mut dyn FnMut(u8, u8) -> Option<u32>, a: &Src| -> Option<u32> {
+            let (f, i) = match a.rtype {
+                R_TEMP => (pf::TEMP, a.num as u32),
+                R_INPUT => (pf::INPUT, input(U_COLOR, a.num as u8)?),
+                R_CONST => (pf::CONST, a.num as u32),
+                R_ADDR if v14 => (pf::INPUT, input(U_TEXCOORD, a.num as u8)?),
+                R_ADDR => (pf::TEMP, 8 + a.num as u32),
+                _ => return None,
+            };
+            let sw = a.swz[0] as u32 | (a.swz[1] as u32) << 2 | (a.swz[2] as u32) << 4 | (a.swz[3] as u32) << 6;
+            Some(op(f, i, sw, a.modifier as u32))
+        };
+        let dst = |d: &Dst| -> Option<u32> {
+            let (f, i) = match d.rtype {
+                R_TEMP => (pf::TEMP, d.num as u32),
+                R_ADDR => (pf::TEMP, 8 + d.num as u32),
+                _ => return None,
+            };
+            Some(f | i << 4 | (d.mask as u32) << 16 | (d.saturate as u32) << 20 | ((d.shift as u32) & 15) << 24)
+        };
+        let d = x.dst;
+        let n = d.map_or(0, |d| d.num);
+        let t30 = |mask: u32| dmask(pf::TEMP, 30, mask);
+        let r30 = op(pf::TEMP, 30, SW_ID, 0);
+        match x.op {
+            PHASE | NOP => {}
+            // tex tN (1.1-1.3) / texld rN, src (1.4).
+            66 => {
+                let d = d?;
+                if v14 {
+                    out.push(ins(66, dst(&d)?, [src(&mut input, x.src.first()?)?, 0, 0], d.num as u8));
+                } else {
+                    out.push(ins(66, dmask(pf::TEMP, 8 + n as u32, 15), [tc(&mut input, n, SW_ID)?, 0, 0], n as u8));
+                }
+            }
+            // texcoord tN (1.1-1.3: saturated, w 1) / texcrd rN, tM (1.4).
+            64 => {
+                let d = d?;
+                if v14 {
+                    out.push(ins(MOV, dst(&d)?, [src(&mut input, x.src.first()?)?, 0, 0], 0));
+                } else {
+                    out.push(ins(MOV, dmask(pf::TEMP, 8 + n as u32, 7) | 1 << 20, [tc(&mut input, n, SW_ID)?, 0, 0], 0));
+                    out.push(ins(MOV, dmask(pf::TEMP, 8 + n as u32, 8), [op(pf::CONST, C_ONE, SW_ID, 0), 0, 0], 0));
+                }
+            }
+            // texkill: the coordinates' x, y, z (1.1-1.3), or a register.
+            TEXKILL => {
+                let d = d?;
+                let r = if !v14 || d.rtype == R_ADDR {
+                    tc(&mut input, n, 0xA4)?
+                } else {
+                    op(pf::TEMP, n as u32, 0xA4, 0)
+                };
+                out.push(ins(TEXKILL, 0, [r, 0, 0], 0));
+            }
+            // texbem(l) tN, tM: coordinates moved by the stage's bump matrix.
+            67 | 68 => {
+                let m = src(&mut input, x.src.first()?)?;
+                let with = |sw: u32| (m & !(0xFF << 16)) | sw << 16;
+                out.push(ins(MAD, t30(3), [with(0x00), op(pf::CONST, C_BUMP + n as u32, 0x44, 0), tc(&mut input, n, SW_ID)?], 0));
+                out.push(ins(MAD, t30(3), [with(0x55), op(pf::CONST, C_BUMP + n as u32, 0xEE, 0), r30], 0));
+                out.push(ins(66, dmask(pf::TEMP, 8 + n as u32, 15), [r30, 0, 0], n as u8));
+                if x.op == 68 {
+                    out.push(ins(MAD, dmask(pf::TEMP, 29, 15), [with(0xAA), op(pf::CONST, C_LUM + n as u32, 0x00, 0), op(pf::CONST, C_LUM + n as u32, 0x55, 0)], 0));
+                    out.push(ins(MUL, dmask(pf::TEMP, 8 + n as u32, 7), [op(pf::TEMP, 8 + n as u32, SW_ID, 0), op(pf::TEMP, 29, SW_ID, 0), 0], 0));
+                }
+            }
+            // texreg2ar / gb / rgb tN, tM: tM's components as coordinates.
+            69 | 70 | 82 => {
+                let m = src(&mut input, x.src.first()?)?;
+                let sw = match x.op {
+                    69 => 0x03,
+                    70 => 0xA9,
+                    _ => 0xA4,
+                };
+                out.push(ins(66, dmask(pf::TEMP, 8 + n as u32, 15), [(m & !(0xFF << 16)) | sw << 16, 0, 0], n as u8));
+            }
+            // texm3x2pad, texm3x3pad: a row's dot product into scratch.
+            71 | 73 => {
+                let m = src(&mut input, x.src.first()?)?;
+                out.push(ins(DP3, t30(1 << pads.min(2)), [tc(&mut input, n, SW_ID)?, m, 0], 0));
+                pads += 1;
+            }
+            // The last row, then the lookup (texm3x3spec and vspec sample
+            // as texm3x3tex does: cube maps aren't sampled yet).
+            72 | 74 | 76 | 77 | 86 | 83 | 85 | 84 => {
+                let m = src(&mut input, x.src.first()?)?;
+                let row = match x.op {
+                    83 | 85 => 0,
+                    _ => pads.min(2),
+                };
+                out.push(ins(DP3, t30(1 << row), [tc(&mut input, n, SW_ID)?, m, 0], 0));
+                if x.op == 83 {
+                    out.push(ins(MOV, t30(2), [op(pf::CONST, C_ZERO, SW_ID, 0), 0, 0], 0));
+                }
+                pads = 0;
+                match x.op {
+                    // texdp3: the dot product, replicated.
+                    85 => out.push(ins(MOV, dmask(pf::TEMP, 8 + n as u32, 15), [op(pf::TEMP, 30, 0x00, 0), 0, 0], 0)),
+                    // texm3x3: the vector.
+                    86 => {
+                        out.push(ins(MOV, dmask(pf::TEMP, 8 + n as u32, 7), [r30, 0, 0], 0));
+                        out.push(ins(MOV, dmask(pf::TEMP, 8 + n as u32, 8), [op(pf::CONST, C_ONE, SW_ID, 0), 0, 0], 0));
+                    }
+                    // texm3x2depth: depth = x / y.
+                    84 => {
+                        out.push(ins(RCP, dmask(pf::TEMP, 29, 1), [op(pf::TEMP, 30, 0x55, 0), 0, 0], 0));
+                        out.push(ins(MUL, dmask(pf::DEPTH, 0, 1), [r30, op(pf::TEMP, 29, 0x00, 0), 0], 0));
+                    }
+                    _ => out.push(ins(66, dmask(pf::TEMP, 8 + n as u32, 15), [r30, 0, 0], n as u8)),
+                }
+            }
+            // texdepth rN (1.4): depth = r.x / r.y.
+            87 => {
+                out.push(ins(RCP, dmask(pf::TEMP, 29, 1), [op(pf::TEMP, n as u32, 0x55, 0), 0, 0], 0));
+                out.push(ins(MUL, dmask(pf::DEPTH, 0, 1), [op(pf::TEMP, n as u32, SW_ID, 0), op(pf::TEMP, 29, 0x00, 0), 0], 0));
+            }
+            // bem rD.xy, s0, s1 (1.4): s0 + the stage's bump matrix times s1.
+            89 => {
+                let (a, b) = (src(&mut input, x.src.first()?)?, src(&mut input, x.src.get(1)?)?);
+                let with = |sw: u32| (b & !(0xFF << 16)) | sw << 16;
+                out.push(ins(MAD, t30(3), [with(0x00), op(pf::CONST, C_BUMP + n as u32, 0x44, 0), a], 0));
+                out.push(ins(MAD, t30(3), [with(0x55), op(pf::CONST, C_BUMP + n as u32, 0xEE, 0), r30], 0));
+                out.push(ins(MOV, dst(&d?)?, [r30, 0, 0], 0));
+            }
+            // The arithmetic, as it is.
+            o => {
+                let mut k = ins(o, dst(&d?)?, [0; 3], 0);
+                for (i, a) in x.src.iter().enumerate().take(3) {
+                    k.src[i] = src(&mut input, a)?;
+                }
+                out.push(k);
+            }
+        }
+    }
+    out.push(ins(MOV, dmask(pf::COLOR, 0, 15), [op(pf::TEMP, 0, SW_ID, 0), 0, 0], 0));
+    Some((out, varyings))
 }

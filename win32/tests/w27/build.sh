@@ -28,7 +28,10 @@ for e in vs20_main vs20_proj vs20_fog vs30_main ps20_modulate ps20_light ps20_mi
     "$FXC" /nologo /T $p /E $e /Fh build/d3d3_$e.h /Vn $e d3d3.hlsl >/dev/null
 done
 
-for t in d3d1 d3d2 d3d3; do
+# d3d4's ps_1_x shaders, assembled (fxc no longer emits ps_1_x).
+python psasm.py d3d4.psa build/d3d4_shaders.h
+
+for t in d3d1 d3d2 d3d3 d3d4; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \
         $t.c /Fobuild/$t.obj
@@ -40,10 +43,10 @@ done
 
 # On Windows: the reference pixels (this machine's GPU), then the run that
 # compares with them.
-for t in d3d1 d3d2 d3d3; do
+for t in d3d1 d3d2 d3d3 d3d4; do
     (cd build && ./$t.exe record ../expected/$t.ref >/dev/null)
     cp expected/$t.ref build/$t.ref
     cp expected/$t.ref "$OUT/$t.ref"
     (cd build && ./$t.exe >../expected/$t.out 2>&1; echo "exit $?" >>../expected/$t.out) || true
 done
-echo "built: d3d1.exe d3d2.exe d3d3.exe"
+echo "built: d3d1.exe d3d2.exe d3d3.exe d3d4.exe"

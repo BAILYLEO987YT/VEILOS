@@ -343,17 +343,15 @@ fn vs_vertex(sh: &crate::shader::Shader, ctx: &Ctx, elems: &[Element], src: &[So
     o
 }
 
-/// A fixed-function vertex's values as a pixel shader's inputs.
-fn ff_outs(o: &mut V, vary: &[(u8, u8)]) {
+/// A fixed-function vertex's values as a pixel shader's inputs (texture
+/// coordinates whole, as the vertex has them).
+fn ff_outs(o: &mut V, vary: &[(u8, u8)], inp: &In) {
     use crate::shader as s;
     for (k, &(u, i)) in vary.iter().enumerate() {
         o.outs[k] = match (u, i) {
             (s::U_COLOR, 0) => o.d,
             (s::U_COLOR, 1) => o.s,
-            (s::U_TEXCOORD, n) if (n as usize) < k::SLOTS => {
-                let t = o.t[n as usize];
-                [t[0], t[1], 0.0, t[2]]
-            }
+            (s::U_TEXCOORD, n) if (n as usize) < 8 => inp.tex[n as usize],
             (s::U_FOG, 0) => [o.fog; 4],
             _ => [0.0, 0.0, 0.0, 1.0],
         };
@@ -1345,6 +1343,19 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
         for &(n, v) in &p.defi {
             ints[(n as usize) & 15] = v;
         }
+        if p.major == 1 {
+            use crate::shader::{C_BUMP, C_LUM, C_ONE};
+            let f = |v: u32| f32::from_bits(v);
+            for st in 0..4 {
+                let t = &s.tss[st];
+                let at = (C_BUMP as usize + st) * 4;
+                c[at..at + 4].copy_from_slice(&[f(t[7]), f(t[8]), f(t[9]), f(t[10])]);
+                let at = (C_LUM as usize + st) * 4;
+                c[at..at + 2].copy_from_slice(&[f(t[22]), f(t[23])]);
+            }
+            let at = C_ONE as usize * 4;
+            c[at..at + 4].copy_from_slice(&[1.0; 4]);
+        }
         c.extend(ints.iter().flatten().map(|&i| f32::from_bits(i as u32)));
         c
     });
@@ -1377,8 +1388,9 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
                 let v = match vs {
                     Some(sh) => vs_vertex(sh, &ctx, &elems, src, vi, &consts, &ctx.clip_planes, &o.vary, clamp_colors),
                     None => {
-                        let mut v = ctx.process(&fetch_vertex(&elems, src, vi));
-                        ff_outs(&mut v, &o.vary);
+                        let inp = fetch_vertex(&elems, src, vi);
+                        let mut v = ctx.process(&inp);
+                        ff_outs(&mut v, &o.vary, &inp);
                         v
                     }
                 };

@@ -565,7 +565,7 @@ fn stages(p: &Pass, fr: &Frag) -> Option<[i32; 4]> {
                 let uses = |a: &[u32; 3]| a.iter().any(|x| x & 0xF == ta::TEXTURE);
                 if uses(&st.color_arg) || uses(&st.alpha_arg) {
                     let (u, v, lambda) = fr.uv[i];
-                    texel = sample(t, &g.samplers[i], u, v, lambda);
+                    texel = sample(t, &g.samplers[i], u, v, lambda, false);
                     if i == 0 && g.flags & F_TEX_MASK != 0 && texel[3] == 0 {
                         return None;
                     }
@@ -1175,13 +1175,16 @@ fn address(i: i64, n: usize, mode: u32) -> Option<usize> {
 
 /// One level, nearest or bilinear, at (u, v) in that level's texels with 16
 /// fraction bits, as [r, g, b, a].
-fn sample_level(t: &Texture, s: &Sampler, l: &Level, u: i64, v: i64, nearest: bool) -> [i32; 4] {
+/// `hp`: with 8 more fraction bits (0 ..= 255 x 256), for pixel shaders,
+/// whose texels may become coordinates.
+fn sample_level(t: &Texture, s: &Sampler, l: &Level, u: i64, v: i64, nearest: bool, hp: bool) -> [i32; 4] {
     let get = |x: i64, y: i64| match (address(x, l.w, s.address[0]), address(y, l.h, s.address[1])) {
         (Some(x), Some(y)) => argb(t.texels[l.at + y * l.w + x]),
         _ => argb(s.border),
     };
     if nearest {
-        return get(u >> 16, v >> 16);
+        let c = get(u >> 16, v >> 16);
+        return if hp { c.map(|x| x << 8) } else { c };
     }
     let u = u - 0x8000;
     let v = v - 0x8000;
@@ -1194,18 +1197,18 @@ fn sample_level(t: &Texture, s: &Sampler, l: &Level, u: i64, v: i64, nearest: bo
         let top = a[i] * (256 - fx) + b[i] * fx;
         let bot = c[i] * (256 - fx) + d[i] * fx;
         // Truncated, as Windows' software OpenGL does.
-        out[i] = (top * (256 - fy) + bot * fy) >> 16;
+        out[i] = (top * (256 - fy) + bot * fy) >> if hp { 8 } else { 16 };
     }
     out
 }
 
 /// The texel colour at (u, v) in level-0 texels (16 fraction bits), with
 /// level of detail `lambda` (8 fraction bits), as the sampler says.
-fn sample(t: &Texture, s: &Sampler, u: i64, v: i64, lambda: i32) -> [i32; 4] {
+fn sample(t: &Texture, s: &Sampler, u: i64, v: i64, lambda: i32, hp: bool) -> [i32; 4] {
     let first = (s.max_level as usize).min(t.levels.len() - 1);
     let at = |n: usize, nearest: bool| {
         let n = (n + first).min(t.levels.len() - 1);
-        sample_level(t, s, &t.levels[n], u >> n, v >> n, nearest)
+        sample_level(t, s, &t.levels[n], u >> n, v >> n, nearest, hp)
     };
     let lambda = lambda + s.lod_bias;
     // Where magnification ends: GL's 0.5 for a linear magnification over a
@@ -2221,9 +2224,9 @@ impl PsProgram {
             base + if x.ctrl & 2 != 0 { (c[3] * 256.0) as i32 } else { 0 }
         };
         let u = to_ints(&[c[0] * tw * 256.0, c[1] * th * 256.0, 0.0, 0.0]);
-        let px = sample(t, &p.g.samplers[s], (u[0] as i64) << 8, (u[1] as i64) << 8, lambda);
+        let px = sample(t, &p.g.samplers[s], (u[0] as i64) << 8, (u[1] as i64) << 8, lambda, true);
         let f = from_ints(&px);
-        mul(&f, &splat(1.0 / 255.0))
+        mul(&f, &splat(1.0 / (255.0 * 256.0)))
     }
 }
 
