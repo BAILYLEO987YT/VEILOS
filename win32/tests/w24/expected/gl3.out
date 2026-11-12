@@ -1,0 +1,31 @@
+pixel format: set
+context: current
+accumulation bits: enough
+errors while drawing: 0x0
+attribute stack depth: 0
+polygon offset factor while pushed: 2.5
+after the pop: -1.0
+line stipple: 0x1234 x 5
+light map: 8 wide, min filter 0x2601
+raster position valid: 1
+selection: 3 hits [1 names, z 0.55-0.55, name 1] [1 names, z 0.60-0.60, name 2] [1 names, z 0.65-0.65, name 3]
+feedback: 33 values: 1792.00 7.00 1795.00 3.00 10.50 10.25 0.50 1.00 0.00 0.00 1.00 50.50 20.75 0.50 0.00 1.00 0.00 1.00 20.25 50.50 0.50 0.00 0.00 1.00 1.00 1793.00 5.50 6.50 0.50 1.00 1.00 1.00 1.00
+popping an empty attribute stack: 0x504
+a sphere map for r: 0x500
+a bad pixel type: 0x500
+a bad logic op: 0x500
+a bad render mode: 0x500
+no error left: 0x0
+panel 0 (draw pixels): ok
+panel 1 (bitmaps): ok
+panel 2 (copies and 1D textures): ok
+panel 3 (texgen): ok
+panel 4 (clip planes): ok
+panel 5 (polygon offset): ok
+panel 6 (stipples): ok
+panel 7 (logic ops and attributes): ok
+panel 8 (accumulation): ok
+panel 9 (evaluators): ok
+panel 10 (light map): ok
+panel 11 (texture environments): ok
+exit 0

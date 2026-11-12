@@ -5,7 +5,7 @@
 //!   2  a window or a bitmap (a DIB section in a memory DC), single-buffered
 //!
 //! 32-bit colour with no alpha bits, a 24-bit depth buffer, an 8-bit stencil
-//! buffer. SwapBuffers is
+//! buffer, a 64-bit accumulation buffer. SwapBuffers is
 //! opengl32's: it hands it over with `VeilGdiSetSwapHook` when loaded.
 
 use crate::{Handle, Obj, Target};
@@ -38,6 +38,8 @@ fn describe(n: i32, out: *mut u8) {
     (d[10], d[11], d[12], d[13], d[14], d[15]) = (8, 16, 8, 8, 8, 0);
     d[23] = 24; // cDepthBits
     d[24] = 8; // cStencilBits
+    // cAccumBits and each channel's.
+    (d[18], d[19], d[20], d[21], d[22]) = (64, 16, 16, 16, 16);
     unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), out, 40) };
 }
 

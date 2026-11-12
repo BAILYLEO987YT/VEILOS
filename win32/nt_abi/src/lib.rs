@@ -216,10 +216,12 @@ pub mod sys {
     /// NtQueryDirectoryObject(dir, buffer*, length, single, restart, context*, returned*).
     pub const NT_QUERY_DIRECTORY_OBJECT: u32 = BASE + 86;
     /// VEIL_GPU3D(op, a, b, c): the 3D rasterizer (src/raster3d.rs). Ops:
-    /// 0 create a target (width, height, handle out*), 1 clear (target,
+    /// 0 create a target with colour, depth and stencil (width, height,
+    /// handle out*), 1 clear (target,
     /// ClearArgs*), 2 draw (target, DrawArgs*), 3 read pixels (target,
     /// ReadArgs*), 4 create (0, TexArgs*, handle out*) or replace (texture,
-    /// TexArgs*) a texture.
+    /// TexArgs*) a texture, 5 write pixels straight in (target,
+    /// PixelArgs*), 6 read depth or stencil (target, PixelArgs*).
     pub const VEIL_GPU3D: u32 = BASE + 87;
     pub const END: u32 = BASE + 88;
 }

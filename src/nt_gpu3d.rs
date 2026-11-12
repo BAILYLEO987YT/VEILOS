@@ -104,23 +104,28 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 core::ptr::copy_nonoverlapping(args.tris as *const Tri, tris.as_mut_ptr(), tn);
                 tris.set_len(tn);
             }
-            let mut texs: Vec<Option<Arc<Texture>>> = Vec::with_capacity(gn);
-            for g in &groups {
-                texs.push(if g.flags & F_TEXTURE != 0 {
-                    match obj(proc, g.texture).as_deref() {
-                        Some(Gpu3d::Texture(tx)) => Some(tx.lock().clone()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                });
-            }
-            let passes: Vec<Pass> = groups.iter().zip(texs.iter()).map(|(g, tx)| {
+            let tex_of = |on: bool, h: u64| -> Option<Arc<Texture>> {
+                if !on {
+                    return None;
+                }
+                match obj(proc, h).as_deref() {
+                    Some(Gpu3d::Texture(tx)) => Some(tx.lock().clone()),
+                    _ => None,
+                }
+            };
+            let texs: Vec<(Option<Arc<Texture>>, Option<Arc<Texture>>)> = groups
+                .iter()
+                .map(|g| (tex_of(g.flags & F_TEXTURE != 0, g.texture), tex_of(g.flags & F_TEXTURE2 != 0, g.texture2)))
+                .collect();
+            let passes: Vec<Pass> = groups.iter().zip(texs.iter()).map(|(g, (t1, t2))| {
                 let mut g = *g;
-                if tx.is_none() {
+                if t1.is_none() {
                     g.flags &= !F_TEXTURE;
                 }
-                Pass { g, tex: tx.as_deref() }
+                if t2.is_none() {
+                    g.flags &= !F_TEXTURE2;
+                }
+                Pass { g, tex: t1.as_deref(), tex2: t2.as_deref() }
             }).collect();
             let mut t = t.lock();
             crate::lgpu::execute_3d(t.buffers(), &tris, &passes);
@@ -176,6 +181,42 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                     _ => status::INVALID_HANDLE,
                 }
             }
+        }
+        // Write pixels straight in (5) or read depth or stencil out (6):
+        // a = target, b = PixelArgs*.
+        5 | 6 => {
+            let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
+            let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
+            let Some(pa) = read::<PixelArgs>(b) else { return status::ACCESS_VIOLATION };
+            if pa.w <= 0 || pa.h <= 0 {
+                return status::SUCCESS;
+            }
+            if pa.w > MAX_SIDE as i32 || pa.h > MAX_SIDE as i32 {
+                return status::INVALID_PARAMETER;
+            }
+            let row = pa.w as usize * 4;
+            for r in 0..pa.h as i64 {
+                if !ptr_ok((pa.ptr as i64 + r * pa.stride) as u64, row) {
+                    return status::ACCESS_VIOLATION;
+                }
+            }
+            let mut vals = vec![0u32; (pa.w * pa.h) as usize];
+            let mut t = t.lock();
+            let buf = t.buffers();
+            if op == 5 {
+                for r in 0..pa.h as usize {
+                    let src = (pa.ptr as i64 + r as i64 * pa.stride) as *const u32;
+                    unsafe { core::ptr::copy_nonoverlapping(src, vals.as_mut_ptr().add(r * pa.w as usize), pa.w as usize) };
+                }
+                write_pixels(buf, &pa, &vals);
+            } else {
+                read_pixels(buf, &pa, &mut vals);
+                for r in 0..pa.h as usize {
+                    let dst = (pa.ptr as i64 + r as i64 * pa.stride) as *mut u32;
+                    unsafe { core::ptr::copy_nonoverlapping(vals.as_ptr().add(r * pa.w as usize), dst, pa.w as usize) };
+                }
+            }
+            status::SUCCESS
         }
         _ => status::INVALID_PARAMETER,
     }

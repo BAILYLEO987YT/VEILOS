@@ -14,7 +14,7 @@ VC="C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36
 OUT=../../../storage/tests
 mkdir -p build expected "$OUT"
 
-for t in gl1 gl2; do
+for t in gl1 gl2 gl3; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \
         $t.c /Fobuild/$t.obj
@@ -25,10 +25,10 @@ for t in gl1 gl2; do
 done
 
 # On Windows: the reference pixels, then the run that compares with them.
-for t in gl1 gl2; do
+for t in gl1 gl2 gl3; do
     (cd build && ./$t.exe record ../expected/$t.ref >/dev/null)
     cp expected/$t.ref build/$t.ref
     cp expected/$t.ref "$OUT/$t.ref"
     (cd build && ./$t.exe >../expected/$t.out 2>&1; echo "exit $?" >>../expected/$t.out) || true
 done
-echo "built: gl1.exe gl2.exe"
+echo "built: gl1.exe gl2.exe gl3.exe"

@@ -42,6 +42,32 @@ pub unsafe extern "system" fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 
             let n = (a * b) as usize;
             add(Obj::Target { w: a as usize, h: b as usize, color: vec![0; n], depth: vec![DEPTH_MAX; n], stencil: vec![0; n] }, c)
         }
+        5 | 6 => {
+            let Some(Some(Obj::Target { w, h, color, depth, stencil })) = l.get_mut(a as usize - 1) else { return -1 };
+            let buf = Buffers { color: color.as_mut_ptr(), depth: depth.as_mut_ptr(), stencil: stencil.as_mut_ptr(), w: *w, h: *h };
+            let pa = unsafe { &*(b as *const PixelArgs) };
+            if pa.w <= 0 || pa.h <= 0 {
+                return 0;
+            }
+            let mut vals = vec![0u32; (pa.w * pa.h) as usize];
+            for r in 0..pa.h as usize {
+                let p = (pa.ptr as i64 + r as i64 * pa.stride) as *mut u32;
+                let row = &mut vals[r * pa.w as usize..(r + 1) * pa.w as usize];
+                if op == 5 {
+                    unsafe { core::ptr::copy_nonoverlapping(p, row.as_mut_ptr(), pa.w as usize) };
+                }
+            }
+            if op == 5 {
+                write_pixels(buf, pa, &vals);
+            } else {
+                read_pixels(buf, pa, &mut vals);
+                for r in 0..pa.h as usize {
+                    let p = (pa.ptr as i64 + r as i64 * pa.stride) as *mut u32;
+                    unsafe { core::ptr::copy_nonoverlapping(vals.as_ptr().add(r * pa.w as usize), p, pa.w as usize) };
+                }
+            }
+            0
+        }
         1 | 2 | 3 => {
             let Some(Some(Obj::Target { w, h, color, depth, stencil })) = l.get_mut(a as usize - 1) else { return -1 };
             let buf = Buffers { color: color.as_mut_ptr(), depth: depth.as_mut_ptr(), stencil: stencil.as_mut_ptr(), w: *w, h: *h };
@@ -52,22 +78,23 @@ pub unsafe extern "system" fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 
                     let groups = unsafe { core::slice::from_raw_parts(d.groups as *const Group, d.group_count as usize) };
                     let tris = unsafe { core::slice::from_raw_parts(d.tris as *const Tri, d.tri_count as usize) };
                     let h = *h;
-                    let mut texs = Vec::new();
-                    for g in groups {
-                        texs.push(match l.get(g.texture.wrapping_sub(1) as usize) {
-                            Some(Some(Obj::Texture(t))) if g.flags & F_TEXTURE != 0 => Some(t.clone()),
-                            _ => None,
-                        });
-                    }
+                    let tex_of = |on: bool, h: u64| match l.get(h.wrapping_sub(1) as usize) {
+                        Some(Some(Obj::Texture(t))) if on => Some(t.clone()),
+                        _ => None,
+                    };
+                    let texs: Vec<_> = groups.iter().map(|g| (tex_of(g.flags & F_TEXTURE != 0, g.texture), tex_of(g.flags & F_TEXTURE2 != 0, g.texture2))).collect();
                     let passes: Vec<Pass> = groups
                         .iter()
                         .zip(texs.iter())
-                        .map(|(g, t)| {
+                        .map(|(g, (t1, t2))| {
                             let mut g = *g;
-                            if t.is_none() {
+                            if t1.is_none() {
                                 g.flags &= !F_TEXTURE;
                             }
-                            Pass { g, tex: t.as_deref() }
+                            if t2.is_none() {
+                                g.flags &= !F_TEXTURE2;
+                            }
+                            Pass { g, tex: t1.as_deref(), tex2: t2.as_deref() }
                         })
                         .collect();
                     let mut y = 0;
@@ -175,6 +202,7 @@ pub unsafe extern "system" fn DescribePixelFormat(_hdc: u64, n: i32, size: u32, 
             (d[10], d[11], d[12], d[13], d[14], d[15]) = (8, 16, 8, 8, 8, 0);
             d[23] = 24;
             d[24] = 8;
+            (d[18], d[19], d[20], d[21], d[22]) = (64, 16, 16, 16, 16);
             unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), out, 40) };
         }
     }

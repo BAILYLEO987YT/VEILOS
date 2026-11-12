@@ -5,9 +5,9 @@
 // Primitives already transformed, clipped and mapped to the window by the
 // API above (opengl32.dll does the fixed-function vertex stage in user mode)
 // are filled here: triangles, lines and points. Every pixel they cover goes
-// through one fragment pipeline in GL's order: texturing (with mipmaps), fog,
-// the alpha test, the stencil test, the depth test, blending and the colour
-// mask. `lgpu::execute_3d` cuts the target into bands and renders them on
+// through one fragment pipeline in GL's order: polygon stipple, texturing
+// (two units, with mipmaps), fog, the alpha test, the stencil test, the
+// depth test, blending or a logic op, and the colour mask. `lgpu::execute_3d` cuts the target into bands and renders them on
 // every CPU; a band only touches its own rows of the colour, depth and
 // stencil buffers, and runs its primitives in order, so the result is the
 // same as a serial render.
@@ -53,10 +53,14 @@ pub struct Vert {
     /// 0 ..= 255, fx32 (255: no fog); otherwise the eye distance, fx32, the
     /// fog worked out per pixel.
     pub f: i64,
+    /// The second texture unit's position (F_TEXTURE2), as `uq` and `vq`.
+    pub uq2: i64,
+    pub vq2: i64,
 }
 
-/// A triangle, or a line (`v[0]`, `v[1]`) or a point (`v[0]`), as the
-/// group's `kind` says.
+/// A triangle, or a line (`v[0]`, `v[1]`; `v[2].x` is where its stipple
+/// pattern starts, in pixels) or a point (`v[0]`), as the group's `kind`
+/// says.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Tri {
@@ -70,6 +74,14 @@ pub const F_TEXTURE: u32 = 8;
 pub const F_ALPHA_TEST: u32 = 16;
 pub const F_FOG: u32 = 32;
 pub const F_STENCIL: u32 = 64;
+/// A second texture unit (multitexture), applied after the first.
+pub const F_TEXTURE2: u32 = 128;
+/// Texels with alpha 0 discard the fragment (glBitmap).
+pub const F_TEX_MASK: u32 = 256;
+pub const F_POLY_STIPPLE: u32 = 512;
+pub const F_LINE_STIPPLE: u32 = 1024;
+/// A logic op (`logic_op`) instead of blending.
+pub const F_LOGIC_OP: u32 = 2048;
 
 pub const KIND_TRIANGLES: u32 = 0;
 pub const KIND_LINES: u32 = 1;
@@ -118,6 +130,18 @@ pub struct Group {
     /// parameters, fx32: for GL_LINEAR f = a d + b, else the density in a.
     pub fog_mode: u32,
     pub fog_params: [i64; 2],
+    /// The second unit's texture handle and environment (F_TEXTURE2).
+    pub texture2: u64,
+    pub tex_env2: u32,
+    /// GL_CLEAR (0x1500) ..= GL_SET (0x150F) (F_LOGIC_OP).
+    pub logic_op: u32,
+    /// The line stipple pattern (16 bits) and its repeat factor << 16.
+    pub line_stipple: u32,
+    /// The polygon stipple: 32 rows from the window's bottom, bit 31 the
+    /// leftmost pixel.
+    pub stipple: [u32; 32],
+    /// GL_TEXTURE_ENV_COLOR for each unit (GL_BLEND), 0xAARRGGBB.
+    pub env_color: [u32; 2],
 }
 
 #[repr(C)]
@@ -155,6 +179,24 @@ pub struct ReadArgs {
     pub stride: i64,
 }
 
+/// Pixels written straight into a target (op 5) or read from its depth or
+/// stencil buffer (op 6), rows `stride` bytes apart, y downwards.
+#[repr(C)]
+pub struct PixelArgs {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub ptr: u64,
+    pub stride: i64,
+    /// 0 colour (0x00RRGGBB), 1 depth (0 ..= DEPTH_MAX), 2 stencil.
+    pub which: u32,
+    /// Writing colour: the colour mask (bits 0-2); stencil: the bits written.
+    pub mask: u32,
+    /// Writing: only inside this (x0, y0, x1, y1).
+    pub scissor: [i32; 4],
+}
+
 #[repr(C)]
 pub struct TexArgs {
     /// Level 0's size.
@@ -175,7 +217,6 @@ pub const DEPTH_MAX: u32 = 0xFF_FFFF;
 /// Subpixel steps per pixel. Windows' software OpenGL doesn't snap vertices
 /// to a coarse grid (its coverage matches exact edges), so neither do we.
 pub const SUB: i32 = 256;
-const FINITE_DIFF: bool = false;
 const HALF: i32 = SUB / 2;
 
 const GL_NEVER: u32 = 0x200;
@@ -197,6 +238,7 @@ const GL_DST_COLOR: u32 = 0x306;
 const GL_ONE_MINUS_DST_COLOR: u32 = 0x307;
 const GL_SRC_ALPHA_SATURATE: u32 = 0x308;
 const GL_DECAL: u32 = 0x2101;
+const GL_ADD: u32 = 0x0104;
 const GL_REPLACE: u32 = 0x1E01;
 const GL_KEEP: u32 = 0x1E00;
 const GL_INCR: u32 = 0x1E02;
@@ -264,6 +306,7 @@ unsafe impl Sync for Buffers {}
 pub struct Pass<'a> {
     pub g: Group,
     pub tex: Option<&'a Texture>,
+    pub tex2: Option<&'a Texture>,
 }
 
 /// The pixel rows a primitive of `g` can touch (for banding).
@@ -316,7 +359,7 @@ pub fn render_band(buf: Buffers, tris: &[Tri], passes: &[Pass], y0: i32, y1: i32
         for t in &tris[first..end] {
             match g.kind {
                 KIND_TRIANGLES => draw_tri(buf, t, p, clip),
-                KIND_LINES => draw_line(buf, &t.v[0], &t.v[1], p, clip),
+                KIND_LINES => draw_line(buf, &t.v[0], &t.v[1], t.v[2].x as i64, p, clip),
                 _ => draw_point(buf, &t.v[0], p, clip),
             }
         }
@@ -334,6 +377,10 @@ struct Frag {
     v: i64,
     /// The level of detail, log2 of texels per pixel, 8 fraction bits.
     lambda: i32,
+    /// The same for the second unit.
+    u2: i64,
+    v2: i64,
+    lambda2: i32,
     /// Fog: how much of the colour is kept, 0 ..= 255.
     f: i32,
 }
@@ -344,6 +391,13 @@ struct Frag {
 fn fragment(buf: Buffers, p: &Pass, at: usize, fr: &Frag) {
     let g = &p.g;
     let flags = g.flags;
+    if flags & F_POLY_STIPPLE != 0 {
+        // In window coordinates, rows counted from the bottom.
+        let (x, y) = (at % buf.w, buf.h - 1 - at / buf.w);
+        if (g.stipple[y & 31] >> (31 - (x & 31))) & 1 == 0 {
+            return;
+        }
+    }
     let dptr = unsafe { buf.depth.add(at) };
     let stencil = flags & F_STENCIL != 0;
     let depth_ok = flags & F_DEPTH_TEST == 0 || depth_pass(g.depth_func, fr.z, unsafe { *dptr });
@@ -355,7 +409,16 @@ fn fragment(buf: Buffers, p: &Pass, at: usize, fr: &Frag) {
     let mut c = fr.c;
     if let Some(tx) = p.tex {
         if flags & F_TEXTURE != 0 {
-            c = tex_env(g.tex_env, c, sample(tx, fr.u, fr.v, fr.lambda));
+            let t = sample(tx, fr.u, fr.v, fr.lambda);
+            if flags & F_TEX_MASK != 0 && t[3] == 0 {
+                return;
+            }
+            c = tex_env(g.tex_env, c, t, g.env_color[0]);
+        }
+    }
+    if let Some(tx) = p.tex2 {
+        if flags & F_TEXTURE2 != 0 {
+            c = tex_env(g.tex_env2, c, sample(tx, fr.u2, fr.v2, fr.lambda2), g.env_color[1]);
         }
     }
     if flags & F_FOG != 0 {
@@ -392,10 +455,13 @@ fn fragment(buf: Buffers, p: &Pass, at: usize, fr: &Frag) {
     }
     let cptr = unsafe { buf.color.add(at) };
     let dst = unsafe { *cptr };
-    if flags & F_BLEND != 0 {
+    if flags & F_BLEND != 0 && flags & F_LOGIC_OP == 0 {
         c = blend(g.src_blend, g.dst_blend, c, dst);
     }
-    let src = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+    let mut src = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+    if flags & F_LOGIC_OP != 0 {
+        src = logic(g.logic_op, src, dst) & 0xFF_FFFF;
+    }
     let m = mask_bits(g.color_mask);
     unsafe { *cptr = (src & m) | (dst & !m & 0xFF_FFFF) };
 }
@@ -474,15 +540,19 @@ fn draw_tri(buf: Buffers, t: &Tri, p: &Pass, clip: [i32; 4]) {
     let a = plane(v[0].a, v[1].a, v[2].a);
     let fog = if g.flags & F_FOG != 0 { plane(v[0].f, v[1].f, v[2].f) } else { Plane::default() };
     let tex = g.flags & F_TEXTURE != 0 && p.tex.is_some();
+    let tex2 = g.flags & F_TEXTURE2 != 0 && p.tex2.is_some();
     let (uq, vq) = if tex { (plane(v[0].uq, v[1].uq, v[2].uq), plane(v[0].vq, v[1].vq, v[2].vq)) } else { Default::default() };
+    let (uq2, vq2) = if tex2 { (plane(v[0].uq2, v[1].uq2, v[2].uq2), plane(v[0].vq2, v[1].vq2, v[2].vq2)) } else { Default::default() };
     // Equal q (no perspective, e.g. an orthographic projection): texture
     // coordinates are linear in the window, no division needed.
     let affine = v[0].q == v[1].q && v[1].q == v[2].q;
     let q = if affine { Plane::default() } else { plane(v[0].q, v[1].q, v[2].q) };
     let fogged = g.flags & F_FOG != 0;
     // Mipmaps: the level of detail. Linear coordinates have it constant.
-    let mipmapped = tex && p.tex.is_some_and(|t| t.levels.len() > 1 || t.min_filter != t_mag(t));
+    let mip = |t: Option<&Texture>| t.is_some_and(|t| t.levels.len() > 1 || t.min_filter != t_mag(t));
+    let (mipmapped, mipmapped2) = (tex && mip(p.tex), tex2 && mip(p.tex2));
     let affine_lambda = if tex && affine { lod(uq.dx, vq.dx, uq.dy, vq.dy) } else { 0 };
+    let affine_lambda2 = if tex2 && affine { lod(uq2.dx, vq2.dx, uq2.dy, vq2.dy) } else { 0 };
 
     let skip = (bx0 - ox) as i64;
     for py in by0..by1 {
@@ -502,51 +572,47 @@ fn draw_tri(buf: Buffers, t: &Tri, p: &Pass, clip: [i32; 4]) {
                     u: 0,
                     v: 0,
                     lambda: affine_lambda,
+                    u2: 0,
+                    v2: 0,
+                    lambda2: affine_lambda2,
                     f: 255,
                 };
                 // Texture coordinates were sent times q (1/w), to be
                 // divided by it: perspective-correct.
-                let recip = if affine || !tex { 0 } else { (1i64 << 62) / q.at(col, row).max(1) };
+                let recip = if affine || !(tex || tex2) { 0 } else { (1i64 << 62) / q.at(col, row).max(1) };
                 if fogged {
                     let fv = fog.at(col, row);
                     fr.f = if g.fog_mode == 0 { chan(fv) } else { fog_per_pixel(g, fv) };
                 }
-                if tex {
+                // One unit's position (texels, 16 fraction bits) and level
+                // of detail at this pixel.
+                let coords = |uq: &Plane, vq: &Plane, mipmapped: bool, lambda: i32| -> (i64, i64, i32) {
                     if affine {
-                        fr.u = uq.at(col, row) >> 16;
-                        fr.v = vq.at(col, row) >> 16;
-                    } else {
-                        // Texture coordinates were sent times q (1/w):
-                        // one division a pixel (recip = 2^30 / q) and a
-                        // multiply per coordinate.
-                        let qv = q.at(col, row).max(1);
-                        let (uv, vv) = (uq.at(col, row), vq.at(col, row));
-                        fr.u = ((uv as i128 * recip as i128) >> 46) as i64;
-                        fr.v = ((vv as i128 * recip as i128) >> 46) as i64;
-                        if mipmapped {
-                            // d(uq / q)/dx = (uq_x q - uq q_x) / q^2, fx32
-                            // texels: divided by q twice through recip.
-                            let d = |val: i64, step: i64, dq: i64| -> i64 {
-                                let num = (step as i128) * (qv as i128) - (val as i128) * (dq as i128);
-                                let once = (num * recip as i128) >> 62;
-                                ((once * recip as i128) >> 30) as i64
-                            };
-                            fr.lambda = if FINITE_DIFF {
-                                // u, v (fx32) at (col, row) shifted.
-                                let at = |dc: i64, dr: i64| -> (i64, i64) {
-                                    let qq = q.at(col + dc, row + dr).max(1);
-                                    let r = (1i64 << 62) / qq;
-                                    (((uq.at(col + dc, row + dr) as i128 * r as i128) >> 30) as i64, ((vq.at(col + dc, row + dr) as i128 * r as i128) >> 30) as i64)
-                                };
-                                let (u0, v0) = at(0, 0);
-                                let (ux, vx) = at(1, 0);
-                                let (uy, vy) = at(0, 1);
-                                lod(ux - u0, vx - v0, uy - u0, vy - v0)
-                            } else {
-                                lod(d(uv, uq.dx, q.dx), d(vv, vq.dx, q.dx), d(uv, uq.dy, q.dy), d(vv, vq.dy, q.dy))
-                            };
-                        }
+                        return (uq.at(col, row) >> 16, vq.at(col, row) >> 16, lambda);
                     }
+                    // Sent times q (1/w): one division a pixel (recip =
+                    // 2^30 / q) and a multiply per coordinate.
+                    let qv = q.at(col, row).max(1);
+                    let (uv, vv) = (uq.at(col, row), vq.at(col, row));
+                    let u = ((uv as i128 * recip as i128) >> 46) as i64;
+                    let v = ((vv as i128 * recip as i128) >> 46) as i64;
+                    if !mipmapped {
+                        return (u, v, 0);
+                    }
+                    // d(uq / q)/dx = (uq_x q - uq q_x) / q^2, fx32 texels:
+                    // divided by q twice through recip.
+                    let d = |val: i64, step: i64, dq: i64| -> i64 {
+                        let num = (step as i128) * (qv as i128) - (val as i128) * (dq as i128);
+                        let once = (num * recip as i128) >> 62;
+                        ((once * recip as i128) >> 30) as i64
+                    };
+                    (u, v, lod(d(uv, uq.dx, q.dx), d(vv, vq.dx, q.dx), d(uv, uq.dy, q.dy), d(vv, vq.dy, q.dy)))
+                };
+                if tex {
+                    (fr.u, fr.v, fr.lambda) = coords(&uq, &vq, mipmapped, affine_lambda);
+                }
+                if tex2 {
+                    (fr.u2, fr.v2, fr.lambda2) = coords(&uq2, &vq2, mipmapped2, affine_lambda2);
                 }
                 fragment(buf, p, line + px as usize, &fr);
             }
@@ -562,7 +628,7 @@ fn t_mag(t: &Texture) -> u32 {
 }
 
 /// Interpolates a line's or a point's values, linearly in the window.
-fn lerp_frag(a: &Vert, b: &Vert, t: i64, tex: bool, fog_mode: Option<&Group>) -> Frag {
+fn lerp_frag(a: &Vert, b: &Vert, t: i64, tex: (bool, bool), fog_mode: Option<&Group>) -> Frag {
     // t: 0 ..= 2^16.
     let l = |x: i64, y: i64| x + (((y - x) as i128 * t as i128) >> 16) as i64;
     let mut fr = Frag {
@@ -571,6 +637,9 @@ fn lerp_frag(a: &Vert, b: &Vert, t: i64, tex: bool, fog_mode: Option<&Group>) ->
         u: 0,
         v: 0,
         lambda: 0,
+        u2: 0,
+        v2: 0,
+        lambda2: 0,
         f: 255,
     };
     let q = l(a.q, b.q).max(1);
@@ -578,11 +647,20 @@ fn lerp_frag(a: &Vert, b: &Vert, t: i64, tex: bool, fog_mode: Option<&Group>) ->
         let fv = l(a.f, b.f);
         fr.f = match fog_mode { Some(g) if g.fog_mode != 0 => fog_per_pixel(g, fv), _ => chan(fv) };
     }
-    if tex {
+    if tex.0 {
         fr.u = (((l(a.uq, b.uq) as i128) << 16) / q as i128) as i64;
         fr.v = (((l(a.vq, b.vq) as i128) << 16) / q as i128) as i64;
     }
+    if tex.1 {
+        fr.u2 = (((l(a.uq2, b.uq2) as i128) << 16) / q as i128) as i64;
+        fr.v2 = (((l(a.vq2, b.vq2) as i128) << 16) / q as i128) as i64;
+    }
     fr
+}
+
+/// Both units' "is it textured" for lines and points.
+fn units(p: &Pass) -> (bool, bool) {
+    (p.g.flags & F_TEXTURE != 0 && p.tex.is_some(), p.g.flags & F_TEXTURE2 != 0 && p.tex2.is_some())
 }
 
 /// GL's lines without antialiasing, by its diamond-exit rule: along the
@@ -591,9 +669,12 @@ fn lerp_frag(a: &Vert, b: &Vert, t: i64, tex: bool, fog_mode: Option<&Group>) ->
 /// so not the end's pixel if the end is inside its diamond, and the start's
 /// pixel, if the start lies past its centre, only if the start is inside its
 /// diamond. Across it, the pixel the line is in at the centre. Values along
-/// it step from the start's at the first pixel drawn, as Windows does.
-fn draw_line(buf: Buffers, a: &Vert, b: &Vert, p: &Pass, clip: [i32; 4]) {
-    let tex = p.g.flags & F_TEXTURE != 0 && p.tex.is_some();
+/// it step from the start's at the first pixel drawn, as Windows does. A
+/// stipple pattern counts pixels along from `stipple_at`.
+fn draw_line(buf: Buffers, a: &Vert, b: &Vert, stipple_at: i64, p: &Pass, clip: [i32; 4]) {
+    let tex = units(p);
+    let stipple = p.g.flags & F_LINE_STIPPLE != 0;
+    let (pattern, factor) = ((p.g.line_stipple & 0xFFFF) as i64, ((p.g.line_stipple >> 16) as i64).max(1));
     let (dx, dy) = (b.x as i64 - a.x as i64, b.y as i64 - a.y as i64);
     if dx == 0 && dy == 0 {
         return;
@@ -624,7 +705,10 @@ fn draw_line(buf: Buffers, a: &Vert, b: &Vert, p: &Pass, clip: [i32; 4]) {
         // the diamond; the end's pixel not if it ends inside it.
         let before = (c - m0) * step < 0;
         let skip = (before && !in_diamond(m0, n0, i)) || (i == pe && in_diamond(m1, n1, i)) || (c - m1) * step > 0;
-        if !skip {
+        let i0 = first.unwrap_or(i);
+        // The stipple pattern counts pixels from the first one along.
+        let stippled_out = stipple && !skip && (pattern >> (((stipple_at + (i - i0).abs()) / factor) % 16)) & 1 == 0;
+        if !skip && !stippled_out {
             let i0 = *first.get_or_insert(i);
             // Where along the line, 0 ..= 2^16: the first pixel drawn has
             // the start's values, each pixel after adds 1/length.
@@ -641,6 +725,9 @@ fn draw_line(buf: Buffers, a: &Vert, b: &Vert, p: &Pass, clip: [i32; 4]) {
                 }
             }
         }
+        if !skip {
+            first.get_or_insert(i);
+        }
         if i == pe {
             break;
         }
@@ -651,7 +738,7 @@ fn draw_line(buf: Buffers, a: &Vert, b: &Vert, p: &Pass, clip: [i32; 4]) {
 /// GL's points without antialiasing: the pixels whose centres are in the
 /// `size` x `size` square around the point (half-open, as lines are).
 fn draw_point(buf: Buffers, v: &Vert, p: &Pass, clip: [i32; 4]) {
-    let tex = p.g.flags & F_TEXTURE != 0 && p.tex.is_some();
+    let tex = units(p);
     let size = (p.g.size.max(SUB) as i64 + HALF as i64) / SUB as i64;
     let s = SUB as i64;
     let first = |c: i64| (c - size * s / 2 - HALF as i64).div_euclid(s) + 1;
@@ -830,9 +917,38 @@ fn sample(t: &Texture, u: i64, v: i64, lambda: i32) -> [i32; 4] {
     }
 }
 
-fn tex_env(mode: u32, c: [i32; 4], t: [i32; 4]) -> [i32; 4] {
+/// GL_CLEAR ..= GL_SET on two 0x00RRGGBB pixels.
+fn logic(op: u32, s: u32, d: u32) -> u32 {
+    match op & 0xF {
+        0x0 => 0,
+        0x1 => s & d,
+        0x2 => s & !d,
+        0x3 => s,
+        0x4 => !s & d,
+        0x5 => d,
+        0x6 => s ^ d,
+        0x7 => s | d,
+        0x8 => !(s | d),
+        0x9 => !(s ^ d),
+        0xA => !d,
+        0xB => s | !d,
+        0xC => !s,
+        0xD => !s | d,
+        0xE => !(s & d),
+        _ => 0xFF_FFFF,
+    }
+}
+
+fn tex_env(mode: u32, c: [i32; 4], t: [i32; 4], env: u32) -> [i32; 4] {
     match mode {
         GL_REPLACE => t,
+        // GL_BLEND: towards the environment colour by the texel.
+        0x0BE2 => {
+            let e = [(env >> 16 & 0xFF) as i32, (env >> 8 & 0xFF) as i32, (env & 0xFF) as i32];
+            let mix = |cc: i32, tc: i32, ec: i32| mul255(cc, 255 - tc) + mul255(ec, tc);
+            [mix(c[0], t[0], e[0]), mix(c[1], t[1], e[1]), mix(c[2], t[2], e[2]), mul255(c[3], t[3])]
+        }
+        GL_ADD => [(c[0] + t[0]).min(255), (c[1] + t[1]).min(255), (c[2] + t[2]).min(255), mul255(c[3], t[3])],
         GL_DECAL => {
             let mix = |cc: i32, tc: i32| mul255(cc, 255 - t[3]) + mul255(tc, t[3]);
             [mix(c[0], t[0]), mix(c[1], t[1]), mix(c[2], t[2]), c[3]]
@@ -891,6 +1007,64 @@ pub fn texture(a: &TexArgs, texels: Vec<u32>) -> Texture {
         mag_nearest: a.mag_filter == GL_NEAREST,
         repeat_s: a.wrap_s == GL_REPEAT,
         repeat_t: a.wrap_t == GL_REPEAT,
+    }
+}
+
+/// Write `src` (`a.w` x `a.h` values, rows packed) into the target as
+/// PixelArgs says, straight (no fragment pipeline beyond the scissor and
+/// masks).
+pub fn write_pixels(buf: Buffers, a: &PixelArgs, src: &[u32]) {
+    let m = mask_bits(a.mask);
+    for row in 0..a.h.max(0) {
+        let y = a.y + row;
+        if y < a.scissor[1].max(0) || y >= a.scissor[3].min(buf.h as i32) {
+            continue;
+        }
+        for col in 0..a.w.max(0) {
+            let x = a.x + col;
+            if x < a.scissor[0].max(0) || x >= a.scissor[2].min(buf.w as i32) {
+                continue;
+            }
+            let at = y as usize * buf.w + x as usize;
+            let v = src[(row * a.w + col) as usize];
+            unsafe {
+                match a.which {
+                    1 => *buf.depth.add(at) = v.min(DEPTH_MAX),
+                    2 => {
+                        let s = buf.stencil.add(at);
+                        let wm = (a.mask & 0xFF) as u8;
+                        *s = (v as u8 & wm) | (*s & !wm);
+                    }
+                    _ => {
+                        let c = buf.color.add(at);
+                        *c = (v & m) | (*c & !m & 0xFF_FFFF);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read `a.w` x `a.h` depth (`which` 1) or stencil (2) values into `dst`,
+/// rows packed; outside the target reads 0.
+pub fn read_pixels(buf: Buffers, a: &PixelArgs, dst: &mut [u32]) {
+    for row in 0..a.h.max(0) {
+        for col in 0..a.w.max(0) {
+            let (x, y) = (a.x + col, a.y + row);
+            let v = if x < 0 || y < 0 || x >= buf.w as i32 || y >= buf.h as i32 {
+                0
+            } else {
+                let at = y as usize * buf.w + x as usize;
+                unsafe {
+                    match a.which {
+                        1 => *buf.depth.add(at),
+                        2 => *buf.stencil.add(at) as u32,
+                        _ => *buf.color.add(at),
+                    }
+                }
+            };
+            dst[(row * a.w + col) as usize] = v;
+        }
     }
 }
 

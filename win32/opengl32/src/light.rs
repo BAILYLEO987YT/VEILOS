@@ -132,6 +132,7 @@ impl Material {
     }
 }
 
+#[derive(Clone)]
 pub struct Lighting {
     pub lights: [Light; 8],
     /// Front and back.
@@ -223,6 +224,7 @@ impl Lighting {
 
 // -----| fog |-----
 
+#[derive(Clone)]
 pub struct Fog {
     pub mode: u32,
     pub density: f32,

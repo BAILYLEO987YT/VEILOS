@@ -9,12 +9,20 @@
 //! SetDIBitsToDevice: at SwapBuffers for a double-buffered window, at
 //! glFlush/glFinish for a single-buffered one (a DIB section included).
 //!
-//!   lib.rs     contexts, wgl*, state, the vertex stage and the gl* exports
-//!   light.rs   lighting and fog
-//!   lists.rs   display lists
+//!   lib.rs      contexts, wgl*, state, the vertex stage and the gl* exports
+//!   light.rs    lighting and fog
+//!   lists.rs    display lists
+//!   pixels.rs   raster position, images, bitmaps, pixel transfer, buffers,
+//!               accumulation, font bitmaps
+//!   more.rs     texgen, clip planes, polygon offset, stipples, logic ops,
+//!               1D and copied textures, getters, every call's variants
+//!   attrib.rs   the attribute stacks
+//!   select.rs   selection and feedback
+//!   eval.rs     evaluators
+//!   ext.rs      extensions and wglGetProcAddress
 //!
-//! Not here yet: polygon stipple, line stipple, accumulation, selection and
-//! feedback, colour index mode, evaluators.
+//! Not here: colour index mode (no pixel format has it), wglUseFontOutlines,
+//! and layer planes.
 
 #![no_std]
 #![allow(non_snake_case, clippy::missing_safety_doc)]
@@ -23,8 +31,16 @@ extern crate alloc;
 
 #[path = "../../dllrt.rs"]
 mod dllrt;
+mod attrib;
+mod eval;
+mod ext;
 mod light;
 mod lists;
+mod more;
+mod pixels;
+mod select;
+
+use pixels::unpack;
 
 use lists::rec;
 
@@ -87,6 +103,8 @@ struct KVert {
     b: i64,
     a: i64,
     f: i64,
+    uq2: i64,
+    vq2: i64,
 }
 
 #[repr(C)]
@@ -120,6 +138,25 @@ struct KGroup {
     scissor: [i32; 4],
     fog_mode: u32,
     fog_params: [i64; 2],
+    texture2: u64,
+    tex_env2: u32,
+    logic_op: u32,
+    line_stipple: u32,
+    stipple: [u32; 32],
+    env_color: [u32; 2],
+}
+
+#[repr(C)]
+struct PixelArgs {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    ptr: u64,
+    stride: i64,
+    which: u32,
+    mask: u32,
+    scissor: [i32; 4],
 }
 
 #[repr(C)]
@@ -170,6 +207,11 @@ const F_TEXTURE: u32 = 8;
 const F_ALPHA_TEST: u32 = 16;
 const F_FOG: u32 = 32;
 const F_STENCIL: u32 = 64;
+const F_TEXTURE2: u32 = 128;
+const F_TEX_MASK: u32 = 256;
+const F_POLY_STIPPLE: u32 = 512;
+const F_LINE_STIPPLE: u32 = 1024;
+const F_LOGIC_OP: u32 = 2048;
 const KIND_TRIANGLES: u32 = 0;
 const KIND_LINES: u32 = 1;
 const KIND_POINTS: u32 = 2;
@@ -210,6 +252,22 @@ const GL_BLEND: u32 = 0x0BE2;
 const GL_DITHER: u32 = 0x0BD0;
 const GL_SCISSOR_TEST: u32 = 0x0C11;
 const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE_1D: u32 = 0x0DE0;
+const GL_TEXTURE_GEN_S: u32 = 0x0C60;
+const GL_TEXTURE_GEN_MODE: u32 = 0x2500;
+const GL_OBJECT_PLANE: u32 = 0x2501;
+const GL_EYE_PLANE: u32 = 0x2502;
+const GL_EYE_LINEAR: u32 = 0x2400;
+const GL_OBJECT_LINEAR: u32 = 0x2401;
+const GL_SPHERE_MAP: u32 = 0x2402;
+const GL_CLIP_PLANE0: u32 = 0x3000;
+const GL_POLYGON_OFFSET_FILL: u32 = 0x8037;
+const GL_POLYGON_OFFSET_LINE: u32 = 0x2A02;
+const GL_POLYGON_OFFSET_POINT: u32 = 0x2A01;
+const GL_POLYGON_STIPPLE: u32 = 0x0B42;
+const GL_LINE_STIPPLE: u32 = 0x0B24;
+const GL_COLOR_LOGIC_OP: u32 = 0x0BF2;
+const GL_ADD: u32 = 0x0104;
 const GL_LIGHTING: u32 = 0x0B50;
 const GL_LIGHT0: u32 = 0x4000;
 const GL_COLOR_MATERIAL: u32 = 0x0B57;
@@ -295,6 +353,7 @@ const GL_CLAMP: u32 = 0x2900;
 const GL_REPEAT: u32 = 0x2901;
 const GL_TEXTURE_ENV: u32 = 0x2300;
 const GL_TEXTURE_ENV_MODE: u32 = 0x2200;
+const GL_TEXTURE_ENV_COLOR: u32 = 0x2201;
 const GL_MODULATE: u32 = 0x2100;
 const GL_DECAL: u32 = 0x2101;
 const GL_REPLACE: u32 = 0x1E01;
@@ -361,12 +420,27 @@ pub(crate) fn sin_cos(x: f64) -> (f64, f64) {
     }
 }
 
+pub(crate) fn floor(x: f64) -> f64 {
+    let i = x as i64 as f64;
+    if i > x { i - 1.0 } else { i }
+}
+
 fn round(x: f64) -> f64 {
     if x >= 0.0 { (x + 0.5) as i64 as f64 } else { -((-x + 0.5) as i64 as f64) }
 }
 
 fn clamp01(x: f32) -> f32 {
     if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) }
+}
+
+/// A vertex's distance from clip plane `plane`: 0-5 the view volume's
+/// sides (in clip space), 6-11 the user's planes. Inside is >= 0.
+fn plane_distance(v: &Vtx, plane: usize) -> f32 {
+    if plane >= 6 {
+        return v.clipd[plane - 6];
+    }
+    let (axis, sign) = (plane / 2, if plane % 2 == 0 { 1.0 } else { -1.0 });
+    v.clip[3] + sign * v.clip[axis]
 }
 
 /// What normals are multiplied by: the inverse transpose of the upper 3x3
@@ -397,7 +471,10 @@ struct Vtx {
     col: [f32; 4],
     /// Lit for the back face (two-sided lighting), else `col`.
     back: [f32; 4],
-    tc: [f32; 4],
+    /// Each texture unit's coordinates.
+    tc: [[f32; 4]; 2],
+    /// Signed distances from the user clip planes (inside: >= 0).
+    clipd: [f32; 6],
     /// Eye distance, for fog.
     dist: f32,
 }
@@ -405,7 +482,7 @@ struct Vtx {
 impl Vtx {
     fn lerp(&self, b: &Vtx, t: f32) -> Vtx {
         let l = |x: [f32; 4], y: [f32; 4]| core::array::from_fn(|k| x[k] + (y[k] - x[k]) * t);
-        Vtx { clip: l(self.clip, b.clip), col: l(self.col, b.col), back: l(self.back, b.back), tc: l(self.tc, b.tc), dist: self.dist + (b.dist - self.dist) * t }
+        Vtx { clip: l(self.clip, b.clip), col: l(self.col, b.col), back: l(self.back, b.back), tc: [l(self.tc[0], b.tc[0]), l(self.tc[1], b.tc[1])], clipd: core::array::from_fn(|i| self.clipd[i] + (b.clipd[i] - self.clipd[i]) * t), dist: self.dist + (b.dist - self.dist) * t }
     }
 }
 
@@ -506,14 +583,16 @@ struct Ctx {
     made_current: bool,
 
     matrix_mode: u32,
-    stacks: [Vec<Mat>; 3],
+    /// Modelview, projection, and each texture unit's texture matrix.
+    stacks: [Vec<Mat>; 4],
     viewport: [i32; 4],
     depth_range: [f32; 2],
 
     clear_color: [f32; 4],
     clear_depth: f32,
     color: [f32; 4],
-    tc: [f32; 4],
+    /// Each texture unit's current coordinates.
+    tc: [[f32; 4]; 2],
     normal: [f32; 3],
 
     caps: Vec<u32>,
@@ -531,8 +610,32 @@ struct Ctx {
 
     textures: Vec<(u32, Tex)>,
     next_name: u32,
-    bound: u32,
-    tex_env: u32,
+    /// The active texture unit (multitexture), and the one the client's
+    /// texture coordinate array calls go to.
+    unit: usize,
+    client_unit: usize,
+    /// Each unit's bound texture: [2D, 1D].
+    bound: [[u32; 2]; 2],
+    /// Each unit's texturing on: [2D, 1D].
+    tex_on: [[bool; 2]; 2],
+    tex_env: [u32; 2],
+    env_color: [[f32; 4]; 2],
+    /// Each unit's texture coordinate generation, for s, t, r, q.
+    texgen: [[TexGen; 4]; 2],
+    /// User clip planes, in eye coordinates.
+    clip_planes: [[f32; 4]; 6],
+    /// glPolygonOffset's factor and units.
+    poly_offset: [f32; 2],
+    poly_stipple: [u32; 32],
+    /// glLineStipple's factor and pattern, and how far along a strip the
+    /// pattern is.
+    line_stipple: [u32; 2],
+    stipple_count: f32,
+    logic_op: u32,
+    /// The current polygon's offset, while its outline or corners are drawn
+    /// as lines or points.
+    offset_now: f64,
+    offsetting: bool,
     /// GL_PERSPECTIVE_CORRECTION_HINT is GL_NICEST. Only kept for glGet:
     /// textures are always perspective-correct (Windows' software OpenGL
     /// approximates below GL_NICEST), colours always linear in the window.
@@ -556,13 +659,33 @@ struct Ctx {
 
     prim: Option<u32>,
     verts: Vec<Vtx>,
-    arrays: [Array; 4],
+    arrays: [Array; 5],
 
     groups: Vec<KGroup>,
     tris: Vec<KTri>,
     error: u32,
-    unpack_align: i32,
-    pack_align: i32,
+    unpack: pixels::PixelStore,
+    pack: pixels::PixelStore,
+    transfer: pixels::Transfer,
+    raster: pixels::Raster,
+    /// Textures made for glDrawPixels and glBitmap, closed after the batch
+    /// that uses them.
+    temp_textures: Vec<u64>,
+    /// glDrawBuffer(GL_NONE); drawing into the front buffer (shown at each
+    /// glFlush); glReadBuffer of the front buffer.
+    draw_none: bool,
+    draw_front: bool,
+    read_front: bool,
+    /// The frame last shown: the front buffer, double-buffered.
+    front: Vec<u32>,
+    accum: Vec<[f32; 4]>,
+    clear_accum: [f32; 4],
+    edge_flag: bool,
+    select: select::Select,
+    eval: eval::Eval,
+    attrib_stack: Vec<attrib::Saved>,
+    client_stack: Vec<attrib::ClientSaved>,
+    swap_interval: i32,
     /// Frame read back for presenting.
     frame: Vec<u32>,
 }
@@ -571,6 +694,64 @@ const A_VERTEX: usize = 0;
 const A_COLOR: usize = 1;
 const A_TEXCOORD: usize = 2;
 const A_NORMAL: usize = 3;
+/// The second texture unit's coordinate array.
+const A_TEXCOORD2: usize = 4;
+
+#[derive(Clone, Copy)]
+struct TexGen {
+    on: bool,
+    mode: u32,
+    object: [f32; 4],
+    eye: [f32; 4],
+}
+
+impl TexGen {
+    fn new(coord: usize) -> TexGen {
+        let plane = match coord {
+            0 => [1.0, 0.0, 0.0, 0.0],
+            1 => [0.0, 1.0, 0.0, 0.0],
+            _ => [0.0; 4],
+        };
+        TexGen { on: false, mode: GL_EYE_LINEAR, object: plane, eye: plane }
+    }
+}
+
+/// The inverse of `m` (column-major), or identity if it has none.
+fn inverse(m: &Mat) -> Mat {
+    let a: [f64; 16] = core::array::from_fn(|i| m[i] as f64);
+    let mut inv = [0f64; 16];
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+    let det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    if det == 0.0 {
+        return IDENTITY;
+    }
+    core::array::from_fn(|i| (inv[i] / det) as f32)
+}
+
+/// A plane (a row vector) carried into the space `m` maps to: p m^-1.
+fn plane_through(p: [f32; 4], m: &Mat) -> [f32; 4] {
+    let inv = inverse(m);
+    core::array::from_fn(|c| (0..4).map(|r| p[r] * inv[c * 4 + r]).sum())
+}
+
+fn dot4(a: [f32; 4], b: [f32; 4]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+}
 
 /// Batches are sent once this many triangles are waiting.
 const BATCH_TRIS: usize = 8192;
@@ -583,15 +764,25 @@ impl Ctx {
     }
 
     fn on(&self, cap: u32) -> bool {
-        self.caps.contains(&cap)
+        match cap {
+            GL_TEXTURE_2D => self.tex_on[self.unit][0],
+            GL_TEXTURE_1D => self.tex_on[self.unit][1],
+            c if (GL_TEXTURE_GEN_S..GL_TEXTURE_GEN_S + 4).contains(&c) => self.texgen[self.unit][(c - GL_TEXTURE_GEN_S) as usize].on,
+            _ => self.caps.contains(&cap),
+        }
+    }
+
+    /// The matrix stack glMatrixMode chose.
+    fn stack(&self) -> usize {
+        match self.matrix_mode {
+            GL_PROJECTION => 1,
+            GL_TEXTURE => 2 + self.unit,
+            _ => 0,
+        }
     }
 
     fn top(&mut self) -> &mut Mat {
-        let i = match self.matrix_mode {
-            GL_PROJECTION => 1,
-            GL_TEXTURE => 2,
-            _ => 0,
-        };
+        let i = self.stack();
         self.stacks[i].last_mut().unwrap()
     }
 
@@ -604,8 +795,9 @@ impl Ctx {
         self.textures.iter_mut().find(|t| t.0 == name).map(|t| &mut t.1)
     }
 
-    fn bound_tex(&mut self) -> &mut Tex {
-        let n = self.bound;
+    /// Unit `unit`'s bound texture of `dim` (0 2D, 1 1D).
+    fn bound_of(&mut self, unit: usize, dim: usize) -> &mut Tex {
+        let n = self.bound[unit][dim];
         if self.tex(n).is_none() {
             self.textures.push((n, Tex::new()));
         }
@@ -623,6 +815,9 @@ impl Ctx {
     }
 
     fn mask_bits(&self) -> u32 {
+        if self.draw_none {
+            return 0;
+        }
         (self.color_mask[0] as u32) | (self.color_mask[1] as u32) << 1 | (self.color_mask[2] as u32) << 2
     }
 
@@ -642,14 +837,16 @@ impl Ctx {
         unsafe { VeilGpu3d(2, self.target, &args as *const _ as u64, 0) };
         self.groups.clear();
         self.tris.clear();
+        for h in self.temp_textures.drain(..) {
+            unsafe { NtClose(h) };
+        }
     }
 
-    /// The bound texture's kernel handle and size, if texturing applies.
-    fn texture_for_draw(&mut self) -> Option<(u64, u32, u32)> {
-        if !self.on(GL_TEXTURE_2D) {
-            return None;
-        }
-        let t = self.bound_tex();
+    /// Unit `unit`'s texture (2D over 1D, as GL has it): its kernel handle
+    /// and size, if texturing applies.
+    fn texture_for_draw(&mut self, unit: usize) -> Option<(u64, u32, u32)> {
+        let dim = if self.tex_on[unit][0] { 0 } else if self.tex_on[unit][1] { 1 } else { return None };
+        let t = self.bound_of(unit, dim);
         if !t.complete() {
             return None;
         }
@@ -675,8 +872,9 @@ impl Ctx {
         Some((t.handle, t.w, t.h))
     }
 
-    fn state(&mut self, kind: u32, size: f32) -> (KGroup, Option<(u32, u32)>) {
-        let tex = self.texture_for_draw();
+    fn state(&mut self, kind: u32, size: f32) -> (KGroup, [Option<(u32, u32)>; 2]) {
+        let tex = self.texture_for_draw(0);
+        let tex2 = self.texture_for_draw(1);
         let mut flags = 0;
         if self.on(GL_DEPTH_TEST) {
             flags |= F_DEPTH_TEST;
@@ -698,6 +896,18 @@ impl Ctx {
         }
         if self.on(GL_STENCIL_TEST) {
             flags |= F_STENCIL;
+        }
+        if tex2.is_some() {
+            flags |= F_TEXTURE2;
+        }
+        if self.on(GL_COLOR_LOGIC_OP) {
+            flags |= F_LOGIC_OP;
+        }
+        if kind == KIND_TRIANGLES && self.on(GL_POLYGON_STIPPLE) {
+            flags |= F_POLY_STIPPLE;
+        }
+        if kind == KIND_LINES && self.on(GL_LINE_STIPPLE) {
+            flags |= F_LINE_STIPPLE;
         }
         let ch = |v: f32| (clamp01(v) * 255.0 + 0.5) as u32;
         let s = self.stencil;
@@ -730,12 +940,21 @@ impl Ctx {
             alpha_ref: (clamp01(self.alpha_ref) * 510.0 + 0.5) as u32,
             src_blend: self.blend_src,
             dst_blend: self.blend_dst,
-            tex_env: self.tex_env,
+            tex_env: self.tex_env[0],
+            texture2: tex2.map_or(0, |t| t.0),
+            tex_env2: self.tex_env[1],
+            logic_op: self.logic_op,
+            line_stipple: (self.line_stipple[1] & 0xFFFF) | self.line_stipple[0].clamp(1, 256) << 16,
+            stipple: self.poly_stipple,
+            env_color: self.env_color.map(|c| {
+                let ch = |v: f32| (clamp01(v) * 255.0 + 0.5) as u32;
+                ch(c[3]) << 24 | ch(c[0]) << 16 | ch(c[1]) << 8 | ch(c[2])
+            }),
             color_mask: self.mask_bits(),
             texture: tex.map_or(0, |t| t.0),
             scissor: self.scissor_box(),
         };
-        (g, tex.map(|t| (t.1, t.2)))
+        (g, [tex.map(|t| (t.1, t.2)), tex2.map(|t| (t.1, t.2))])
     }
 
     fn push_tri(&mut self, g: &KGroup, t: KTri) {
@@ -760,11 +979,10 @@ impl Ctx {
         let mv = self.stacks[0].last().copied().unwrap();
         let eye = xform(&mv, obj);
         let clip = xform(&self.stacks[1].last().copied().unwrap(), eye);
-        let tc = xform(&self.stacks[2].last().copied().unwrap(), self.tc);
-        let (col, back) = if self.on(GL_LIGHTING) {
-            if self.on(GL_COLOR_MATERIAL) {
-                self.light.color_material(self.color);
-            }
+        let lit = self.on(GL_LIGHTING);
+        let sphere = (0..2).any(|u| self.texgen[u][..2].iter().any(|g| g.on && g.mode == GL_SPHERE_MAP));
+        // The eye-space normal, when lighting or a sphere map needs it.
+        let ne = if lit || sphere {
             let nm = normal_matrix(&mv);
             let n = self.normal;
             let mut ne = [0.0f32; 3];
@@ -774,6 +992,39 @@ impl Ctx {
             if self.on(GL_NORMALIZE) {
                 ne = light::normalize(ne);
             }
+            ne
+        } else {
+            [0.0; 3]
+        };
+        // Texture coordinates: generated where asked, then each unit's
+        // texture matrix.
+        let mut tc = self.tc;
+        for (u, t) in tc.iter_mut().enumerate() {
+            for (k, g) in self.texgen[u].iter().enumerate() {
+                if !g.on {
+                    continue;
+                }
+                t[k] = match g.mode {
+                    GL_OBJECT_LINEAR => dot4(g.object, obj),
+                    GL_EYE_LINEAR => dot4(g.eye, eye),
+                    _ => {
+                        // GL_SPHERE_MAP: from the reflection of the eye
+                        // direction about the normal.
+                        let e = light::normalize([eye[0], eye[1], eye[2]]);
+                        let d = 2.0 * (ne[0] * e[0] + ne[1] * e[1] + ne[2] * e[2]);
+                        let r = [e[0] - d * ne[0], e[1] - d * ne[1], e[2] - d * ne[2] + 1.0];
+                        let m = 2.0 * sqrt((r[0] * r[0] + r[1] * r[1] + r[2] * r[2]) as f64) as f32;
+                        if m == 0.0 { 0.5 } else { r[k.min(1)] / m + 0.5 }
+                    }
+                };
+            }
+            *t = xform(&self.stacks[2 + u].last().copied().unwrap(), *t);
+        }
+        let clipd = core::array::from_fn(|i| if self.on(GL_CLIP_PLANE0 + i as u32) { dot4(self.clip_planes[i], eye) } else { 0.0 });
+        let (col, back) = if lit {
+            if self.on(GL_COLOR_MATERIAL) {
+                self.light.color_material(self.color);
+            }
             let front = self.light.shade(eye, ne, 0);
             (front, if self.light.two_side { self.light.shade(eye, ne, 1) } else { front })
         } else {
@@ -781,7 +1032,7 @@ impl Ctx {
         };
         // Fog by eye distance along z.
         let dist = if eye[3] != 0.0 { (eye[2] / eye[3]).abs() } else { eye[2].abs() };
-        self.verts.push(Vtx { clip, col, back, tc, dist });
+        self.verts.push(Vtx { clip, col, back, tc, clipd, dist });
     }
 
     /// Window coordinates (y upwards, as GL has them), depth and 1/w.
@@ -799,7 +1050,9 @@ impl Ctx {
 
     /// The kernel's vertices for one primitive (`back`: its back face's
     /// colours), with a texture of `tw` x `th` texels.
-    fn kverts(&self, poly: &[Vtx], win: &[[f64; 4]], back: bool, tw: f64, th: f64) -> Vec<KVert> {
+    fn kverts(&self, poly: &[Vtx], win: &[[f64; 4]], back: bool, tex: [Option<(u32, u32)>; 2]) -> Vec<KVert> {
+        let (tw, th) = tex[0].map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
+        let (tw2, th2) = tex[1].map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
         let qmax = win.iter().map(|w| w[3]).fold(0.0f64, f64::max);
         poly.iter()
             .zip(win.iter())
@@ -812,8 +1065,10 @@ impl Ctx {
                     y: round((self.h as f64 - w[1]) * SUB) as i32,
                     z: (w[2].clamp(0.0, 1.0) * DEPTH_MAX * FX) as i64,
                     q: (q * FX) as i64,
-                    uq: (v.tc[0] as f64 / v.tc[3] as f64 * tw * q * FX) as i64,
-                    vq: (v.tc[1] as f64 / v.tc[3] as f64 * th * q * FX) as i64,
+                    uq: (v.tc[0][0] as f64 / v.tc[0][3] as f64 * tw * q * FX) as i64,
+                    vq: (v.tc[0][1] as f64 / v.tc[0][3] as f64 * th * q * FX) as i64,
+                    uq2: (v.tc[1][0] as f64 / v.tc[1][3] as f64 * tw2 * q * FX) as i64,
+                    vq2: (v.tc[1][1] as f64 / v.tc[1][3] as f64 * th2 * q * FX) as i64,
                     r: col(c[0]),
                     g: col(c[1]),
                     b: col(c[2]),
@@ -834,11 +1089,11 @@ impl Ctx {
             a.back = b.back;
         }
         let (mut t0, mut t1) = (0.0f32, 1.0f32);
-        for plane in 0..6 {
-            let d = |v: &Vtx| {
-                let (axis, sign) = (plane / 2, if plane % 2 == 0 { 1.0 } else { -1.0 });
-                v.clip[3] + sign * v.clip[axis]
-            };
+        for plane in 0..12 {
+            if plane >= 6 && !self.on(GL_CLIP_PLANE0 + plane as u32 - 6) {
+                continue;
+            }
+            let d = |v: &Vtx| plane_distance(v, plane);
             let (da, db) = (d(&a), d(&b));
             if da < 0.0 && db < 0.0 {
                 return;
@@ -855,22 +1110,44 @@ impl Ctx {
         let (na, nb) = (a.lerp(&b, t0), a.lerp(&b, t1));
         a = na;
         b = nb;
+        if self.select.mode != select::GL_RENDER {
+            let win = [self.window(&a), self.window(&b)];
+            self.capture(KIND_LINES, &[a, b], &win, false);
+            return;
+        }
         let (g, tex) = self.state(KIND_LINES, self.line_width);
-        let (tw, th) = tex.map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
-        let win = [self.window(&a), self.window(&b)];
-        let kv = self.kverts(&[a, b], &win, false, tw, th);
-        self.push_tri(&g, KTri { v: [kv[0], kv[1], kv[1]] });
+        let mut win = [self.window(&a), self.window(&b)];
+        if self.on(GL_POLYGON_OFFSET_LINE) && self.offsetting {
+            let o = self.offset_now;
+            for w in &mut win {
+                w[2] += o;
+            }
+        }
+        let kv = self.kverts(&[a, b], &win, false, tex);
+        // Where the stipple pattern is along a strip, in pixels.
+        let mut third = kv[1];
+        third.x = self.stipple_count as i32;
+        let len = (win[1][0] - win[0][0]).abs().max((win[1][1] - win[0][1]).abs());
+        self.stipple_count += len as f32;
+        self.push_tri(&g, KTri { v: [kv[0], kv[1], third] });
     }
 
     fn point(&mut self, v: Vtx) {
         let c = v.clip;
-        if (0..3).any(|k| c[k] < -c[3] || c[k] > c[3]) {
+        if (0..3).any(|k| c[k] < -c[3] || c[k] > c[3]) || (0..6).any(|i| self.on(GL_CLIP_PLANE0 + i as u32) && v.clipd[i] < 0.0) {
+            return;
+        }
+        if self.select.mode != select::GL_RENDER {
+            let win = [self.window(&v)];
+            self.capture(KIND_POINTS, &[v], &win, false);
             return;
         }
         let (g, tex) = self.state(KIND_POINTS, self.point_size);
-        let (tw, th) = tex.map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
-        let win = [self.window(&v)];
-        let kv = self.kverts(&[v], &win, false, tw, th);
+        let mut win = [self.window(&v)];
+        if self.on(GL_POLYGON_OFFSET_POINT) && self.offsetting {
+            win[0][2] += self.offset_now;
+        }
+        let kv = self.kverts(&[v], &win, false, tex);
         self.push_tri(&g, KTri { v: [kv[0], kv[0], kv[0]] });
     }
 
@@ -949,12 +1226,13 @@ impl Ctx {
                 p.back = b;
             }
         }
-        // Against the six planes of the view volume, in clip space.
-        for plane in 0..6 {
-            let d = |v: &Vtx| {
-                let (axis, sign) = (plane / 2, if plane % 2 == 0 { 1.0 } else { -1.0 });
-                v.clip[3] + sign * v.clip[axis]
-            };
+        // Against the six planes of the view volume, in clip space, then
+        // the user's clip planes.
+        for plane in 0..12 {
+            if plane >= 6 && !self.on(GL_CLIP_PLANE0 + plane as u32 - 6) {
+                continue;
+            }
+            let d = |v: &Vtx| plane_distance(v, plane);
             if poly.iter().all(|v| d(v) >= 0.0) {
                 continue;
             }
@@ -980,7 +1258,7 @@ impl Ctx {
             }
         }
         // To the window (y upwards here, as GL has it).
-        let win: Vec<[f64; 4]> = poly.iter().map(|v| self.window(v)).collect();
+        let mut win: Vec<[f64; 4]> = poly.iter().map(|v| self.window(v)).collect();
         // Facing: counter-clockwise in the window is positive area.
         let mut area = 0.0;
         for i in 0..win.len() {
@@ -1003,6 +1281,34 @@ impl Ctx {
         }
         // Two-sided lighting: a back face takes its back colours.
         let back = !front && self.on(GL_LIGHTING) && self.light.two_side;
+        if self.select.mode != select::GL_RENDER {
+            self.capture(KIND_TRIANGLES, &poly, &win, back);
+            return;
+        }
+        // glPolygonOffset: factor x the steepest depth slope + units x the
+        // smallest depth step, for the face's fill mode.
+        let mode = self.polygon_mode[!front as usize];
+        let cap = match mode { GL_LINE => GL_POLYGON_OFFSET_LINE, GL_POINT => GL_POLYGON_OFFSET_POINT, _ => GL_POLYGON_OFFSET_FILL };
+        self.offset_now = 0.0;
+        if self.on(cap) {
+            let (a, b, c) = (win[0], win[1], win[2]);
+            let (e1, e2) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+            let nz = e1[0] * e2[1] - e1[1] * e2[0];
+            let slope = if nz == 0.0 {
+                0.0
+            } else {
+                let nx = e1[1] * e2[2] - e1[2] * e2[1];
+                let ny = e1[2] * e2[0] - e1[0] * e2[2];
+                (nx / nz).abs().max((ny / nz).abs())
+            };
+            self.offset_now = self.poly_offset[0] as f64 * slope + self.poly_offset[1] as f64 / DEPTH_MAX;
+            if mode == GL_FILL {
+                for w in &mut win {
+                    w[2] += self.offset_now;
+                }
+            }
+        }
+        self.offsetting = true;
         // glPolygonMode: outlines or corners instead of filling.
         match self.polygon_mode[!front as usize] {
             GL_LINE => {
@@ -1020,6 +1326,7 @@ impl Ctx {
                     self.line(a, b);
                     self.shade_model = flat;
                 }
+                self.offsetting = false;
                 return;
             }
             GL_POINT => {
@@ -1030,13 +1337,14 @@ impl Ctx {
                     }
                     self.point(v);
                 }
+                self.offsetting = false;
                 return;
             }
             _ => {}
         }
+        self.offsetting = false;
         let (g, tex) = self.state(KIND_TRIANGLES, 1.0);
-        let (tw, th) = tex.map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
-        let kv = self.kverts(&poly, &win, back, tw, th);
+        let kv = self.kverts(&poly, &win, back, tex);
         for i in 1..kv.len() - 1 {
             self.push_tri(&g, KTri { v: [kv[0], kv[i], kv[i + 1]] });
         }
@@ -1065,6 +1373,7 @@ impl Ctx {
         unsafe {
             SetDIBitsToDevice(self.hdc, 0, 0, self.w as u32, self.h as u32, 0, 0, 0, self.h as u32, self.frame.as_ptr() as *const u8, bmi.as_ptr(), 0)
         };
+        self.front.clone_from(&self.frame);
     }
 
     /// Follow the DC's size (a resized window gets a new, blank target).
@@ -1159,13 +1468,13 @@ pub extern "system" fn wglCreateContext(hdc: u64) -> u64 {
         double: format == 1,
         made_current: false,
         matrix_mode: GL_MODELVIEW,
-        stacks: [vec![IDENTITY], vec![IDENTITY], vec![IDENTITY]],
+        stacks: [vec![IDENTITY], vec![IDENTITY], vec![IDENTITY], vec![IDENTITY]],
         viewport: [0, 0, w, h],
         depth_range: [0.0, 1.0],
         clear_color: [0.0; 4],
         clear_depth: 1.0,
         color: [1.0; 4],
-        tc: [0.0, 0.0, 0.0, 1.0],
+        tc: [[0.0, 0.0, 0.0, 1.0]; 2],
         normal: [0.0, 0.0, 1.0],
         caps: vec![GL_DITHER],
         depth_func: GL_LESS,
@@ -1181,8 +1490,21 @@ pub extern "system" fn wglCreateContext(hdc: u64) -> u64 {
         scissor: [0, 0, w, h],
         textures: Vec::new(),
         next_name: 1,
-        bound: 0,
-        tex_env: GL_MODULATE,
+        unit: 0,
+        client_unit: 0,
+        bound: [[0; 2]; 2],
+        tex_on: [[false; 2]; 2],
+        tex_env: [GL_MODULATE; 2],
+        env_color: [[0.0; 4]; 2],
+        texgen: [core::array::from_fn(TexGen::new); 2],
+        clip_planes: [[0.0; 4]; 6],
+        poly_offset: [0.0; 2],
+        poly_stipple: [0xFFFF_FFFF; 32],
+        line_stipple: [1, 0xFFFF],
+        stipple_count: 0.0,
+        logic_op: 0x1503,
+        offset_now: 0.0,
+        offsetting: false,
         perspective: false,
         fog_nicest: false,
         light: light::Lighting::new(),
@@ -1195,12 +1517,27 @@ pub extern "system" fn wglCreateContext(hdc: u64) -> u64 {
         lists: lists::Lists::default(),
         prim: None,
         verts: Vec::new(),
-        arrays: [Array::default(); 4],
+        arrays: [Array::default(); 5],
         groups: Vec::new(),
         tris: Vec::new(),
         error: GL_NO_ERROR,
-        unpack_align: 4,
-        pack_align: 4,
+        unpack: pixels::PixelStore::new(),
+        pack: pixels::PixelStore::new(),
+        transfer: pixels::Transfer::new(),
+        raster: pixels::Raster::new(),
+        temp_textures: Vec::new(),
+        draw_none: false,
+        draw_front: false,
+        read_front: format != 1,
+        front: Vec::new(),
+        accum: Vec::new(),
+        clear_accum: [0.0; 4],
+        edge_flag: true,
+        select: select::Select::new(),
+        eval: eval::Eval::new(),
+        attrib_stack: Vec::new(),
+        client_stack: Vec::new(),
+        swap_interval: 1,
         frame: Vec::new(),
     });
     let p = Box::into_raw(ctx) as usize;
@@ -1269,11 +1606,6 @@ pub extern "system" fn wglGetCurrentDC() -> u64 {
     current().map_or(0, |c| c.hdc)
 }
 
-/// No extensions yet.
-#[no_mangle]
-pub extern "system" fn wglGetProcAddress(_name: *const u8) -> usize {
-    0
-}
 
 #[no_mangle]
 pub extern "system" fn wglShareLists(_a: u64, _b: u64) -> Bool {
@@ -1324,7 +1656,7 @@ pub extern "system" fn glGetString(name: u32) -> *const u8 {
         0x1F00 => b"VEILOS\0",
         0x1F01 => b"VEILOS software rasterizer\0",
         0x1F02 => b"1.1.0\0",
-        0x1F03 => b"GL_EXT_bgra\0",
+        0x1F03 => ext::EXTENSIONS,
         _ => {
             with(|c| c.err(GL_INVALID_ENUM));
             return core::ptr::null();
@@ -1341,6 +1673,12 @@ fn set_cap(cap: u32, on: bool) {
     outside(|c| {
         if (GL_LIGHT0..GL_LIGHT0 + 8).contains(&cap) {
             c.light.lights[(cap - GL_LIGHT0) as usize].on = on;
+        }
+        match cap {
+            GL_TEXTURE_2D => return c.tex_on[c.unit][0] = on,
+            GL_TEXTURE_1D => return c.tex_on[c.unit][1] = on,
+            x if (GL_TEXTURE_GEN_S..GL_TEXTURE_GEN_S + 4).contains(&x) => return c.texgen[c.unit][(x - GL_TEXTURE_GEN_S) as usize].on = on,
+            _ => {}
         }
         if on != c.on(cap) {
             if on {
@@ -1414,6 +1752,9 @@ pub extern "system" fn glClear(mask: u32) {
             stencil_write: c.stencil[3] & 0xFF,
         };
         unsafe { VeilGpu3d(1, c.target, &args as *const _ as u64, 0) };
+        if mask & 0x200 != 0 {
+            c.clear_accum_buffer();
+        }
     })
 }
 
@@ -1516,26 +1857,12 @@ pub extern "system" fn glColorMask(r: u8, g: u8, b: u8, a: u8) {
     outside(|c| c.color_mask = [r != 0, g != 0, b != 0, a != 0])
 }
 
-#[no_mangle]
-pub extern "system" fn glPixelStorei(name: u32, v: i32) {
-    outside(|c| {
-        if !matches!(v, 1 | 2 | 4 | 8) {
-            c.err(GL_INVALID_VALUE);
-            return;
-        }
-        match name {
-            GL_UNPACK_ALIGNMENT => c.unpack_align = v,
-            GL_PACK_ALIGNMENT => c.pack_align = v,
-            _ => {}
-        }
-    })
-}
 
 #[no_mangle]
 pub extern "system" fn glFlush() {
     outside(|c| {
         c.flush();
-        if !c.double {
+        if !c.double || c.draw_front {
             c.present();
         }
     })
@@ -1603,7 +1930,8 @@ fn get(name: u32, out: &mut [f64; 16]) -> usize {
                 4
             }
             0x0BA6 | 0x0BA7 | 0x0BA8 => {
-                let m = c.stacks[(name - 0x0BA6) as usize].last().unwrap();
+                let s = if name == 0x0BA8 { 2 + c.unit } else { (name - 0x0BA6) as usize };
+                let m = c.stacks[s].last().unwrap();
                 for i in 0..16 {
                     out[i] = m[i] as f64;
                 }
@@ -1620,12 +1948,31 @@ fn get(name: u32, out: &mut [f64; 16]) -> usize {
             0x0B11 => one(out, c.point_size as f64),
             0x0B32 => one(out, c.lists.base as f64),
             0x0D31 => one(out, 8.0),
+            // Multitexture: units, the active and client-active unit.
+            0x84E2 => one(out, 2.0),
+            0x84E0 => one(out, (0x84C0 + c.unit) as f64),
+            0x84E1 => one(out, (0x84C0 + c.client_unit) as f64),
+            0x0B31 => one(out, c.attrib_stack.len() as f64),
+            0x0BB0 => one(out, c.attrib_stack.len() as f64),
+            0x0BB1 => one(out, c.client_stack.len() as f64),
+            0x0D35 | 0x0D3B => one(out, 16.0),
+            0x0C40 => one(out, c.select.mode as f64),
+            0x0B43 => one(out, c.edge_flag as u32 as f64),
+            // GL_POLYGON_OFFSET_FACTOR, GL_POLYGON_OFFSET_UNITS
+            0x8038 => one(out, c.poly_offset[0] as f64),
+            0x2A00 => one(out, c.poly_offset[1] as f64),
+            0x0B25 => one(out, c.line_stipple[1] as f64),
+            0x0B26 => one(out, c.line_stipple[0] as f64),
+            0x0BF0 => one(out, c.logic_op as f64),
+            0x0C01 => one(out, if c.draw_none { 0.0 } else if c.draw_front || !c.double { 0x404 as f64 } else { 0x405 as f64 }),
+            0x0C02 => one(out, if c.read_front || !c.double { 0x404 as f64 } else { 0x405 as f64 }),
             0x0D3A => {
                 out[0] = MAX_TEXTURE_SIZE as f64;
                 out[1] = MAX_TEXTURE_SIZE as f64;
                 2
             }
-            0x8069 => one(out, c.bound as f64),
+            0x8069 => one(out, c.bound[c.unit][0] as f64),
+            0x8068 => one(out, c.bound[c.unit][1] as f64),
             0x0C54 => one(out, if c.fog_nicest { 0x1102 as f64 } else { 0x1100 as f64 }),
             0x0C50 => one(out, if c.perspective { 0x1102 as f64 } else { 0x1100 as f64 }),
             0x0C32 => one(out, c.double as u32 as f64),
@@ -1634,8 +1981,42 @@ fn get(name: u32, out: &mut [f64; 16]) -> usize {
             0x0B54 => one(out, c.shade_model as f64),
             0x0B45 => one(out, c.cull_mode as f64),
             0x0B46 => one(out, c.front_face as f64),
-            GL_UNPACK_ALIGNMENT => one(out, c.unpack_align as f64),
-            GL_PACK_ALIGNMENT => one(out, c.pack_align as f64),
+            GL_UNPACK_ALIGNMENT => one(out, c.unpack.align as f64),
+            GL_PACK_ALIGNMENT => one(out, c.pack.align as f64),
+            0x0CF0 => one(out, c.unpack.swap_bytes as u32 as f64),
+            0x0CF1 => one(out, c.unpack.lsb_first as u32 as f64),
+            0x0CF2 => one(out, c.unpack.row_length as f64),
+            0x0CF3 => one(out, c.unpack.skip_rows as f64),
+            0x0CF4 => one(out, c.unpack.skip_pixels as f64),
+            0x0D00 => one(out, c.pack.swap_bytes as u32 as f64),
+            0x0D01 => one(out, c.pack.lsb_first as u32 as f64),
+            0x0D02 => one(out, c.pack.row_length as f64),
+            0x0D03 => one(out, c.pack.skip_rows as f64),
+            0x0D04 => one(out, c.pack.skip_pixels as f64),
+            0x0D16 => one(out, c.transfer.zoom[0] as f64),
+            0x0D17 => one(out, c.transfer.zoom[1] as f64),
+            // The raster position, its validity, colour, distance, texture.
+            0x0B07 => {
+                let r = c.raster.win;
+                out[..4].copy_from_slice(&[r[0], r[1], r[2], 1.0]);
+                4
+            }
+            0x0B08 => one(out, c.raster.valid as u32 as f64),
+            0x0B04 => {
+                out[..4].copy_from_slice(&c.raster.color.map(|x| x as f64));
+                4
+            }
+            0x0B09 => one(out, c.raster.dist as f64),
+            0x0B06 => {
+                out[..4].copy_from_slice(&c.raster.tc.map(|x| x as f64));
+                4
+            }
+            // Accumulation buffer bits: 16 a channel.
+            0x0D58..=0x0D5B => one(out, 16.0),
+            0x0B80 => {
+                out[..4].copy_from_slice(&c.clear_accum.map(|x| x as f64));
+                4
+            }
             0x0C22 => {
                 out[..4].copy_from_slice(&c.clear_color.map(|x| x as f64));
                 4
@@ -1697,7 +2078,7 @@ pub unsafe extern "system" fn glMultMatrixd(m: *const f64) {
 pub extern "system" fn glPushMatrix() {
     rec!(glPushMatrix());
     outside(|c| {
-        let i = match c.matrix_mode { GL_PROJECTION => 1, GL_TEXTURE => 2, _ => 0 };
+        let i = c.stack();
         if c.stacks[i].len() >= STACK_DEPTH {
             c.err(GL_STACK_OVERFLOW);
         } else {
@@ -1711,7 +2092,7 @@ pub extern "system" fn glPushMatrix() {
 pub extern "system" fn glPopMatrix() {
     rec!(glPopMatrix());
     outside(|c| {
-        let i = match c.matrix_mode { GL_PROJECTION => 1, GL_TEXTURE => 2, _ => 0 };
+        let i = c.stack();
         if c.stacks[i].len() <= 1 {
             c.err(GL_STACK_UNDERFLOW);
         } else {
@@ -1827,6 +2208,8 @@ pub extern "system" fn glBegin(mode: u32) {
         } else {
             c.prim = Some(mode);
             c.verts.clear();
+            c.select.line_reset = true;
+            c.stipple_count = 0.0;
         }
     })
 }
@@ -1894,7 +2277,7 @@ fn ub(x: u8) -> f32 {
 
 fn texcoord(s: f32, t: f32, r: f32, q: f32) {
     rec!(texcoord(s, t, r, q));
-    with(|c| c.tc = [s, t, r, q])
+    with(|c| c.tc[c.unit] = [s, t, r, q])
 }
 
 #[no_mangle] pub extern "system" fn glTexCoord1f(s: f32) { texcoord(s, 0.0, 0.0, 1.0) }
@@ -1945,7 +2328,7 @@ fn client_state(a: u32, on: bool) {
         let i = match a {
             GL_VERTEX_ARRAY => A_VERTEX,
             GL_COLOR_ARRAY => A_COLOR,
-            GL_TEXTURE_COORD_ARRAY => A_TEXCOORD,
+            GL_TEXTURE_COORD_ARRAY => if c.client_unit == 1 { A_TEXCOORD2 } else { A_TEXCOORD },
             GL_NORMAL_ARRAY => A_NORMAL,
             _ => {
                 // Index and edge flag arrays: accepted, never used.
@@ -1982,7 +2365,10 @@ fn pointer(i: usize, size: i32, kind: u32, stride: i32, ptr: usize) {
 
 #[no_mangle] pub extern "system" fn glVertexPointer(size: i32, kind: u32, stride: i32, p: usize) { pointer(A_VERTEX, size, kind, stride, p) }
 #[no_mangle] pub extern "system" fn glColorPointer(size: i32, kind: u32, stride: i32, p: usize) { pointer(A_COLOR, size, kind, stride, p) }
-#[no_mangle] pub extern "system" fn glTexCoordPointer(size: i32, kind: u32, stride: i32, p: usize) { pointer(A_TEXCOORD, size, kind, stride, p) }
+#[no_mangle] pub extern "system" fn glTexCoordPointer(size: i32, kind: u32, stride: i32, p: usize) {
+    let i = if with(|c| c.client_unit) == 1 { A_TEXCOORD2 } else { A_TEXCOORD };
+    pointer(i, size, kind, stride, p)
+}
 #[no_mangle] pub extern "system" fn glNormalPointer(kind: u32, stride: i32, p: usize) { pointer(A_NORMAL, 3, kind, stride, p) }
 
 impl Ctx {
@@ -1998,7 +2384,10 @@ impl Ctx {
                 self.color = col;
             }
             if a[A_TEXCOORD].on {
-                self.tc = a[A_TEXCOORD].get(i, false);
+                self.tc[0] = a[A_TEXCOORD].get(i, false);
+            }
+            if a[A_TEXCOORD2].on {
+                self.tc[1] = a[A_TEXCOORD2].get(i, false);
             }
             if a[A_NORMAL].on {
                 let n = a[A_NORMAL].get(i, true);
@@ -2037,7 +2426,7 @@ impl Ctx {
                         }
                         c
                     }),
-                    tc: a[A_TEXCOORD].on.then(|| a[A_TEXCOORD].get(i, false)),
+                    tc: [a[A_TEXCOORD].on.then(|| a[A_TEXCOORD].get(i, false)), a[A_TEXCOORD2].on.then(|| a[A_TEXCOORD2].get(i, false))],
                     normal: a[A_NORMAL].on.then(|| a[A_NORMAL].get(i, true)),
                     pos: {
                         let mut p = a[A_VERTEX].get(i, false);
@@ -2067,7 +2456,7 @@ impl Ctx {
 #[derive(Clone, Copy)]
 struct Element {
     color: Option<[f32; 4]>,
-    tc: Option<[f32; 4]>,
+    tc: [Option<[f32; 4]>; 2],
     normal: Option<[f32; 4]>,
     pos: [f32; 4],
 }
@@ -2079,8 +2468,10 @@ fn draw_recorded(mode: u32, els: &[Element]) {
             if let Some(col) = e.color {
                 c.color = col;
             }
-            if let Some(t) = e.tc {
-                c.tc = t;
+            for u in 0..2 {
+                if let Some(t) = e.tc[u] {
+                    c.tc[u] = t;
+                }
             }
             if let Some(n) = e.normal {
                 c.normal = [n[0], n[1], n[2]];
@@ -2165,8 +2556,12 @@ pub unsafe extern "system" fn glDeleteTextures(n: i32, names: *const u32) {
                     unsafe { NtClose(t.handle) };
                 }
             }
-            if c.bound == name {
-                c.bound = 0;
+            for u in c.bound.iter_mut() {
+                for b in u.iter_mut() {
+                    if *b == name {
+                        *b = 0;
+                    }
+                }
             }
         }
     })
@@ -2181,51 +2576,19 @@ pub extern "system" fn glIsTexture(name: u32) -> u8 {
 pub extern "system" fn glBindTexture(target: u32, name: u32) {
     rec!(glBindTexture(target, name));
     outside(|c| {
-        if target != GL_TEXTURE_2D {
-            if target != 0x0DE0 {
+        let dim = match target {
+            GL_TEXTURE_2D => 0,
+            GL_TEXTURE_1D => 1,
+            _ => {
                 c.err(GL_INVALID_ENUM);
+                return;
             }
-            return;
-        }
-        c.bound = name;
-        c.bound_tex();
+        };
+        c.flush();
+        let u = c.unit;
+        c.bound[u][dim] = name;
+        c.bound_of(u, dim);
     })
-}
-
-/// Texels from client memory as 0xAARRGGBB, rows of `w`.
-unsafe fn unpack(c: &Ctx, w: i32, h: i32, format: u32, kind: u32, pixels: *const u8) -> Option<Vec<u32>> {
-    let comps = match format {
-        GL_RGB | GL_BGR_EXT => 3,
-        GL_RGBA | GL_BGRA_EXT => 4,
-        GL_LUMINANCE | GL_ALPHA | 0x1903 => 1,
-        GL_LUMINANCE_ALPHA => 2,
-        _ => return None,
-    };
-    if kind != GL_UNSIGNED_BYTE {
-        return None;
-    }
-    let align = c.unpack_align as usize;
-    let row = (w as usize * comps).div_ceil(align) * align;
-    let mut out = Vec::with_capacity((w * h) as usize);
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let p = unsafe { pixels.add(y * row + x * comps) };
-            let b = |i: usize| unsafe { *p.add(i) } as u32;
-            let (r, g, bl, a) = match format {
-                GL_RGB => (b(0), b(1), b(2), 255),
-                GL_BGR_EXT => (b(2), b(1), b(0), 255),
-                GL_RGBA => (b(0), b(1), b(2), b(3)),
-                GL_BGRA_EXT => (b(2), b(1), b(0), b(3)),
-                GL_LUMINANCE => (b(0), b(0), b(0), 255),
-                GL_LUMINANCE_ALPHA => (b(0), b(0), b(0), b(1)),
-                GL_ALPHA => (0, 0, 0, b(0)),
-                // GL_RED
-                _ => (b(0), 0, 0, 255),
-            };
-            out.push(a << 24 | r << 16 | g << 8 | bl);
-        }
-    }
-    Some(out)
 }
 
 /// What the internal format keeps of a texel.
@@ -2267,21 +2630,32 @@ pub unsafe extern "system" fn glTexImage2D(target: u32, level: i32, ifmt: i32, w
         };
         let texels: Vec<u32> = texels.into_iter().map(|p| internal(ifmt, p)).collect();
         if c.lists.compiling.is_some() && c.lists.replaying == 0 {
-            let _ = lists::record(alloc::boxed::Box::new(move || tex_image(level, w, h, texels.clone())));
+            let _ = lists::record(alloc::boxed::Box::new(move || tex_image(0, level, w, h, texels.clone())));
             return;
         }
-        tex_image_in(c, level, w, h, texels);
+        tex_image_in(c, 0, level, w, h, texels);
     })
 }
 
 /// A level's texels, already converted (from a display list).
-fn tex_image(level: i32, w: i32, h: i32, texels: Vec<u32>) {
-    outside(|c| tex_image_in(c, level, w, h, texels))
+fn tex_image(dim: usize, level: i32, w: i32, h: i32, texels: Vec<u32>) {
+    outside(|c| tex_image_in(c, dim, level, w, h, texels))
 }
 
-fn tex_image_in(c: &mut Ctx, level: i32, w: i32, h: i32, texels: Vec<u32>) {
+/// The texture dimension a target names: 0 for GL_TEXTURE_2D, 1 for
+/// GL_TEXTURE_1D.
+fn dim_of(target: u32) -> Option<usize> {
+    match target {
+        GL_TEXTURE_2D => Some(0),
+        GL_TEXTURE_1D => Some(1),
+        _ => None,
+    }
+}
+
+fn tex_image_in(c: &mut Ctx, dim: usize, level: i32, w: i32, h: i32, texels: Vec<u32>) {
     c.flush();
-    let t = c.bound_tex();
+    let u = c.unit;
+    let t = c.bound_of(u, dim);
     if level == 0 {
         t.w = w as u32;
         t.h = h as u32;
@@ -2313,19 +2687,20 @@ pub unsafe extern "system" fn glTexSubImage2D(target: u32, level: i32, x: i32, y
         if c.lists.compiling.is_some() && c.lists.replaying == 0 {
             let _ = lists::record(alloc::boxed::Box::new(move || {
                 let src = src.clone();
-                outside(|c| sub_image(c, level, x, y, w, h, format, &src))
+                outside(|c| sub_image(c, 0, level, x, y, w, h, format, &src))
             }));
             return;
         }
-        sub_image(c, level, x, y, w, h, format, &src);
+        sub_image(c, 0, level, x, y, w, h, format, &src);
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sub_image(c: &mut Ctx, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, src: &[u32]) {
+fn sub_image(c: &mut Ctx, dim: usize, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, src: &[u32]) {
     {
         c.flush();
-        let t = c.bound_tex();
+        let u = c.unit;
+        let t = c.bound_of(u, dim);
         let l = level.max(0) as usize;
         let (lw, lh) = t.level_size(l);
         if t.mips.get(l).is_none_or(|m| m.len() != (lw * lh) as usize) {
@@ -2336,7 +2711,7 @@ fn sub_image(c: &mut Ctx, level: i32, x: i32, y: i32, w: i32, h: i32, format: u3
             c.err(GL_INVALID_VALUE);
             return;
         }
-        let t = c.bound_tex();
+        let t = c.bound_of(u, dim);
         let m = &mut t.mips[l];
         for row in 0..h as usize {
             for col in 0..w as usize {
@@ -2353,10 +2728,13 @@ fn sub_image(c: &mut Ctx, level: i32, x: i32, y: i32, w: i32, h: i32, format: u3
 fn tex_param(target: u32, name: u32, v: u32) {
     rec!(tex_param(target, name, v));
     outside(|c| {
-        if target != GL_TEXTURE_2D {
+        let Some(dim) = dim_of(target) else {
             c.err(GL_INVALID_ENUM);
             return;
-        }
+        };
+        // GL_CLAMP_TO_EDGE (EXT/SGIS_texture_edge_clamp) is how GL_CLAMP
+        // is drawn here.
+        let v = if v == 0x812F { GL_CLAMP } else { v };
         let ok = match name {
             GL_TEXTURE_MIN_FILTER => (GL_NEAREST..=GL_LINEAR).contains(&v) || (0x2700..=GL_LINEAR_MIPMAP_LINEAR).contains(&v),
             GL_TEXTURE_MAG_FILTER => v == GL_NEAREST || v == GL_LINEAR,
@@ -2369,7 +2747,8 @@ fn tex_param(target: u32, name: u32, v: u32) {
             return;
         }
         c.flush();
-        let t = c.bound_tex();
+        let u = c.unit;
+        let t = c.bound_of(u, dim);
         match name {
             GL_TEXTURE_MIN_FILTER => t.min = v,
             GL_TEXTURE_MAG_FILTER => t.mag = v,
@@ -2393,8 +2772,8 @@ fn tex_env(target: u32, name: u32, v: u32) {
             return;
         }
         if name == GL_TEXTURE_ENV_MODE {
-            if matches!(v, GL_MODULATE | GL_DECAL | GL_REPLACE) {
-                c.tex_env = v;
+            if matches!(v, GL_MODULATE | GL_DECAL | GL_REPLACE | GL_BLEND | GL_ADD) {
+                c.tex_env[c.unit] = v;
             } else {
                 c.err(GL_INVALID_ENUM);
             }
@@ -2404,8 +2783,27 @@ fn tex_env(target: u32, name: u32, v: u32) {
 
 #[no_mangle] pub extern "system" fn glTexEnvi(t: u32, n: u32, v: i32) { tex_env(t, n, v as u32) }
 #[no_mangle] pub extern "system" fn glTexEnvf(t: u32, n: u32, v: f32) { tex_env(t, n, v as u32) }
-#[no_mangle] pub unsafe extern "system" fn glTexEnviv(t: u32, n: u32, v: *const i32) { tex_env(t, n, unsafe { *v } as u32) }
-#[no_mangle] pub unsafe extern "system" fn glTexEnvfv(t: u32, n: u32, v: *const f32) { tex_env(t, n, unsafe { *v } as u32) }
+#[no_mangle]
+pub unsafe extern "system" fn glTexEnviv(t: u32, n: u32, v: *const i32) {
+    if n == GL_TEXTURE_ENV_COLOR {
+        let c: [f32; 4] = core::array::from_fn(|i| (unsafe { *v.add(i) } as f64 / 2147483647.0) as f32);
+        return env_color(t, c);
+    }
+    tex_env(t, n, unsafe { *v } as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn glTexEnvfv(t: u32, n: u32, v: *const f32) {
+    if n == GL_TEXTURE_ENV_COLOR {
+        return env_color(t, core::array::from_fn(|i| unsafe { *v.add(i) }));
+    }
+    tex_env(t, n, unsafe { *v } as u32)
+}
+
+fn env_color(target: u32, c: [f32; 4]) {
+    rec!(env_color(target, c));
+    outside(|ctx| if target == GL_TEXTURE_ENV { ctx.env_color[ctx.unit] = c.map(clamp01) } else { ctx.err(GL_INVALID_ENUM) })
+}
 
 // -----| lighting and materials |-----
 
@@ -2632,48 +3030,3 @@ pub extern "system" fn glClearStencil(s: i32) {
     outside(|c| c.clear_stencil = s as u32)
 }
 
-// -----| reading pixels |-----
-
-#[no_mangle]
-pub unsafe extern "system" fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, out: *mut u8) {
-    outside(|c| {
-        if w < 0 || h < 0 {
-            c.err(GL_INVALID_VALUE);
-            return;
-        }
-        let comps = match format {
-            GL_RGB | GL_BGR_EXT => 3,
-            GL_RGBA | GL_BGRA_EXT => 4,
-            _ => {
-                c.err(GL_INVALID_ENUM);
-                return;
-            }
-        };
-        if kind != GL_UNSIGNED_BYTE {
-            c.err(GL_INVALID_ENUM);
-            return;
-        }
-        if w == 0 || h == 0 {
-            return;
-        }
-        c.flush();
-        // The rows asked for, top one first (GL counts rows from the bottom).
-        let mut buf = vec![0u32; (w * h) as usize];
-        let r = ReadArgs { x, y: c.h - (y + h), w, h, dst: buf.as_mut_ptr() as u64, stride: w as i64 * 4 };
-        unsafe { VeilGpu3d(3, c.target, &r as *const _ as u64, 0) };
-        let align = c.pack_align as usize;
-        let row = (w as usize * comps).div_ceil(align) * align;
-        for gl_row in 0..h as usize {
-            let src = &buf[(h as usize - 1 - gl_row) * w as usize..][..w as usize];
-            for (i, &p) in src.iter().enumerate() {
-                let (r, g, b) = ((p >> 16) as u8, (p >> 8) as u8, p as u8);
-                let d = unsafe { out.add(gl_row * row + i * comps) };
-                let px: [u8; 4] = match format {
-                    GL_BGR_EXT | GL_BGRA_EXT => [b, g, r, 255],
-                    _ => [r, g, b, 255],
-                };
-                unsafe { core::ptr::copy_nonoverlapping(px.as_ptr(), d, comps) };
-            }
-        }
-    })
-}
