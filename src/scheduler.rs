@@ -777,6 +777,19 @@ pub fn init() {
     crate::println!("[SCHED] Adaptive scheduler online.");
 }
 
+/// From the main loop: save learned profiles at most every 30 s (saving at
+/// every process exit cost a disk write each time).
+pub fn flush_if_due(now_ms: u64) {
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if now_ms.wrapping_sub(LAST.load(Ordering::Relaxed)) < 30_000 {
+        return;
+    }
+    LAST.store(now_ms, Ordering::Relaxed);
+    if let Some(mut s) = SCHEDULER.try_lock() {
+        s.flush_profiles();
+    }
+}
+
 /// Read the saved app profiles. Call once the disk is mounted: `init` runs
 /// before storage binds, when there's nothing to read yet.
 pub fn load_profiles() {

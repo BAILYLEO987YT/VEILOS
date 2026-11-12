@@ -5,8 +5,12 @@
 // One `Disk` per AHCI port, shared by everything that uses that disk, with a
 // lock around the port so two CPUs can never drive it at once. Each disk has
 // a 64 KiB DMA bounce buffer (128 sectors per command; it was 8) and a
-// write-through sector cache, which is also the FAT cache: FAT and directory
-// sectors are re-read constantly and now come from memory.
+// sector cache, which is also the FAT cache: FAT and directory sectors are
+// re-read constantly and come from memory. In Security Mode the cache is
+// write-through and holds 1 MiB; in Performance Mode it is write-back (dirty
+// sectors go to the disk within a second, sorted and merged into large
+// commands, and on FlushFileBuffers, power-off and leaving the mode) and holds
+// 64 MiB, bulk reads included.
 //
 // On top of a disk sit `Partition`s (MBR primary entries, GPT entries, or
 // the whole disk for a superfloppy). Each is a `vfs::BlockDevice` with
@@ -30,58 +34,84 @@ pub const SECTOR: usize = 512;
 const BOUNCE_BYTES: usize = 64 * 1024;
 const BOUNCE_SECTORS: u32 = (BOUNCE_BYTES / SECTOR) as u32;
 
-/// Sectors kept in each disk's cache (1 MiB).
+/// Sectors kept in each disk's cache: 1 MiB in Security Mode, 64 MiB in
+/// Performance Mode (P2).
 const CACHE_SECTORS: usize = 2048;
-/// Reads larger than this bypass the cache (bulk file data would only evict
-/// the metadata the cache is for).
+const CACHE_SECTORS_PERF: usize = 131_072;
+/// In Security Mode, reads larger than this bypass the cache (bulk file data
+/// would only evict the metadata the cache is for). Performance Mode keeps
+/// everything.
 const CACHEABLE_READ_SECTORS: u32 = 64;
+/// Performance Mode writes back what's dirty at least this often (ms).
+const WRITE_BACK_MS: u64 = 1000;
+
+fn performance() -> bool {
+    crate::policy::POLICY.lock().get_mode() == crate::policy::PolicyMode::Performance
+}
+
+struct Entry {
+    used: u64,
+    /// Newer than the disk (Performance Mode's write-back).
+    dirty: bool,
+    data: Box<[u8; SECTOR]>,
+}
 
 struct SectorCache {
-    map: BTreeMap<u64, (u64, Box<[u8; SECTOR]>)>, // lba -> (last use, data)
+    map: BTreeMap<u64, Entry>,
     clock: u64,
     hits: u64,
     misses: u64,
+    dirty: usize,
 }
 
 impl SectorCache {
     const fn new() -> Self {
-        Self { map: BTreeMap::new(), clock: 0, hits: 0, misses: 0 }
+        Self { map: BTreeMap::new(), clock: 0, hits: 0, misses: 0, dirty: 0 }
     }
 
     fn get(&mut self, lba: u64) -> Option<&[u8; SECTOR]> {
         self.clock += 1;
         let clock = self.clock;
-        self.map.get_mut(&lba).map(|(used, data)| {
-            *used = clock;
-            &**data
+        self.map.get_mut(&lba).map(|e| {
+            e.used = clock;
+            &*e.data
         })
     }
 
-    fn put(&mut self, lba: u64, data: &[u8]) {
+    /// Store a sector. `dirty`: it isn't on the disk yet. A clean copy never
+    /// replaces a dirty one (`keep_dirty`), so a read can't undo a write.
+    fn put(&mut self, lba: u64, data: &[u8], dirty: bool, keep_dirty: bool) {
         self.clock += 1;
         let clock = self.clock;
         match self.map.get_mut(&lba) {
-            Some((used, buf)) => {
-                *used = clock;
-                buf.copy_from_slice(data);
+            Some(e) => {
+                e.used = clock;
+                if e.dirty && keep_dirty && !dirty {
+                    return;
+                }
+                e.data.copy_from_slice(data);
+                if e.dirty != dirty {
+                    if dirty { self.dirty += 1 } else { self.dirty -= 1 }
+                    e.dirty = dirty;
+                }
             }
             None => {
                 let mut buf = Box::new([0u8; SECTOR]);
                 buf.copy_from_slice(data);
-                self.map.insert(lba, (clock, buf));
-                if self.map.len() > CACHE_SECTORS {
-                    self.evict();
+                self.map.insert(lba, Entry { used: clock, dirty, data: buf });
+                if dirty {
+                    self.dirty += 1;
                 }
             }
         }
     }
 
-    /// Drop the least recently used quarter in one pass.
-    fn evict(&mut self) {
-        let mut stamps: Vec<u64> = self.map.values().map(|(used, _)| *used).collect();
-        stamps.sort_unstable();
-        let cutoff = stamps[stamps.len() / 4];
-        self.map.retain(|_, (used, _)| *used > cutoff);
+    fn forget(&mut self, lba: u64) {
+        if let Some(e) = self.map.remove(&lba) {
+            if e.dirty {
+                self.dirty -= 1;
+            }
+        }
     }
 }
 
@@ -90,6 +120,89 @@ struct DiskInner {
     bounce_phys: u64,
     bounce_virt: *mut u8,
     cache: SectorCache,
+}
+
+impl DiskInner {
+    fn write_disk(&mut self, lba: u64, src: &[u8]) -> bool {
+        let count = (src.len() / SECTOR) as u32;
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(BOUNCE_SECTORS);
+            let bytes = chunk as usize * SECTOR;
+            let part = &src[done as usize * SECTOR..done as usize * SECTOR + bytes];
+            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), self.bounce_virt, bytes) };
+            if !unsafe { &mut *self.port }.write_sectors(lba + done as u64, chunk, self.bounce_phys, Disk::phys_offset()) {
+                return false;
+            }
+            done += chunk;
+        }
+        true
+    }
+
+    /// Write the dirty sectors among `lbas` (sorted), contiguous ones in one
+    /// command each, and mark them clean.
+    fn write_back(&mut self, lbas: &[u64]) -> bool {
+        let mut ok = true;
+        let mut i = 0;
+        while i < lbas.len() {
+            let start = lbas[i];
+            let mut run: Vec<u8> = Vec::new();
+            let mut n = 0u64;
+            while i < lbas.len() && lbas[i] == start + n && n < BOUNCE_SECTORS as u64 {
+                run.extend_from_slice(&*self.cache.map[&lbas[i]].data);
+                n += 1;
+                i += 1;
+            }
+            if self.write_disk(start, &run) {
+                for k in 0..n {
+                    if let Some(e) = self.cache.map.get_mut(&(start + k)) {
+                        if e.dirty {
+                            e.dirty = false;
+                            self.cache.dirty -= 1;
+                        }
+                    }
+                }
+            } else {
+                crate::serial_println!("[BLOCK] write-back of {} sector(s) at {} failed", n, start);
+                ok = false;
+            }
+        }
+        ok
+    }
+
+    /// Everything dirty to the disk.
+    fn flush(&mut self) -> bool {
+        if self.cache.dirty == 0 {
+            return true;
+        }
+        let lbas: Vec<u64> = self.cache.map.iter().filter(|(_, e)| e.dirty).map(|(&l, _)| l).collect();
+        self.write_back(&lbas)
+    }
+
+    /// Over the limit: drop the least recently used quarter, writing back
+    /// what's dirty among it first.
+    fn trim(&mut self, limit: usize) {
+        if self.cache.map.len() <= limit {
+            return;
+        }
+        let mut stamps: Vec<u64> = self.cache.map.values().map(|e| e.used).collect();
+        stamps.sort_unstable();
+        let cutoff = stamps[stamps.len() / 4];
+        let victims: Vec<u64> = self.cache.map.iter().filter(|(_, e)| e.used <= cutoff).map(|(&l, _)| l).collect();
+        let dirty: Vec<u64> = victims.iter().copied().filter(|l| self.cache.map[l].dirty).collect();
+        if !dirty.is_empty() && !self.write_back(&dirty) {
+            // Keep what couldn't be written rather than lose it.
+            for l in victims {
+                if !self.cache.map[&l].dirty {
+                    self.cache.forget(l);
+                }
+            }
+            return;
+        }
+        for l in victims {
+            self.cache.forget(l);
+        }
+    }
 }
 
 /// An AHCI disk. Clone the `Arc` to share it.
@@ -103,10 +216,42 @@ pub struct Disk {
 unsafe impl Send for Disk {}
 unsafe impl Sync for Disk {}
 
+/// Every disk, for write-back.
+static DISKS: Mutex<Vec<Arc<Disk>>> = Mutex::new(Vec::new());
+static LAST_FLUSH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Write every disk's dirty sectors now (FlushFileBuffers, power-off,
+/// leaving Performance Mode).
+pub fn flush_all() {
+    let disks: Vec<Arc<Disk>> = DISKS.lock().clone();
+    for d in disks {
+        d.inner.lock().flush();
+    }
+}
+
+/// From the main loop: Performance Mode's lazy writer.
+pub fn tick(now_ms: u64) {
+    use core::sync::atomic::Ordering;
+    let last = LAST_FLUSH_MS.load(Ordering::Relaxed);
+    if now_ms.wrapping_sub(last) < WRITE_BACK_MS {
+        return;
+    }
+    LAST_FLUSH_MS.store(now_ms, Ordering::Relaxed);
+    let disks: Vec<Arc<Disk>> = match DISKS.try_lock() {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    for d in disks {
+        if let Some(mut inner) = d.inner.try_lock() {
+            inner.flush();
+        }
+    }
+}
+
 impl Disk {
     pub fn new(port: &'static mut HbaPort, port_num: usize, sectors: u64) -> Option<Arc<Self>> {
         let (bounce_phys, bounce_virt) = crate::memory::DmaRegion::new(BOUNCE_BYTES)?.leak();
-        Some(Arc::new(Self {
+        let disk = Arc::new(Self {
             port_num,
             sectors,
             inner: Mutex::new(DiskInner {
@@ -115,30 +260,33 @@ impl Disk {
                 bounce_virt,
                 cache: SectorCache::new(),
             }),
-        }))
+        });
+        DISKS.lock().push(disk.clone());
+        Some(disk)
     }
 
     fn phys_offset() -> VirtAddr {
         crate::memory::get_phys_mem_offset()
     }
 
-    /// Read `buf.len() / 512` sectors from absolute `lba`.
+    /// Read `buf.len() / 512` sectors from absolute `lba`. Cached sectors
+    /// (dirty ones in particular) win over what's on the disk.
     pub fn read(&self, lba: u64, buf: &mut [u8]) -> bool {
         let count = (buf.len() / SECTOR) as u32;
+        let perf = performance();
+        let cacheable = perf || count <= CACHEABLE_READ_SECTORS;
         let mut d = self.inner.lock();
 
-        if count <= CACHEABLE_READ_SECTORS {
-            let all_cached = (0..count as u64).all(|i| d.cache.map.contains_key(&(lba + i)));
-            if all_cached {
-                for i in 0..count as usize {
-                    let s = d.cache.get(lba + i as u64).unwrap();
-                    buf[i * SECTOR..(i + 1) * SECTOR].copy_from_slice(s);
-                }
-                d.cache.hits += 1;
-                return true;
+        let all_cached = (0..count as u64).all(|i| d.cache.map.contains_key(&(lba + i)));
+        if all_cached {
+            for i in 0..count as usize {
+                let s = d.cache.get(lba + i as u64).unwrap();
+                buf[i * SECTOR..(i + 1) * SECTOR].copy_from_slice(s);
             }
-            d.cache.misses += 1;
+            d.cache.hits += 1;
+            return true;
         }
+        d.cache.misses += 1;
 
         let mut done = 0u32;
         while done < count {
@@ -150,40 +298,50 @@ impl Disk {
             }
             let dst = &mut buf[done as usize * SECTOR..done as usize * SECTOR + bytes];
             unsafe { core::ptr::copy_nonoverlapping(virt, dst.as_mut_ptr(), bytes) };
-            if count <= CACHEABLE_READ_SECTORS {
-                for i in 0..chunk as usize {
-                    d.cache.put(lba + done as u64 + i as u64, &dst[i * SECTOR..(i + 1) * SECTOR]);
-                }
-            }
             done += chunk;
+        }
+        // What the cache holds is at least as new as the disk.
+        let end = lba + count as u64;
+        let cached: Vec<u64> = d.cache.map.range(lba..end).map(|(&l, _)| l).collect();
+        for l in &cached {
+            let i = (l - lba) as usize;
+            let s = d.cache.get(*l).unwrap();
+            buf[i * SECTOR..(i + 1) * SECTOR].copy_from_slice(s);
+        }
+        if cacheable {
+            for i in 0..count as usize {
+                d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], false, true);
+            }
+            d.trim(if perf { CACHE_SECTORS_PERF } else { CACHE_SECTORS });
         }
         true
     }
 
-    /// Write `buf.len() / 512` sectors to absolute `lba` (write-through:
-    /// cached copies are updated, never left stale).
+    /// Write `buf.len() / 512` sectors to absolute `lba`. Security Mode
+    /// writes through; Performance Mode (P1) keeps them dirty in the cache
+    /// for the lazy writer (`tick`), at most `WRITE_BACK_MS` behind.
     pub fn write(&self, lba: u64, buf: &[u8]) -> bool {
         let count = (buf.len() / SECTOR) as u32;
+        let perf = performance();
         let mut d = self.inner.lock();
-        let mut done = 0u32;
-        while done < count {
-            let chunk = (count - done).min(BOUNCE_SECTORS);
-            let bytes = chunk as usize * SECTOR;
-            let src = &buf[done as usize * SECTOR..done as usize * SECTOR + bytes];
-            let (port, phys, virt) = (d.port, d.bounce_phys, d.bounce_virt);
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), virt, bytes) };
-            if !unsafe { &mut *port }.write_sectors(lba + done as u64, chunk, phys, Self::phys_offset()) {
-                // Unknown what reached the disk: forget the range.
-                for i in 0..count as u64 {
-                    d.cache.map.remove(&(lba + i));
-                }
-                return false;
+        if perf {
+            for i in 0..count as usize {
+                d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], true, false);
             }
-            for i in 0..chunk as usize {
-                d.cache.put(lba + done as u64 + i as u64, &src[i * SECTOR..(i + 1) * SECTOR]);
-            }
-            done += chunk;
+            d.trim(CACHE_SECTORS_PERF);
+            return true;
         }
+        if !d.write_disk(lba, buf) {
+            // Unknown what reached the disk: forget the range.
+            for i in 0..count as u64 {
+                d.cache.forget(lba + i);
+            }
+            return false;
+        }
+        for i in 0..count as usize {
+            d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], false, false);
+        }
+        d.trim(CACHE_SECTORS);
         true
     }
 

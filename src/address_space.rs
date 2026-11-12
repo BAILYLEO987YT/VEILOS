@@ -196,7 +196,7 @@ pub fn destroy(cr3: u64) {
     }
     free_table(cr3);
     freed += 1;
-    crate::serial_println!("[ASPACE] freed {} page-table frames of address space {:#x}", freed, cr3);
+    crate::trace_println!("[ASPACE] freed {} page-table frames of address space {:#x}", freed, cr3);
 }
 
 /// Free the table at `phys` (a level-`level` table: 3 = PDPT, 2 = PD, 1 = PT)

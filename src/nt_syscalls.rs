@@ -25,6 +25,16 @@ pub fn handles(id: u64) -> bool {
 }
 
 pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    if !crate::sysprof::on() {
+        return dispatch_inner(id, a0, a1, a2, a3);
+    }
+    let t0 = crate::time::rdtsc();
+    let r = dispatch_inner(id, a0, a1, a2, a3);
+    crate::sysprof::record((id - sys::BASE as u64) as usize, crate::time::rdtsc().wrapping_sub(t0));
+    r
+}
+
+fn dispatch_inner(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let Some(proc) = crate::process::PROCESSOR.lock().get_active() else {
         return ret(status::INVALID_HANDLE);
     };
@@ -699,7 +709,7 @@ fn load_dll(proc: &Process, name: u64, chars: u64, base_out: u64, inits: u64) ->
     let (base, calls) = match linker.load_at_runtime(&mut mem, &name) {
         Ok(r) => r,
         Err(s) => {
-            crate::serial_println!("[MODULES] pid {}: LoadLibrary({}) failed: {:#x}", proc.pid, name, s as u32);
+            crate::trace_println!("[MODULES] pid {}: LoadLibrary({}) failed: {:#x}", proc.pid, name, s as u32);
             return s;
         }
     };
@@ -746,14 +756,14 @@ fn get_proc_address(proc: &Process, base: u64, name: u64, out: u64) -> NtStatus 
     match linker.proc_address(&mut mem, base, symbol.as_deref(), name as u16) {
         Some(addr) => {
             if proc.trace_syscalls.load(core::sync::atomic::Ordering::Relaxed) {
-                crate::serial_println!("[MODULES] pid {}: GetProcAddress({:#x}, {}) = {:#x}", proc.pid, base, symbol.as_deref().unwrap_or("#"), addr);
+                crate::trace_println!("[MODULES] pid {}: GetProcAddress({:#x}, {}) = {:#x}", proc.pid, base, symbol.as_deref().unwrap_or("#"), addr);
             }
             unsafe { *(out as *mut u64) = addr };
             status::SUCCESS
         }
         None => {
             // Rare, and the name is what's needed to add it.
-            crate::serial_println!(
+            crate::trace_println!(
                 "[MODULES] pid {}: GetProcAddress({:#x}, {}) not found",
                 proc.pid, base, symbol.as_deref().map_or(alloc::format!("#{}", name), |s| alloc::string::String::from(s))
             );

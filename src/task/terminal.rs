@@ -922,6 +922,15 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 }
             }
         }
+        "SYSPROF" => {
+            // Time per NT service (sysprof.rs), dumped to the serial log.
+            match parts.get(1).copied() {
+                Some("START") => { crate::sysprof::start(); history.push(String::from("SYSPROF: on")); }
+                Some("STOP") => { crate::sysprof::stop(); history.push(String::from("SYSPROF: off")); }
+                Some("DUMP") => { crate::sysprof::dump(); history.push(String::from("SYSPROF: written to the serial log")); }
+                _ => history.push(String::from("Usage: SYSPROF START | STOP | DUMP")),
+            }
+        }
         "SAMPLE" => {
             match parts.get(1).map(|s| s.to_uppercase()).as_deref() {
                 Some("START") => {

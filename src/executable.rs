@@ -190,7 +190,7 @@ impl PeFile {
     }
 
     pub fn parse(data: &[u8]) -> Result<Self, &'static str> {
-        crate::serial_println!("[PE_PARSE] Initiating parse of binary ({} bytes)", data.len());
+        crate::trace_println!("[PE_PARSE] Initiating parse of binary ({} bytes)", data.len());
         if data.len() < core::mem::size_of::<DosHeader>() {
             return Err("File too small for DOS header");
         }
@@ -292,7 +292,7 @@ impl PeFile {
         let mut imports = Vec::new();
         if import_dir_rva != 0 {
             if let Some(mut offset) = Self::rva_to_offset(&sections, import_dir_rva) {
-                crate::serial_println!("[PE_PARSE] Identified Import Table at File Offset {:#X}", offset);
+                crate::trace_println!("[PE_PARSE] Identified Import Table at File Offset {:#X}", offset);
                 loop {
                     if data.len() < offset + core::mem::size_of::<ImageImportDescriptor>() { break; }
                     let desc = unsafe { core::ptr::read_unaligned(data.as_ptr().add(offset) as *const ImageImportDescriptor) };
@@ -410,27 +410,27 @@ impl PeFile {
     }
 
     pub fn print_info(&self) {
-        crate::serial_println!("PE File Info:");
-        crate::serial_println!("  - Entry Point (RVA): {:#X}", self.entry_point);
-        crate::serial_println!("  - Image Base: {:#018X}", self.image_base);
-        crate::serial_println!("  - Sections:");
+        crate::trace_println!("PE File Info:");
+        crate::trace_println!("  - Entry Point (RVA): {:#X}", self.entry_point);
+        crate::trace_println!("  - Image Base: {:#018X}", self.image_base);
+        crate::trace_println!("  - Sections:");
         for section in &self.sections {
             let name = core::str::from_utf8(&section.name).unwrap_or("Unknown").trim_matches('\0');
             let v_addr = section.virtual_address;
             let p_data = section.pointer_to_raw_data;
-            crate::serial_println!("    - {:<8} (V: {:#010X}, P: {:#010X})", name, v_addr, p_data);
+            crate::trace_println!("    - {:<8} (V: {:#010X}, P: {:#010X})", name, v_addr, p_data);
         }
-        crate::serial_println!("  - Imports:");
+        crate::trace_println!("  - Imports:");
         for imp in &self.imports {
-            crate::serial_println!("    - {} (OFT: {:#X}, FT: {:#X})", imp.name, imp.original_first_thunk, imp.first_thunk);
+            crate::trace_println!("    - {} (OFT: {:#X}, FT: {:#X})", imp.name, imp.original_first_thunk, imp.first_thunk);
         }
-        crate::serial_println!("  - Exports ({}):", self.exports.len());
+        crate::trace_println!("  - Exports ({}):", self.exports.len());
         for exp in self.exports.iter().take(10) {
             let name = exp.name.as_deref().unwrap_or("<ordinal>");
-            crate::serial_println!("    - {} @ {:#X} (ord {})", name, exp.rva, exp.ordinal);
+            crate::trace_println!("    - {} @ {:#X} (ord {})", name, exp.rva, exp.ordinal);
         }
         if self.exports.len() > 10 {
-            crate::serial_println!("    - ... (trunc)");
+            crate::trace_println!("    - ... (trunc)");
         }
     }
 }

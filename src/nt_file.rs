@@ -802,6 +802,8 @@ pub fn delete(oa: u64) -> NtStatus {
 
 pub fn flush(f: &FileObject, iosb: u64) -> NtStatus {
     let s = f.flush();
+    // FlushFileBuffers means on the disk, write-back cache or not.
+    crate::block::flush_all();
     write_iosb(iosb, s, 0);
     s
 }

@@ -275,7 +275,7 @@ fn spawn_with(name: &'static str, cr3: u64, pid: u32, stack_size: usize, f: impl
         thread.id = ct.next_id;
         ct.next_id += 1;
         let id = thread.id;
-        crate::serial_println!("[KTHREAD] CPU {}: spawned thread {} '{}'", cpu, id, name);
+        crate::trace_println!("[KTHREAD] CPU {}: spawned thread {} '{}'", cpu, id, name);
         ct.threads.push(thread);
         id
     })
@@ -428,7 +428,7 @@ fn reap(cpu: usize) {
         dead
     });
     for t in &dead {
-        crate::serial_println!("[KTHREAD] CPU {}: reaped thread {} '{}'", cpu, t.id, t.name);
+        crate::trace_println!("[KTHREAD] CPU {}: reaped thread {} '{}'", cpu, t.id, t.name);
     }
     // Dropped here, with interrupts on (heap frees are IRQ-safe either way).
 }

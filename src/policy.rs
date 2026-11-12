@@ -25,6 +25,11 @@ impl PolicyManager {
     pub fn set_mode(&mut self, mode: PolicyMode) {
         if self.current_mode == mode { return; }
         self.current_mode = mode;
+        crate::VERBOSE_LOG.store(mode == PolicyMode::Security, core::sync::atomic::Ordering::Relaxed);
+        if mode == PolicyMode::Security {
+            // Nothing may stay only in Performance Mode's write-back cache.
+            crate::block::flush_all();
+        }
         println!("\n[POLICY] Switching to {:?} Mode...", mode);
 
         match mode {

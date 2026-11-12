@@ -82,6 +82,7 @@ pub mod nt_gpu3d;
 pub mod nt_sound;
 pub mod entropy;
 pub mod security;
+pub mod sysprof;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;
@@ -136,6 +137,21 @@ macro_rules! serial_print {
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+}
+
+/// Detailed serial logging (loader, modules, thread and exit details): on in
+/// Security Mode, where it is part of the audit trail, off in Performance
+/// Mode, where each byte is an I/O-port write (a VM exit in a VM).
+pub static VERBOSE_LOG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// `serial_println!` while `VERBOSE_LOG` is on.
+#[macro_export]
+macro_rules! trace_println {
+    ($($arg:tt)*) => {
+        if $crate::VERBOSE_LOG.load(core::sync::atomic::Ordering::Relaxed) {
+            $crate::serial_println!($($arg)*);
+        }
+    };
 }
 
 // -----| vga macros |-----
@@ -634,6 +650,9 @@ async fn gui_refresh_task() {
         // Drive the smoltcp network stack — processes incoming Ethernet
         // frames, runs DHCP/DNS, and delivers UDP/TCP data to sockets.
         crate::network::poll();
+        // Performance Mode's lazy writer (block.rs).
+        crate::block::tick(crate::time::now_ms());
+        crate::scheduler::flush_if_due(crate::time::now_ms());
         
         // Drive the distributed mesh layer — sends LAN announcements,
         // polls the discovery UDP socket, and processes incoming packets.
