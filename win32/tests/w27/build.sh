@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the W27 (G5d) Direct3D 9 test (MSVC, /MD) against the real import
+# Build the W27 (G5d, G5e) Direct3D 9 tests (MSVC, /MD) against the real import
 # libraries, copy it to storage/tests/, and record on Windows what this
 # machine's GPU draws (expected/d3d1.ref, a PPM) and what the test prints
 # against it (expected/d3d1.out). Run from anywhere: sh win32/tests/w27/build.sh
@@ -14,7 +14,15 @@ VC="C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36
 OUT=../../../storage/tests
 mkdir -p build expected "$OUT"
 
-for t in d3d1; do
+# d3d2's shaders, compiled by the SDK's fxc into headers (the profile is in
+# each entry point's name: vs11_ is vs_1_1, vs2a_ vs_2_a).
+FXC="$KITS/bin/$KIT_VER/x64/fxc.exe"
+for e in vs11_lit vs20_loop vs20_skin vs20_wave vs11_fog vs11_points vs20_texgen vs2a_dyn vs20_plain vs20_misc vs20_call; do
+    p=$(echo $e | sed 's/^\(..\)\(.\)\(.\)_.*/\1_\2_\3/')
+    "$FXC" /nologo /T $p /E $e /Fh build/d3d2_$e.h /Vn $e d3d2.hlsl >/dev/null
+done
+
+for t in d3d1 d3d2; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \
         $t.c /Fobuild/$t.obj
@@ -26,10 +34,10 @@ done
 
 # On Windows: the reference pixels (this machine's GPU), then the run that
 # compares with them.
-for t in d3d1; do
+for t in d3d1 d3d2; do
     (cd build && ./$t.exe record ../expected/$t.ref >/dev/null)
     cp expected/$t.ref build/$t.ref
     cp expected/$t.ref "$OUT/$t.ref"
     (cd build && ./$t.exe >../expected/$t.out 2>&1; echo "exit $?" >>../expected/$t.out) || true
 done
-echo "built: d3d1.exe"
+echo "built: d3d1.exe d3d2.exe"

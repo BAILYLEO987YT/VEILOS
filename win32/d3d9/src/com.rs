@@ -58,6 +58,7 @@ pub enum Body {
     StateBlock(Box<crate::state::StateBlock>),
     SwapChain,
     Query(u32),
+    Shader(Box<crate::shader::Shader>),
 }
 
 #[repr(C)]

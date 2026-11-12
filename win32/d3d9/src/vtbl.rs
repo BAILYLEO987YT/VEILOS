@@ -116,7 +116,7 @@ pub static IDIRECT3DDEVICE9: Vtbl<119> = Vtbl([
     crate::device::Dev_GetVertexDeclaration as *const (),
     crate::device::Dev_SetFVF as *const (),
     crate::device::Dev_GetFVF as *const (),
-    stub_Dev_CreateVertexShader as *const (),
+    crate::shader::Dev_CreateVertexShader as *const (),
     crate::device::Dev_SetVertexShader as *const (),
     crate::device::Dev_GetVertexShader as *const (),
     crate::device::Dev_SetVertexShaderConstantF as *const (),
@@ -131,7 +131,7 @@ pub static IDIRECT3DDEVICE9: Vtbl<119> = Vtbl([
     crate::device::Dev_GetStreamSourceFreq as *const (),
     crate::device::Dev_SetIndices as *const (),
     crate::device::Dev_GetIndices as *const (),
-    stub_Dev_CreatePixelShader as *const (),
+    crate::shader::Dev_CreatePixelShader as *const (),
     crate::device::Dev_SetPixelShader as *const (),
     crate::device::Dev_GetPixelShader as *const (),
     crate::device::Dev_SetPixelShaderConstantF as *const (),
@@ -195,7 +195,7 @@ pub static IDIRECT3DVERTEXSHADER9: Vtbl<5> = Vtbl([
     crate::com::Unk_AddRef as *const (),
     crate::com::Unk_Release as *const (),
     crate::com::Res_GetDevice as *const (),
-    stub_VS_GetFunction as *const (),
+    crate::shader::VS_GetFunction as *const (),
 ]);
 
 pub static IDIRECT3DPIXELSHADER9: Vtbl<5> = Vtbl([
@@ -203,7 +203,7 @@ pub static IDIRECT3DPIXELSHADER9: Vtbl<5> = Vtbl([
     crate::com::Unk_AddRef as *const (),
     crate::com::Unk_Release as *const (),
     crate::com::Res_GetDevice as *const (),
-    stub_PS_GetFunction as *const (),
+    crate::shader::PS_GetFunction as *const (),
 ]);
 
 pub static IDIRECT3DBASETEXTURE9: Vtbl<17> = Vtbl([
@@ -408,14 +408,6 @@ unsafe extern "system" fn stub_Dev_ProcessVertices() -> i32 {
     unimplemented(b"IDirect3DDevice9::ProcessVertices\0");
     D3DERR_INVALIDCALL
 }
-unsafe extern "system" fn stub_Dev_CreateVertexShader() -> i32 {
-    unimplemented(b"IDirect3DDevice9::CreateVertexShader\0");
-    D3DERR_INVALIDCALL
-}
-unsafe extern "system" fn stub_Dev_CreatePixelShader() -> i32 {
-    unimplemented(b"IDirect3DDevice9::CreatePixelShader\0");
-    D3DERR_INVALIDCALL
-}
 unsafe extern "system" fn stub_Dev_DrawRectPatch() -> i32 {
     unimplemented(b"IDirect3DDevice9::DrawRectPatch\0");
     D3DERR_INVALIDCALL
@@ -426,14 +418,6 @@ unsafe extern "system" fn stub_Dev_DrawTriPatch() -> i32 {
 }
 unsafe extern "system" fn stub_Dev_DeletePatch() -> i32 {
     unimplemented(b"IDirect3DDevice9::DeletePatch\0");
-    D3DERR_INVALIDCALL
-}
-unsafe extern "system" fn stub_VS_GetFunction() -> i32 {
-    unimplemented(b"IDirect3DVertexShader9::GetFunction\0");
-    D3DERR_INVALIDCALL
-}
-unsafe extern "system" fn stub_PS_GetFunction() -> i32 {
-    unimplemented(b"IDirect3DPixelShader9::GetFunction\0");
     D3DERR_INVALIDCALL
 }
 unsafe extern "system" fn stub_VolTex_GetLevelDesc() -> i32 {

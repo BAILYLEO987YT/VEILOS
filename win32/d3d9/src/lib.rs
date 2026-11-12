@@ -14,9 +14,10 @@
 //!   res.rs     surfaces, textures, buffers, declarations, copies
 //!   format.rs  pixel formats, DXT
 //!   draw.rs    the pipeline, draw calls, Clear, Present
+//!   shader.rs  shader bytecode, and vertex shaders run
 //!
-//! Not yet: shaders (G5e), volume textures, cube map sampling, multisampling,
-//! vertex blending, and more than one swap chain.
+//! Not yet: pixel shaders (G5e2), volume textures, cube map sampling,
+//! multisampling, vertex blending, and more than one swap chain.
 
 #![no_std]
 #![allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
@@ -31,6 +32,7 @@ mod device;
 mod draw;
 mod format;
 mod res;
+mod shader;
 mod state;
 mod vtbl;
 

@@ -767,10 +767,10 @@ pub unsafe extern "system" fn Dev_GetIndices(this: *mut Com, out: *mut *mut Com)
     if i.is_null() { S_OK } else { r }
 }
 
-// -----| shaders (G5e): only "none" can be set yet, and constants kept |-----
+// -----| shaders: vertex shaders (shader.rs); pixel shaders not yet (G5e2) |-----
 
 pub unsafe extern "system" fn Dev_SetVertexShader(this: *mut Com, s: *mut Com) -> i32 {
-    if !s.is_null() {
+    if !s.is_null() && !crate::shader::of(s).is_some_and(|s| !s.pixel) {
         return D3DERR_INVALIDCALL;
     }
     dev(this).record(M_VS, |st, counted| {
@@ -784,7 +784,9 @@ pub unsafe extern "system" fn Dev_SetVertexShader(this: *mut Com, s: *mut Com) -
 }
 
 pub unsafe extern "system" fn Dev_GetVertexShader(this: *mut Com, out: *mut *mut Com) -> i32 {
-    put(out, dev(this).state.vs)
+    let s = dev(this).state.vs;
+    let r = unsafe { out_ref(out, s) };
+    if s.is_null() { S_OK } else { r }
 }
 
 pub unsafe extern "system" fn Dev_SetPixelShader(this: *mut Com, s: *mut Com) -> i32 {
@@ -802,7 +804,9 @@ pub unsafe extern "system" fn Dev_SetPixelShader(this: *mut Com, s: *mut Com) ->
 }
 
 pub unsafe extern "system" fn Dev_GetPixelShader(this: *mut Com, out: *mut *mut Com) -> i32 {
-    put(out, dev(this).state.ps)
+    let s = dev(this).state.ps;
+    let r = unsafe { out_ref(out, s) };
+    if s.is_null() { S_OK } else { r }
 }
 
 fn set_consts<T: Copy>(dst: &mut [T], start: u32, src: *const T, n: u32) -> i32 {

@@ -1,0 +1,26 @@
+Direct3D: created
+device: created
+GetRenderTargetData: 0x0
+vertex shaders 2.0 or later: yes
+vertex shader constants >= 256: yes
+GetFunction size matches: yes
+GetVertexShader: the same
+after setting none: none
+constants back: 1.5 -2.0 3.0 4.0 8.0
+integer constant back: 7 -2 3
+boolean constants back: 1 0
+a bad shader: refused
+constant 300: 0x8876086c
+panel 0 (vs_1_1 lighting): ok
+panel 1 (loop over lights): ok
+panel 2 (matrix palette): ok
+panel 3 (wave): ok
+panel 4 (shader fog): ok
+panel 5 (point sizes): ok
+panel 6 (texture coordinates): ok
+panel 7 (dynamic branches): ok
+panel 8 (clip plane): ok
+panel 9 (three streams): ok
+panel 10 (misc operations): ok
+panel 11 (boolean branch): ok
+exit 0

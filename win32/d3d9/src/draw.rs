@@ -289,6 +289,55 @@ struct Source {
     stride: usize,
 }
 
+/// One element of vertex `n`, if its stream has it.
+fn fetch_elem(e: &Element, src: &[Source; 16], n: usize) -> Option<[f32; 4]> {
+    let s = &src[(e.stream as usize).min(15)];
+    let at = n * s.stride + e.offset as usize;
+    let size = type_size(e.etype);
+    if s.ptr.is_null() || size == 0 || at + size > s.len {
+        return None;
+    }
+    Some(fetch(e.etype, unsafe { core::slice::from_raw_parts(s.ptr.add(at), size) }).0)
+}
+
+/// A vertex through a vertex shader: its inputs by the shader's
+/// declarations, its outputs taken as the fixed-function pipeline's
+/// (position, colours, texture coordinates, fog, point size).
+fn vs_vertex(sh: &crate::shader::Shader, ctx: &Ctx, elems: &[Element], src: &[Source; 16], n: usize, k: &crate::shader::VsConsts, planes: &[(usize, [f32; 4])]) -> V {
+    use crate::shader as s;
+    let mut inputs = [[0.0, 0.0, 0.0, 1.0f32]; 16];
+    for dc in sh.decls.iter().filter(|d| d.rtype == s::R_INPUT && d.num < 16) {
+        if let Some(e) = elems.iter().find(|e| e.usage == dc.usage && e.index == dc.index) {
+            if let Some(v) = fetch_elem(e, src, n) {
+                inputs[dc.num as usize] = v;
+            }
+        }
+    }
+    let outs = sh.run_vs(&inputs, k);
+    let get = |u: u8, i: u8| outs.iter().find(|o| o.0 == u && o.1 == i).map(|o| o.2);
+    let mut o = V::default();
+    o.c = get(s::U_POSITION, 0).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    o.d = get(s::U_COLOR, 0).unwrap_or([1.0; 4]).map(|x| x.clamp(0.0, 1.0));
+    o.s = get(s::U_COLOR, 1).unwrap_or([0.0; 4]).map(|x| x.clamp(0.0, 1.0));
+    for (i, slot) in ctx.slots.iter().enumerate() {
+        let Some((_, flags, _)) = slot else { continue };
+        let c = get(s::U_TEXCOORD, i as u8).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let count = (flags & 0xFF) as usize;
+        let q = if flags & 0x100 != 0 && count >= 2 { c[count - 1] } else { 1.0 };
+        o.t[i] = [c[0], c[1], q];
+    }
+    o.fog = match ctx.fog {
+        Fog::Table => o.c[3],
+        _ => get(s::U_FOG, 0).map_or(1.0, |f| f[0]),
+    };
+    o.psize = get(s::U_PSIZE, 0).map_or(ctx.point_size, |p| p[0]).clamp(ctx.point_min_max[0], ctx.point_min_max[1].max(ctx.point_min_max[0]));
+    // With a vertex shader, user clip planes are in clip space.
+    for &(i, p) in planes {
+        o.u[i] = p[0] * o.c[0] + p[1] * o.c[1] + p[2] * o.c[2] + p[3] * o.c[3];
+    }
+    o
+}
+
 fn fetch_vertex(elems: &[Element], src: &[Source; 16], n: usize) -> In {
     let mut v = In { pos: [0.0, 0.0, 0.0, 1.0], pretransformed: false, normal: None, psize: None, diffuse: None, specular: None, tex: [[0.0, 0.0, 0.0, 1.0]; 8], dims: [0; 8] };
     for e in elems {
@@ -1195,7 +1244,8 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
     let ctx = Ctx::new(d);
     let (group, group_ccw, tex_size) = group(d);
     let s = &d.state;
-    let pre = elems.iter().any(|e| e.usage == U_POSITIONT);
+    let vs = crate::shader::of(s.vs).filter(|v| !v.pixel);
+    let pre = vs.is_none() && elems.iter().any(|e| e.usage == U_POSITIONT);
     // Pretransformed vertices fog by z.
     let mut group = group;
     if pre {
@@ -1218,6 +1268,7 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
         planes: if pre { 0 } else { s.rs[rs::CLIPPLANEENABLE] & 63 },
         sprite: s.rs[rs::POINTSPRITEENABLE] != 0,
     };
+    let consts = crate::shader::VsConsts { f: &s.vs_f, i: &s.vs_i, b: &s.vs_b };
     // Each vertex processed once.
     let mut cache: Vec<(usize, V)> = Vec::new();
     let mut verts: Vec<V> = Vec::with_capacity(n);
@@ -1226,7 +1277,10 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
         let v = match cache.binary_search_by_key(&vi, |e| e.0) {
             Ok(j) => cache[j].1,
             Err(j) => {
-                let v = ctx.process(&fetch_vertex(&elems, src, vi));
+                let v = match vs {
+                    Some(sh) => vs_vertex(sh, &ctx, &elems, src, vi, &consts, &ctx.clip_planes),
+                    None => ctx.process(&fetch_vertex(&elems, src, vi)),
+                };
                 if cache.len() < 1 << 16 {
                     cache.insert(j, (vi, v));
                 }

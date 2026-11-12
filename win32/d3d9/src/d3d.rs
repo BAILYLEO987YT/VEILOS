@@ -227,13 +227,22 @@ pub fn caps(t: u32, out: *mut u8) {
     u(184, 0xFF_FFFF); // MaxVertexIndex
     u(188, 16); // MaxStreams
     u(192, 508); // MaxStreamStride
-    // Shaders: none yet (G5e).
-    u(196, 0xFFFE_0000);
+    // Vertex shaders up to vs_3_0; pixel shaders not yet (G5e2).
+    u(196, 0xFFFE_0300);
+    u(200, 256); // MaxVertexShaderConst
     u(204, 0xFFFF_0000);
     u(212, 1 | 0x40); // DevCaps2: STREAMOFFSET, VERTEXELEMENTSCANSHARESTREAMOFFSET
     u(232, 1); // NumberOfAdaptersInGroup
     u(236, 0x3FF); // DeclTypes
     u(240, 1); // NumSimultaneousRTs
     u(244, 0x100 | 0x200 | 0x100_0000 | 0x200_0000); // StretchRectFilterCaps
+    // VS20Caps: predication, flow control 24 deep dynamically and 4
+    // statically, 32 temporaries.
+    u(248, 1);
+    u(252, 24);
+    u(256, 32);
+    u(260, 4);
+    u(288, 65535); // MaxVShaderInstructionsExecuted
+    u(296, 32768); // MaxVertexShader30InstructionSlots
     unsafe { core::ptr::copy_nonoverlapping(c.as_ptr(), out, c.len()) };
 }
