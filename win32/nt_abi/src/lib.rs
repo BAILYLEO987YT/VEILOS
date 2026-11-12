@@ -223,7 +223,13 @@ pub mod sys {
     /// TexArgs*) a texture, 5 write pixels straight in (target,
     /// PixelArgs*), 6 read depth or stencil (target, PixelArgs*).
     pub const VEIL_GPU3D: u32 = BASE + 87;
-    pub const END: u32 = BASE + 88;
+    /// VEIL_SOUND(op, a, b, c): sound streams (src/nt_sound.rs). Ops: 0 open
+    /// (rate, bits << 8 | channels, handle out*), 1 write (stream,
+    /// SoundWrite*), 2 info (stream, SoundInfo* out), 3 control (stream,
+    /// 0 pause / 1 resume / 2 flush / 3 volume, value), 4 device
+    /// (SoundDevice* out). STATUS_DEVICE_DOES_NOT_EXIST with no sound device.
+    pub const VEIL_SOUND: u32 = BASE + 88;
+    pub const END: u32 = BASE + 89;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).

@@ -297,6 +297,8 @@ fn load_and_spawn_pe_inner(
         };
     }
     process_inner.parent_pid.store(options.parent_pid, core::sync::atomic::Ordering::Relaxed);
+    // Security Mode: the parent's capabilities, or the signed-in user's (security.rs).
+    *process_inner.capabilities.lock() = crate::security::caps_for_new(options.parent_pid);
     process_inner.stack_base = stack_base;
     // mapped_pages is transferred to the process at the very end of this
     // function, once nothing else can fail — until then the caller's rollback
@@ -831,6 +833,14 @@ pub fn on_process_exit(process: &Arc<Process>) {
 
     crate::nt_user::process_exited(process.pid);
     crate::nt_registry::process_exited(process.pid as u32);
+
+    // The adaptive scheduler learns from the session that started at launch
+    // (scheduler.rs), and its profiles are saved while they're fresh.
+    if let Some(mut s) = crate::scheduler::SCHEDULER.try_lock() {
+        let tick = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        s.on_process_exit(process.pid as u32, 0, tick);
+        s.flush_profiles();
+    }
 
     // 3. Drop the process's worker threads.
     if let Some(mut tm) = crate::process::THREAD_MANAGER.try_lock() {

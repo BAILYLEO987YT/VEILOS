@@ -38,6 +38,7 @@ mod profile;
 mod rare;
 mod registry;
 mod resource;
+mod sound;
 mod support;
 mod system;
 mod sync;

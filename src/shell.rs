@@ -517,7 +517,7 @@ fn run_action(a: OsAction) {
 
 /// Emulator power-off. Real hardware needs ACPI (not implemented yet): if the
 /// machine is still running afterwards, the user is told.
-fn power_off() {
+pub fn power_off() {
     use x86_64::instructions::port::Port;
     crate::serial_println!("[SHELL] shutdown requested");
     crate::users::USER_DB.lock().save();

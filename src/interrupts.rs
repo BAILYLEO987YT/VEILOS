@@ -962,6 +962,8 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     crate::scheduler::scheduler_tick(tick);
     crate::kusd::tick(tick);
     crate::debugger::profiler_tick(tick);
+    crate::audio::tick(tick);
+    crate::entropy::stir(stack_frame.instruction_pointer.as_u64());
 
     // Wake any SleepFutures whose deadline has been reached.
     // retain() walks the Vec once, calling wake_by_ref() on expired entries
@@ -1017,6 +1019,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     // Fast-Path: Read the raw scancode from the hardware and shove it into the Async Queue.
     // We do ZERO heavy processing in the hardware interrupt layer itself!
     let scancode: u8 = unsafe { port.read() };
+    crate::entropy::stir(scancode as u64);
     crate::task::keyboard::add_scancode(scancode);
 
     end_of_interrupt(InterruptIndex::Keyboard);
@@ -1026,6 +1029,7 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     use x86_64::instructions::port::Port;
     let mut port = Port::new(0x60);
     let packet: u8 = unsafe { port.read() };
+    crate::entropy::stir(packet as u64 | 0x100);
     // Use add_byte_and_process instead of add_byte so MOUSE_STATE is updated
     // immediately inside the ISR. This keeps the cursor moving even when the
     // async executor is permanently frozen after iretq into a user process.

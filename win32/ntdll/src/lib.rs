@@ -117,6 +117,7 @@ syscall_stubs! {
     VeilUserTimer, ZwVeilUserTimer => sys::VEIL_USER_TIMER;
     VeilUserQuery, ZwVeilUserQuery => sys::VEIL_USER_QUERY;
     VeilGpu3d, ZwVeilGpu3d => sys::VEIL_GPU3D;
+    VeilSound, ZwVeilSound => sys::VEIL_SOUND;
 }
 
 #[unsafe(naked)]

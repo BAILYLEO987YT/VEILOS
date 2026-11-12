@@ -79,6 +79,9 @@ pub mod workers;
 pub mod lgpu;
 pub mod raster3d;
 pub mod nt_gpu3d;
+pub mod nt_sound;
+pub mod entropy;
+pub mod security;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;
@@ -222,6 +225,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Calibrate the TSC against the PIT: the clock for delay_us and driver timeouts.
     crate::time::init();
+    crate::entropy::init();
 
     // Set up IDT and Hardware Interrupts (PIC)
     interrupts::init_idt();
@@ -281,6 +285,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Storage first: the filesystems are needed by most of the rest of boot.
     crate::hal::bind(crate::hal::DeviceClass::Storage);
     crate::vfs::ensure_standard_dirs();
+    crate::scheduler::load_profiles();
 
     // Phase 13: the network stack (VirtIO-net + smoltcp) starts when its NIC binds.
     crate::hal::bind(crate::hal::DeviceClass::Network);
@@ -315,6 +320,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // -----| multitasking setup |-----
 
     crate::hal::bind(crate::hal::DeviceClass::Display);
+    crate::hal::bind(crate::hal::DeviceClass::Multimedia);
     // Every class is bound: devices nobody drives can sleep.
     crate::hal::power_down_idle();
     if crate::graphics::FRAMEBUFFER.lock().is_none() {

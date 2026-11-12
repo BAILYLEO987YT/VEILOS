@@ -72,6 +72,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "winmm"
+version = "0.1.0"
+dependencies = [
+ "nt_abi",
+]
+
+[[package]]
 name = "ws2_32"
 version = "0.1.0"
 dependencies = [

@@ -28,10 +28,10 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | ✅ | SATA (AHCI), several disks, GPT/MBR | ✅ | |
 | **1.0** | A common real Ethernet NIC (Intel e1000e/I219 and/or Realtek r8169) | ❌ | Only virtio-net is supported (and bonded). |
 | | Wi-Fi | ❌ | The networks listed in Quick Settings are hard-coded in `apps.rs`. |
-| **1.0** | Audio output (Intel HD Audio) | ❌ | `audio.rs` is only a volume variable. |
-| | Laptop: battery, brightness, lid, touchpad | ❌ | The brightness slider is a variable. |
+| **1.0** | Audio output (Intel HD Audio) | ⚠️ | Done 2026-11-11 in QEMU (`intel-hda` + `hda-output`): `audio.rs` drives the controller and its codec and mixes any number of streams at 48 kHz. The volume slider and the `SOUND` command set the master volume. Real codecs (Realtek etc.) are untested, and there's no input or headphone-jack switching. |
+| | Laptop: battery, brightness, lid, touchpad | ❌ | Since 2026-11-11 the brightness slider dims the picture on its way to the screen (`ui.rs`, never below 10%, on every CPU). There's still no backlight control, and nothing for battery, lid or touchpad. |
 | ✅ | Several displays, runtime resolution | ✅ | In a VM. Set in `/etc/display.cfg`, with no GUI for it. |
-| | Interrupt-driven drivers (MSI) rather than polling | ⚠️ | Wastes power and CPU. Fine for 1.0. |
+| | Interrupt-driven drivers (MSI) rather than polling | ⚠️ | Wastes power and CPU. Fine for 1.0. Looked at 2026-11-12 and left: `pci.rs` reads MSI/MSI-X, but no driver could use an interrupt yet. Kernel code switches threads only cooperatively, and the storage path holds spinlocks across a command, so AHCI can't block or yield while it waits (another thread on that CPU would spin on the same lock forever). It could only halt until the interrupt, which must then be sent to the waiting CPU, or each command waits up to a timer tick (1 ms). The network is polled from the main loop every millisecond, and sound from the timer. Doing it right needs sleeping locks in the storage stack first. |
 
 ## 3. Kernel and system core
 
@@ -40,7 +40,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | ✅ | Preemptive multitasking, SMP, threads | ✅ | |
 | ✅ | Per-process address spaces, memory protection | ✅ | |
 | ✅ | A crashing program doesn't take the OS down | ✅ | Win32 exceptions end the process. |
-| **1.0** | ACPI: real power-off, reboot, power button | ❌ | Power-off only works through QEMU's ports (`shell.rs:518`). The Quick Settings power button only shows a notification. |
+| **1.0** | ACPI: real power-off, reboot, power button | ❌ | Power-off only works through QEMU's and VirtualBox's ports (`shell.rs`, `power_off`). Since 2026-11-11 the Quick Settings power button calls it too (checked in QEMU: the VM powers off), so it now does the same as the menu's Shut down. Real hardware still needs ACPI. |
 | | Sleep / resume (S3) | ❌ | Needs an AML interpreter. |
 | | Swap / pagefile, demand-zero memory | ⚠️ | Images page in from disk. Nothing pages out. |
 | **1.0** | Runs for days without leaking or hanging (soak test) | ⚠️ | Never measured. |
@@ -62,9 +62,9 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | | Requirement | Status | Notes |
 |---|---|---|---|
 | ✅ | Login with hashed passwords, lock screen, sign out | ✅ | PBKDF-SHA256 with 100k rounds. |
-| **1.0** | Security Mode actually enforced on Win32 programs | ⚠️ | The October audit found the capability checks don't cover Win32 file, memory, window and process syscalls. Recheck. |
-| **1.0** | Credential storage (`CredWriteW` etc.) | ❌ | claude.exe's login sits in a plain file. |
-| | Encrypted keys persist across reboots | ⚠️ | The audit had `cen_persist_key` not writing anything. Recheck. |
+| **1.0** | Security Mode actually enforced on Win32 programs | ✅ | Done 2026-11-12 (`src/security.rs`; WIN32_DESIGN.md A3). Each Windows program gets the signed-in user's role capabilities, and its children get its own. The NT services check them: writing, creating and deleting files, starting programs, ending another program or touching its memory outside its own family, the network beyond loopback, windows and 3D. Denials answer ERROR_ACCESS_DENIED / WSAEACCES and show a notification. Checked in QEMU with `win32/tests/w26/sec1.c`: as admin the output is identical to Windows (only an unrelated program's memory is refused), and as guest writes, deletes, new processes and the network are refused while reading and loopback work. git (add, commit, rm, log, status through cmd) runs as admin with no denials. Git Bash's fork wasn't run (no Git Bash on the test disk). Files have no owners yet, so this is per role, not per folder. |
+| **1.0** | Credential storage (`CredWriteW` etc.) | ❌ | claude.exe's login sits in a plain file. The key ledger (§5 below, done 2026-11-12) is what it can be built on: per-user, unlocked by the sign-in password. |
+| | Encrypted keys persist across reboots | ✅ | Done 2026-11-12. Rechecked first: `cen_persist_key` did write, but `cen_init` was never called (so there was no master key and every save failed). The master key was also re-derived from a timer at each boot, `cen_load_keys` parsed nothing, keys and nonces came from counters (predictable keys, and nonces that repeat after a reboot) and nothing ever saved a key. Now each user has a random master key in `/etc/keys/<user>/master.vmk`, encrypted with a key derived from their sign-in password. It's unlocked at sign-in, when their saved keys load, and forgotten at sign-out. A password change re-wraps it; an admin reset removes that user's saved keys, which can't be opened any more. Keys, salts and nonces come from a new kernel random pool (`entropy.rs`). Checked in QEMU with the `KEYS TEST` / `KEYS CHECK` terminal commands: a key saved in one boot decrypts its file after a reboot, and again after a password change. No feature saves keys yet: the clipboard's keys are per entry and stay in memory. |
 | | Firewall / per-app network permission | ❌ | |
 | | TLS certificate revocation | ❌ | |
 
@@ -90,7 +90,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | | Requirement | Status | Notes |
 |---|---|---|---|
 | **1.0** | **A web browser** | ❌ | The biggest single gap. The realistic route is running a Windows browser (Firefox or a Chromium build) with software rendering. That needs more Win32 (DirectWrite/D2D or GDI fallbacks, COM, more of `ws2_32` overlapped I/O) and is a good target to drive the work. |
-| **1.0** | Play music/video | ❌ | Needs audio. A Windows player (e.g. VLC or mpv) would cover it once sound and Win32 audio APIs (WASAPI/waveOut) exist. |
+| **1.0** | Play music/video | ⚠️ | Sound and `winmm` (waveOut, PlaySound, Beep, MessageBeep) work since 2026-11-11. A Windows player (e.g. VLC or mpv) would also want WASAPI or DirectSound, which aren't there yet. |
 | | PDF viewer, zip/unzip in the GUI | ❌ | SumatraPDF or 7-Zip through Win32 would cover them. |
 | ✅ | Classic Win32 GUI programs, console programs | ✅ | Notepad, regedit, cmd, git, cargo, curl, claude.exe. |
 | **1.0** | Install software: run common Windows installers (NSIS/Inno setup.exe, MSI) or a package manager that works | ⚠️ | Portable copy-and-run works. Installers are untested. The October audit found `pkgmgr.rs` faked its build steps. |
@@ -116,7 +116,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 4. **ACPI power-off/reboot** (a minimal AML interpreter, or the `acpi`/`aml` crates).
 5. **Installer.**
 6. **Crash-safe filesystem** (journal on your own FS, or fsck for FAT as a stopgap).
-7. **HD Audio** + Win32 audio APIs.
+7. **HD Audio** + Win32 audio APIs. *(HD Audio and waveOut done in QEMU 2026-11-11; WASAPI/DirectSound left.)*
 8. **A browser running.** This will drag in a lot of the remaining Win32 work.
 9. **Settings and file manager made real**, keyboard layouts, time zone.
 10. **Soak test on real hardware** and an update mechanism.
@@ -135,7 +135,7 @@ Steps 1-4 can be tested in QEMU (OVMF for UEFI, `-device qemu-xhci`, `-device nv
 | Own native format alongside Windows' | ⚠️ | `vnr.rs` / `game_sdk.rs` exist. The October audit found them only initialised and never used. |
 | Security Mode / Performance Mode live switch | ⚠️ | The toggle changes capability bits. The ring-0 "elevate the process" path (`policy::run_task`) has no callers, so Performance Mode does nothing real yet. |
 | Deep-root customisation (behaviour, not just colours) | ⚠️ | VScript (`config.vsh`, `SHELL.VSH`, themes) drives the shell, snapping and clipboard. Scheduler and policy customisation isn't exposed. |
-| Adaptive Resource Engine (learns app usage) | ⚠️ | Profiles exist. The audit found they never learn: `on_process_exit` isn't called for normal apps. |
+| Adaptive Resource Engine (learns app usage) | ⚠️ | Since 2026-11-11 the profiles learn: every process exit records its session (`loader::on_process_exit`) and saves `/SCHEDPRO.BIN`. They are read back once the disk is mounted (before, the load ran before storage existed and always found nothing). Checked in QEMU across a reboot. Still open: the scheduler tracks one session at a time (a child process replaces its parent's), and whether a learned priority changes how threads are actually scheduled hasn't been checked. |
 | Cluster Mode / VEIL-MESH (delegate, compute, offload, storage, controller, hub nodes) | ⚠️ | `distributed.rs`, `task_capsule.rs` and `checkpoint.rs` exist, with an offload policy in `config.vsh`. The audit found screen capture and input injection faked and the mesh GPU backend deferred. Node types other than offload/compute aren't there. |
 | Anti-cheat compatibility / hypervisor | ⚠️ | Scaffolds (`anticheat.rs`, `hypervisor.rs`). |
 

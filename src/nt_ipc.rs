@@ -102,24 +102,9 @@ pub fn sys_info(op: u64, out: u64, size: u64) -> NtStatus {
     }
 }
 
-/// Random bytes: RDRAND where the CPU has it. Elsewhere (QEMU's default CPU)
-/// this is the time stamp counter stirred by a generator, good enough for hash
-/// tables and temp names but NOT for keys.
+/// Random bytes for ProcessPrng and friends: the kernel's pool (entropy.rs).
 fn fill_random(out: &mut [u8]) {
-    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let has_rdrand = unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 30) != 0;
-    for chunk in out.chunks_mut(8) {
-        let mut v = 0u64;
-        let got = has_rdrand && unsafe { core::arch::x86_64::_rdrand64_step(&mut v) } == 1;
-        if !got {
-            // SplitMix64, with the clock mixed in on every step.
-            let mut z = STATE.fetch_add(0x9E37_79B9_7F4A_7C15 ^ crate::time::rdtsc(), Ordering::Relaxed);
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            v = z ^ (z >> 31);
-        }
-        chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
-    }
+    crate::entropy::fill(out);
 }
 
 // -----| named objects |-----

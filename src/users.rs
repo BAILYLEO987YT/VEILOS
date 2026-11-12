@@ -273,6 +273,10 @@ impl User {
         let seed = crate::interrupts::TICKS.load(Ordering::Relaxed) as u32;
         let salt = derive_salt(&self.username, seed);
         self.password_hash = hash_password(new_password, &salt);
+        // The saved keys' master key goes with the password.
+        if let Err(e) = crate::encryption::cen_change_password(&self.username, old_password, new_password) {
+            crate::serial_println!("[CEN] {}: master key not re-wrapped: {}", self.username, e);
+        }
         Ok(())
     }
 
@@ -283,6 +287,8 @@ impl User {
         self.password_hash = hash_password(new_password, &salt);
         self.locked = false;
         self.failed_attempts = 0;
+        // Without the old password their saved keys can't be opened again.
+        crate::encryption::cen_forget_user(&self.username);
     }
 
     /// Unlock a locked account (admin action).
@@ -492,6 +498,7 @@ impl Session {
 
     pub fn logout(&mut self) {
         println!("[SESSION] '{}' logged out.", self.username);
+        crate::encryption::cen_lock_user();
         self.username   = String::new();
         self.logged_in  = false;
         self.locked     = false;

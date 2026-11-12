@@ -28,6 +28,9 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let Some(proc) = crate::process::PROCESSOR.lock().get_active() else {
         return ret(status::INVALID_HANDLE);
     };
+    if let Err(s) = permitted(&proc, id as u32, a0, a1) {
+        return ret(s);
+    }
     let s = match id as u32 {
         sys::NT_TERMINATE_PROCESS => terminate_process(&proc, a0, a1 as NtStatus),
         sys::NT_WRITE_FILE => io(&proc, a0, true),
@@ -104,6 +107,7 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::VEIL_SOCKET => crate::nt_socket::call(&proc, a0, a1, a2, a3),
         sys::VEIL_CONSOLE => crate::nt_console::call(&proc, a0, a1, a2, a3),
         sys::VEIL_GPU3D => crate::nt_gpu3d::call(&proc, a0, a1, a2, a3),
+        sys::VEIL_SOUND => crate::nt_sound::call(&proc, a0, a1, a2, a3),
         sys::VEIL_CREATE_THREAD => crate::nt_process::create_thread(&proc, a0, a1, a2, a3),
         sys::VEIL_CREATE_PROCESS => crate::nt_process::create_process(&proc, a0, a1),
         sys::VEIL_CREATE_PIPE => crate::nt_process::create_pipe(&proc, a0, a1, a2),
@@ -197,6 +201,57 @@ pub fn dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 }
 
 /// NTSTATUS in rax: the 32-bit value, zero-extended.
+/// Security Mode (security.rs): the capability a call needs, checked before
+/// it runs. Opening files is checked in nt_file::create_file, sockets in
+/// nt_socket.rs.
+fn permitted(proc: &Arc<Process>, id: u32, a0: u64, a1: u64) -> Result<(), NtStatus> {
+    use crate::capability::Capability as C;
+    use crate::security::{require, require_on};
+    // The process a handle names, when it isn't this one.
+    let other = |h: u64| -> Option<u32> {
+        if h == CURRENT_PROCESS || h == 0 {
+            return None;
+        }
+        match object(proc, h) {
+            Some(KernelObjectRef::Process(p)) if p.pid != proc.pid => Some(p.pid),
+            _ => None,
+        }
+    };
+    match id {
+        sys::NT_DELETE_FILE => require(proc, C::FsModify, "deleting a file"),
+        sys::NT_SET_INFORMATION_FILE => match stack(4).unwrap_or(0) as u32 {
+            // Rename, link, disposition (and their Ex forms).
+            10 | 11 | 13 | 64 | 65 | 72 => require(proc, C::FsModify, "renaming or deleting a file"),
+            // Times and attributes, allocation, end of file.
+            4 | 19 | 20 => require(proc, C::FsWrite, "changing a file"),
+            _ => Ok(()),
+        },
+        sys::VEIL_CREATE_PROCESS => require(proc, C::ProcFork, "starting a program"),
+        sys::NT_TERMINATE_PROCESS => match other(a0) {
+            Some(pid) => require_on(proc, pid, C::ProcKill, "ending another program"),
+            None => Ok(()),
+        },
+        sys::NT_ALLOCATE_VIRTUAL_MEMORY
+        | sys::NT_ALLOCATE_VIRTUAL_MEMORY_EX
+        | sys::NT_FREE_VIRTUAL_MEMORY
+        | sys::NT_PROTECT_VIRTUAL_MEMORY
+        | sys::NT_QUERY_VIRTUAL_MEMORY
+        | sys::NT_READ_VIRTUAL_MEMORY
+        | sys::NT_WRITE_VIRTUAL_MEMORY
+        | sys::NT_UNMAP_VIEW_OF_SECTION => match other(a0) {
+            Some(pid) => require_on(proc, pid, C::ProcTrace, "another program's memory"),
+            None => Ok(()),
+        },
+        sys::NT_MAP_VIEW_OF_SECTION => match other(a1) {
+            Some(pid) => require_on(proc, pid, C::ProcTrace, "another program's memory"),
+            None => Ok(()),
+        },
+        sys::VEIL_USER_CREATE_WINDOW => require(proc, C::GpuSubmit, "opening a window"),
+        sys::VEIL_GPU3D if a0 == 0 => require(proc, C::GpuSubmit, "3D drawing"),
+        _ => Ok(()),
+    }
+}
+
 fn ret(s: NtStatus) -> u64 {
     s as u32 as u64
 }

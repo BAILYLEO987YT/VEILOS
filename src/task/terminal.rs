@@ -44,7 +44,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from("VEILOS SHELL - AVAILABLE COMMANDS:"));
             history.push(String::from(" FS:      LS [PATH]  CAT [FILE]  HEAD [FILE]  MKDIR [DIR]  RM [FILE]  PWD"));
             history.push(String::from(" PROC:    PS  KILL [PID]  CAPS [PID]"));
-            history.push(String::from(" HW:      DEVICES  DISPLAYS  SLOTS  WORKERS  GPUTEST  RUN"));
+            history.push(String::from(" HW:      DEVICES  DISPLAYS  SLOTS  WORKERS  GPUTEST  SOUND [VOLUME]  RUN"));
             history.push(String::from(" PKG:     PKG LIST  PKG INSTALL [NAME]  PKG REMOVE [NAME]"));
             history.push(String::from(" DEBUG:   TRACE [N]  PROFILE [START|STOP|REPORT]  DBG [ATTACH|BP] [PID/ADDR]"));
             history.push(String::from(" POLICY:  POLICY  POLICY SET [PROFILE] [PID]  MODE [SECURITY|PERFORMANCE]"));
@@ -618,6 +618,57 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(alloc::format!("workers: 64 chunks  1 CPU {} ms  all CPUs {} ms  speedup {}.{}x",
                 seq / 1000, par / 1000, seq / par.max(1), (seq * 10 / par.max(1)) % 10));
             history.push(alloc::format!("chunks run per CPU: {:?}", per_cpu));
+        }
+        "KEYS" => {
+            // KEYS: the keys in memory. KEYS TEST: save a new key and encrypt a
+            // file with it. KEYS CHECK: decrypt that file with the saved keys
+            // (after a reboot and sign-in). See encryption.rs, Section 8.
+            use crate::encryption as cen;
+            let me = crate::users::SESSION.lock().username.clone();
+            let file = alloc::format!("/home/{}/keytest.bin", me);
+            let mut out: Vec<String> = Vec::new();
+            match parts.get(1).copied() {
+                Some("TEST") => {
+                    let r = cen::cen_generate_key(cen::FeatureTag::new("selftest"), cen::SecurityLevel::Standard, None)
+                        .and_then(|h| cen::cen_persist_key(h).map(|_| h))
+                        .and_then(|h| cen::cen_encrypt(h, b"VEILOS key ledger test", None));
+                    match r {
+                        Ok(enc) => {
+                            let ok = crate::vfs::VFS.write_file(&file, &enc).is_ok();
+                            out.push(alloc::format!("keys: saved a key; {} bytes encrypted to {} ({})", enc.len(), file, if ok { "written" } else { "write failed" }));
+                        }
+                        Err(e) => out.push(alloc::format!("keys: {}", e)),
+                    }
+                }
+                Some("CHECK") => {
+                    let enc = crate::vfs::VFS.read_file(&file).unwrap_or_default();
+                    let keys = cen::cen_load_keys(cen::FeatureTag::new("selftest")).unwrap_or_default();
+                    let hit = keys.iter().find_map(|&h| cen::cen_decrypt(h, &enc, None).ok());
+                    out.push(match hit {
+                        Some(p) => alloc::format!("keys: {} saved key(s); decrypted: {}", keys.len(), core::str::from_utf8(&p).unwrap_or("?")),
+                        None => alloc::format!("keys: {} saved key(s); {} not decrypted", keys.len(), file),
+                    });
+                }
+                _ => {
+                    for h in cen::cen_list_keys(None) {
+                        if let Some((f, level, algo, saved)) = cen::cen_key_info(h) {
+                            out.push(alloc::format!("  {} {} {:?} {:?}{}", h, f.as_str(), level, algo, if saved { " saved" } else { "" }));
+                        }
+                    }
+                    out.push(alloc::format!("keys: {} in memory", cen::cen_list_keys(None).len()));
+                }
+            }
+            for l in out {
+                crate::serial_println!("[KEYS] {}", l);
+                history.push(l);
+            }
+        }
+        "SOUND" => {
+            // SOUND [0-100]: the sound device, and the master volume (audio.rs).
+            if let Some(v) = parts.get(1).and_then(|v| v.parse::<u8>().ok()) {
+                crate::audio::set_volume(v);
+            }
+            history.push(alloc::format!("  {}", crate::audio::describe()));
         }
         "RUN" => {
             // RUN <path>: start a Windows program (as double-clicking it does).

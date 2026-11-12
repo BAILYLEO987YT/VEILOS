@@ -457,6 +457,11 @@ pub fn commit_dirty_rect(x: usize, y: usize, w: usize, h: usize) {
 /// Back buffer -> every head the rectangle touches, through the logical GPU:
 /// split into bands and copied on every CPU (lgpu, HAL step 7C).
 fn commit_from(bb_ptr: *mut u32, x: usize, y: usize, w: usize, h: usize) {
+    let bright = crate::desktop::BRIGHTNESS.load(AtomicOrd::Relaxed).clamp(10, 100) as u32;
+    if bright < 100 {
+        commit_dimmed(bb_ptr, x, y, w, h, bright * 256 / 100);
+        return;
+    }
     let src = crate::lgpu::Surface { ptr: bb_ptr, width: screen_w(), height: screen_h(), stride: screen_w() };
     let (x1, y1) = ((x + w).min(screen_w()), (y + h).min(screen_h()));
     for head in crate::graphics::HEADS.lock().iter() {
@@ -469,6 +474,37 @@ fn commit_from(bb_ptr: *mut u32, x: usize, y: usize, w: usize, h: usize) {
         let target = crate::lgpu::Surface { ptr: fb.base_addr as *mut u32, width: fb.width, height: fb.height, stride: fb.stride };
         let dst = crate::lgpu::Rect::new(hx0 - head.x, y, hx1 - head.x, hy1);
         crate::lgpu::execute(&[crate::lgpu::Op::Copy { src, src_x: hx0, src_y: y, dst, transparent: None }], &target);
+    }
+}
+
+/// `commit_from` with every pixel scaled by `k`/256 (the brightness slider):
+/// rows in bands of 16, on every CPU.
+fn commit_dimmed(bb_ptr: *mut u32, x: usize, y: usize, w: usize, h: usize, k: u32) {
+    let (x1, y1) = ((x + w).min(screen_w()), (y + h).min(screen_h()));
+    let sw = screen_w();
+    let bb = bb_ptr as usize;
+    for head in crate::graphics::HEADS.lock().iter() {
+        let fb = &head.fb;
+        let (hx0, hx1) = (x.max(head.x), x1.min(head.x + fb.width));
+        let hy1 = y1.min(fb.height);
+        if hx0 >= hx1 || y >= hy1 {
+            continue;
+        }
+        let (base, stride, hx) = (fb.base_addr as usize, fb.stride, head.x);
+        let bands = (hy1 - y).div_ceil(16);
+        crate::workers::for_each(bands, &|b| {
+            for row in y + b * 16..(y + b * 16 + 16).min(hy1) {
+                for col in hx0..hx1 {
+                    // SAFETY: inside the back buffer and this head's framebuffer.
+                    unsafe {
+                        let p = *((bb as *const u32).add(row * sw + col));
+                        let rb = ((p & 0x00FF_00FF) * k >> 8) & 0x00FF_00FF;
+                        let g = ((p & 0x0000_FF00) * k >> 8) & 0x0000_FF00;
+                        core::ptr::write_volatile((base as *mut u32).add(row * stride + col - hx), rb | g);
+                    }
+                }
+            }
+        });
     }
 }
 

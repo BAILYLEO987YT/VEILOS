@@ -302,6 +302,29 @@ pub fn create_file(proc: &crate::process::Process, out: u64, access: u64, oa: u6
     let existing = stat(&path);
     let want_dir = options & file::DIRECTORY_FILE != 0;
 
+    // Security Mode (security.rs): reading needs fs.read; writing, creating,
+    // replacing or truncating fs.write; deleting fs.modify.
+    {
+        use crate::capability::Capability as C;
+        let creates = matches!(disposition, file::SUPERSEDE | file::CREATE | file::OVERWRITE | file::OVERWRITE_IF)
+            || (disposition == file::OPEN_IF && existing.is_none());
+        // Write data or attributes, append, GENERIC_WRITE, GENERIC_ALL.
+        let writes = access & (file::WRITE_DATA | file::APPEND_DATA | 0x0000_0110 | file::GENERIC_WRITE | 0x1000_0000) != 0;
+        let deletes = access & file::DELETE != 0 || options & file::DELETE_ON_CLOSE != 0;
+        let checks = [
+            (true, C::FsRead, "reading files"),
+            (creates || writes, C::FsWrite, "writing files"),
+            (deletes, C::FsModify, "deleting files"),
+        ];
+        for (needed, cap, what) in checks {
+            if needed {
+                if let Err(s) = crate::security::require(proc, cap, what) {
+                    return s;
+                }
+            }
+        }
+    }
+
     // A deleted file's name is gone at once (as on Windows 11), though its
     // handles go on working. It can't be made again until they've closed.
     if existing.is_none() && find_open(&path).is_some() && disposition != file::OPEN && disposition != file::OVERWRITE {

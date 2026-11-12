@@ -52,7 +52,10 @@ use smoltcp::wire::Ipv4Address;
 static LAST_MB: AtomicBool = AtomicBool::new(false);
 static LAST_RMB: AtomicBool = AtomicBool::new(false);
 
-pub static BRIGHTNESS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(80);
+/// Screen brightness, 0-100 (the Quick Settings slider). With no backlight to
+/// drive, below 100 the picture is dimmed on its way to the screen
+/// (`ui::commit_dirty_rect`), never below 10%.
+pub static BRIGHTNESS: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(100);
 static LAST_MX: AtomicU32  = AtomicU32::new(0);
 static LAST_MY: AtomicU32  = AtomicU32::new(0);
 
@@ -2000,6 +2003,10 @@ impl LoginScreen {
             Ok(()) => {
                 let username = self.username_buf.clone();
                 crate::users::SESSION.lock().login(&username);
+                // The user's saved keys (encryption.rs): unlocked by this password.
+                if let Err(e) = crate::encryption::cen_unlock_user(&username, &self.password_buf) {
+                    crate::serial_println!("[CEN] {}: keys not unlocked: {}", username, e);
+                }
                 DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
                 self.clear_buffers();
                 notify(NotifCategory::Success, "Welcome",
