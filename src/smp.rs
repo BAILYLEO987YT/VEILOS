@@ -201,6 +201,30 @@ pub fn enable_sse() {
         core::arch::asm!("fninit", options(nostack, nomem));
     }
     enable_xsave_query();
+    enable_smep();
+}
+
+/// CR4.SMEP (bit 20), where the CPU has it (CPUID.7.EBX bit 7): the kernel
+/// can't execute a user page, so a kernel bug or exploit can't jump into code
+/// a program supplied. Both modes: it costs nothing. (SMAP, which would also
+/// stop the kernel touching user data outside marked windows, needs STAC/CLAC
+/// around every user-memory access first.)
+fn enable_smep() {
+    let ebx = unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ebx;
+    if ebx & (1 << 7) == 0 {
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            "or  rax, {bit}",
+            "mov cr4, rax",
+            bit = const 1u64 << 20,
+            out("rax") _,
+            options(nostack),
+        );
+    }
+    crate::serial_println!("[SMP] SMEP on");
 }
 
 /// CR4.OSXSAVE (bit 18), where the CPU has XSAVE, with XCR0 = x87 + SSE:
