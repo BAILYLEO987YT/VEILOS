@@ -22,8 +22,10 @@
 // ERROR_ACCESS_DENIED, as on Windows. Each (process, capability) denial is
 // logged once and shown as a notification.
 //
-// Performance Mode turns the checks off (CapabilityChecker::gate does the
-// same for the older checks).
+// Performance Mode (P5) keeps the role's limits (a guest still can't write
+// or reach the network) and relaxes only what Windows doesn't check either:
+// between processes of the signed-in user, ending one or using its memory
+// needs nothing.
 
 use alloc::collections::BTreeSet;
 use spin::Mutex;
@@ -84,9 +86,6 @@ static DENIED: Mutex<BTreeSet<(u32, u64)>> = Mutex::new(BTreeSet::new());
 /// Ok if `proc` has `cap` (or Performance Mode is on), else ACCESS_DENIED,
 /// logged and shown once per process and capability.
 pub fn require(proc: &Process, cap: Capability, what: &str) -> Result<(), NtStatus> {
-    if crate::policy::POLICY.lock().get_mode() == crate::policy::PolicyMode::Performance {
-        return Ok(());
-    }
     if proc.capabilities.lock().has(cap) {
         return Ok(());
     }
@@ -139,6 +138,11 @@ fn ancestor(a: u32, b: u32) -> bool {
 /// needs nothing more; anything else needs `cap`.
 pub fn require_on(proc: &Process, target_pid: u32, cap: Capability, what: &str) -> Result<(), NtStatus> {
     if target_pid == proc.pid || ancestor(proc.pid, target_pid) || ancestor(target_pid, proc.pid) {
+        return Ok(());
+    }
+    // Performance Mode: every program belongs to the signed-in user, which
+    // is all Windows asks.
+    if crate::policy::performance() {
         return Ok(());
     }
     require(proc, cap, what)

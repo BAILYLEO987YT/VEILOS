@@ -25,6 +25,7 @@ impl PolicyManager {
     pub fn set_mode(&mut self, mode: PolicyMode) {
         if self.current_mode == mode { return; }
         self.current_mode = mode;
+        PERFORMANCE.store(mode == PolicyMode::Performance, core::sync::atomic::Ordering::Relaxed);
         crate::VERBOSE_LOG.store(mode == PolicyMode::Security, core::sync::atomic::Ordering::Relaxed);
         if mode == PolicyMode::Security {
             // Nothing may stay only in Performance Mode's write-back cache.
@@ -150,3 +151,11 @@ impl PolicyManager {
 }
 
 pub static POLICY: Mutex<PolicyManager> = Mutex::new(PolicyManager::new());
+
+/// The mode without the lock, for hot paths (the timer interrupt, the disk
+/// cache). Kept equal to POLICY's by `set_mode`.
+pub static PERFORMANCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn performance() -> bool {
+    PERFORMANCE.load(core::sync::atomic::Ordering::Relaxed)
+}

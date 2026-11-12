@@ -496,6 +496,9 @@ impl DesktopWindowManager {
     pub fn focus(&mut self, id: u32) {
         if self.focused_id == Some(id) { return; } // already focused, no Z-change needed
         self.focused_id = Some(id);
+        // Performance Mode's focus boost (kthread.rs) follows the focused window.
+        let owner = self.windows.iter().find(|w| w.id == id).map_or(0, |w| w.owner_pid);
+        crate::kthread::FOREGROUND_PID.store(owner, core::sync::atomic::Ordering::Relaxed);
         let max_z = self.windows.iter().map(|w| w.z_order).max().unwrap_or(0);
 
         // Normalise Z-order if it would overflow i32 (after ~2 billion clicks, but defensive).

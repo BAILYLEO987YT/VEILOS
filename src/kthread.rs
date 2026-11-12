@@ -37,6 +37,11 @@ const USER_STACK_SIZE: usize = 256 * 1024;
 
 /// How long a ring-3 thread runs before the timer may switch away from it.
 pub const USER_SLICE_MS: u64 = 10;
+/// Performance Mode (P4): the focused program's threads run three slices
+/// before another thread on the CPU gets a turn.
+pub const FOREGROUND_SLICE_MS: u64 = 30;
+/// The process owning the focused window (desktop.rs), 0 for none.
+pub static FOREGROUND_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Saved state of a switched-out thread. `fx` must be 16-byte aligned.
 #[repr(C, align(16))]
@@ -336,9 +341,11 @@ pub fn others_ready() -> bool {
 /// interrupted ring 3: switch away once the thread's slice is used up.
 pub fn preempt_from_timer() {
     let cpu = crate::smp::cpu_index();
+    let fg = FOREGROUND_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let slice = if crate::policy::performance() && fg != 0 && current_pid() == fg { FOREGROUND_SLICE_MS } else { USER_SLICE_MS };
     let due = {
         let ct = CPUS[cpu].lock();
-        now_ms().wrapping_sub(ct.slice_start) >= USER_SLICE_MS
+        now_ms().wrapping_sub(ct.slice_start) >= slice
     };
     if due {
         unsafe { reschedule(cpu, State::Ready) };

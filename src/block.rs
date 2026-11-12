@@ -10,7 +10,7 @@
 // write-through and holds 1 MiB; in Performance Mode it is write-back (dirty
 // sectors go to the disk within a second, sorted and merged into large
 // commands, and on FlushFileBuffers, power-off and leaving the mode) and holds
-// 64 MiB, bulk reads included.
+// 64 MiB. Bulk reads bypass it in both modes.
 //
 // On top of a disk sit `Partition`s (MBR primary entries, GPT entries, or
 // the whole disk for a superfloppy). Each is a `vfs::BlockDevice` with
@@ -38,15 +38,15 @@ const BOUNCE_SECTORS: u32 = (BOUNCE_BYTES / SECTOR) as u32;
 /// Performance Mode (P2).
 const CACHE_SECTORS: usize = 2048;
 const CACHE_SECTORS_PERF: usize = 131_072;
-/// In Security Mode, reads larger than this bypass the cache (bulk file data
-/// would only evict the metadata the cache is for). Performance Mode keeps
-/// everything.
+/// Reads larger than this bypass the cache (bulk file data would only evict
+/// the metadata the cache is for). Measured: caching them sector by sector
+/// cost more than it saved, even in Performance Mode.
 const CACHEABLE_READ_SECTORS: u32 = 64;
 /// Performance Mode writes back what's dirty at least this often (ms).
 const WRITE_BACK_MS: u64 = 1000;
 
 fn performance() -> bool {
-    crate::policy::POLICY.lock().get_mode() == crate::policy::PolicyMode::Performance
+    crate::policy::performance()
 }
 
 struct Entry {
@@ -274,7 +274,7 @@ impl Disk {
     pub fn read(&self, lba: u64, buf: &mut [u8]) -> bool {
         let count = (buf.len() / SECTOR) as u32;
         let perf = performance();
-        let cacheable = perf || count <= CACHEABLE_READ_SECTORS;
+        let cacheable = count <= CACHEABLE_READ_SECTORS;
         let mut d = self.inner.lock();
 
         let all_cached = (0..count as u64).all(|i| d.cache.map.contains_key(&(lba + i)));
