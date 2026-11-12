@@ -227,10 +227,11 @@ pub fn caps(t: u32, out: *mut u8) {
     u(184, 0xFF_FFFF); // MaxVertexIndex
     u(188, 16); // MaxStreams
     u(192, 508); // MaxStreamStride
-    // Vertex shaders up to vs_3_0; pixel shaders not yet (G5e2).
+    // Vertex and pixel shaders up to 3.0 (ps_1_x is G5e3).
     u(196, 0xFFFE_0300);
     u(200, 256); // MaxVertexShaderConst
-    u(204, 0xFFFF_0000);
+    u(204, 0xFFFF_0300);
+    u(208, f(1.0)); // PixelShader1xMaxValue
     u(212, 1 | 0x40); // DevCaps2: STREAMOFFSET, VERTEXELEMENTSCANSHARESTREAMOFFSET
     u(232, 1); // NumberOfAdaptersInGroup
     u(236, 0x3FF); // DeclTypes
@@ -242,7 +243,17 @@ pub fn caps(t: u32, out: *mut u8) {
     u(252, 24);
     u(256, 32);
     u(260, 4);
+    // PS20Caps: arbitrary swizzles, gradients, predication, no
+    // dependent-read or texture instruction limits, flow control, 32
+    // temporaries, 512 slots.
+    u(264, 1 | 2 | 4 | 8 | 16);
+    u(268, 24);
+    u(272, 32);
+    u(276, 4);
+    u(280, 512);
     u(288, 65535); // MaxVShaderInstructionsExecuted
+    u(292, 65535); // MaxPShaderInstructionsExecuted
+    u(300, 32768); // MaxPixelShader30InstructionSlots
     u(296, 32768); // MaxVertexShader30InstructionSlots
     unsafe { core::ptr::copy_nonoverlapping(c.as_ptr(), out, c.len()) };
 }

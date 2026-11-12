@@ -754,6 +754,9 @@ impl Ctx {
             group_count: self.groups.len() as u32,
             tri_count: self.tris.len() as u32,
             tris: self.tris.as_ptr() as u64,
+            attrs: 0,
+            attr_len: 0,
+            _pad: 0,
         };
         unsafe { VeilGpu3d(2, self.target, &args as *const _ as u64, 0) };
         self.groups.clear();
@@ -869,7 +872,7 @@ impl Ctx {
                 st
             },
             samplers: {
-                let mut s = [Sampler::default(); k::SLOTS];
+                let mut s = [Sampler::default(); k::SAMPLERS];
                 s[0] = tex.map_or(Sampler::default(), |t| t.0);
                 s[1] = tex2.map_or(Sampler::default(), |t| t.0);
                 s

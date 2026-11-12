@@ -51,6 +51,7 @@ impl<T> Drop for Guard<'_, T> {
 enum Obj {
     Target { w: usize, h: usize, color: Vec<u32>, depth: Vec<u32>, stencil: Vec<u8> },
     Texture(Arc<Texture>),
+    Shader(Arc<PsProgram>),
 }
 
 static OBJS: Lock<Vec<Option<Obj>>> = Lock::new(Vec::new());
@@ -83,12 +84,20 @@ pub unsafe extern "system" fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 
                 0
             }
         }
+        7 => {
+            let pa = unsafe { &*(b as *const PsArgs) };
+            let ins = unsafe { core::slice::from_raw_parts(pa.code as *const PsIns, pa.count as usize) };
+            match ps_program(ins, pa.inputs) {
+                Some(s) => add(&mut l, Obj::Shader(Arc::new(s)), c),
+                None => -1,
+            }
+        }
         1 | 2 | 3 | 5 | 6 => {
             // A draw's textures first (shared), then the target (mutable).
-            let texs: Vec<[Option<Arc<Texture>>; SLOTS]> = if op == 2 {
+            let (texs, shaders): (Vec<[Option<Arc<Texture>>; SAMPLERS]>, Vec<Option<Arc<PsProgram>>>) = if op == 2 {
                 let d = unsafe { &*(b as *const DrawArgs) };
                 let groups = unsafe { core::slice::from_raw_parts(d.groups as *const Group, d.group_count as usize) };
-                groups
+                let texs = groups
                     .iter()
                     .map(|g| {
                         core::array::from_fn(|i| match l.get(g.samplers[i].texture.wrapping_sub(1) as usize) {
@@ -96,9 +105,17 @@ pub unsafe extern "system" fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 
                             _ => None,
                         })
                     })
-                    .collect()
+                    .collect();
+                let shaders = groups
+                    .iter()
+                    .map(|g| match l.get(g.ps.wrapping_sub(1) as usize) {
+                        Some(Some(Obj::Shader(s))) if g.flags & F_SHADER != 0 => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (texs, shaders)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             // Ops 1 and 2: another target's depth and stencil buffers (c).
             let lend = if (op == 1 || op == 2) && c != 0 && c != a {
@@ -120,10 +137,17 @@ pub unsafe extern "system" fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 
                     let d = unsafe { &*(b as *const DrawArgs) };
                     let groups = unsafe { core::slice::from_raw_parts(d.groups as *const Group, d.group_count as usize) };
                     let tris = unsafe { core::slice::from_raw_parts(d.tris as *const Tri, d.tri_count as usize) };
+                    let attrs = if d.attr_len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(d.attrs as *const f32, d.attr_len as usize) } };
                     let passes: Vec<Pass> = groups
                         .iter()
-                        .zip(texs.iter())
-                        .map(|(g, ts)| Pass { g: *g, tex: core::array::from_fn(|i| ts[i].as_deref()) })
+                        .zip(texs.iter().zip(shaders.iter()))
+                        .map(|(g, (ts, ps))| {
+                            let mut g = *g;
+                            if g.flags & F_SHADER != 0 && ps.is_none() {
+                                g.count = 0;
+                            }
+                            Pass { g, tex: core::array::from_fn(|i| ts[i].as_deref()), ps: ps.as_deref(), attrs }
+                        })
                         .collect();
                     let mut y = 0;
                     while y < *h as i32 {

@@ -9,10 +9,10 @@
 //! predicate, sources (type, number, swizzle, modifier, and an address
 //! register token when relatively addressed). DEF's values come raw.
 
-#![allow(dead_code)] // the pixel shader parts are G5e2's
-
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+
+use gfx3d::raster3d::{pf, PsArgs, PsIns, PS_INPUTS};
 
 use crate::com::*;
 use crate::vtbl;
@@ -94,18 +94,15 @@ pub const R_OUTPUT: u8 = 6;
 pub const R_CONSTINT: u8 = 7;
 pub const R_COLOROUT: u8 = 8;
 pub const R_DEPTHOUT: u8 = 9;
-pub const R_SAMPLER: u8 = 10;
 pub const R_CONSTBOOL: u8 = 14;
 pub const R_LOOP: u8 = 15;
 pub const R_MISC: u8 = 17;
-pub const R_LABEL: u8 = 18;
 pub const R_PREDICATE: u8 = 19;
 
 // Usages (D3DDECLUSAGE_*).
 pub const U_POSITION: u8 = 0;
 pub const U_PSIZE: u8 = 4;
 pub const U_TEXCOORD: u8 = 5;
-pub const U_POSITIONT: u8 = 9;
 pub const U_COLOR: u8 = 10;
 pub const U_FOG: u8 = 11;
 
@@ -172,6 +169,16 @@ pub struct Shader {
     pub defb: Vec<(u16, bool)>,
     /// Each label's instruction.
     pub labels: Vec<(u16, usize)>,
+    /// A pixel shader: the kernel's program, and its inputs' usages in
+    /// the order the program numbers them.
+    pub kernel: u64,
+    pub varyings: Vec<(u8, u8)>,
+}
+
+impl Drop for Shader {
+    fn drop(&mut self) {
+        crate::res::close_later(self.kernel);
+    }
 }
 
 fn src_param(t: u32, extra: Option<u32>, vs11: bool) -> Src {
@@ -220,7 +227,20 @@ pub fn parse(tokens: &[u32]) -> Option<Shader> {
         return None;
     }
     let vs11 = !pixel && major == 1;
-    let mut s = Shader { pixel, major, minor, tokens: Vec::new(), ins: Vec::new(), decls: Vec::new(), defs: Vec::new(), defi: Vec::new(), defb: Vec::new(), labels: Vec::new() };
+    let mut s = Shader {
+        pixel,
+        major,
+        minor,
+        tokens: Vec::new(),
+        ins: Vec::new(),
+        decls: Vec::new(),
+        defs: Vec::new(),
+        defi: Vec::new(),
+        defb: Vec::new(),
+        labels: Vec::new(),
+        kernel: 0,
+        varyings: Vec::new(),
+    };
     let mut i = 1;
     loop {
         let t = *tokens.get(i)?;
@@ -827,13 +847,166 @@ pub unsafe extern "system" fn Dev_CreateVertexShader(this: *mut Com, code: *cons
     }
 }
 
-pub unsafe extern "system" fn Dev_CreatePixelShader(_this: *mut Com, _code: *const u32, out: *mut *mut Com) -> i32 {
-    // Pixel shaders are G5e2.
-    let _ = &PS_IIDS;
-    if !out.is_null() {
-        unsafe { *out = core::ptr::null_mut() };
+/// ps_2_0 and later: made into the kernel's program (ps_1_x is G5e3).
+pub unsafe extern "system" fn Dev_CreatePixelShader(this: *mut Com, code: *const u32, out: *mut *mut Com) -> i32 {
+    if code.is_null() || out.is_null() {
+        return D3DERR_INVALIDCALL;
     }
-    D3DERR_INVALIDCALL
+    let tokens = unsafe { core::slice::from_raw_parts(code, length(code)) };
+    let Some(mut s) = parse(tokens).filter(|s| s.pixel && s.major >= 2) else { return D3DERR_INVALIDCALL };
+    let Some((ins, varyings)) = to_kernel(&s) else { return D3DERR_INVALIDCALL };
+    let args = PsArgs { code: ins.as_ptr() as u64, count: ins.len() as u32, inputs: varyings.len() as u32 };
+    let mut h = 0u64;
+    if gfx3d::gpu3d(7, 0, &args as *const _ as u64, &mut h as *mut u64 as u64) != 0 {
+        return D3DERR_INVALIDCALL;
+    }
+    (s.kernel, s.varyings) = (h, varyings);
+    unsafe { *out = Com::new(&vtbl::IDIRECT3DPIXELSHADER9, &PS_IIDS, this, Body::Shader(Box::new(s))) };
+    S_OK
+}
+
+/// A pixel shader as the kernel's instructions (gfx3d's PsIns), and the
+/// usage of each input it numbers. None if it uses what we can't run.
+pub fn to_kernel(s: &Shader) -> Option<(Vec<PsIns>, Vec<(u8, u8)>)> {
+    // Inputs: ps_2_0's colours (v0-1) and texture coordinates (t0-7), or
+    // ps_3_0's declared inputs.
+    let mut varyings: Vec<(u8, u8)> = Vec::new();
+    let mut input_of: Vec<((u8, u16), u32)> = Vec::new();
+    for d in &s.decls {
+        let usage = match d.rtype {
+            R_INPUT if s.major >= 3 => (d.usage, d.index),
+            R_INPUT => (U_COLOR, d.num as u8),
+            R_ADDR => (U_TEXCOORD, d.num as u8),
+            _ => continue,
+        };
+        if varyings.len() == PS_INPUTS {
+            return None;
+        }
+        input_of.push(((d.rtype, d.num), varyings.len() as u32));
+        varyings.push(usage);
+    }
+    let file = |rtype: u8, num: u16| -> Option<(u32, u32)> {
+        Some(match rtype {
+            R_TEMP => (pf::TEMP, num as u32),
+            R_INPUT | R_ADDR => (pf::INPUT, input_of.iter().find(|e| e.0 == (rtype, num))?.1),
+            R_CONST => (pf::CONST, num as u32),
+            11 => (pf::CONST, num as u32 + 2048),
+            R_CONSTINT => (pf::CONSTINT, num as u32),
+            R_CONSTBOOL => (pf::CONSTBOOL, num as u32),
+            R_LOOP => (pf::LOOP, 0),
+            R_PREDICATE => (pf::PRED, 0),
+            R_MISC => (pf::MISC, num as u32),
+            _ => return None,
+        })
+    };
+    let src = |x: &Src| -> Option<u32> {
+        let (f, i) = file(x.rtype, x.num)?;
+        let rel = match x.rel {
+            None => 0,
+            Some((R_LOOP, _, _)) => 1 << 28,
+            Some(_) => return None,
+        };
+        let sw = x.swz[0] as u32 | (x.swz[1] as u32) << 2 | (x.swz[2] as u32) << 4 | (x.swz[3] as u32) << 6;
+        Some(f | i << 4 | sw << 16 | (x.modifier as u32) << 24 | rel)
+    };
+    let dst = |d: &Dst, mask: u8| -> Option<u32> {
+        let (f, i) = match d.rtype {
+            R_COLOROUT if d.num == 0 => (pf::COLOR, 0),
+            // Further render targets aren't kept: written to a scratch temp.
+            R_COLOROUT => (pf::TEMP, 31),
+            R_DEPTHOUT => (pf::DEPTH, 0),
+            t => file(t, d.num)?,
+        };
+        let rel = if matches!(d.rel, Some((R_LOOP, _, _))) { 1 << 28 } else { 0 };
+        Some(f | i << 4 | (mask as u32) << 16 | (d.saturate as u32) << 20 | ((d.shift as u32) & 15) << 24 | rel)
+    };
+    let pred = |p: &Option<Src>| -> u32 {
+        match p {
+            Some(x) => 1 << 31 | (x.swz[0] as u32 | (x.swz[1] as u32) << 2 | (x.swz[2] as u32) << 4 | (x.swz[3] as u32) << 6) << 16 | ((x.modifier == 13) as u32) << 24,
+            None => 0,
+        }
+    };
+    let mut out: Vec<PsIns> = Vec::new();
+    // Where each of the shader's instructions starts in `out`.
+    let mut at: Vec<usize> = Vec::with_capacity(s.ins.len() + 1);
+    for x in &s.ins {
+        at.push(out.len());
+        let mut k = PsIns { op: x.op, ctrl: x.ctrl, sampler: 0, dst: 0, src: [0; 3], pred: pred(&x.pred), jump: 0 };
+        match x.op {
+            M4X4 | M4X3 | M3X4 | M3X3 | M3X2 => {
+                // One DP4 or DP3 a row, each writing its component.
+                let d = x.dst?;
+                let rows = match x.op {
+                    M4X4 | M3X4 => 4,
+                    M4X3 | M3X3 => 3,
+                    _ => 2,
+                };
+                for row in 0..rows {
+                    let mut m = *x.src.get(1)?;
+                    m.num += row as u16;
+                    out.push(PsIns {
+                        op: if matches!(x.op, M4X4 | M4X3) { DP4 } else { DP3 },
+                        dst: dst(&d, d.mask & (1 << row))?,
+                        src: [src(x.src.first()?)?, src(&m)?, 0],
+                        ..k
+                    });
+                }
+                continue;
+            }
+            // texkill names its register as a destination.
+            TEXKILL => {
+                let d = x.dst?;
+                let r = Src { rtype: d.rtype, num: d.num, swz: [0, 1, 2, 3], modifier: 0, rel: None };
+                k.src[0] = src(&r)?;
+            }
+            // texld coordinates, sampler; texldl too.
+            66 | TEXLDL => {
+                k.dst = dst(&x.dst?, x.dst?.mask)?;
+                k.src[0] = src(x.src.first()?)?;
+                k.sampler = x.src.get(1)?.num as u8;
+            }
+            _ => {
+                if let Some(d) = x.dst {
+                    k.dst = dst(&d, d.mask)?;
+                }
+                // SINCOS's extra sources (ps_2_0's constants) aren't needed.
+                for (i, sx) in x.src.iter().enumerate().take(3) {
+                    k.src[i] = src(sx)?;
+                }
+                // IF's boolean, REP and LOOP's integer register numbers.
+                if matches!(x.op, IF | REP) {
+                    k.src[0] = src(x.src.first()?)?;
+                }
+                if x.op == LOOP {
+                    k.src[0] = src(x.src.get(1)?)?;
+                }
+                if matches!(x.op, CALL | CALLNZ) {
+                    if x.op == CALLNZ {
+                        k.src[1] = src(x.src.get(1)?)?;
+                    }
+                    k.src[0] = 0;
+                }
+                if x.op == LABEL {
+                    k.src[0] = 0;
+                }
+            }
+        }
+        out.push(k);
+    }
+    at.push(out.len());
+    // Jumps: to the new places of the shader's instructions, and labels.
+    for (i, x) in s.ins.iter().enumerate() {
+        let j = match x.op {
+            IF | IFC | ELSE | LOOP | REP | ENDLOOP | ENDREP | BREAK | BREAKC | BREAKP => at[x.jump],
+            CALL | CALLNZ => {
+                let l = x.src.first()?.num;
+                at[s.labels.iter().find(|e| e.0 == l)?.1]
+            }
+            _ => continue,
+        };
+        out[at[i]].jump = j as u32;
+    }
+    Some((out, varyings))
 }
 
 unsafe fn get_function(this: *mut Com, data: *mut u8, size: *mut u32) -> i32 {

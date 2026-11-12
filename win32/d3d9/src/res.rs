@@ -168,7 +168,7 @@ impl Surface {
 /// waiting in a batch: closed at the next flush.
 pub static PENDING_CLOSE: crate::dllrt::Lock<Vec<u64>> = crate::dllrt::Lock::new(Vec::new());
 
-fn close_later(h: u64) {
+pub fn close_later(h: u64) {
     if h != 0 {
         PENDING_CLOSE.lock().push(h);
     }

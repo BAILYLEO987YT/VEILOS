@@ -38,6 +38,8 @@ pub struct Params {
 pub struct Batch {
     pub tris: Vec<Tri>,
     pub groups: Vec<Group>,
+    /// Pixel shader planes and constants (raster3d's DrawArgs::attrs).
+    pub attrs: Vec<f32>,
     /// The render target and depth target they're for.
     pub target: u64,
     pub depth: u64,
@@ -77,11 +79,15 @@ impl Device {
                 group_count: b.groups.len() as u32,
                 tri_count: b.tris.len() as u32,
                 tris: b.tris.as_ptr() as u64,
+                attrs: b.attrs.as_ptr() as u64,
+                attr_len: b.attrs.len() as u32,
+                _pad: 0,
             };
             gfx3d::gpu3d(2, b.target, &args as *const _ as u64, b.depth);
         }
         b.tris.clear();
         b.groups.clear();
+        b.attrs.clear();
         for h in core::mem::take(&mut *res::PENDING_CLOSE.lock()) {
             gfx3d::close(h);
         }
@@ -790,7 +796,7 @@ pub unsafe extern "system" fn Dev_GetVertexShader(this: *mut Com, out: *mut *mut
 }
 
 pub unsafe extern "system" fn Dev_SetPixelShader(this: *mut Com, s: *mut Com) -> i32 {
-    if !s.is_null() {
+    if !s.is_null() && !crate::shader::of(s).is_some_and(|s| s.pixel) {
         return D3DERR_INVALIDCALL;
     }
     dev(this).record(M_PS, |st, counted| {

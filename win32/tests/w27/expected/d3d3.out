@@ -1,0 +1,22 @@
+Direct3D: created
+device: created
+GetRenderTargetData: 0x0
+pixel shaders 2.0 or later: yes
+pixel shaders 3.0: yes
+GetFunction size matches: yes
+GetPixelShader: the same
+pixel constant back: 0.25 -1.00 2.00 4.00
+a vertex shader as a pixel shader: refused
+panel 0 (texture times colour): ok
+panel 1 (per-pixel lighting): ok
+panel 2 (two textures mixed): ok
+panel 3 (texkill and cmp): ok
+panel 4 (dependent read): ok
+panel 5 (projected texture): ok
+panel 6 (bias): ok
+panel 7 (math): ok
+panel 8 (shader depth): ok
+panel 9 (fog after a shader): ok
+panel 10 (ps_3_0 loop, vFace, vPos): ok
+panel 11 (ps_3_0 branches): ok
+exit 0

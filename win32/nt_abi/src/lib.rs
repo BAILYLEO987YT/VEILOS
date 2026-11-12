@@ -221,7 +221,8 @@ pub mod sys {
     /// (target, DrawArgs*, depth target), 3 read pixels (target,
     /// ReadArgs*), 4 create (0, TexArgs*, handle out*) or replace (texture,
     /// TexArgs*) a texture, 5 write pixels straight in (target,
-    /// PixelArgs*), 6 read depth or stencil (target, PixelArgs*). A depth
+    /// PixelArgs*), 6 read depth or stencil (target, PixelArgs*), 7 create a
+    /// pixel shader (0, PsArgs*, handle out*). A depth
     /// target (0: the target's own) lends its depth and stencil buffers.
     pub const VEIL_GPU3D: u32 = BASE + 87;
     /// VEIL_SOUND(op, a, b, c): sound streams (src/nt_sound.rs). Ops: 0 open

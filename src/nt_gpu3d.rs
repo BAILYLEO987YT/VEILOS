@@ -73,6 +73,8 @@ pub enum Gpu3d {
     Target(Mutex<Target>),
     /// Replaced whole on update, so a draw holds the version it started with.
     Texture(Mutex<Arc<Texture>>),
+    /// A pixel shader (op 7), never changed once made.
+    Shader(Arc<PsProgram>),
 }
 
 fn obj(proc: &Process, h: u64) -> Option<Arc<Gpu3d>> {
@@ -122,11 +124,18 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
         2 => {
             let Some(args) = read::<DrawArgs>(b) else { return status::ACCESS_VIOLATION };
             let (gn, tn) = (args.group_count as usize, args.tri_count as usize);
-            if gn > 1 << 20 || tn > 1 << 22
+            let an = args.attr_len as usize;
+            if gn > 1 << 20 || tn > 1 << 22 || an > 1 << 26
                 || !ptr_ok(args.groups, gn * core::mem::size_of::<Group>())
                 || !ptr_ok(args.tris, tn * core::mem::size_of::<Tri>())
+                || (an > 0 && !ptr_ok(args.attrs, an * 4))
             {
                 return status::ACCESS_VIOLATION;
+            }
+            let mut attrs: Vec<f32> = Vec::with_capacity(an);
+            unsafe {
+                core::ptr::copy_nonoverlapping(args.attrs as *const f32, attrs.as_mut_ptr(), an);
+                attrs.set_len(an);
             }
             // Copied in: the bands run on CPUs that can't see this process.
             let groups: Vec<Group> = (0..gn).map(|i| unsafe { core::ptr::read_unaligned((args.groups as *const Group).add(i)) }).collect();
@@ -144,13 +153,28 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                     _ => None,
                 }
             };
-            // Each group's slots' textures, held for the draw.
-            let texs: Vec<[Option<Arc<Texture>>; SLOTS]> =
+            // Each group's samplers' textures and its pixel shader, held for
+            // the draw.
+            let texs: Vec<[Option<Arc<Texture>>; SAMPLERS]> =
                 groups.iter().map(|g| core::array::from_fn(|i| tex_of(g.samplers[i].texture))).collect();
+            let shaders: Vec<Option<Arc<PsProgram>>> = groups
+                .iter()
+                .map(|g| match obj(proc, g.ps).as_deref() {
+                    Some(Gpu3d::Shader(s)) if g.flags & F_SHADER != 0 && s.inputs >= g.ps_inputs => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
             let passes: Vec<Pass> = groups
                 .iter()
-                .zip(texs.iter())
-                .map(|(g, ts)| Pass { g: *g, tex: core::array::from_fn(|i| ts[i].as_deref()) })
+                .zip(texs.iter().zip(shaders.iter()))
+                .map(|(g, (ts, ps))| {
+                    let mut g = *g;
+                    // A shaded group whose shader is gone isn't drawn.
+                    if g.flags & F_SHADER != 0 && ps.is_none() {
+                        g.count = 0;
+                    }
+                    Pass { g, tex: core::array::from_fn(|i| ts[i].as_deref()), ps: ps.as_deref(), attrs: &attrs }
+                })
                 .collect();
             with_targets(proc, a, c, |buf| crate::lgpu::execute_3d(buf, &tris, &passes))
         }
@@ -203,6 +227,19 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                     }
                     _ => status::INVALID_HANDLE,
                 }
+            }
+        }
+        // A pixel shader: a = 0, b = PsArgs*, c = handle out.
+        7 => {
+            let Some(pa) = read::<PsArgs>(b) else { return status::ACCESS_VIOLATION };
+            let n = pa.count as usize;
+            if n == 0 || n > 1 << 14 || !ptr_ok(pa.code, n * core::mem::size_of::<PsIns>()) {
+                return status::INVALID_PARAMETER;
+            }
+            let ins: Vec<PsIns> = (0..n).map(|i| unsafe { core::ptr::read_unaligned((pa.code as *const PsIns).add(i)) }).collect();
+            match ps_program(&ins, pa.inputs) {
+                Some(s) => new_handle(proc, Gpu3d::Shader(Arc::new(s)), c),
+                None => status::INVALID_PARAMETER,
             }
         }
         // Write pixels straight in (5) or read depth or stencil out (6):

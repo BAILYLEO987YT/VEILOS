@@ -36,6 +36,8 @@ use alloc::vec::Vec;
 pub const SLOTS: usize = 4;
 /// Texture stages (Direct3D's eight).
 pub const STAGES: usize = 8;
+/// Samplers a pixel shader can use (the first SLOTS serve the stages too).
+pub const SAMPLERS: usize = 16;
 
 /// A vertex in window space, y downwards.
 #[repr(C)]
@@ -94,6 +96,9 @@ pub const F_DST_ALPHA: u32 = 8192;
 /// Colours, specular and per-vertex fog perspective-correct (Direct3D),
 /// not linear in the window (Windows' software OpenGL).
 pub const F_PERSPECTIVE: u32 = 16384;
+/// A pixel shader (`ps`) colours the fragment instead of the texture
+/// stages, from per-primitive planes in DrawArgs' `attrs` (`PsProgram`).
+pub const F_SHADER: u32 = 32768;
 
 /// With a per-pixel fog mode: the vertices' fog values are 1/d, which is
 /// linear in the window where d (Direct3D's w) isn't.
@@ -244,10 +249,19 @@ pub struct Group {
     pub stipple: [u32; 32],
     /// The texture stages, up to the first whose colour op is DISABLE (or 0).
     pub stages: [Stage; STAGES],
-    /// Stage i samples slot i's texture.
-    pub samplers: [Sampler; SLOTS],
+    /// Stage i samples slot i's texture; a pixel shader any of them.
+    pub samplers: [Sampler; SAMPLERS],
     /// D3DRS_TEXTUREFACTOR, 0xAARRGGBB.
     pub tfactor: u32,
+    /// F_SHADER: the pixel shader's handle, how many float4 inputs it has,
+    /// where in `attrs` this group's first primitive's planes are, and its
+    /// constants (224 float4, then 16 int4 as raw bits), and its boolean
+    /// constants (bit i: b_i).
+    pub ps: u64,
+    pub ps_inputs: u32,
+    pub attr_first: u32,
+    pub const_first: u32,
+    pub ps_bools: u32,
 }
 
 #[repr(C)]
@@ -256,6 +270,20 @@ pub struct DrawArgs {
     pub group_count: u32,
     pub tri_count: u32,
     pub tris: u64,
+    /// Pixel shader data (f32): each F_SHADER group's primitives' planes
+    /// (`PsProgram`), and its constants.
+    pub attrs: u64,
+    pub attr_len: u32,
+    pub _pad: u32,
+}
+
+/// VEIL_GPU3D op 7: a pixel shader program, `count` PsIns at `code`.
+#[repr(C)]
+pub struct PsArgs {
+    pub code: u64,
+    pub count: u32,
+    /// How many float4 inputs it reads (at most PS_INPUTS).
+    pub inputs: u32,
 }
 
 #[repr(C)]
@@ -403,10 +431,13 @@ pub struct Buffers {
 unsafe impl Send for Buffers {}
 unsafe impl Sync for Buffers {}
 
-/// A group with its textures looked up.
+/// A group with its textures (and pixel shader, and the batch's shader
+/// data) looked up.
 pub struct Pass<'a> {
     pub g: Group,
-    pub tex: [Option<&'a Texture>; SLOTS],
+    pub tex: [Option<&'a Texture>; SAMPLERS],
+    pub ps: Option<&'a PsProgram>,
+    pub attrs: &'a [f32],
 }
 
 impl Pass<'_> {
@@ -473,11 +504,23 @@ pub fn render_band(buf: Buffers, tris: &[Tri], passes: &[Pass], y0: i32, y1: i32
         if clip[0] >= clip[2] || clip[1] >= clip[3] {
             continue;
         }
-        let used = p.slots_used();
-        for t in &tris[first..end] {
+        let used = if g.flags & F_SHADER != 0 { 0 } else { p.slots_used() };
+        // A pixel shader's primitives each have their planes.
+        let shader = p.ps.filter(|_| g.flags & F_SHADER != 0);
+        let rec_len = PS_HEADER + 12 * g.ps_inputs as usize;
+        let _sse = shader.map(|_| SseGuard::new());
+        for (i, t) in tris[first..end].iter().enumerate() {
+            let rec = shader.and_then(|_| {
+                let at = g.attr_first as usize + i * rec_len;
+                p.attrs.get(at..at + rec_len)
+            });
+            // A shaded primitive without its planes isn't drawn.
+            if shader.is_some() && rec.is_none() {
+                continue;
+            }
             match g.kind {
-                KIND_TRIANGLES => draw_tri(buf, t, p, used, clip),
-                KIND_LINES => draw_line(buf, &t.v[0], &t.v[1], t.v[2].x as i64, p, used, clip),
+                KIND_TRIANGLES => draw_tri(buf, t, p, used, clip, rec),
+                KIND_LINES => draw_line(buf, &t.v[0], &t.v[1], t.v[2].x as i64, p, used, clip, rec),
                 _ => draw_point(buf, &t.v[0], p, used, clip),
             }
         }
@@ -614,10 +657,11 @@ fn combine(op: u32, a1: [i32; 4], a2: [i32; 4], a0: [i32; 4], fa: i32, n: usize)
     out
 }
 
-/// Texturing, specular, fog, the alpha, stencil and depth tests, blending
-/// and the colour mask, for pixel (x, y).
+/// Texturing (or the pixel shader, with the primitive's planes `rec`),
+/// specular, fog, the alpha, stencil and depth tests, blending and the
+/// colour mask, for pixel (x, y).
 #[inline(always)]
-fn fragment(buf: Buffers, p: &Pass, x: usize, y: usize, fr: &Frag) {
+fn fragment(buf: Buffers, p: &Pass, x: usize, y: usize, fr: &Frag, rec: Option<&[f32]>) {
     let at = y * buf.w + x;
     let dat = y * buf.dw + x;
     let g = &p.g;
@@ -631,13 +675,32 @@ fn fragment(buf: Buffers, p: &Pass, x: usize, y: usize, fr: &Frag) {
     }
     let dptr = unsafe { buf.depth.add(dat) };
     let stencil = flags & F_STENCIL != 0;
-    let depth_ok = flags & F_DEPTH_TEST == 0 || depth_pass(g.depth_func, fr.z, unsafe { *dptr });
+    let shader = match (p.ps, rec) {
+        (Some(ps), Some(rec)) if flags & F_SHADER != 0 => Some((ps, rec)),
+        _ => None,
+    };
+    // A shader that writes depth runs before the depth test.
+    let mut z = fr.z;
+    let mut shaded = None;
+    if let Some((ps, rec)) = shader {
+        if ps.writes_depth {
+            let Some((c, d)) = ps.run(p, rec, x, y) else { return };
+            z = d.unwrap_or(z);
+            shaded = Some(c);
+        }
+    }
+    let depth_ok = flags & F_DEPTH_TEST == 0 || depth_pass(g.depth_func, z, unsafe { *dptr });
     // Without a stencil test a failed depth test has no other effect: stop
     // before texturing.
     if !depth_ok && !stencil {
         return;
     }
-    let Some(mut c) = stages(p, fr) else { return };
+    let color = match (shader, shaded) {
+        (_, Some(c)) => Some(c),
+        (Some((ps, rec)), None) => ps.run(p, rec, x, y).map(|r| r.0),
+        _ => stages(p, fr),
+    };
+    let Some(mut c) = color else { return };
     if flags & F_SPECULAR != 0 {
         for i in 0..3 {
             c[i] = (c[i] + fr.spec[i]).min(255);
@@ -675,7 +738,7 @@ fn fragment(buf: Buffers, p: &Pass, x: usize, y: usize, fr: &Frag) {
         }
     }
     if flags & F_DEPTH_TEST != 0 && flags & F_DEPTH_WRITE != 0 {
-        unsafe { *dptr = fr.z };
+        unsafe { *dptr = z };
     }
     let cptr = unsafe { buf.color.add(at) };
     let dst = unsafe { *cptr };
@@ -692,7 +755,7 @@ fn fragment(buf: Buffers, p: &Pass, x: usize, y: usize, fr: &Frag) {
     unsafe { *cptr = (src & m) | (dst & !m & keep) };
 }
 
-fn draw_tri(buf: Buffers, t: &Tri, p: &Pass, used: u32, clip: [i32; 4]) {
+fn draw_tri(buf: Buffers, t: &Tri, p: &Pass, used: u32, clip: [i32; 4], rec: Option<&[f32]>) {
     let mut v = t.v;
     let det = |v: &[Vert; 3]| {
         (v[1].x as i64 - v[0].x as i64) * (v[2].y as i64 - v[0].y as i64)
@@ -857,7 +920,7 @@ fn draw_tri(buf: Buffers, t: &Tri, p: &Pass, used: u32, clip: [i32; 4]) {
                         (u, v, lambda)
                     };
                 }
-                fragment(buf, p, px as usize, py as usize, &fr);
+                fragment(buf, p, px as usize, py as usize, &fr, rec);
             }
             w0 += e12.dx;
             w1 += e20.dx;
@@ -902,7 +965,7 @@ fn lerp_frag(a: &Vert, b: &Vert, t: i64, used: u32, g: &Group) -> Frag {
 /// diamond. Across it, the pixel the line is in at the centre. Values along
 /// it step from the start's at the first pixel drawn, as Windows does. A
 /// stipple pattern counts pixels along from `stipple_at`.
-fn draw_line(buf: Buffers, a: &Vert, b: &Vert, stipple_at: i64, p: &Pass, used: u32, clip: [i32; 4]) {
+fn draw_line(buf: Buffers, a: &Vert, b: &Vert, stipple_at: i64, p: &Pass, used: u32, clip: [i32; 4], rec: Option<&[f32]>) {
     let stipple = p.g.flags & F_LINE_STIPPLE != 0;
     let (pattern, factor) = ((p.g.line_stipple & 0xFFFF) as i64, ((p.g.line_stipple >> 16) as i64).max(1));
     let (dx, dy) = (b.x as i64 - a.x as i64, b.y as i64 - a.y as i64);
@@ -951,7 +1014,7 @@ fn draw_line(buf: Buffers, a: &Vert, b: &Vert, stipple_at: i64, p: &Pass, used: 
             for j in j0..j0 + width {
                 let (px, py) = if xmajor { (i, j) } else { (j, i) };
                 if px >= clip[0] as i64 && px < clip[2] as i64 && py >= clip[1] as i64 && py < clip[3] as i64 {
-                    fragment(buf, p, px as usize, py as usize, &fr);
+                    fragment(buf, p, px as usize, py as usize, &fr, rec);
                 }
             }
         }
@@ -975,7 +1038,7 @@ fn draw_point(buf: Buffers, v: &Vert, p: &Pass, used: u32, clip: [i32; 4]) {
     let fr = lerp_frag(v, v, 0, used, &p.g);
     for py in y0.max(clip[1] as i64)..(y0 + size).min(clip[3] as i64) {
         for px in x0.max(clip[0] as i64)..(x0 + size).min(clip[2] as i64) {
-            fragment(buf, p, px as usize, py as usize, &fr);
+            fragment(buf, p, px as usize, py as usize, &fr, None);
         }
     }
 }
@@ -1343,5 +1406,931 @@ pub fn clear(buf: Buffers, c: &ClearArgs) {
                 *s = (c.stencil as u8 & sm) | (*s & !sm);
             }
         }
+    }
+}
+
+// -----| pixel shaders (WIN32_DESIGN.md G5e2) |-----
+//
+// d3d9.dll turns a pixel shader's bytecode into PsIns (op 7 makes a
+// program of them, checked here once), and gives each shaded primitive a
+// record of planes in DrawArgs' `attrs`: [x0, y0, face, Qa, Qb, Qc], then
+// per input four components' a, then b, then c (12 floats). At pixel
+// centre (X, Y) (the rasterizer's coordinates, +0.5) with dx = X - x0,
+// dy = Y - y0: Q = Qa + Qb dx + Qc dy, and an input is (a + b dx + c dy) / Q,
+// so perspective-correct. A group's constants follow at `const_first`: 224
+// float4, then 16 int4 (raw bits).
+//
+// The arithmetic runs on SSE, in inline assembly (the kernel is built
+// soft-float, so Rust floats would be emulated); the transcendental
+// functions are scalar. `SseGuard` saves and restores the FPU and SSE
+// state around a band's shading: on the calling CPU it's the program's.
+
+/// Inputs a pixel shader can have (ps_3_0's ten, colours, texcoords).
+pub const PS_INPUTS: usize = 12;
+pub const PS_CONSTS: usize = 224;
+/// Floats before the inputs in a primitive's record.
+pub const PS_HEADER: usize = 6;
+/// Floats in a group's constant block.
+pub const PS_CONST_BLOCK: usize = PS_CONSTS * 4 + 64;
+
+/// PsIns register files (bits 0-3 of an operand).
+pub mod pf {
+    pub const TEMP: u32 = 0;
+    pub const INPUT: u32 = 1;
+    pub const CONST: u32 = 2;
+    pub const CONSTINT: u32 = 3;
+    pub const CONSTBOOL: u32 = 4;
+    pub const LOOP: u32 = 5;
+    pub const PRED: u32 = 6;
+    pub const COLOR: u32 = 7;
+    pub const DEPTH: u32 = 8;
+    /// vPos (0), vFace (1).
+    pub const MISC: u32 = 9;
+}
+
+/// One pixel shader instruction. `op` is Direct3D's opcode (D3DSIO_*;
+/// the matrix ones lowered to DP3/DP4 by the DLL; TEX is texld, ctrl 1
+/// projected, 2 biased). Operands:
+///   source: file 0-3, index 4-15, swizzle 16-23, modifier 24-27 (D3DSPSM),
+///           bit 28 indexed by aL
+///   dest:   file 0-3, index 4-15, mask 16-19, saturate 20, shift 24-27
+///           (signed), bit 28 indexed by aL
+///   pred:   0 none, else bit 31, swizzle 16-23, bit 24 negated
+/// `jump`: for IF/IFC/ELSE/LOOP/REP/BREAK*, the matching ELSE/ENDIF or
+/// loop end; for loop ends, the loop start; for CALL/CALLNZ, the label.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PsIns {
+    pub op: u16,
+    pub ctrl: u8,
+    pub sampler: u8,
+    pub dst: u32,
+    pub src: [u32; 3],
+    pub pred: u32,
+    pub jump: u32,
+}
+
+pub struct PsProgram {
+    pub ins: Vec<PsIns>,
+    pub inputs: u32,
+    pub writes_depth: bool,
+    /// Inputs a TEX reads its coordinates straight from (bit i): their
+    /// derivatives give the level of detail.
+    deriv: u32,
+    /// Some TEX reads coordinates it worked out, or DSX/DSY asks: carry
+    /// every register's derivatives along (forward differentiation).
+    dual: bool,
+}
+
+mod sio {
+    pub const MOV: u16 = 1;
+    pub const ADD: u16 = 2;
+    pub const SUB: u16 = 3;
+    pub const MAD: u16 = 4;
+    pub const MUL: u16 = 5;
+    pub const RCP: u16 = 6;
+    pub const RSQ: u16 = 7;
+    pub const DP3: u16 = 8;
+    pub const DP4: u16 = 9;
+    pub const MIN: u16 = 10;
+    pub const MAX: u16 = 11;
+    pub const SLT: u16 = 12;
+    pub const SGE: u16 = 13;
+    pub const EXP: u16 = 14;
+    pub const LOG: u16 = 15;
+    pub const LIT: u16 = 16;
+    pub const DST: u16 = 17;
+    pub const LRP: u16 = 18;
+    pub const FRC: u16 = 19;
+    pub const CALL: u16 = 25;
+    pub const CALLNZ: u16 = 26;
+    pub const LOOP: u16 = 27;
+    pub const RET: u16 = 28;
+    pub const ENDLOOP: u16 = 29;
+    pub const LABEL: u16 = 30;
+    pub const POW: u16 = 32;
+    pub const CRS: u16 = 33;
+    pub const SGN: u16 = 34;
+    pub const ABS: u16 = 35;
+    pub const NRM: u16 = 36;
+    pub const SINCOS: u16 = 37;
+    pub const REP: u16 = 38;
+    pub const ENDREP: u16 = 39;
+    pub const IF: u16 = 40;
+    pub const IFC: u16 = 41;
+    pub const ELSE: u16 = 42;
+    pub const ENDIF: u16 = 43;
+    pub const BREAK: u16 = 44;
+    pub const BREAKC: u16 = 45;
+    pub const TEXKILL: u16 = 65;
+    pub const TEX: u16 = 66;
+    pub const CND: u16 = 80;
+    pub const CMP: u16 = 88;
+    pub const DP2ADD: u16 = 90;
+    pub const DSX: u16 = 91;
+    pub const DSY: u16 = 92;
+    pub const SETP: u16 = 94;
+    pub const TEXLDL: u16 = 95;
+    pub const BREAKP: u16 = 96;
+}
+
+fn sources(op: u16) -> usize {
+    use sio::*;
+    match op {
+        MAD | LRP | CND | CMP | DP2ADD => 3,
+        ADD | SUB | MUL | DP3 | DP4 | MIN | MAX | SLT | SGE | DST | POW | CRS | TEX | TEXLDL | SETP | IFC | BREAKC | CALLNZ => 2,
+        MOV | RCP | RSQ | EXP | LOG | LIT | FRC | SGN | ABS | NRM | SINCOS | TEXKILL | DSX | DSY | REP | IF | LOOP | BREAKP => 1,
+        _ => 0,
+    }
+}
+
+/// Check a pixel shader's instructions; None if they could do harm or
+/// aren't ours to run.
+pub fn ps_program(ins: &[PsIns], inputs: u32) -> Option<PsProgram> {
+    use sio::*;
+    if inputs as usize > PS_INPUTS || ins.is_empty() || ins.len() > 1 << 14 {
+        return None;
+    }
+    let ok_src = |s: u32| {
+        let (f, i) = (s & 15, (s >> 4) & 0xFFF);
+        match f {
+            pf::TEMP => i < 32,
+            pf::INPUT => i < inputs,
+            pf::CONST => (i as usize) < PS_CONSTS,
+            pf::CONSTINT | pf::CONSTBOOL => i < 16,
+            pf::LOOP | pf::PRED => i == 0,
+            pf::MISC => i < 2,
+            _ => false,
+        }
+    };
+    let mut deriv = 0;
+    let mut dual = false;
+    let mut writes_depth = false;
+    for x in ins {
+        let known = matches!(
+            x.op,
+            0 | MOV..=FRC | CALL..=LABEL | POW..=BREAKC | TEXKILL | TEX | CND | CMP | DP2ADD | DSX | DSY | SETP | TEXLDL | BREAKP
+        );
+        if !known || x.jump as usize > ins.len() || x.sampler as usize >= SAMPLERS {
+            return None;
+        }
+        if !x.src[..sources(x.op)].iter().all(|&s| ok_src(s)) {
+            return None;
+        }
+        let has_dst = !matches!(x.op, 0 | CALL | CALLNZ | LOOP | RET | ENDLOOP | LABEL | REP | ENDREP | IF | IFC | ELSE | ENDIF | BREAK | BREAKC | BREAKP | TEXKILL);
+        if has_dst {
+            let (f, i) = (x.dst & 15, (x.dst >> 4) & 0xFFF);
+            let ok = match f {
+                pf::TEMP => i < 32,
+                pf::COLOR | pf::DEPTH | pf::PRED => i == 0,
+                _ => false,
+            };
+            if !ok {
+                return None;
+            }
+            writes_depth |= f == pf::DEPTH;
+        }
+        if matches!(x.op, TEX) {
+            if x.src[0] & 15 == pf::INPUT && x.src[0] & (1 << 28) == 0 && (x.src[0] >> 24) & 15 == 0 {
+                deriv |= 1 << ((x.src[0] >> 4) & 0xFFF);
+            } else {
+                dual = true;
+            }
+        }
+        dual |= matches!(x.op, DSX | DSY);
+    }
+    if dual {
+        deriv = (1 << inputs) - 1;
+    }
+    Some(PsProgram { ins: ins.to_vec(), inputs, writes_depth, deriv, dual })
+}
+
+// -----| SSE |-----
+
+type F4 = [f32; 4];
+
+macro_rules! sse2 {
+    ($op:literal, $a:expr, $b:expr) => {{
+        let (a, b): (&F4, &F4) = ($a, $b);
+        let mut o: F4 = [0.0; 4];
+        unsafe {
+            core::arch::asm!(
+                "movups xmm0, [{a}]",
+                "movups xmm1, [{b}]",
+                concat!($op, " xmm0, xmm1"),
+                "movups [{o}], xmm0",
+                a = in(reg) a.as_ptr(),
+                b = in(reg) b.as_ptr(),
+                o = in(reg) o.as_mut_ptr(),
+                out("xmm0") _,
+                out("xmm1") _,
+                options(nostack)
+            );
+        }
+        o
+    }};
+}
+
+fn add(a: &F4, b: &F4) -> F4 {
+    sse2!("addps", a, b)
+}
+fn sub(a: &F4, b: &F4) -> F4 {
+    sse2!("subps", a, b)
+}
+fn mul(a: &F4, b: &F4) -> F4 {
+    sse2!("mulps", a, b)
+}
+fn div(a: &F4, b: &F4) -> F4 {
+    sse2!("divps", a, b)
+}
+fn min4(a: &F4, b: &F4) -> F4 {
+    sse2!("minps", a, b)
+}
+fn max4(a: &F4, b: &F4) -> F4 {
+    sse2!("maxps", a, b)
+}
+fn sqrt4(a: &F4) -> F4 {
+    sse2!("sqrtps", a, a)
+}
+fn and4(a: &F4, b: &F4) -> F4 {
+    sse2!("andps", a, b)
+}
+/// All-ones where a < b.
+fn lt(a: &F4, b: &F4) -> F4 {
+    sse2!("cmpltps", a, b)
+}
+/// All-ones where a <= b.
+fn le(a: &F4, b: &F4) -> F4 {
+    sse2!("cmpleps", a, b)
+}
+
+fn splat(x: f32) -> F4 {
+    [x; 4]
+}
+
+const ONE: F4 = [1.0; 4];
+const ZERO: F4 = [0.0; 4];
+
+/// The sum of a's components, in every component.
+fn hsum(a: &F4) -> F4 {
+    let mut o: F4 = [0.0; 4];
+    unsafe {
+        core::arch::asm!(
+            "movups xmm0, [{a}]",
+            "movaps xmm1, xmm0",
+            "shufps xmm1, xmm1, 0x4E",
+            "addps xmm0, xmm1",
+            "movaps xmm1, xmm0",
+            "shufps xmm1, xmm1, 0xB1",
+            "addps xmm0, xmm1",
+            "movups [{o}], xmm0",
+            a = in(reg) a.as_ptr(),
+            o = in(reg) o.as_mut_ptr(),
+            out("xmm0") _,
+            out("xmm1") _,
+            options(nostack)
+        );
+    }
+    o
+}
+
+fn dp4(a: &F4, b: &F4) -> F4 {
+    hsum(&mul(a, b))
+}
+
+fn dp3(a: &F4, b: &F4) -> F4 {
+    let mut m = mul(a, b);
+    m[3] = 0.0;
+    hsum(&m)
+}
+
+fn floor4(a: &F4) -> F4 {
+    let mut o: F4 = [0.0; 4];
+    unsafe {
+        core::arch::asm!(
+            "movups xmm0, [{a}]",
+            "cvttps2dq xmm1, xmm0",
+            "cvtdq2ps xmm1, xmm1",
+            // Truncation went up for negatives: take one off there.
+            "movaps xmm2, xmm0",
+            "cmpltps xmm2, xmm1",
+            "movups xmm3, [{one}]",
+            "andps xmm2, xmm3",
+            "subps xmm1, xmm2",
+            "movups [{o}], xmm1",
+            a = in(reg) a.as_ptr(),
+            one = in(reg) ONE.as_ptr(),
+            o = in(reg) o.as_mut_ptr(),
+            out("xmm0") _,
+            out("xmm1") _,
+            out("xmm2") _,
+            out("xmm3") _,
+            options(nostack)
+        );
+    }
+    o
+}
+
+/// Where `mask` is all ones, b; else c.
+fn select(mask: &F4, b: &F4, c: &F4) -> F4 {
+    core::array::from_fn(|i| if mask[i].to_bits() != 0 { b[i] } else { c[i] })
+}
+
+/// 0 ..= 1 to 0 ..= 255, rounded.
+fn to_bytes(a: &F4) -> [i32; 4] {
+    let mut o = [0i32; 4];
+    let k255: F4 = [255.0; 4];
+    let half: F4 = [0.5; 4];
+    unsafe {
+        core::arch::asm!(
+            "movups xmm0, [{a}]",
+            "movups xmm1, [{one}]",
+            "minps xmm0, xmm1",
+            "xorps xmm1, xmm1",
+            "maxps xmm0, xmm1",
+            "movups xmm1, [{k}]",
+            "mulps xmm0, xmm1",
+            "movups xmm1, [{h}]",
+            "addps xmm0, xmm1",
+            "cvttps2dq xmm0, xmm0",
+            "movdqu [{o}], xmm0",
+            a = in(reg) a.as_ptr(),
+            one = in(reg) ONE.as_ptr(),
+            k = in(reg) k255.as_ptr(),
+            h = in(reg) half.as_ptr(),
+            o = in(reg) o.as_mut_ptr(),
+            out("xmm0") _,
+            out("xmm1") _,
+            options(nostack)
+        );
+    }
+    o
+}
+
+/// 4 x i32 to floats.
+fn from_ints(a: &[i32; 4]) -> F4 {
+    let mut o: F4 = [0.0; 4];
+    unsafe {
+        core::arch::asm!(
+            "movdqu xmm0, [{a}]",
+            "cvtdq2ps xmm0, xmm0",
+            "movups [{o}], xmm0",
+            a = in(reg) a.as_ptr(),
+            o = in(reg) o.as_mut_ptr(),
+            out("xmm0") _,
+            options(nostack)
+        );
+    }
+    o
+}
+
+/// Truncated to integers (fixed point by scaling first).
+fn to_ints(a: &F4) -> [i32; 4] {
+    let mut o = [0i32; 4];
+    unsafe {
+        core::arch::asm!(
+            "movups xmm0, [{a}]",
+            "cvttps2dq xmm0, xmm0",
+            "movdqu [{o}], xmm0",
+            a = in(reg) a.as_ptr(),
+            o = in(reg) o.as_mut_ptr(),
+            out("xmm0") _,
+            options(nostack)
+        );
+    }
+    o
+}
+
+/// The FPU and SSE state saved (and MXCSR set: every exception masked,
+/// round to nearest) while it lives.
+pub struct SseGuard {
+    area: alloc::boxed::Box<FxArea>,
+}
+
+#[repr(C, align(16))]
+struct FxArea([u8; 512]);
+
+impl SseGuard {
+    pub fn new() -> SseGuard {
+        let mut area = alloc::boxed::Box::new(FxArea([0; 512]));
+        let csr: u32 = 0x1F80;
+        unsafe {
+            core::arch::asm!("fxsave64 [{a}]", "ldmxcsr [{c}]", a = in(reg) area.0.as_mut_ptr(), c = in(reg) &csr, options(nostack));
+        }
+        SseGuard { area }
+    }
+}
+
+impl Drop for SseGuard {
+    fn drop(&mut self) {
+        unsafe { core::arch::asm!("fxrstor64 [{a}]", a = in(reg) self.area.0.as_ptr(), options(nostack)) };
+    }
+}
+
+// -----| scalar functions |-----
+
+fn fl(x: f32) -> f32 {
+    floor4(&splat(x))[0]
+}
+
+fn exp2f(x: f32) -> f32 {
+    if x > 128.0 {
+        return f32::INFINITY;
+    }
+    if x < -150.0 {
+        return 0.0;
+    }
+    let n = fl(x);
+    let f = (x - n) * core::f32::consts::LN_2;
+    let (mut term, mut sum) = (1.0f32, 1.0f32);
+    for k in 1..12 {
+        term = term * f / k as f32;
+        sum += term;
+    }
+    sum * f32::from_bits(((n as i32 + 127).clamp(1, 254) as u32) << 23)
+}
+
+fn log2f(x: f32) -> f32 {
+    if !(x > 0.0) {
+        return f32::NEG_INFINITY;
+    }
+    if x == f32::INFINITY {
+        return x;
+    }
+    let bits = x.to_bits();
+    let e = ((bits >> 23) & 0xFF) as i32 - 127;
+    let m = f32::from_bits((bits & 0x7F_FFFF) | (127 << 23));
+    let z = (m - 1.0) / (m + 1.0);
+    let (mut t, mut s) = (z, 0.0f32);
+    for k in 0..10 {
+        s += t / (2 * k + 1) as f32;
+        t = t * z * z;
+    }
+    2.0 * s * core::f32::consts::LOG2_E + e as f32
+}
+
+fn sincosf(x: f32) -> (f32, f32) {
+    let tau = 2.0 * core::f32::consts::PI;
+    let x = x - tau * fl(x / tau + 0.5);
+    let (mut s, mut c, mut ts, mut tc) = (0.0f32, 0.0f32, x, 1.0f32);
+    for k in 0..9 {
+        s += ts;
+        c += tc;
+        ts = ts * -x * x / ((2 * k + 2) * (2 * k + 3)) as f32;
+        tc = tc * -x * x / ((2 * k + 1) * (2 * k + 2)) as f32;
+    }
+    (s, c)
+}
+
+fn cmp_scalar(c: u8, a: f32, b: f32) -> bool {
+    match c {
+        1 => a > b,
+        2 => a == b,
+        3 => a >= b,
+        4 => a < b,
+        5 => a != b,
+        6 => a <= b,
+        _ => false,
+    }
+}
+
+// -----| running |-----
+
+impl PsProgram {
+    /// Run for pixel (x, y) of the primitive whose planes are `rec`: its
+    /// colour (0 ..= 255) and depth (0 ..= DEPTH_MAX) if it writes one, or
+    /// None if TEXKILL discards it.
+    pub fn run(&self, p: &Pass, rec: &[f32], x: usize, y: usize) -> Option<([i32; 4], Option<u32>)> {
+        use sio::*;
+        let g = &p.g;
+        let cf = g.const_first as usize;
+        let block = p.attrs.get(cf..cf + PS_CONST_BLOCK)?;
+        let consts = &block[..PS_CONSTS * 4];
+        let ints = &block[PS_CONSTS * 4..];
+        // The inputs, perspective-correct, and the derivatives a TEX needs.
+        let pos = from_ints(&[x as i32, y as i32, 0, 0]);
+        let dx = pos[0] + 0.5 - rec[0];
+        let dy = pos[1] + 0.5 - rec[1];
+        let (vdx, vdy) = (splat(dx), splat(dy));
+        let q = rec[3] + rec[4] * dx + rec[5] * dy;
+        let iq = splat(if q != 0.0 { 1.0 / q } else { 0.0 });
+        // Derivatives are taken at the centre of the pixel's 2x2 quad, as a
+        // GPU's differences across the quad give them.
+        let qpos = from_ints(&[(x & !1) as i32 + 1, (y & !1) as i32 + 1, 0, 0]);
+        let (qdx, qdy) = (splat(qpos[0] - rec[0]), splat(qpos[1] - rec[1]));
+        let qq = rec[3] + rec[4] * qdx[0] + rec[5] * qdy[0];
+        let iqq = splat(if qq != 0.0 { 1.0 / qq } else { 0.0 });
+        let mut inp = [ZERO; PS_INPUTS];
+        let mut dd = [(ZERO, ZERO); PS_INPUTS];
+        for i in 0..self.inputs as usize {
+            let at = PS_HEADER + 12 * i;
+            let pa: &F4 = rec[at..at + 4].try_into().ok()?;
+            let pb: &F4 = rec[at + 4..at + 8].try_into().ok()?;
+            let pc: &F4 = rec[at + 8..at + 12].try_into().ok()?;
+            let v = mul(&add(&add(pa, &mul(pb, &vdx)), &mul(pc, &vdy)), &iq);
+            if self.deriv & (1 << i) != 0 {
+                let vq = mul(&add(&add(pa, &mul(pb, &qdx)), &mul(pc, &qdy)), &iqq);
+                dd[i] = (mul(&sub(pb, &mul(&vq, &splat(rec[4]))), &iqq), mul(&sub(pc, &mul(&vq, &splat(rec[5]))), &iqq));
+            }
+            inp[i] = v;
+        }
+        let misc = [[pos[0], pos[1], 0.0, 0.0], [rec[2]; 4]];
+        let mut r = [ZERO; 32];
+        let mut rd = [(ZERO, ZERO); 32];
+        let mut color: F4 = [0.0, 0.0, 0.0, 1.0];
+        let mut depth = None;
+        let mut pred = [false; 4];
+        let mut al = 0i32;
+        let mut loops: [(usize, i32, i32, i32); 8] = [(0, 0, 0, 0); 8];
+        let mut nl = 0;
+        let mut calls = [0usize; 8];
+        let mut nc = 0;
+        let int_const = |n: u32| -> [i32; 4] { core::array::from_fn(|k| ints.get((n as usize & 15) * 4 + k).map_or(0, |f| f.to_bits() as i32)) };
+        let bool_const = |n: u32| g.ps_bools & (1 << (n & 15)) != 0;
+        let mut pc = 0usize;
+        let mut steps = 0u32;
+        while pc < self.ins.len() {
+            steps += 1;
+            if steps > 1 << 16 {
+                break;
+            }
+            let x = &self.ins[pc];
+            pc += 1;
+            let read = |s: u32, r: &[F4; 32], pred: &[bool; 4], al: i32| -> F4 {
+                let (f, mut i) = (s & 15, ((s >> 4) & 0xFFF) as i32);
+                if s & (1 << 28) != 0 {
+                    i += al;
+                }
+                let v: F4 = match f {
+                    pf::TEMP => r[(i as usize) & 31],
+                    pf::INPUT => inp[(i.max(0) as usize).min(PS_INPUTS - 1)],
+                    pf::CONST => {
+                        let i = i.clamp(0, PS_CONSTS as i32 - 1) as usize * 4;
+                        [consts[i], consts[i + 1], consts[i + 2], consts[i + 3]]
+                    }
+                    pf::CONSTINT => from_ints(&int_const(i as u32)),
+                    pf::CONSTBOOL => splat(if bool_const(i as u32) { 1.0 } else { 0.0 }),
+                    pf::LOOP => from_ints(&[al; 4]),
+                    pf::PRED => pred.map(|b| if b { 1.0 } else { 0.0 }),
+                    pf::MISC => misc[(i as usize) & 1],
+                    _ => ZERO,
+                };
+                let sw = s >> 16;
+                let v: F4 = core::array::from_fn(|k| v[((sw >> (2 * k)) & 3) as usize]);
+                match (s >> 24) & 15 {
+                    1 => v.map(|x| f32::from_bits(x.to_bits() ^ 0x8000_0000)),
+                    2 => sub(&v, &splat(0.5)),
+                    3 => sub(&splat(0.5), &v),
+                    4 => mul(&sub(&v, &splat(0.5)), &splat(2.0)),
+                    5 => mul(&sub(&v, &splat(0.5)), &splat(-2.0)),
+                    6 => sub(&ONE, &v),
+                    7 => add(&v, &v),
+                    8 => sub(&ZERO, &add(&v, &v)),
+                    9 => div(&v, &splat(v[2])),
+                    10 => div(&v, &splat(v[3])),
+                    11 => v.map(|x| f32::from_bits(x.to_bits() & 0x7FFF_FFFF)),
+                    12 => v.map(|x| f32::from_bits(x.to_bits() | 0x8000_0000)),
+                    _ => v,
+                }
+            };
+            let n = sources(x.op);
+            let mut s = [ZERO; 3];
+            for k in 0..n {
+                s[k] = read(x.src[k], &r, &pred, al);
+            }
+            // Their derivatives (dual programs only).
+            let mut sd = [(ZERO, ZERO); 3];
+            if self.dual {
+                for k in 0..n {
+                    sd[k] = read_d(x.src[k], &s[k], &rd, &dd, al);
+                }
+            }
+            match x.op {
+                0 | LABEL => continue,
+                IF => {
+                    if !bool_const((x.src[0] >> 4) & 0xFFF) {
+                        pc = x.jump as usize + 1;
+                    }
+                    continue;
+                }
+                IFC => {
+                    if !cmp_scalar(x.ctrl & 7, s[0][0], s[1][0]) {
+                        pc = x.jump as usize + 1;
+                    }
+                    continue;
+                }
+                ELSE => {
+                    pc = x.jump as usize;
+                    continue;
+                }
+                ENDIF => continue,
+                REP | LOOP => {
+                    let c = int_const((x.src[0] >> 4) & 0xFFF);
+                    if c[0] <= 0 || nl == loops.len() {
+                        pc = x.jump as usize + 1;
+                    } else {
+                        loops[nl] = (pc, c[0], al, if x.op == LOOP { c[2] } else { 0 });
+                        nl += 1;
+                        if x.op == LOOP {
+                            al = c[1];
+                        }
+                    }
+                    continue;
+                }
+                ENDREP | ENDLOOP => {
+                    if nl > 0 {
+                        let l = &mut loops[nl - 1];
+                        l.1 -= 1;
+                        if l.1 > 0 {
+                            al += l.3;
+                            pc = l.0;
+                        } else {
+                            al = l.2;
+                            nl -= 1;
+                        }
+                    }
+                    continue;
+                }
+                BREAK | BREAKC | BREAKP => {
+                    let go = match x.op {
+                        BREAK => true,
+                        BREAKC => cmp_scalar(x.ctrl & 7, s[0][0], s[1][0]),
+                        _ => pred[((x.src[0] >> 16) & 3) as usize] != ((x.src[0] >> 24) & 15 == 13),
+                    };
+                    if go && nl > 0 {
+                        nl -= 1;
+                        al = loops[nl].2;
+                        pc = x.jump as usize + 1;
+                    }
+                    continue;
+                }
+                CALL | CALLNZ => {
+                    let go = x.op == CALL || {
+                        let b = x.src[1];
+                        if b & 15 == pf::PRED { pred[((b >> 16) & 3) as usize] != ((b >> 24) & 15 == 13) } else { bool_const((b >> 4) & 0xFFF) }
+                    };
+                    if go && nc < calls.len() {
+                        calls[nc] = pc;
+                        nc += 1;
+                        pc = x.jump as usize + 1;
+                    }
+                    continue;
+                }
+                RET => {
+                    if nc == 0 {
+                        break;
+                    }
+                    nc -= 1;
+                    pc = calls[nc];
+                    continue;
+                }
+                TEXKILL => {
+                    if s[0].iter().any(|&c| c < 0.0) {
+                        return None;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let (a, b, c) = (&s[0], &s[1], &s[2]);
+            let v: F4 = match x.op {
+                MOV => *a,
+                ADD => add(a, b),
+                SUB => sub(a, b),
+                MUL => mul(a, b),
+                MAD => add(&mul(a, b), c),
+                MIN => min4(a, b),
+                MAX => max4(b, a),
+                SLT => and4(&lt(a, b), &ONE),
+                SGE => and4(&le(b, a), &ONE),
+                DP3 => dp3(a, b),
+                DP4 => dp4(a, b),
+                DP2ADD => splat(a[0] * b[0] + a[1] * b[1] + c[0]),
+                RCP => div(&ONE, &splat(a[0])),
+                RSQ => div(&ONE, &sqrt4(&splat(f32::from_bits(a[0].to_bits() & 0x7FFF_FFFF)))),
+                EXP => splat(exp2f(a[0])),
+                LOG => splat(log2f(f32::from_bits(a[0].to_bits() & 0x7FFF_FFFF))),
+                POW => splat(exp2f(b[0] * log2f(f32::from_bits(a[0].to_bits() & 0x7FFF_FFFF)))),
+                LIT => {
+                    let p = a[3].clamp(-128.0, 128.0);
+                    [1.0, a[0].max(0.0), if a[0] > 0.0 && a[1] > 0.0 { exp2f(p * log2f(a[1])) } else { 0.0 }, 1.0]
+                }
+                DST => [1.0, a[1] * b[1], a[2], b[3]],
+                LRP => add(&mul(a, &sub(b, c)), c),
+                FRC => sub(a, &floor4(a)),
+                CRS => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0], 0.0],
+                SGN => a.map(|x| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }),
+                ABS => a.map(|x| f32::from_bits(x.to_bits() & 0x7FFF_FFFF)),
+                NRM => {
+                    let l = dp3(a, a);
+                    mul(a, &div(&ONE, &sqrt4(&l)))
+                }
+                SINCOS => {
+                    let (sn, cs) = sincosf(a[0]);
+                    [cs, sn, 0.0, 0.0]
+                }
+                CMP => select(&le(&ZERO, a), b, c),
+                CND => select(&lt(&splat(0.5), a), b, c),
+                SETP => core::array::from_fn(|k| if cmp_scalar(x.ctrl & 7, a[k], b[k]) { 1.0 } else { 0.0 }),
+                DSX => sd[0].0,
+                DSY => sd[0].1,
+                TEX | TEXLDL => self.texld(p, x, a, &dd, &sd[0]),
+                _ => ZERO,
+            };
+            let vd = if self.dual { derivative(x.op, &s, &sd, &v) } else { (ZERO, ZERO) };
+            // The destination: shift, saturate, masked and predicated.
+            let d = x.dst;
+            let shift = (((d >> 24) & 15) as i32) << 28 >> 28;
+            let scale = splat(if shift > 0 { (1 << shift) as f32 } else { 1.0 / (1 << -shift) as f32 });
+            let mut v = if shift != 0 { mul(&v, &scale) } else { v };
+            let mut vd = if shift != 0 { (mul(&vd.0, &scale), mul(&vd.1, &scale)) } else { vd };
+            if d & (1 << 20) != 0 {
+                // Clamped: no slope where it was cut.
+                let inside = and4(&le(&ZERO, &v), &le(&v, &ONE));
+                vd = (select(&inside, &vd.0, &ZERO), select(&inside, &vd.1, &ZERO));
+                v = max4(&min4(&v, &ONE), &ZERO);
+            }
+            let mut mask = (d >> 16) & 15;
+            if x.pred != 0 {
+                for k in 0..4 {
+                    if pred[((x.pred >> (16 + 2 * k)) & 3) as usize] == ((x.pred >> 24) & 1 != 0) {
+                        mask &= !(1 << k);
+                    }
+                }
+            }
+            let (f, mut i) = (d & 15, ((d >> 4) & 0xFFF) as i32);
+            if d & (1 << 28) != 0 {
+                i += al;
+            }
+            for k in 0..4 {
+                if mask & (1 << k) == 0 {
+                    continue;
+                }
+                match f {
+                    pf::TEMP => {
+                        r[(i as usize) & 31][k] = v[k];
+                        rd[(i as usize) & 31].0[k] = vd.0[k];
+                        rd[(i as usize) & 31].1[k] = vd.1[k];
+                    }
+                    pf::COLOR => color[k] = v[k],
+                    pf::DEPTH => depth = Some(v[0]),
+                    pf::PRED => pred[k] = v[k] != 0.0,
+                    _ => {}
+                }
+            }
+        }
+        let depth = depth.map(|z| (z.clamp(0.0, 1.0) * DEPTH_MAX as f32) as u32);
+        Some((to_bytes(&color), depth))
+    }
+
+    /// texld (TEX: projected, biased) and texldl: the sampler's texel at
+    /// the coordinates `c`, 0 ..= 1.
+    fn texld(&self, p: &Pass, x: &PsIns, c: &F4, dd: &[(F4, F4); PS_INPUTS], cd: &(F4, F4)) -> F4 {
+        let s = x.sampler as usize;
+        let Some(t) = p.tex[s] else { return [0.0, 0.0, 0.0, 1.0] };
+        let l0 = &t.levels[0];
+        let (tw, th) = (l0.w as f32, l0.h as f32);
+        let mut c = *c;
+        let mut cd = *cd;
+        if x.op == sio::TEX && x.ctrl & 1 != 0 && c[3] != 0.0 {
+            // Projected: (c / w)' = (c' - (c / w) w') / w.
+            let iw = splat(1.0 / c[3]);
+            c = mul(&c, &iw);
+            cd = (mul(&sub(&cd.0, &mul(&c, &splat(cd.0[3]))), &iw), mul(&sub(&cd.1, &mul(&c, &splat(cd.1[3]))), &iw));
+        }
+        // Level of detail: from the input's derivatives (texels per pixel),
+        // or texldl's w.
+        let lambda = if x.op == sio::TEXLDL {
+            (c[3] * 256.0) as i32
+        } else {
+            let src = x.src[0];
+            let direct = src & 15 == pf::INPUT && src & (1 << 28) == 0 && (src >> 24) & 15 == 0 && x.ctrl & 1 == 0;
+            let (ddx, ddy) = if direct {
+                let (ddx, ddy) = dd[(((src >> 4) & 0xFFF) as usize).min(PS_INPUTS - 1)];
+                let sw = src >> 16;
+                let pick = |v: &F4| -> F4 { core::array::from_fn(|k| v[((sw >> (2 * k)) & 3) as usize]) };
+                (pick(&ddx), pick(&ddy))
+            } else {
+                cd
+            };
+            // log2 of the longer of the two steps across the texture, as
+            // GPUs work it out.
+            let (ux, vx, uy, vy) = (ddx[0] * tw, ddx[1] * th, ddy[0] * tw, ddy[1] * th);
+            let len2 = (ux * ux + vx * vx).max(uy * uy + vy * vy);
+            let base = if len2 > 0.0 { (0.5 * log2f(len2) * 256.0).max(-32768.0) as i32 } else { -32768 };
+            base + if x.ctrl & 2 != 0 { (c[3] * 256.0) as i32 } else { 0 }
+        };
+        let u = to_ints(&[c[0] * tw * 256.0, c[1] * th * 256.0, 0.0, 0.0]);
+        let px = sample(t, &p.g.samplers[s], (u[0] as i64) << 8, (u[1] as i64) << 8, lambda);
+        let f = from_ints(&px);
+        mul(&f, &splat(1.0 / 255.0))
+    }
+}
+
+/// A source's derivatives (d/dx, d/dy): the register's, swizzled, with the
+/// modifier's slope.
+fn read_d(s: u32, val: &F4, rd: &[(F4, F4); 32], dd: &[(F4, F4); PS_INPUTS], al: i32) -> (F4, F4) {
+    let (f, mut i) = (s & 15, ((s >> 4) & 0xFFF) as i32);
+    if s & (1 << 28) != 0 {
+        i += al;
+    }
+    let (dx, dy) = match f {
+        pf::TEMP => rd[(i as usize) & 31],
+        pf::INPUT => dd[(i.max(0) as usize).min(PS_INPUTS - 1)],
+        _ => return (ZERO, ZERO),
+    };
+    let sw = s >> 16;
+    let pick = |v: &F4| -> F4 { core::array::from_fn(|k| v[((sw >> (2 * k)) & 3) as usize]) };
+    let (dx, dy) = (pick(&dx), pick(&dy));
+    let k = match (s >> 24) & 15 {
+        1 | 3 | 6 => -1.0,
+        4 | 7 => 2.0,
+        5 | 8 => -2.0,
+        11 => return (val_sign(val, &dx), val_sign(val, &dy)),
+        12 => {
+            let (a, b) = (val_sign(val, &dx), val_sign(val, &dy));
+            return (mul(&a, &splat(-1.0)), mul(&b, &splat(-1.0)));
+        }
+        _ => 1.0,
+    };
+    if k == 1.0 { (dx, dy) } else { (mul(&dx, &splat(k)), mul(&dy, &splat(k))) }
+}
+
+/// d|x| = sign(x) dx (val is already |x|; the sign is the source's).
+fn val_sign(_val: &F4, d: &F4) -> F4 {
+    *d
+}
+
+/// An instruction's result's derivatives from its sources' (s, sd) and
+/// its result v; 0 for what doesn't vary smoothly.
+fn derivative(op: u16, s: &[F4; 3], sd: &[(F4, F4); 3], v: &F4) -> (F4, F4) {
+    use sio::*;
+    let (a, b, c) = (&s[0], &s[1], &s[2]);
+    let each = |f: &dyn Fn(&F4, &F4, &F4) -> F4| (f(&sd[0].0, &sd[1].0, &sd[2].0), f(&sd[0].1, &sd[1].1, &sd[2].1));
+    match op {
+        MOV | FRC => sd[0],
+        ADD => each(&|da, db, _| add(da, db)),
+        SUB => each(&|da, db, _| sub(da, db)),
+        MUL => each(&|da, db, _| add(&mul(da, b), &mul(a, db))),
+        MAD => each(&|da, db, dc| add(&add(&mul(da, b), &mul(a, db)), dc)),
+        DP3 => each(&|da, db, _| add(&dp3(da, b), &dp3(a, db))),
+        DP4 => each(&|da, db, _| add(&dp4(da, b), &dp4(a, db))),
+        DP2ADD => each(&|da, db, dc| splat(da[0] * b[0] + a[0] * db[0] + da[1] * b[1] + a[1] * db[1] + dc[0])),
+        LRP => each(&|da, db, dc| add(&add(&mul(da, &sub(b, c)), &mul(a, &sub(db, dc))), dc)),
+        MIN | MAX => {
+            let first = if op == MIN { le(a, b) } else { le(b, a) };
+            (select(&first, &sd[0].0, &sd[1].0), select(&first, &sd[0].1, &sd[1].1))
+        }
+        CMP => {
+            let m = le(&ZERO, a);
+            (select(&m, &sd[1].0, &sd[2].0), select(&m, &sd[1].1, &sd[2].1))
+        }
+        CND => {
+            let m = lt(&splat(0.5), a);
+            (select(&m, &sd[1].0, &sd[2].0), select(&m, &sd[1].1, &sd[2].1))
+        }
+        ABS => {
+            let neg = lt(a, &ZERO);
+            let f = |d: &F4| select(&neg, &mul(d, &splat(-1.0)), d);
+            (f(&sd[0].0), f(&sd[0].1))
+        }
+        // (1/x)' = -x' / x^2; (x^-1/2)' = -x' / (2 x^3/2); scalar.
+        RCP => {
+            let k = -v[0] * v[0];
+            (splat(k * sd[0].0[0]), splat(k * sd[0].1[0]))
+        }
+        RSQ => {
+            let k = -0.5 * v[0] * v[0] * v[0];
+            (splat(k * sd[0].0[0]), splat(k * sd[0].1[0]))
+        }
+        EXP => {
+            let k = v[0] * core::f32::consts::LN_2;
+            (splat(k * sd[0].0[0]), splat(k * sd[0].1[0]))
+        }
+        LOG => {
+            let k = if a[0] != 0.0 { core::f32::consts::LOG2_E / a[0] } else { 0.0 };
+            (splat(k * sd[0].0[0]), splat(k * sd[0].1[0]))
+        }
+        POW => {
+            // (a^b)' = a^b (b' ln a + b a' / a).
+            let la = if a[0] > 0.0 { log2f(a[0]) * core::f32::consts::LN_2 } else { 0.0 };
+            let ia = if a[0] != 0.0 { b[0] / a[0] } else { 0.0 };
+            let f = |da: &F4, db: &F4| splat(v[0] * (db[0] * la + ia * da[0]));
+            (f(&sd[0].0, &sd[1].0), f(&sd[0].1, &sd[1].1))
+        }
+        SINCOS => {
+            let f = |d: &F4| [-v[1] * d[0], v[0] * d[0], 0.0, 0.0];
+            (f(&sd[0].0), f(&sd[0].1))
+        }
+        NRM => {
+            // (a / |a|)' = a' / |a| - a (a . a') / |a|^3.
+            let il = div(&ONE, &sqrt4(&dp3(a, a)));
+            let f = |d: &F4| {
+                let k = mul(&dp3(a, d), &mul(&il, &il));
+                mul(&sub(d, &mul(a, &k)), &il)
+            };
+            (f(&sd[0].0), f(&sd[0].1))
+        }
+        _ => (ZERO, ZERO),
     }
 }

@@ -22,7 +22,13 @@ for e in vs11_lit vs20_loop vs20_skin vs20_wave vs11_fog vs11_points vs20_texgen
     "$FXC" /nologo /T $p /E $e /Fh build/d3d2_$e.h /Vn $e d3d2.hlsl >/dev/null
 done
 
-for t in d3d1 d3d2; do
+# d3d3's: vertex and pixel shaders.
+for e in vs20_main vs20_proj vs20_fog vs30_main ps20_modulate ps20_light ps20_mix ps20_kill ps20_dependent ps20_proj ps20_bias ps20_math ps20_depth ps20_fog ps30_main ps30_branch; do
+    p=$(echo $e | sed 's/^\(..\)\(.\)\(.\)_.*/\1_\2_\3/')
+    "$FXC" /nologo /T $p /E $e /Fh build/d3d3_$e.h /Vn $e d3d3.hlsl >/dev/null
+done
+
+for t in d3d1 d3d2 d3d3; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \
         $t.c /Fobuild/$t.obj
@@ -34,10 +40,10 @@ done
 
 # On Windows: the reference pixels (this machine's GPU), then the run that
 # compares with them.
-for t in d3d1 d3d2; do
+for t in d3d1 d3d2 d3d3; do
     (cd build && ./$t.exe record ../expected/$t.ref >/dev/null)
     cp expected/$t.ref build/$t.ref
     cp expected/$t.ref "$OUT/$t.ref"
     (cd build && ./$t.exe >../expected/$t.out 2>&1; echo "exit $?" >>../expected/$t.out) || true
 done
-echo "built: d3d1.exe d3d2.exe"
+echo "built: d3d1.exe d3d2.exe d3d3.exe"

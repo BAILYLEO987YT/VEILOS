@@ -303,7 +303,7 @@ fn fetch_elem(e: &Element, src: &[Source; 16], n: usize) -> Option<[f32; 4]> {
 /// A vertex through a vertex shader: its inputs by the shader's
 /// declarations, its outputs taken as the fixed-function pipeline's
 /// (position, colours, texture coordinates, fog, point size).
-fn vs_vertex(sh: &crate::shader::Shader, ctx: &Ctx, elems: &[Element], src: &[Source; 16], n: usize, k: &crate::shader::VsConsts, planes: &[(usize, [f32; 4])]) -> V {
+fn vs_vertex(sh: &crate::shader::Shader, ctx: &Ctx, elems: &[Element], src: &[Source; 16], n: usize, k: &crate::shader::VsConsts, planes: &[(usize, [f32; 4])], vary: &[(u8, u8)], clamp_colors: bool) -> V {
     use crate::shader as s;
     let mut inputs = [[0.0, 0.0, 0.0, 1.0f32]; 16];
     for dc in sh.decls.iter().filter(|d| d.rtype == s::R_INPUT && d.num < 16) {
@@ -335,7 +335,29 @@ fn vs_vertex(sh: &crate::shader::Shader, ctx: &Ctx, elems: &[Element], src: &[So
     for &(i, p) in planes {
         o.u[i] = p[0] * o.c[0] + p[1] * o.c[1] + p[2] * o.c[2] + p[3] * o.c[3];
     }
+    // A pixel shader's inputs, by usage (ps_2_0's colours saturated).
+    for (k, &(u, i)) in vary.iter().enumerate() {
+        let v = get(u, i).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        o.outs[k] = if u == s::U_COLOR && clamp_colors { v.map(|x| x.clamp(0.0, 1.0)) } else { v };
+    }
     o
+}
+
+/// A fixed-function vertex's values as a pixel shader's inputs.
+fn ff_outs(o: &mut V, vary: &[(u8, u8)]) {
+    use crate::shader as s;
+    for (k, &(u, i)) in vary.iter().enumerate() {
+        o.outs[k] = match (u, i) {
+            (s::U_COLOR, 0) => o.d,
+            (s::U_COLOR, 1) => o.s,
+            (s::U_TEXCOORD, n) if (n as usize) < k::SLOTS => {
+                let t = o.t[n as usize];
+                [t[0], t[1], 0.0, t[2]]
+            }
+            (s::U_FOG, 0) => [o.fog; 4],
+            _ => [0.0, 0.0, 0.0, 1.0],
+        };
+    }
 }
 
 fn fetch_vertex(elems: &[Element], src: &[Source; 16], n: usize) -> In {
@@ -384,6 +406,8 @@ struct V {
     /// Distances from the user clip planes.
     u: [f32; 6],
     psize: f32,
+    /// A pixel shader's inputs, in the order its program numbers them.
+    outs: [[f32; 4]; k::PS_INPUTS],
 }
 
 fn lerp_v(a: &V, b: &V, t: f32) -> V {
@@ -397,6 +421,7 @@ fn lerp_v(a: &V, b: &V, t: f32) -> V {
         fog: l(a.fog, b.fog),
         u: core::array::from_fn(|i| l(a.u[i], b.u[i])),
         psize: l(a.psize, b.psize),
+        outs: core::array::from_fn(|i| l4(a.outs[i], b.outs[i])),
     }
 }
 
@@ -826,6 +851,12 @@ struct Out {
     bias: (f64, f64),
     planes: u32,
     sprite: bool,
+    /// A pixel shader: its constant block, and its inputs' usages.
+    ps_consts: Option<Vec<f32>>,
+    vary: Vec<(u8, u8)>,
+    /// Nothing pushed yet: a shaded draw starts a group of its own, since
+    /// its constants may differ from the last draw's.
+    fresh: core::cell::Cell<bool>,
 }
 
 impl Out {
@@ -882,21 +913,31 @@ impl Out {
     }
 }
 
-fn push(d: &mut Device, g: &Group, t: Tri) {
+fn push(d: &mut Device, g: &Group, t: Tri, o: &Out, rec: Option<&[f32]>) {
     let b = &mut d.batch;
-    let same = b.groups.last().is_some_and(|l| {
+    let fresh = o.fresh.replace(false) && o.ps_consts.is_some();
+    let same = !fresh && b.groups.last().is_some_and(|l| {
         let mut l = *l;
-        (l.first, l.count) = (0, 0);
+        (l.first, l.count, l.attr_first, l.const_first) = (0, 0, g.attr_first, g.const_first);
         l == *g
     });
     if !same {
         let mut n = *g;
         n.first = b.tris.len() as u32;
+        // A shaded group: its constants, then its primitives' planes.
+        if let Some(c) = &o.ps_consts {
+            n.const_first = b.attrs.len() as u32;
+            b.attrs.extend_from_slice(c);
+            n.attr_first = b.attrs.len() as u32;
+        }
         b.groups.push(n);
+    }
+    if let Some(r) = rec {
+        b.attrs.extend_from_slice(r);
     }
     b.groups.last_mut().unwrap().count += 1;
     b.tris.push(t);
-    if b.tris.len() >= 1 << 16 {
+    if b.tris.len() >= 1 << 16 || b.attrs.len() >= 1 << 22 {
         d.flush();
     }
 }
@@ -949,14 +990,18 @@ fn triangle(d: &mut Device, o: &Out, a: &V, b: &V, c: &V, provoking: &V) {
             let mut lg = *g;
             (lg.kind, lg.size) = (k::KIND_LINES, k::SUB);
             for i in 0..ws.len() {
-                let kv = o.kverts(&[ws[i], ws[(i + 1) % ws.len()]], zb);
-                push(d, &lg, Tri { v: [kv[0], kv[1], Vert::default()] });
+                let edge = [ws[i], ws[(i + 1) % ws.len()]];
+                let kv = o.kverts(&edge, zb);
+                let rec = o.ps_consts.as_ref().map(|_| record(o, &kv, &edge, if cw { 1.0 } else { -1.0 }));
+                push(d, &lg, Tri { v: [kv[0], kv[1], Vert::default()] }, o, rec.as_deref());
             }
         }
         _ => {
             for i in 1..ws.len() - 1 {
-                let kv = o.kverts(&[ws[0], ws[i], ws[i + 1]], zb);
-                push(d, g, Tri { v: kv });
+                let tri = [ws[0], ws[i], ws[i + 1]];
+                let kv = o.kverts(&tri, zb);
+                let rec = o.ps_consts.as_ref().map(|_| record(o, &kv, &tri, if cw { 1.0 } else { -1.0 }));
+                push(d, g, Tri { v: kv }, o, rec.as_deref());
             }
         }
     }
@@ -970,8 +1015,10 @@ fn line(d: &mut Device, o: &Out, a: &V, b: &V) {
     let Some((a, b)) = (if o.pre { Some((a, b)) } else { clip_line(a, b, o.planes) }) else { return };
     let mut g = o.group;
     (g.kind, g.size) = (k::KIND_LINES, k::SUB);
-    let kv = o.kverts(&[o.window(&a), o.window(&b)], 0.0);
-    push(d, &g, Tri { v: [kv[0], kv[1], Vert::default()] });
+    let ends = [o.window(&a), o.window(&b)];
+    let kv = o.kverts(&ends, 0.0);
+    let rec = o.ps_consts.as_ref().map(|_| record(o, &kv, &ends, 1.0));
+    push(d, &g, Tri { v: [kv[0], kv[1], Vert::default()] }, o, rec.as_deref());
 }
 
 /// A point: a square `psize` across, as two triangles (point sprites
@@ -986,6 +1033,11 @@ fn point_at(d: &mut Device, o: &Out, w: &W) {
             for tc in c.v.t.iter_mut() {
                 *tc = [s, t, 1.0];
             }
+            for (k, &(u, _)) in o.vary.iter().enumerate() {
+                if u == crate::shader::U_TEXCOORD {
+                    c.v.outs[k] = [s, t, 0.0, 1.0];
+                }
+            }
         }
         c
     };
@@ -993,8 +1045,10 @@ fn point_at(d: &mut Device, o: &Out, w: &W) {
     let mut g = o.group;
     g.kind = k::KIND_TRIANGLES;
     let kv = o.kverts(&q, 0.0);
-    push(d, &g, Tri { v: [kv[0], kv[1], kv[2]] });
-    push(d, &g, Tri { v: [kv[0], kv[2], kv[3]] });
+    for (a, b, c) in [(0, 1, 2), (0, 2, 3)] {
+        let rec = o.ps_consts.as_ref().map(|_| record(o, &[kv[a], kv[b], kv[c]], &[q[a], q[b], q[c]], 1.0));
+        push(d, &g, Tri { v: [kv[a], kv[b], kv[c]] }, o, rec.as_deref());
+    }
 }
 
 fn point(d: &mut Device, o: &Out, v: &V) {
@@ -1117,11 +1171,12 @@ fn group(d: &mut Device) -> (Group, Option<Group>, [(f64, f64); k::SLOTS]) {
             constant: t[tss::CONSTANT],
         };
     }
-    let mut samplers = [Sampler::default(); k::SLOTS];
-    let mut sizes = [(0.0, 0.0); k::SLOTS];
+    let ps = crate::shader::of(s.ps).filter(|p| p.pixel);
+    let mut samplers = [Sampler::default(); k::SAMPLERS];
+    let mut sizes = [(0.0, 0.0); k::SAMPLERS];
     let mut need_flush = false;
-    for i in 0..k::SLOTS {
-        if stages[i].color_op <= 1 {
+    for i in 0..if ps.is_some() { k::SAMPLERS } else { k::SLOTS } {
+        if ps.is_none() && stages[i].color_op <= 1 {
             break;
         }
         let tex = s.textures[i];
@@ -1193,16 +1248,37 @@ fn group(d: &mut Device) -> (Group, Option<Group>, [(f64, f64); k::SLOTS]) {
     }
     // The textures, uploaded if they changed.
     let mut g = g;
-    for i in 0..k::SLOTS {
+    for i in 0..k::SAMPLERS {
         if sizes[i].0 > 0.0 {
             g.samplers[i].texture = unsafe { texture(d.state.textures[i]) }.kernel();
         }
+    }
+    // A pixel shader instead of the stages: specular and (ps_3_0) fog are
+    // its own business.
+    if let Some(p) = crate::shader::of(d.state.ps).filter(|p| p.pixel) {
+        g.flags = (g.flags | k::F_SHADER) & !k::F_SPECULAR;
+        if p.major >= 3 {
+            g.flags &= !k::F_FOG;
+        }
+        g.ps = p.kernel;
+        g.ps_inputs = p.varyings.len() as u32;
+        g.stages = Default::default();
+        let mut bools = 0u32;
+        for (i, &b) in d.state.ps_b.iter().enumerate() {
+            if b != 0 {
+                bools |= 1 << i;
+            }
+        }
+        for &(n, b) in &p.defb {
+            bools = (bools & !(1 << (n & 15))) | ((b as u32) << (n & 15));
+        }
+        g.ps_bools = bools;
     }
     let ccw = ccw.map(|mut c| {
         c.samplers = g.samplers;
         c
     });
-    (g, ccw, sizes)
+    (g, ccw, core::array::from_fn(|i| sizes[i]))
 }
 
 // -----| draw calls |-----
@@ -1255,6 +1331,24 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
         g.fog_mode = group.fog_mode;
         g
     });
+    let psh = crate::shader::of(s.ps).filter(|p| p.pixel);
+    let vary: Vec<(u8, u8)> = psh.map(|p| p.varyings.clone()).unwrap_or_default();
+    let ps_consts = psh.map(|p| {
+        let mut c: Vec<f32> = s.ps_f.iter().flatten().copied().collect();
+        c.resize(k::PS_CONSTS * 4, 0.0);
+        for &(n, v) in &p.defs {
+            if (n as usize) < k::PS_CONSTS {
+                c[n as usize * 4..n as usize * 4 + 4].copy_from_slice(&v);
+            }
+        }
+        let mut ints = s.ps_i;
+        for &(n, v) in &p.defi {
+            ints[(n as usize) & 15] = v;
+        }
+        c.extend(ints.iter().flatten().map(|&i| f32::from_bits(i as u32)));
+        c
+    });
+    let clamp_colors = psh.is_none_or(|p| p.major < 3);
     let o = Out {
         group,
         group_ccw,
@@ -1267,6 +1361,9 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
         bias: (s.rsf(rs::DEPTHBIAS) as f64, s.rsf(rs::SLOPESCALEDEPTHBIAS) as f64),
         planes: if pre { 0 } else { s.rs[rs::CLIPPLANEENABLE] & 63 },
         sprite: s.rs[rs::POINTSPRITEENABLE] != 0,
+        ps_consts,
+        vary,
+        fresh: core::cell::Cell::new(true),
     };
     let consts = crate::shader::VsConsts { f: &s.vs_f, i: &s.vs_i, b: &s.vs_b };
     // Each vertex processed once.
@@ -1278,8 +1375,12 @@ fn draw(d: &mut Device, t: u32, count: u32, src: &[Source; 16], index: &dyn Fn(u
             Ok(j) => cache[j].1,
             Err(j) => {
                 let v = match vs {
-                    Some(sh) => vs_vertex(sh, &ctx, &elems, src, vi, &consts, &ctx.clip_planes),
-                    None => ctx.process(&fetch_vertex(&elems, src, vi)),
+                    Some(sh) => vs_vertex(sh, &ctx, &elems, src, vi, &consts, &ctx.clip_planes, &o.vary, clamp_colors),
+                    None => {
+                        let mut v = ctx.process(&fetch_vertex(&elems, src, vi));
+                        ff_outs(&mut v, &o.vary);
+                        v
+                    }
                 };
                 if cache.len() < 1 << 16 {
                     cache.insert(j, (vi, v));
@@ -1500,4 +1601,53 @@ pub unsafe extern "system" fn Dev_Present(this: *mut Com, src: *const [i32; 4], 
         ReleaseDC(win, hdc);
     }
     S_OK
+}
+
+/// A shaded primitive's record for the kernel: [x0, y0, face, Q planes],
+/// then each input's planes (a, b, c over four components), each value v
+/// as v q, so the kernel's (v q) / q is perspective-correct. For a line,
+/// the gradient runs along it.
+fn record(o: &Out, kv: &[Vert], ws: &[W], face: f32) -> Vec<f32> {
+    let n = o.vary.len();
+    let mut r = Vec::with_capacity(k::PS_HEADER + 12 * n);
+    let pos = |i: usize| (kv[i].x as f64 / SUB, kv[i].y as f64 / SUB);
+    let q = |i: usize| kv[i].q as f64 / FX;
+    let (x0, y0) = pos(0);
+    // The plane through (0, 0, f0), (x1, y1, f1), (x2, y2, f2), relative to
+    // vertex 0.
+    let solve: alloc::boxed::Box<dyn Fn(&[f64]) -> [f64; 3]> = if kv.len() >= 3 {
+        let ((ax, ay), (bx, by)) = (pos(1), pos(2));
+        let (x1, y1, x2, y2) = (ax - x0, ay - y0, bx - x0, by - y0);
+        let det = x1 * y2 - x2 * y1;
+        alloc::boxed::Box::new(move |f: &[f64]| {
+            if det == 0.0 {
+                return [f[0], 0.0, 0.0];
+            }
+            let (d1, d2) = (f[1] - f[0], f[2] - f[0]);
+            [f[0], (d1 * y2 - d2 * y1) / det, (d2 * x1 - d1 * x2) / det]
+        })
+    } else {
+        let (ax, ay) = pos(1);
+        let (dx, dy) = (ax - x0, ay - y0);
+        let l2 = dx * dx + dy * dy;
+        alloc::boxed::Box::new(move |f: &[f64]| {
+            let d = f[1] - f[0];
+            if l2 == 0.0 { [f[0], 0.0, 0.0] } else { [f[0], d * dx / l2, d * dy / l2] }
+        })
+    };
+    let qs: Vec<f64> = (0..kv.len()).map(q).collect();
+    let qp = solve(&qs);
+    r.extend_from_slice(&[x0 as f32, y0 as f32, face, qp[0] as f32, qp[1] as f32, qp[2] as f32]);
+    for i in 0..n {
+        let planes: [[f64; 3]; 4] = core::array::from_fn(|c| {
+            let f: Vec<f64> = (0..kv.len()).map(|v| ws[v].v.outs[i][c] as f64 * qs[v]).collect();
+            solve(&f)
+        });
+        for part in 0..3 {
+            for c in 0..4 {
+                r.push(planes[c][part] as f32);
+            }
+        }
+    }
+    r
 }
