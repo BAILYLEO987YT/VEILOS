@@ -1,0 +1,69 @@
+Direct3D: created
+device: created
+D3DRS_LIGHTING = 1
+D3DRS_ZENABLE = 1
+D3DRS_CULLMODE = 3
+D3DRS_ZFUNC = 4
+D3DRS_SRCBLEND = 2
+D3DRS_DESTBLEND = 1
+D3DRS_ALPHAFUNC = 8
+D3DRS_SHADEMODE = 2
+D3DRS_COLORVERTEX = 1
+D3DRS_DIFFUSEMATERIALSOURCE = 1
+D3DRS_STENCILMASK = 4294967295
+D3DRS_COLORWRITEENABLE = 15
+D3DRS_TEXTUREFACTOR = 4294967295
+D3DRS_BLENDOP = 1
+D3DRS_FOGEND = 1.00
+D3DRS_POINTSIZE_MAX = 64 or more
+stage 0 COLOROP = 4
+stage 1 COLOROP = 1
+stage 0 ALPHAOP = 2
+stage 3 TEXCOORDINDEX = 3
+sampler 0 ADDRESSU = 1
+sampler 0 MAGFILTER = 1
+viewport after SetRenderTarget: 64x64
+StretchRect: 0x0
+UpdateSurface: 0x0
+Present: 0x0
+GetRenderTargetData: 0x0
+blend stages >= 4: yes
+simultaneous textures >= 2: yes
+lights >= 8: yes
+DOTPRODUCT3, LERP, MULTIPLYADD: yes
+two-sided stencil: yes
+A8R8G8B8 textures: 0x0
+DXT5 textures: 0x0
+D24S8 depth: 0x0
+adapters >= 1: yes
+back buffer: format 22, 384x128, usage 1
+ambient after recording: 0x202020
+ambient after Apply: 0x123456
+fog colour after Apply (not recorded): 0xabcdef
+stage 1 COLOROP after Apply: 7
+ambient after Capture and Apply: 0x0
+ZFUNC after an ALL block: 4
+light 3 enabled: yes
+light 7 (never set): 0x8876086c
+texel back: 0x12345678, pitch >= 16: yes
+levels: 1
+levels of a full 32x8 chain: 6
+level 4: 2x1
+event query: 0x0, 1
+a 0-wide texture: 0x8876086c
+a managed render target texture: 0x8876086c
+a light of type 0: 0x0
+device released: yes
+panel 0 (lit sphere): ok
+panel 1 (mipmapped floor): ok
+panel 2 (texture stages): ok
+panel 3 (more stage operations): ok
+panel 4 (blending and alpha test): ok
+panel 5 (compressed textures): ok
+panel 6 (fog): ok
+panel 7 (stencil and depth): ok
+panel 8 (points and lines): ok
+panel 9 (render to texture): ok
+panel 10 (copies): ok
+panel 11 (shading, culling, clip plane): ok
+exit 0

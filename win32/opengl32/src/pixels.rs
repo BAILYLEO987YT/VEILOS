@@ -245,10 +245,6 @@ impl Ctx {
             w: w as u32,
             h: h as u32,
             texels: img.as_ptr() as u64,
-            min_filter: GL_NEAREST,
-            mag_filter: GL_NEAREST,
-            wrap_s: GL_CLAMP,
-            wrap_t: GL_CLAMP,
             levels: 1,
         };
         let mut handle = 0u64;
@@ -257,15 +253,13 @@ impl Ctx {
         }
         self.temp_textures.push(handle);
         let (mut g, _) = self.state(KIND_TRIANGLES, 1.0);
-        g.flags &= !(F_TEXTURE2 | F_POLY_STIPPLE);
-        g.flags |= F_TEXTURE;
-        g.texture = handle;
-        match mask {
-            None => g.tex_env = GL_REPLACE,
-            Some(_) => {
-                g.tex_env = GL_MODULATE;
-                g.flags |= F_TEX_MASK;
-            }
+        g.flags &= !F_POLY_STIPPLE;
+        g.stages = Default::default();
+        g.samplers = Default::default();
+        g.stages[0] = crate::gl_stage(if mask.is_some() { GL_MODULATE } else { GL_REPLACE }, 0);
+        g.samplers[0] = Sampler { texture: handle, min: k::FILTER_POINT, mag: k::FILTER_POINT, address: [k::CLAMP; 2], ..Default::default() };
+        if mask.is_some() {
+            g.flags |= F_TEX_MASK;
         }
         let r = self.raster;
         let col = mask.unwrap_or([1.0; 4]);
@@ -275,15 +269,13 @@ impl Ctx {
             y: round((self.h as f64 - (y + (cy as f64) * h as f64 * zoom[1] as f64)) * SUB) as i32,
             z: (r.win[2].clamp(0.0, 1.0) * DEPTH_MAX * FX) as i64,
             q: FX as i64,
-            uq: ((cx * w) as f64 * FX) as i64,
-            vq: ((cy * h) as f64 * FX) as i64,
+            uv: [[((cx * w) as f64 * FX) as i64, ((cy * h) as f64 * FX) as i64], [0; 2], [0; 2], [0; 2]],
+            spec: [0; 3],
             r: ch(col[0]),
             g: ch(col[1]),
             b: ch(col[2]),
             a: ch(col[3]),
             f: (r.dist as f64 * FX) as i64,
-            uq2: 0,
-            vq2: 0,
         };
         let (c00, c10, c11, c01) = (corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1));
         self.push_tri(&g, KTri { v: [c00, c10, c11] });

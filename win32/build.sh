@@ -9,13 +9,13 @@ LLVM="/c/Program Files/LLVM/bin"
 OUT=target/x86_64-pc-windows-msvc/release
 # Each DLL's preferred base, so it's at the same address in every process (the
 # MSYS2 runtime relies on that, as on Windows): 16 MiB apart from 0x7E0000000000.
-# The Cargo-built ones have 0x00..0x09, opengl32 0x0B and winmm 0x0E (their build.rs), secur32 0x0A, and the
+# The Cargo-built ones have 0x00..0x09, opengl32 0x0B, d3d9 0x0C and winmm 0x0E (their build.rs), secur32 0x0A, and the
 # ones made here count on from 0x10.
 BASE_N=16
 next_base() { BASE=$(printf '0x%x' $((0x7E0000000000 + BASE_N * 0x1000000))); BASE_N=$((BASE_N + 1)); }
 cargo build --release
 mkdir -p ../storage/system
-for dll in ntdll kernel32 ucrtbase gdi32 user32 comctl32 shell32 comdlg32 riched20 ws2_32 opengl32 winmm; do
+for dll in ntdll kernel32 ucrtbase gdi32 user32 comctl32 shell32 comdlg32 riched20 ws2_32 opengl32 winmm d3d9; do
     cp "$OUT/$dll.dll" "../storage/system/$dll.dll"
 done
 

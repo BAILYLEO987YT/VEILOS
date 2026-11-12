@@ -7,6 +7,9 @@ description = "VEILOS opengl32.dll: OpenGL 1.1 fixed function over the kernel's 
 [lib]
 crate-type = ["cdylib"]
 
+[dependencies]
+gfx3d = { path = "../gfx3d" }
+
 [features]
 # Run on Windows itself, for comparing with its OpenGL (src/host.rs).
-host = []
+host = ["gfx3d/host"]

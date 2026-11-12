@@ -1,0 +1,10 @@
+[package]
+name = "gfx3d"
+version = "0.1.0"
+edition = "2021"
+description = "What VEILOS's 3D DLLs share: the kernel rasterizer's ABI (src/raster3d.rs) and VEIL_GPU3D"
+
+[features]
+# Answer VEIL_GPU3D in-process with the kernel's own rasterizer source, for
+# DLLs built to run on Windows next to its own graphics (src/host.rs).
+host = []

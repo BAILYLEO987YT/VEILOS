@@ -11,7 +11,18 @@ name = "comdlg32"
 version = "0.1.0"
 
 [[package]]
+name = "d3d9"
+version = "0.1.0"
+dependencies = [
+ "gfx3d",
+]
+
+[[package]]
 name = "gdi32"
+version = "0.1.0"
+
+[[package]]
+name = "gfx3d"
 version = "0.1.0"
 
 [[package]]
@@ -41,6 +52,9 @@ dependencies = [
 [[package]]
 name = "opengl32"
 version = "0.1.0"
+dependencies = [
+ "gfx3d",
+]
 
 [[package]]
 name = "riched20"

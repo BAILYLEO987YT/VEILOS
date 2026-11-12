@@ -217,11 +217,12 @@ pub mod sys {
     pub const NT_QUERY_DIRECTORY_OBJECT: u32 = BASE + 86;
     /// VEIL_GPU3D(op, a, b, c): the 3D rasterizer (src/raster3d.rs). Ops:
     /// 0 create a target with colour, depth and stencil (width, height,
-    /// handle out*), 1 clear (target,
-    /// ClearArgs*), 2 draw (target, DrawArgs*), 3 read pixels (target,
+    /// handle out*), 1 clear (target, ClearArgs*, depth target), 2 draw
+    /// (target, DrawArgs*, depth target), 3 read pixels (target,
     /// ReadArgs*), 4 create (0, TexArgs*, handle out*) or replace (texture,
     /// TexArgs*) a texture, 5 write pixels straight in (target,
-    /// PixelArgs*), 6 read depth or stencil (target, PixelArgs*).
+    /// PixelArgs*), 6 read depth or stencil (target, PixelArgs*). A depth
+    /// target (0: the target's own) lends its depth and stencil buffers.
     pub const VEIL_GPU3D: u32 = BASE + 87;
     /// VEIL_SOUND(op, a, b, c): sound streams (src/nt_sound.rs). Ops: 0 open
     /// (rate, bits << 8 | channels, handle out*), 1 write (stream,

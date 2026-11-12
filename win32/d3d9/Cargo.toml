@@ -1,0 +1,15 @@
+[package]
+name = "d3d9"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS d3d9.dll: Direct3D 9 over the kernel's 3D rasterizer"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gfx3d = { path = "../gfx3d" }
+
+[features]
+# Run on Windows itself, for comparing with its Direct3D (gfx3d's host build).
+host = ["gfx3d/host"]

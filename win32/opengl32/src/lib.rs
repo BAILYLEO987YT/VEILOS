@@ -54,13 +54,16 @@ type Bool = i32;
 #[cfg(feature = "host")]
 mod host;
 #[cfg(feature = "host")]
-use host::{ChoosePixelFormat, DescribePixelFormat, GetPixelFormat, NtClose, SetPixelFormat, VeilGdiDcSize, VeilGdiSetSwapHook, VeilGpu3d};
+use host::{ChoosePixelFormat, DescribePixelFormat, GetPixelFormat, SetPixelFormat, VeilGdiDcSize, VeilGdiSetSwapHook};
 
-#[cfg(not(feature = "host"))]
-#[link(name = "ntdll", kind = "raw-dylib")]
-unsafe extern "system" {
-    fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32;
-    fn NtClose(h: u64) -> i32;
+#[allow(clippy::missing_safety_doc)]
+unsafe fn VeilGpu3d(op: u64, a: u64, b: u64, c: u64) -> i32 {
+    gfx3d::gpu3d(op, a, b, c)
+}
+
+unsafe fn NtClose(h: u64) -> i32 {
+    gfx3d::close(h);
+    0
 }
 
 #[link(name = "gdi32", kind = "raw-dylib")]
@@ -89,136 +92,52 @@ unsafe extern "system" {
 
 // -----| the kernel's ABI (src/raster3d.rs) |-----
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct KVert {
-    x: i32,
-    y: i32,
-    z: i64,
-    q: i64,
-    uq: i64,
-    vq: i64,
-    r: i64,
-    g: i64,
-    b: i64,
-    a: i64,
-    f: i64,
-    uq2: i64,
-    vq2: i64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct KTri {
-    v: [KVert; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-struct KGroup {
-    first: u32,
-    count: u32,
-    flags: u32,
-    kind: u32,
-    size: i32,
-    depth_func: u32,
-    alpha_func: u32,
-    alpha_ref: u32,
-    src_blend: u32,
-    dst_blend: u32,
-    tex_env: u32,
-    color_mask: u32,
-    fog_color: u32,
-    stencil_func: u32,
-    stencil_ref: u32,
-    stencil_mask: u32,
-    stencil_write: u32,
-    stencil_ops: [u32; 3],
-    texture: u64,
-    scissor: [i32; 4],
-    fog_mode: u32,
-    fog_params: [i64; 2],
-    texture2: u64,
-    tex_env2: u32,
-    logic_op: u32,
-    line_stipple: u32,
-    stipple: [u32; 32],
-    env_color: [u32; 2],
-}
-
-#[repr(C)]
-struct PixelArgs {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    ptr: u64,
-    stride: i64,
-    which: u32,
-    mask: u32,
-    scissor: [i32; 4],
-}
-
-#[repr(C)]
-struct DrawArgs {
-    groups: u64,
-    group_count: u32,
-    tri_count: u32,
-    tris: u64,
-}
-
-#[repr(C)]
-struct ClearArgs {
-    mask: u32,
-    color: u32,
-    depth: u32,
-    color_mask: u32,
-    scissor: [i32; 4],
-    stencil: u32,
-    stencil_write: u32,
-}
-
-#[repr(C)]
-struct ReadArgs {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    dst: u64,
-    stride: i64,
-}
-
-#[repr(C)]
-struct TexArgs {
-    w: u32,
-    h: u32,
-    texels: u64,
-    min_filter: u32,
-    mag_filter: u32,
-    wrap_s: u32,
-    wrap_t: u32,
-    levels: u32,
-}
-
-const F_DEPTH_TEST: u32 = 1;
-const F_DEPTH_WRITE: u32 = 2;
-const F_BLEND: u32 = 4;
-const F_TEXTURE: u32 = 8;
-const F_ALPHA_TEST: u32 = 16;
-const F_FOG: u32 = 32;
-const F_STENCIL: u32 = 64;
-const F_TEXTURE2: u32 = 128;
-const F_TEX_MASK: u32 = 256;
-const F_POLY_STIPPLE: u32 = 512;
-const F_LINE_STIPPLE: u32 = 1024;
-const F_LOGIC_OP: u32 = 2048;
-const KIND_TRIANGLES: u32 = 0;
-const KIND_LINES: u32 = 1;
-const KIND_POINTS: u32 = 2;
+use gfx3d::raster3d::{
+    self as k, ClearArgs, DrawArgs, Group as KGroup, PixelArgs, ReadArgs, Sampler, Stage, TexArgs, Tri as KTri, Vert as KVert, F_ALPHA_TEST, F_BLEND,
+    F_DEPTH_TEST, F_DEPTH_WRITE, F_FOG, F_LINE_STIPPLE, F_LOGIC_OP, F_POLY_STIPPLE, F_STENCIL, F_TEX_MASK, KIND_LINES, KIND_POINTS,
+    KIND_TRIANGLES,
+};
 const DEPTH_MAX: f64 = 16777215.0;
 /// Subpixel steps per pixel (raster3d::SUB).
 const SUB: f64 = 256.0;
 const FX: f64 = 4294967296.0;
+
+/// How the kernel samples a GL texture object.
+fn sampler(t: &Tex) -> Sampler {
+    let point = |f: u32| matches!(f, GL_NEAREST | GL_NEAREST_MIPMAP_NEAREST | GL_NEAREST_MIPMAP_LINEAR);
+    let address = |w: u32| if w == GL_REPEAT { k::WRAP } else { k::CLAMP };
+    Sampler {
+        texture: t.handle,
+        min: if point(t.min) { k::FILTER_POINT } else { k::FILTER_LINEAR },
+        mag: if t.mag == GL_NEAREST { k::FILTER_POINT } else { k::FILTER_LINEAR },
+        mip: match t.min {
+            GL_NEAREST_MIPMAP_NEAREST | GL_LINEAR_MIPMAP_NEAREST => k::FILTER_POINT,
+            GL_NEAREST_MIPMAP_LINEAR | GL_LINEAR_MIPMAP_LINEAR => k::FILTER_LINEAR,
+            _ => 0,
+        },
+        address: [address(t.wrap_s), address(t.wrap_t)],
+        gl_rules: 1,
+        ..Default::default()
+    }
+}
+
+/// A GL texture environment (0: pass the colour on) as a texture stage,
+/// with GL_TEXTURE_ENV_COLOR `color` (0xAARRGGBB).
+pub(crate) fn gl_stage(env: u32, color: u32) -> Stage {
+    use k::{ta, top};
+    let (cur, tex) = (ta::CURRENT, ta::TEXTURE);
+    let (color_op, color_arg, alpha_op) = match env {
+        0 => (top::SELECTARG1, [cur, 0, 0], top::SELECTARG1),
+        GL_REPLACE => (top::SELECTARG1, [tex, 0, 0], top::SELECTARG1),
+        GL_DECAL => (top::BLENDTEXTUREALPHA, [tex, cur, 0], top::SELECTARG2),
+        // Towards the environment colour by the texel.
+        GL_BLEND => (top::LERP, [ta::CONSTANT, cur, tex], top::MODULATE),
+        GL_ADD => (top::ADD, [tex, cur, 0], top::MODULATE),
+        _ => (top::MODULATE, [tex, cur, 0], top::MODULATE),
+    };
+    let alpha_arg = if env == 0 { [cur, 0, 0] } else if env == GL_REPLACE { [tex, 0, 0] } else { [tex, cur, 0] };
+    Stage { color_op, color_arg, alpha_op, alpha_arg, result: 0, constant: color }
+}
 
 // -----| GL constants |-----
 
@@ -347,6 +266,8 @@ const GL_TEXTURE_WRAP_S: u32 = 0x2802;
 const GL_TEXTURE_WRAP_T: u32 = 0x2803;
 const GL_NEAREST: u32 = 0x2600;
 const GL_LINEAR: u32 = 0x2601;
+const GL_NEAREST_MIPMAP_NEAREST: u32 = 0x2700;
+const GL_LINEAR_MIPMAP_NEAREST: u32 = 0x2701;
 const GL_NEAREST_MIPMAP_LINEAR: u32 = 0x2702;
 const GL_LINEAR_MIPMAP_LINEAR: u32 = 0x2703;
 const GL_CLAMP: u32 = 0x2900;
@@ -842,9 +763,9 @@ impl Ctx {
         }
     }
 
-    /// Unit `unit`'s texture (2D over 1D, as GL has it): its kernel handle
-    /// and size, if texturing applies.
-    fn texture_for_draw(&mut self, unit: usize) -> Option<(u64, u32, u32)> {
+    /// Unit `unit`'s texture (2D over 1D, as GL has it): how the kernel
+    /// samples it (its handle included) and its size, if texturing applies.
+    fn texture_for_draw(&mut self, unit: usize) -> Option<(Sampler, u32, u32)> {
         let dim = if self.tex_on[unit][0] { 0 } else if self.tex_on[unit][1] { 1 } else { return None };
         let t = self.bound_of(unit, dim);
         if !t.complete() {
@@ -858,10 +779,6 @@ impl Ctx {
                 w: t.w,
                 h: t.h,
                 texels: texels.as_ptr() as u64,
-                min_filter: t.min,
-                mag_filter: t.mag,
-                wrap_s: t.wrap_s,
-                wrap_t: t.wrap_t,
                 levels: n as u32,
             };
             let mut h = t.handle;
@@ -869,7 +786,7 @@ impl Ctx {
             t.handle = h;
             t.dirty = false;
         }
-        Some((t.handle, t.w, t.h))
+        Some((sampler(t), t.w, t.h))
     }
 
     fn state(&mut self, kind: u32, size: f32) -> (KGroup, [Option<(u32, u32)>; 2]) {
@@ -885,9 +802,6 @@ impl Ctx {
         if self.on(GL_BLEND) {
             flags |= F_BLEND;
         }
-        if tex.is_some() {
-            flags |= F_TEXTURE;
-        }
         if self.on(GL_ALPHA_TEST) {
             flags |= F_ALPHA_TEST;
         }
@@ -896,9 +810,6 @@ impl Ctx {
         }
         if self.on(GL_STENCIL_TEST) {
             flags |= F_STENCIL;
-        }
-        if tex2.is_some() {
-            flags |= F_TEXTURE2;
         }
         if self.on(GL_COLOR_LOGIC_OP) {
             flags |= F_LOGIC_OP;
@@ -940,19 +851,30 @@ impl Ctx {
             alpha_ref: (clamp01(self.alpha_ref) * 510.0 + 0.5) as u32,
             src_blend: self.blend_src,
             dst_blend: self.blend_dst,
-            tex_env: self.tex_env[0],
-            texture2: tex2.map_or(0, |t| t.0),
-            tex_env2: self.tex_env[1],
             logic_op: self.logic_op,
             line_stipple: (self.line_stipple[1] & 0xFFFF) | self.line_stipple[0].clamp(1, 256) << 16,
             stipple: self.poly_stipple,
-            env_color: self.env_color.map(|c| {
-                let ch = |v: f32| (clamp01(v) * 255.0 + 0.5) as u32;
-                ch(c[3]) << 24 | ch(c[0]) << 16 | ch(c[1]) << 8 | ch(c[2])
-            }),
             color_mask: self.mask_bits(),
-            texture: tex.map_or(0, |t| t.0),
             scissor: self.scissor_box(),
+            stages: {
+                // Each unit's environment as a texture stage; unit 0 passes
+                // the colour on unchanged if only unit 1 textures.
+                let mut st = [Stage::default(); k::STAGES];
+                let last = if tex2.is_some() { 2 } else if tex.is_some() { 1 } else { 0 };
+                for (u, s) in st.iter_mut().enumerate().take(last) {
+                    let on = if u == 0 { tex.is_some() } else { tex2.is_some() };
+                    let c = self.env_color[u];
+                    *s = gl_stage(if on { self.tex_env[u] } else { 0 }, ch(c[3]) << 24 | ch(c[0]) << 16 | ch(c[1]) << 8 | ch(c[2]));
+                }
+                st
+            },
+            samplers: {
+                let mut s = [Sampler::default(); k::SLOTS];
+                s[0] = tex.map_or(Sampler::default(), |t| t.0);
+                s[1] = tex2.map_or(Sampler::default(), |t| t.0);
+                s
+            },
+            ..Default::default()
         };
         (g, [tex.map(|t| (t.1, t.2)), tex2.map(|t| (t.1, t.2))])
     }
@@ -1065,10 +987,13 @@ impl Ctx {
                     y: round((self.h as f64 - w[1]) * SUB) as i32,
                     z: (w[2].clamp(0.0, 1.0) * DEPTH_MAX * FX) as i64,
                     q: (q * FX) as i64,
-                    uq: (v.tc[0][0] as f64 / v.tc[0][3] as f64 * tw * q * FX) as i64,
-                    vq: (v.tc[0][1] as f64 / v.tc[0][3] as f64 * th * q * FX) as i64,
-                    uq2: (v.tc[1][0] as f64 / v.tc[1][3] as f64 * tw2 * q * FX) as i64,
-                    vq2: (v.tc[1][1] as f64 / v.tc[1][3] as f64 * th2 * q * FX) as i64,
+                    uv: [
+                        [(v.tc[0][0] as f64 / v.tc[0][3] as f64 * tw * q * FX) as i64, (v.tc[0][1] as f64 / v.tc[0][3] as f64 * th * q * FX) as i64],
+                        [(v.tc[1][0] as f64 / v.tc[1][3] as f64 * tw2 * q * FX) as i64, (v.tc[1][1] as f64 / v.tc[1][3] as f64 * th2 * q * FX) as i64],
+                        [0; 2],
+                        [0; 2],
+                    ],
+                    spec: [0; 3],
                     r: col(c[0]),
                     g: col(c[1]),
                     b: col(c[2]),

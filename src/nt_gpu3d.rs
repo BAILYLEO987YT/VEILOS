@@ -19,7 +19,8 @@ use crate::nt_objects::KernelObjectRef;
 use crate::process::Process;
 use crate::raster3d::*;
 
-/// A colour buffer (0x00RRGGBB, top row first), a depth buffer and an
+/// A colour buffer (0xAARRGGBB, top row first; alpha 0 unless drawn with
+/// F_DST_ALPHA), a depth buffer and an
 /// 8-bit stencil buffer.
 pub struct Target {
     pub w: usize,
@@ -31,8 +32,41 @@ pub struct Target {
 
 impl Target {
     fn buffers(&mut self) -> Buffers {
-        Buffers { color: self.color.as_mut_ptr(), depth: self.depth.as_mut_ptr(), stencil: self.stencil.as_mut_ptr(), w: self.w, h: self.h }
+        Buffers { color: self.color.as_mut_ptr(), depth: self.depth.as_mut_ptr(), stencil: self.stencil.as_mut_ptr(), w: self.w, h: self.h, dw: self.w, dh: self.h }
     }
+}
+
+/// Run `f` on target `a`'s buffers, with target `d`'s depth and stencil
+/// buffers if `d` is another target (0: `a`'s own).
+fn with_targets(proc: &Process, a: u64, d: u64, f: impl FnOnce(Buffers)) -> NtStatus {
+    let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
+    let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
+    let other = if d == 0 || d == a { None } else { obj(proc, d) };
+    let Some(od) = other else {
+        if d != 0 && d != a {
+            return status::INVALID_HANDLE;
+        }
+        f(t.lock().buffers());
+        return status::SUCCESS;
+    };
+    let Gpu3d::Target(td) = &*od else { return status::INVALID_HANDLE };
+    if core::ptr::eq(t, td) {
+        f(t.lock().buffers());
+        return status::SUCCESS;
+    }
+    // Two locks: always the lower address first.
+    let (mut ga, mut gd) = if (t as *const _ as usize) < (td as *const _ as usize) {
+        let ga = t.lock();
+        (ga, td.lock())
+    } else {
+        let gd = td.lock();
+        (t.lock(), gd)
+    };
+    let mut b = ga.buffers();
+    let db = gd.buffers();
+    (b.depth, b.stencil, b.dw, b.dh) = (db.depth, db.stencil, db.w, db.h);
+    f(b);
+    status::SUCCESS
 }
 
 pub enum Gpu3d {
@@ -77,18 +111,15 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
             let t = Target { w: w as usize, h: h as usize, color: vec![0; n], depth: vec![DEPTH_MAX; n], stencil: vec![0; n] };
             new_handle(proc, Gpu3d::Target(Mutex::new(t)), c)
         }
-        // Clear: a = target, b = ClearArgs*.
+        // Clear: a = target, b = ClearArgs*, c = the target whose depth and
+        // stencil buffers to clear (0: a's).
         1 => {
-            let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
-            let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
             let Some(args) = read::<ClearArgs>(b) else { return status::ACCESS_VIOLATION };
-            clear(t.lock().buffers(), &args);
-            status::SUCCESS
+            with_targets(proc, a, c, |buf| clear(buf, &args))
         }
-        // Draw: a = target, b = DrawArgs*.
+        // Draw: a = target, b = DrawArgs*, c = the target whose depth and
+        // stencil buffers to use (0: a's).
         2 => {
-            let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
-            let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
             let Some(args) = read::<DrawArgs>(b) else { return status::ACCESS_VIOLATION };
             let (gn, tn) = (args.group_count as usize, args.tri_count as usize);
             if gn > 1 << 20 || tn > 1 << 22
@@ -104,8 +135,8 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                 core::ptr::copy_nonoverlapping(args.tris as *const Tri, tris.as_mut_ptr(), tn);
                 tris.set_len(tn);
             }
-            let tex_of = |on: bool, h: u64| -> Option<Arc<Texture>> {
-                if !on {
+            let tex_of = |h: u64| -> Option<Arc<Texture>> {
+                if h == 0 {
                     return None;
                 }
                 match obj(proc, h).as_deref() {
@@ -113,23 +144,15 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
                     _ => None,
                 }
             };
-            let texs: Vec<(Option<Arc<Texture>>, Option<Arc<Texture>>)> = groups
+            // Each group's slots' textures, held for the draw.
+            let texs: Vec<[Option<Arc<Texture>>; SLOTS]> =
+                groups.iter().map(|g| core::array::from_fn(|i| tex_of(g.samplers[i].texture))).collect();
+            let passes: Vec<Pass> = groups
                 .iter()
-                .map(|g| (tex_of(g.flags & F_TEXTURE != 0, g.texture), tex_of(g.flags & F_TEXTURE2 != 0, g.texture2)))
+                .zip(texs.iter())
+                .map(|(g, ts)| Pass { g: *g, tex: core::array::from_fn(|i| ts[i].as_deref()) })
                 .collect();
-            let passes: Vec<Pass> = groups.iter().zip(texs.iter()).map(|(g, (t1, t2))| {
-                let mut g = *g;
-                if t1.is_none() {
-                    g.flags &= !F_TEXTURE;
-                }
-                if t2.is_none() {
-                    g.flags &= !F_TEXTURE2;
-                }
-                Pass { g, tex: t1.as_deref(), tex2: t2.as_deref() }
-            }).collect();
-            let mut t = t.lock();
-            crate::lgpu::execute_3d(t.buffers(), &tris, &passes);
-            status::SUCCESS
+            with_targets(proc, a, c, |buf| crate::lgpu::execute_3d(buf, &tris, &passes))
         }
         // Read pixels: a = target, b = ReadArgs*.
         3 => {
