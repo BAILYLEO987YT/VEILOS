@@ -653,6 +653,7 @@ async fn gui_refresh_task() {
         // Performance Mode's lazy writer (block.rs).
         crate::block::tick(crate::time::now_ms());
         crate::scheduler::flush_if_due(crate::time::now_ms());
+        crate::security::flush_audit(crate::time::now_ms());
         
         // Drive the distributed mesh layer — sends LAN announcements,
         // polls the discovery UDP socket, and processes incoming packets.

@@ -323,6 +323,11 @@ pub fn create_file(proc: &crate::process::Process, out: u64, access: u64, oa: u6
                 }
             }
         }
+        if creates || writes || deletes {
+            if let Err(s) = crate::security::require_change(proc, &path) {
+                return s;
+            }
+        }
     }
 
     // A deleted file's name is gone at once (as on Windows 11), though its

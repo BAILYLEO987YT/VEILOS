@@ -522,6 +522,7 @@ pub fn power_off() {
     crate::serial_println!("[SHELL] shutdown requested");
     crate::users::USER_DB.lock().save();
     crate::scheduler::SCHEDULER.lock().flush_profiles();
+    crate::security::flush_audit(0);
     crate::block::flush_all();
     // SAFETY: these ports are the ACPI PM1a control registers of QEMU (newer, older)
     // and VirtualBox; writing the SLP_EN|SLP_TYP value powers the VM off.

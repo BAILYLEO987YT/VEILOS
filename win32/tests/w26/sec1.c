@@ -3,6 +3,7 @@
  *   sec1            files, processes and sockets, printing what each call answered
  *   sec1 sleep      write this process's id to sec1.pid (beside it) and wait 60 s
  *   sec1 poke       read and end the process named in sec1.pid (not a relative)
+ *   sec1 system     create and delete a file in \system (protected in Security Mode)
  *   sec1 child      wait 30 s (started by sec1 itself)
  *
  * On Windows every call here succeeds for a normal user (except the
@@ -131,6 +132,16 @@ int main(int argc, char **argv) {
         if (f) { fprintf(f, "%lu\n", GetCurrentProcessId()); fclose(f); }
         printf("sleeping as %lu\n", GetCurrentProcessId());
         Sleep(60000);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "system")) {
+        /* VEILOS only: \system is protected in Security Mode. */
+        HANDLE h = CreateFileA("C:\\system\\sec1_test.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        show("create a file in \\system", h != INVALID_HANDLE_VALUE);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            show("delete it", DeleteFileA("C:\\system\\sec1_test.txt"));
+        }
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "poke")) {

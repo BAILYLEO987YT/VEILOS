@@ -38,7 +38,7 @@ fn dispatch_inner(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let Some(proc) = crate::process::PROCESSOR.lock().get_active() else {
         return ret(status::INVALID_HANDLE);
     };
-    if let Err(s) = permitted(&proc, id as u32, a0, a1) {
+    if let Err(s) = permitted(&proc, id as u32, a0, a1, a2, a3) {
         return ret(s);
     }
     let s = match id as u32 {
@@ -214,7 +214,7 @@ fn dispatch_inner(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 /// Security Mode (security.rs): the capability a call needs, checked before
 /// it runs. Opening files is checked in nt_file::create_file, sockets in
 /// nt_socket.rs.
-fn permitted(proc: &Arc<Process>, id: u32, a0: u64, a1: u64) -> Result<(), NtStatus> {
+fn permitted(proc: &Arc<Process>, id: u32, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<(), NtStatus> {
     use crate::capability::Capability as C;
     use crate::security::{require, require_on};
     // The process a handle names, when it isn't this one.
@@ -228,10 +228,31 @@ fn permitted(proc: &Arc<Process>, id: u32, a0: u64, a1: u64) -> Result<(), NtSta
         }
     };
     match id {
-        sys::NT_DELETE_FILE => require(proc, C::FsModify, "deleting a file"),
+        sys::NT_DELETE_FILE => {
+            require(proc, C::FsModify, "deleting a file")?;
+            match crate::nt_file::read_object_name(a0).and_then(|n| crate::nt_file::vfs_path(&n)) {
+                Some(path) => crate::security::require_change(proc, &path),
+                None => Ok(()),
+            }
+        }
         sys::NT_SET_INFORMATION_FILE => match stack(4).unwrap_or(0) as u32 {
-            // Rename, link, disposition (and their Ex forms).
-            10 | 11 | 13 | 64 | 65 | 72 => require(proc, C::FsModify, "renaming or deleting a file"),
+            // Rename or link: FILE_RENAME_INFORMATION { flags, root, length @16, name @20 },
+            // and the place it goes may be a system folder.
+            10 | 11 | 65 | 72 => {
+                require(proc, C::FsModify, "renaming or deleting a file")?;
+                let (info, len) = (a2, a3 as usize);
+                if len >= 20 && ptr_ok(info, len) {
+                    let n = (unsafe { *((info + 16) as *const u32) } as usize).min(len - 20) / 2;
+                    let name: alloc::string::String = char::decode_utf16(
+                        unsafe { core::slice::from_raw_parts((info + 20) as *const u16, n) }.iter().copied(),
+                    ).map(|c| c.unwrap_or('?')).collect();
+                    if let Some(path) = crate::nt_file::vfs_path(&name) {
+                        crate::security::require_change(proc, &path)?;
+                    }
+                }
+                Ok(())
+            }
+            13 | 64 => require(proc, C::FsModify, "renaming or deleting a file"),
             // Times and attributes, allocation, end of file.
             4 | 19 | 20 => require(proc, C::FsWrite, "changing a file"),
             _ => Ok(()),

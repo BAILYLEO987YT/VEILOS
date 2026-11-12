@@ -96,6 +96,7 @@ pub fn require(proc: &Process, cap: Capability, what: &str) -> Result<(), NtStat
         }
         d.insert((proc.pid, cap.bit()))
     };
+    audit(proc.pid, &alloc::format!("denied {} (needs {})", what, cap.name()));
     if first {
         crate::serial_println!("[SECURITY] pid {}: {} denied (needs {})", proc.pid, what, cap.name());
         crate::desktop::notify(
@@ -146,4 +147,75 @@ pub fn require_on(proc: &Process, target_pid: u32, cap: Capability, what: &str) 
         return Ok(());
     }
     require(proc, cap, what)
+}
+
+// -----| Security Mode's audit log (S5) and system folders (S6) |-----
+//
+// In Security Mode, what a program does that matters later is written to
+// /var/log/audit.log: programs started, connections beyond this machine,
+// denials, and changes to the system folders. Lines collect in memory and are
+// appended every few seconds from the main loop (`flush_audit`), so no system
+// call waits on the disk for them. And /system and /etc (DLLs, users, the
+// registry) can be changed only by the root account's programs, as Windows
+// keeps C:\Windows from programs that aren't elevated. Performance Mode does
+// neither.
+
+const AUDIT_PATH: &str = "/var/log/audit.log";
+static AUDIT: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Record an event (Security Mode only).
+pub fn audit(pid: u32, what: &str) {
+    if crate::policy::performance() {
+        return;
+    }
+    let line = alloc::format!("{} pid {}: {}\n", crate::time::now_ms(), pid, what);
+    let mut a = AUDIT.lock();
+    if a.len() < 1 << 20 {
+        a.extend_from_slice(line.as_bytes());
+    }
+}
+
+/// From the main loop (and at power-off with `now_ms` 0): append what has
+/// collected to the log, at most every 5 s.
+pub fn flush_audit(now_ms: u64) {
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    use core::sync::atomic::Ordering;
+    if now_ms != 0 && now_ms.wrapping_sub(LAST.load(Ordering::Relaxed)) < 5_000 {
+        return;
+    }
+    LAST.store(now_ms, Ordering::Relaxed);
+    let data = match AUDIT.try_lock() {
+        Some(mut a) if !a.is_empty() => core::mem::take(&mut *a),
+        _ => return,
+    };
+    let vfs = &crate::vfs::VFS;
+    let _ = vfs.create_dir("/var");
+    let _ = vfs.create_dir("/var/log");
+    let ok = match vfs.open(AUDIT_PATH) {
+        Ok(f) => {
+            let at = f.len();
+            f.write_at(at, &data).and_then(|_| f.sync()).is_ok()
+        }
+        Err(_) => vfs.write_file(AUDIT_PATH, &data).is_ok(),
+    };
+    if !ok {
+        crate::serial_println!("[SECURITY] audit log not written ({} bytes)", data.len());
+    }
+}
+
+/// /system or /etc, or something in them.
+pub fn system_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    ["/system", "/etc"].iter().any(|d| p == *d || p.starts_with(&alloc::format!("{}/", d)))
+}
+
+/// Changing `path`: in Security Mode a system folder needs the root
+/// account's programs (kernel.module), and the change is audited.
+pub fn require_change(proc: &Process, path: &str) -> Result<(), NtStatus> {
+    if crate::policy::performance() || !system_path(path) {
+        return Ok(());
+    }
+    require(proc, Capability::KernelModule, "changing system files")?;
+    audit(proc.pid, &alloc::format!("changes {}", path));
+    Ok(())
 }

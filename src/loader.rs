@@ -299,6 +299,7 @@ fn load_and_spawn_pe_inner(
     process_inner.parent_pid.store(options.parent_pid, core::sync::atomic::Ordering::Relaxed);
     // Security Mode: the parent's capabilities, or the signed-in user's (security.rs).
     *process_inner.capabilities.lock() = crate::security::caps_for_new(options.parent_pid);
+    crate::security::audit(options.parent_pid, &alloc::format!("starts pid {} ({})", pid, path));
     process_inner.stack_base = stack_base;
     // mapped_pages is transferred to the process at the very end of this
     // function, once nothing else can fail — until then the caller's rollback

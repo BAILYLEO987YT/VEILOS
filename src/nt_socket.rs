@@ -354,6 +354,7 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
             let (ip, _) = read_sockaddr(b)?;
             if !is_loopback(ip) {
                 net_cap(proc, Capability::NetConnect, "connecting to the network")?;
+                crate::security::audit(proc.pid, &alloc::format!("connects to {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
             }
             connect(&s, b)
         }),
