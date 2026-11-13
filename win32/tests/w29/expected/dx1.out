@@ -1,0 +1,39 @@
+CreateDXGIFactory1: ok
+device and swap chain: created, feature level 0xa100
+B8G8R8A8 texel (10, 20): 0xff2800af
+mip view: format 28, dimension 4, mip 1
+depth texel: depth 0x400000, stencil 0x5a
+Present: 0x0
+EnumAdapters1(0): ok
+adapter has a name: yes
+EnumOutputs(0): ok
+display modes: some
+device as IDXGIDevice: yes
+its adapter: yes
+back buffer as IDXGISurface: yes
+  384x128, format 28
+R8G8B8A8: render target yes, sample yes
+D24S8: depth yes
+1x quality levels: 1
+blend state back: enable 1, src 5, dst 6; target 3: src 5
+rasterizer state: 0x0
+a bad fill mode: 0x80070057
+sampler back: filter 0x15, address 1
+event query: 0x0, 1
+its data size: 4
+a 0-wide texture: 0x80070057
+a colour format as depth: 0x80070057
+a full chain of 32x8: 6 mips
+panel 0: ok
+panel 1: ok
+panel 2: ok
+panel 3: ok
+panel 4: ok
+panel 5: ok
+panel 6: ok
+panel 7: ok
+panel 8: ok
+panel 9: ok
+panel 10: ok
+panel 11: ok
+exit 0

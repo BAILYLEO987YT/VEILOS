@@ -11,6 +11,13 @@ name = "comdlg32"
 version = "0.1.0"
 
 [[package]]
+name = "d3d11"
+version = "0.1.0"
+dependencies = [
+ "gfx3d",
+]
+
+[[package]]
 name = "d3d9"
 version = "0.1.0"
 dependencies = [

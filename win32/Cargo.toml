@@ -3,7 +3,7 @@
 # installs them into storage/system.
 [workspace]
 resolver = "2"
-members = ["nt_abi", "ntdll", "kernel32", "ucrtbase", "gdi32", "user32", "comctl32", "shell32", "comdlg32", "riched20", "ws2_32", "opengl32", "winmm", "gfx3d", "d3d9"]
+members = ["nt_abi", "ntdll", "kernel32", "ucrtbase", "gdi32", "user32", "comctl32", "shell32", "comdlg32", "riched20", "ws2_32", "opengl32", "winmm", "gfx3d", "d3d9", "d3d11"]
 
 [profile.dev]
 panic = "abort"
