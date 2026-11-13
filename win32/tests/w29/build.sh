@@ -15,7 +15,15 @@ VC="C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36
 OUT=../../../storage/tests
 mkdir -p build expected "$OUT"
 
-TESTS="dx1"
+# dx2's shaders, compiled by the SDK's fxc into headers (the profile is in
+# each entry point's name: vs40_ is vs_4_0, ps41_ ps_4_1).
+FXC="$KITS/bin/$KIT_VER/x64/fxc.exe"
+for e in vs40_main vs40_inst ps40_color ps40_tex ps40_math ps40_loop ps40_pos ps41_shadow ps40_flat ps40_index; do
+    p=$(echo $e | sed 's/^\(..\)\(.\)\(.\)_.*/\1_\2_\3/')
+    "$FXC" /nologo /T $p /E $e /Fh build/dx2_$e.h /Vn $e dx2.hlsl >/dev/null
+done
+
+TESTS="dx1 dx2"
 for t in $TESTS; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \

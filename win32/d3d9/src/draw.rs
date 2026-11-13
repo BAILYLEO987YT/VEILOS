@@ -1202,6 +1202,8 @@ fn group(d: &mut Device) -> (Group, Option<Group>, [(f64, f64); k::SLOTS]) {
             lod_bias: (f32::from_bits(ss[ss::MIPMAPLODBIAS]) * 256.0) as i32,
             max_level: ss[ss::MAXMIPLEVEL].max(t.lod),
             gl_rules: 0,
+            compare: 0,
+            packed_depth: 0,
         };
         sizes[i] = (t.w as f64, t.h as f64);
     }
@@ -1649,7 +1651,10 @@ fn record(o: &Out, kv: &[Vert], ws: &[W], face: f32) -> Vec<f32> {
     };
     let qs: Vec<f64> = (0..kv.len()).map(q).collect();
     let qp = solve(&qs);
+    let zs: Vec<f64> = kv.iter().map(|v| v.z as f64 / (FX * k::DEPTH_MAX as f64)).collect();
+    let zp = solve(&zs);
     r.extend_from_slice(&[x0 as f32, y0 as f32, face, qp[0] as f32, qp[1] as f32, qp[2] as f32]);
+    r.extend_from_slice(&[zp[0] as f32, zp[1] as f32, zp[2] as f32]);
     for i in 0..n {
         let planes: [[f64; 3]; 4] = core::array::from_fn(|c| {
             let f: Vec<f64> = (0..kv.len()).map(|v| ws[v].v.outs[i][c] as f64 * qs[v]).collect();

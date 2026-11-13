@@ -15,6 +15,12 @@
 //!              input layouts, queries
 //!   context.rs ID3D11DeviceContext: the pipeline's bindings
 //!   format.rs  DXGI formats
+//!   dxbc.rs    shader bytecode (SM4/SM5) parsed
+//!   shader.rs  shader objects
+//!   vm.rs      the interpreter vertex shaders run on
+//!   ps.rs      pixel shaders as the kernel's programs
+//!   draw.rs    the input assembler, clipping, the viewport, the states as
+//!              the kernel's, and the draw calls
 
 #![no_std]
 #![allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
@@ -26,11 +32,15 @@ mod dllrt;
 mod com;
 mod context;
 mod device;
+mod draw;
+mod dxbc;
 mod dxgi;
 mod format;
+mod ps;
 mod res;
 mod shader;
 mod state;
+mod vm;
 mod vtbl;
 
 use com::*;

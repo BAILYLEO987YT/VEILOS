@@ -194,6 +194,12 @@ pub struct Sampler {
     /// OpenGL's rule: magnification goes up to a level of detail of 0.5,
     /// not 0, with a linear magnification over a nearest minification.
     pub gl_rules: u32,
+    /// Pixel shaders' comparison sampling (sample_c): D3D11_COMPARISON
+    /// (1 never ..= 8 always); 0: none.
+    pub compare: u32,
+    /// The texture holds 24-bit depth across red, green and blue (a depth
+    /// buffer as a shader resource): sampled as that depth in red.
+    pub packed_depth: u32,
 }
 
 /// Primitives `first .. first + count` of a batch, drawn with one state.
@@ -262,6 +268,8 @@ pub struct Group {
     pub attr_first: u32,
     pub const_first: u32,
     pub ps_bools: u32,
+    /// How many float4 constants the block has (0: Direct3D 9's 224).
+    pub ps_consts: u32,
 }
 
 #[repr(C)]
@@ -1431,10 +1439,13 @@ pub fn clear(buf: Buffers, c: &ClearArgs) {
 /// Inputs a pixel shader can have (ps_3_0's ten, colours, texcoords).
 pub const PS_INPUTS: usize = 12;
 pub const PS_CONSTS: usize = 224;
-/// Floats before the inputs in a primitive's record.
-pub const PS_HEADER: usize = 6;
-/// Floats in a group's constant block.
-pub const PS_CONST_BLOCK: usize = PS_CONSTS * 4 + 64;
+/// Floats before the inputs in a primitive's record: [x0, y0, face, Q
+/// plane, Z plane] (Z, the window depth, linear in the window).
+pub const PS_HEADER: usize = 9;
+/// The most float4 constants a block can have.
+pub const PS_CONSTS_MAX: usize = 4096;
+/// Temporaries (Direct3D 11's indexable ones are the last of them).
+pub const PS_TEMPS: usize = 64;
 
 /// PsIns register files (bits 0-3 of an operand).
 pub mod pf {
@@ -1447,8 +1458,88 @@ pub mod pf {
     pub const PRED: u32 = 6;
     pub const COLOR: u32 = 7;
     pub const DEPTH: u32 = 8;
-    /// vPos (0), vFace (1).
+    /// vPos (0), vFace (1), SV_Position (2: centre x, y, window z, 1/w),
+    /// SV_IsFrontFace (3: all ones or zero).
     pub const MISC: u32 = 9;
+}
+
+/// Direct3D 10/11 (SM4/SM5) operations the kernel runs, beyond Direct3D 9's
+/// (which keep their numbers): 0x100 + the SM4 opcode where there is one,
+/// on 32-bit patterns (integers, masks) or per-component floats.
+pub mod sm4 {
+    pub const AND: u16 = 0x101;
+    pub const CONTINUE: u16 = 0x107;
+    pub const DIV: u16 = 0x10E;
+    pub const DP2: u16 = 0x10F;
+    pub const EQ: u16 = 0x118;
+    pub const EXP: u16 = 0x119;
+    pub const FTOI: u16 = 0x11B;
+    pub const FTOU: u16 = 0x11C;
+    pub const GE: u16 = 0x11D;
+    pub const IADD: u16 = 0x11E;
+    pub const IEQ: u16 = 0x120;
+    pub const IGE: u16 = 0x121;
+    pub const ILT: u16 = 0x122;
+    pub const IMAD: u16 = 0x123;
+    pub const IMAX: u16 = 0x124;
+    pub const IMIN: u16 = 0x125;
+    pub const IMUL: u16 = 0x126;
+    pub const INE: u16 = 0x127;
+    pub const INEG: u16 = 0x128;
+    pub const ISHL: u16 = 0x129;
+    pub const ISHR: u16 = 0x12A;
+    pub const ITOF: u16 = 0x12B;
+    pub const LD: u16 = 0x12D;
+    pub const LOG: u16 = 0x12F;
+    pub const LT: u16 = 0x131;
+    pub const MOVC: u16 = 0x137;
+    pub const NE: u16 = 0x139;
+    pub const NOT: u16 = 0x13B;
+    pub const OR: u16 = 0x13C;
+    pub const RESINFO: u16 = 0x13D;
+    pub const ROUND_NE: u16 = 0x140;
+    pub const ROUND_NI: u16 = 0x141;
+    pub const ROUND_PI: u16 = 0x142;
+    pub const ROUND_Z: u16 = 0x143;
+    pub const RSQ: u16 = 0x144;
+    pub const SAMPLE_C: u16 = 0x146;
+    pub const SAMPLE_C_LZ: u16 = 0x147;
+    pub const SAMPLE_D: u16 = 0x149;
+    pub const SQRT: u16 = 0x14B;
+    pub const UDIV: u16 = 0x14E;
+    pub const ULT: u16 = 0x14F;
+    pub const UGE: u16 = 0x150;
+    pub const UMUL: u16 = 0x151;
+    pub const UMAX: u16 = 0x153;
+    pub const UMIN: u16 = 0x154;
+    pub const USHR: u16 = 0x155;
+    pub const UTOF: u16 = 0x156;
+    pub const XOR: u16 = 0x157;
+    pub const LOD: u16 = 0x16C;
+    pub const GATHER4: u16 = 0x16D;
+    pub const RCP: u16 = 0x181;
+    pub const F32TOF16: u16 = 0x182;
+    pub const F16TOF32: u16 = 0x183;
+    pub const COUNTBITS: u16 = 0x186;
+    pub const FIRSTBIT_HI: u16 = 0x187;
+    pub const FIRSTBIT_LO: u16 = 0x188;
+    pub const FIRSTBIT_SHI: u16 = 0x189;
+    pub const UBFE: u16 = 0x18A;
+    pub const IBFE: u16 = 0x18B;
+    pub const BFREV: u16 = 0x18D;
+    // Ours: sine and cosine apart, the remainder, and flow control tested
+    // on a register (ctrl 1: when non-zero, 0: when zero).
+    pub const SIN: u16 = 0x1F0;
+    pub const COS: u16 = 0x1F1;
+    pub const UREM: u16 = 0x1F2;
+    pub const IF: u16 = 0x1F3;
+    pub const BREAKC: u16 = 0x1F4;
+    pub const CONTINUEC: u16 = 0x1F5;
+    /// A loop without a count (and its end): left by BREAK or BREAKC.
+    pub const LOOP: u16 = 0x1F6;
+    pub const ENDLOOP: u16 = 0x1F7;
+    pub const DISCARD: u16 = 0x1F8;
+    pub const RETC: u16 = 0x1F9;
 }
 
 /// One pixel shader instruction. `op` is Direct3D's opcode (D3DSIO_*;
@@ -1471,6 +1562,9 @@ pub struct PsIns {
     pub src: [u32; 3],
     pub pred: u32,
     pub jump: u32,
+    /// Operands with bit 28 are indexed by this: 0, aL (Direct3D 9);
+    /// else bit 31, a temporary (bits 4-15) and its component (16-17).
+    pub rel: u32,
 }
 
 pub struct PsProgram {
@@ -1539,6 +1633,16 @@ mod sio {
 
 fn sources(op: u16) -> usize {
     use sio::*;
+    if op >= 0x100 {
+        use sm4::*;
+        return match op {
+            IMAD | MOVC | SAMPLE_D | UBFE | IBFE => 3,
+            AND | OR | XOR | DIV | DP2 | EQ | NE | LT | GE | IADD | IMUL | IMAX | IMIN | UMAX | UMIN | ISHL | ISHR | USHR | UDIV | UREM | IEQ | INE | IGE
+            | ILT | ULT | UGE | UMUL | SAMPLE_C | SAMPLE_C_LZ => 2,
+            CONTINUE | LOOP | ENDLOOP => 0,
+            _ => 1,
+        };
+    }
     match op {
         MAD | LRP | CND | CMP | DP2ADD => 3,
         ADD | SUB | MUL | DP3 | DP4 | MIN | MAX | SLT | SGE | DST | POW | CRS | TEX | TEXLDL | SETP | IFC | BREAKC | CALLNZ => 2,
@@ -1557,12 +1661,12 @@ pub fn ps_program(ins: &[PsIns], inputs: u32) -> Option<PsProgram> {
     let ok_src = |s: u32| {
         let (f, i) = (s & 15, (s >> 4) & 0xFFF);
         match f {
-            pf::TEMP => i < 32,
+            pf::TEMP => i < PS_TEMPS as u32,
             pf::INPUT => i < inputs,
-            pf::CONST => (i as usize) < PS_CONSTS,
+            pf::CONST => (i as usize) < PS_CONSTS_MAX,
             pf::CONSTINT | pf::CONSTBOOL => i < 16,
             pf::LOOP | pf::PRED => i == 0,
-            pf::MISC => i < 2,
+            pf::MISC => i < 4,
             _ => false,
         }
     };
@@ -1573,18 +1677,27 @@ pub fn ps_program(ins: &[PsIns], inputs: u32) -> Option<PsProgram> {
         let known = matches!(
             x.op,
             0 | MOV..=FRC | CALL..=LABEL | POW..=BREAKC | TEXKILL | TEX | CND | CMP | DP2ADD | DSX | DSY | SETP | TEXLDL | BREAKP
+        ) || matches!(
+            x.op,
+            0x101 | 0x107 | 0x10E | 0x10F | 0x118..=0x12B | 0x12D | 0x12F | 0x131 | 0x137 | 0x139 | 0x13B..=0x13D | 0x140..=0x144
+                | 0x146 | 0x147 | 0x149 | 0x14B | 0x14E..=0x151 | 0x153..=0x157 | 0x16C | 0x16D | 0x181..=0x183 | 0x186..=0x18B | 0x18D
+                | 0x1F0..=0x1F9
         );
+        if x.rel != 0 && (x.rel >> 31 == 0 || (x.rel >> 4) & 0xFFF >= PS_TEMPS as u32) {
+            return None;
+        }
         if !known || x.jump as usize > ins.len() || x.sampler as usize >= SAMPLERS {
             return None;
         }
         if !x.src[..sources(x.op)].iter().all(|&s| ok_src(s)) {
             return None;
         }
-        let has_dst = !matches!(x.op, 0 | CALL | CALLNZ | LOOP | RET | ENDLOOP | LABEL | REP | ENDREP | IF | IFC | ELSE | ENDIF | BREAK | BREAKC | BREAKP | TEXKILL);
+        let has_dst = !matches!(x.op, 0 | CALL | CALLNZ | LOOP | RET | ENDLOOP | LABEL | REP | ENDREP | IF | IFC | ELSE | ENDIF | BREAK | BREAKC | BREAKP | TEXKILL)
+            && !matches!(x.op, sm4::CONTINUE | sm4::IF | sm4::BREAKC | sm4::CONTINUEC | sm4::LOOP | sm4::ENDLOOP | sm4::DISCARD | sm4::RETC);
         if has_dst {
             let (f, i) = (x.dst & 15, (x.dst >> 4) & 0xFFF);
             let ok = match f {
-                pf::TEMP => i < 32,
+                pf::TEMP => i < PS_TEMPS as u32,
                 pf::COLOR | pf::DEPTH | pf::PRED => i == 0,
                 _ => false,
             };
@@ -1593,7 +1706,7 @@ pub fn ps_program(ins: &[PsIns], inputs: u32) -> Option<PsProgram> {
             }
             writes_depth |= f == pf::DEPTH;
         }
-        if matches!(x.op, TEX) {
+        if matches!(x.op, TEX | sm4::SAMPLE_C | sm4::LOD | sm4::GATHER4) {
             if x.src[0] & 15 == pf::INPUT && x.src[0] & (1 << 28) == 0 && (x.src[0] >> 24) & 15 == 0 {
                 deriv |= 1 << ((x.src[0] >> 4) & 0xFFF);
             } else {
@@ -1893,6 +2006,7 @@ fn cmp_scalar(c: u8, a: f32, b: f32) -> bool {
         4 => a < b,
         5 => a != b,
         6 => a <= b,
+        7 => true,
         _ => false,
     }
 }
@@ -1907,9 +2021,10 @@ impl PsProgram {
         use sio::*;
         let g = &p.g;
         let cf = g.const_first as usize;
-        let block = p.attrs.get(cf..cf + PS_CONST_BLOCK)?;
-        let consts = &block[..PS_CONSTS * 4];
-        let ints = &block[PS_CONSTS * 4..];
+        let nconst = if g.ps_consts == 0 { PS_CONSTS } else { (g.ps_consts as usize).min(PS_CONSTS_MAX) };
+        let block = p.attrs.get(cf..cf + nconst * 4 + 64)?;
+        let consts = &block[..nconst * 4];
+        let ints = &block[nconst * 4..];
         // The inputs, perspective-correct, and the derivatives a TEX needs.
         let pos = from_ints(&[x as i32, y as i32, 0, 0]);
         let dx = pos[0] + 0.5 - rec[0];
@@ -1937,9 +2052,18 @@ impl PsProgram {
             }
             inp[i] = v;
         }
-        let misc = [[pos[0], pos[1], 0.0, 0.0], [rec[2]; 4]];
-        let mut r = [ZERO; 32];
-        let mut rd = [(ZERO, ZERO); 32];
+        let z = rec[6] + rec[7] * dx + rec[8] * dy;
+        let front = f32::from_bits(if rec[2] >= 0.0 { 0xFFFF_FFFF } else { 0 });
+        let misc = [[pos[0], pos[1], 0.0, 0.0], [rec[2]; 4], [pos[0] + 0.5, pos[1] + 0.5, z, q], [front; 4]];
+        let mut r = [ZERO; PS_TEMPS];
+        // Derivatives only for programs that need them.
+        let mut rd_store;
+        let rd: &mut [(F4, F4)] = if self.dual {
+            rd_store = [(ZERO, ZERO); PS_TEMPS];
+            &mut rd_store
+        } else {
+            &mut []
+        };
         let mut color: F4 = [0.0, 0.0, 0.0, 1.0];
         let mut depth = None;
         let mut pred = [false; 4];
@@ -1959,23 +2083,30 @@ impl PsProgram {
             }
             let x = &self.ins[pc];
             pc += 1;
-            let read = |s: u32, r: &[F4; 32], pred: &[bool; 4], al: i32| -> F4 {
+            // A relative index: aL, or a temporary's component.
+            let off = if x.rel != 0 { r[((x.rel >> 4) & 63) as usize][((x.rel >> 16) & 3) as usize].to_bits() as i32 } else { al };
+            let read = |s: u32, r: &[F4; PS_TEMPS], pred: &[bool; 4], al: i32| -> F4 {
                 let (f, mut i) = (s & 15, ((s >> 4) & 0xFFF) as i32);
                 if s & (1 << 28) != 0 {
-                    i += al;
+                    i = i.wrapping_add(al);
                 }
                 let v: F4 = match f {
-                    pf::TEMP => r[(i as usize) & 31],
+                    pf::TEMP => r[(i as usize) & 63],
                     pf::INPUT => inp[(i.max(0) as usize).min(PS_INPUTS - 1)],
                     pf::CONST => {
-                        let i = i.clamp(0, PS_CONSTS as i32 - 1) as usize * 4;
-                        [consts[i], consts[i + 1], consts[i + 2], consts[i + 3]]
+                        // Out of range reads 0, as Direct3D 10's do.
+                        if i < 0 || i as usize >= nconst {
+                            ZERO
+                        } else {
+                            let i = i as usize * 4;
+                            [consts[i], consts[i + 1], consts[i + 2], consts[i + 3]]
+                        }
                     }
                     pf::CONSTINT => from_ints(&int_const(i as u32)),
                     pf::CONSTBOOL => splat(if bool_const(i as u32) { 1.0 } else { 0.0 }),
                     pf::LOOP => from_ints(&[al; 4]),
                     pf::PRED => pred.map(|b| if b { 1.0 } else { 0.0 }),
-                    pf::MISC => misc[(i as usize) & 1],
+                    pf::MISC => misc[(i as usize) & 3],
                     _ => ZERO,
                 };
                 let sw = s >> 16;
@@ -1999,13 +2130,13 @@ impl PsProgram {
             let n = sources(x.op);
             let mut s = [ZERO; 3];
             for k in 0..n {
-                s[k] = read(x.src[k], &r, &pred, al);
+                s[k] = read(x.src[k], &r, &pred, off);
             }
             // Their derivatives (dual programs only).
             let mut sd = [(ZERO, ZERO); 3];
             if self.dual {
                 for k in 0..n {
-                    sd[k] = read_d(x.src[k], &s[k], &rd, &dd, al);
+                    sd[k] = read_d(x.src[k], &s[k], rd, &dd, off);
                 }
             }
             match x.op {
@@ -2093,6 +2224,57 @@ impl PsProgram {
                     }
                     continue;
                 }
+                sm4::IF => {
+                    if (s[0][0].to_bits() != 0) != (x.ctrl & 1 != 0) {
+                        pc = x.jump as usize + 1;
+                    }
+                    continue;
+                }
+                sm4::LOOP => {
+                    if nl == loops.len() {
+                        pc = x.jump as usize + 1;
+                    } else {
+                        loops[nl] = (pc, i32::MAX, al, 0);
+                        nl += 1;
+                    }
+                    continue;
+                }
+                sm4::ENDLOOP => {
+                    if nl > 0 {
+                        pc = loops[nl - 1].0;
+                    }
+                    continue;
+                }
+                sm4::CONTINUE | sm4::CONTINUEC => {
+                    if x.op == sm4::CONTINUE || (s[0][0].to_bits() != 0) == (x.ctrl & 1 != 0) {
+                        pc = x.jump as usize;
+                    }
+                    continue;
+                }
+                sm4::BREAKC => {
+                    if (s[0][0].to_bits() != 0) == (x.ctrl & 1 != 0) && nl > 0 {
+                        nl -= 1;
+                        al = loops[nl].2;
+                        pc = x.jump as usize + 1;
+                    }
+                    continue;
+                }
+                sm4::DISCARD => {
+                    if (s[0][0].to_bits() != 0) == (x.ctrl & 1 != 0) {
+                        return None;
+                    }
+                    continue;
+                }
+                sm4::RETC => {
+                    if (s[0][0].to_bits() != 0) == (x.ctrl & 1 != 0) {
+                        if nc == 0 {
+                            break;
+                        }
+                        nc -= 1;
+                        pc = calls[nc];
+                    }
+                    continue;
+                }
                 _ => {}
             }
             let (a, b, c) = (&s[0], &s[1], &s[2]);
@@ -2138,6 +2320,7 @@ impl PsProgram {
                 DSX => sd[0].0,
                 DSY => sd[0].1,
                 TEX | TEXLDL => self.texld(p, x, a, &dd, &sd[0]),
+                op if op >= 0x100 => self.sm4_op(p, x, &s, &sd, &dd),
                 _ => ZERO,
             };
             let vd = if self.dual { derivative(x.op, &s, &sd, &v) } else { (ZERO, ZERO) };
@@ -2163,7 +2346,7 @@ impl PsProgram {
             }
             let (f, mut i) = (d & 15, ((d >> 4) & 0xFFF) as i32);
             if d & (1 << 28) != 0 {
-                i += al;
+                i = i.wrapping_add(off);
             }
             for k in 0..4 {
                 if mask & (1 << k) == 0 {
@@ -2171,9 +2354,11 @@ impl PsProgram {
                 }
                 match f {
                     pf::TEMP => {
-                        r[(i as usize) & 31][k] = v[k];
-                        rd[(i as usize) & 31].0[k] = vd.0[k];
-                        rd[(i as usize) & 31].1[k] = vd.1[k];
+                        r[(i as usize) & 63][k] = v[k];
+                        if let Some(e) = rd.get_mut((i as usize) & 63) {
+                            e.0[k] = vd.0[k];
+                            e.1[k] = vd.1[k];
+                        }
                     }
                     pf::COLOR => color[k] = v[k],
                     pf::DEPTH => depth = Some(v[0]),
@@ -2223,8 +2408,14 @@ impl PsProgram {
             let base = if len2 > 0.0 { (0.5 * log2f(len2) * 256.0).max(-32768.0) as i32 } else { -32768 };
             base + if x.ctrl & 2 != 0 { (c[3] * 256.0) as i32 } else { 0 }
         };
+        let smp = &p.g.samplers[s];
+        if smp.packed_depth != 0 {
+            // A depth buffer read as a texture: its depth, unfiltered.
+            let k = to_ints(&[c[0] * tw, c[1] * th, 0.0, 0.0]);
+            return [packed_depth(texel_at(t, smp, 0, k[0] as i64, k[1] as i64)), 0.0, 0.0, 1.0];
+        }
         let u = to_ints(&[c[0] * tw * 256.0, c[1] * th * 256.0, 0.0, 0.0]);
-        let px = sample(t, &p.g.samplers[s], (u[0] as i64) << 8, (u[1] as i64) << 8, lambda, true);
+        let px = sample(t, smp, (u[0] as i64) << 8, (u[1] as i64) << 8, lambda, true);
         let f = from_ints(&px);
         mul(&f, &splat(1.0 / (255.0 * 256.0)))
     }
@@ -2232,13 +2423,13 @@ impl PsProgram {
 
 /// A source's derivatives (d/dx, d/dy): the register's, swizzled, with the
 /// modifier's slope.
-fn read_d(s: u32, val: &F4, rd: &[(F4, F4); 32], dd: &[(F4, F4); PS_INPUTS], al: i32) -> (F4, F4) {
+fn read_d(s: u32, val: &F4, rd: &[(F4, F4)], dd: &[(F4, F4); PS_INPUTS], al: i32) -> (F4, F4) {
     let (f, mut i) = (s & 15, ((s >> 4) & 0xFFF) as i32);
     if s & (1 << 28) != 0 {
-        i += al;
+        i = i.wrapping_add(al);
     }
     let (dx, dy) = match f {
-        pf::TEMP => rd[(i as usize) & 31],
+        pf::TEMP => rd.get((i as usize) & 63).copied().unwrap_or((ZERO, ZERO)),
         pf::INPUT => dd[(i.max(0) as usize).min(PS_INPUTS - 1)],
         _ => return (ZERO, ZERO),
     };
@@ -2334,6 +2525,318 @@ fn derivative(op: u16, s: &[F4; 3], sd: &[(F4, F4); 3], v: &F4) -> (F4, F4) {
             };
             (f(&sd[0].0), f(&sd[0].1))
         }
+        // Direct3D 10's, per component.
+        sm4::DIV => {
+            // (a / b)' = (a' - v b') / b.
+            let f = |da: &F4, db: &F4| div(&sub(da, &mul(v, db)), b);
+            (f(&sd[0].0, &sd[1].0), f(&sd[0].1, &sd[1].1))
+        }
+        sm4::DP2 => {
+            let f = |da: &F4, db: &F4| splat(da[0] * b[0] + a[0] * db[0] + da[1] * b[1] + a[1] * db[1]);
+            (f(&sd[0].0, &sd[1].0), f(&sd[0].1, &sd[1].1))
+        }
+        sm4::MOVC => {
+            let m: F4 = core::array::from_fn(|k| f32::from_bits(if a[k].to_bits() != 0 { 0xFFFF_FFFF } else { 0 }));
+            (select(&m, &sd[1].0, &sd[2].0), select(&m, &sd[1].1, &sd[2].1))
+        }
+        sm4::SQRT | sm4::RSQ | sm4::RCP | sm4::EXP | sm4::LOG | sm4::SIN | sm4::COS => {
+            // The slope of each component's function at its source.
+            let k: F4 = core::array::from_fn(|i| match op {
+                sm4::SQRT => if v[i] != 0.0 { 0.5 / v[i] } else { 0.0 },
+                sm4::RSQ => -0.5 * v[i] * v[i] * v[i],
+                sm4::RCP => -v[i] * v[i],
+                sm4::EXP => v[i] * core::f32::consts::LN_2,
+                sm4::LOG => if a[i] != 0.0 { core::f32::consts::LOG2_E / a[i] } else { 0.0 },
+                sm4::SIN => sincosf(a[i]).1,
+                _ => -sincosf(a[i]).0,
+            });
+            (mul(&k, &sd[0].0), mul(&k, &sd[0].1))
+        }
         _ => (ZERO, ZERO),
+    }
+}
+
+// -----| Direct3D 10/11's operations |-----
+
+fn bits(v: &F4) -> [u32; 4] {
+    v.map(|f| f.to_bits())
+}
+
+fn from_bits(u: [u32; 4]) -> F4 {
+    u.map(f32::from_bits)
+}
+
+fn mask(b: bool) -> u32 {
+    if b { 0xFFFF_FFFF } else { 0 }
+}
+
+/// |f| below 2^23 (so it has a fraction), and not infinite or NaN.
+fn has_fraction(f: f32) -> bool {
+    (f.to_bits() & 0x7FFF_FFFF) < 0x4B00_0000
+}
+
+fn half_to_f32(h: u32) -> f32 {
+    let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 31, h & 1023);
+    let b = if e == 0 {
+        if m == 0 {
+            s << 31
+        } else {
+            let (mut e, mut m) = (127 - 15 + 1, m);
+            while m & 1024 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            s << 31 | (e as u32) << 23 | (m & 1023) << 13
+        }
+    } else if e == 31 {
+        s << 31 | 0xFF << 23 | m << 13
+    } else {
+        s << 31 | (e + 127 - 15) << 23 | m << 13
+    };
+    f32::from_bits(b)
+}
+
+fn f32_to_half(f: f32) -> u32 {
+    let b = f.to_bits();
+    let s = (b >> 16) & 0x8000;
+    let e = ((b >> 23) & 255) as i32 - 127 + 15;
+    let m = b & 0x7F_FFFF;
+    if (b >> 23) & 255 == 255 {
+        s | 0x7C00 | if m != 0 { 0x200 } else { 0 }
+    } else if e >= 31 {
+        s | 0x7C00
+    } else if e <= 0 {
+        s
+    } else {
+        // Rounded to nearest.
+        let r = s | (e as u32) << 10 | (m >> 13);
+        if m & 0x1000 != 0 { r + 1 } else { r }
+    }
+}
+
+/// A texel of level `n`, as the sampler addresses it, 0xAARRGGBB.
+fn texel_at(t: &Texture, s: &Sampler, n: usize, x: i64, y: i64) -> u32 {
+    let l = &t.levels[n.min(t.levels.len() - 1)];
+    match (address(x, l.w, s.address[0]), address(y, l.h, s.address[1])) {
+        (Some(x), Some(y)) => t.texels[l.at + y * l.w + x],
+        _ => s.border,
+    }
+}
+
+/// 24-bit depth packed into red, green and blue.
+fn packed_depth(v: u32) -> f32 {
+    (v & 0xFF_FFFF) as f32 / 16_777_215.0
+}
+
+fn argb_f(v: u32) -> F4 {
+    let k = 1.0 / 255.0;
+    [(v >> 16 & 0xFF) as f32 * k, (v >> 8 & 0xFF) as f32 * k, (v & 0xFF) as f32 * k, (v >> 24) as f32 * k]
+}
+
+/// The level of detail of gradients `gx`, `gy` on a `tw` x `th` level, 8
+/// fraction bits.
+fn lambda_of(gx: &F4, gy: &F4, tw: f32, th: f32) -> i32 {
+    let (ux, vx, uy, vy) = (gx[0] * tw, gx[1] * th, gy[0] * tw, gy[1] * th);
+    let len2 = (ux * ux + vx * vx).max(uy * uy + vy * vy);
+    if len2 > 0.0 { (0.5 * log2f(len2) * 256.0).max(-32768.0) as i32 } else { -32768 }
+}
+
+/// D3D11_COMPARISON_FUNC (1 never ..= 8 always) as cmp_scalar's: the
+/// reference compared with the texel.
+fn d3d_func(f: u32) -> u8 {
+    match f {
+        2 => 4, // less
+        3 => 2, // equal
+        4 => 6, // less or equal
+        5 => 1, // greater
+        6 => 5, // not equal
+        7 => 3, // greater or equal
+        8 => 7, // always
+        _ => 0, // never
+    }
+}
+
+impl PsProgram {
+    /// The derivatives of coordinates source `src` (`cd`, or the input's
+    /// when they come straight from one).
+    fn coord_derivs(&self, src: u32, cd: &(F4, F4), dd: &[(F4, F4); PS_INPUTS]) -> (F4, F4) {
+        let direct = src & 15 == pf::INPUT && src & (1 << 28) == 0 && (src >> 24) & 15 == 0;
+        if direct {
+            let (ddx, ddy) = dd[(((src >> 4) & 0xFFF) as usize).min(PS_INPUTS - 1)];
+            let sw = src >> 16;
+            let pick = |v: &F4| -> F4 { core::array::from_fn(|k| v[((sw >> (2 * k)) & 3) as usize]) };
+            (pick(&ddx), pick(&ddy))
+        } else {
+            *cd
+        }
+    }
+
+    /// One SM4 operation's result (`s`: its sources, `sd` their derivatives).
+    fn sm4_op(&self, p: &Pass, x: &PsIns, s: &[F4; 3], sd: &[(F4, F4); 3], dd: &[(F4, F4); PS_INPUTS]) -> F4 {
+        use sm4::*;
+        let (a, b, c) = (bits(&s[0]), bits(&s[1]), bits(&s[2]));
+        let (fa, fb) = (&s[0], &s[1]);
+        let each = |f: &dyn Fn(u32, u32, u32) -> u32| from_bits(core::array::from_fn(|k| f(a[k], b[k], c[k])));
+        let fcmp = |f: &dyn Fn(f32, f32) -> bool| from_bits(core::array::from_fn(|k| mask(f(fa[k], fb[k]))));
+        match x.op {
+            AND => each(&|a, b, _| a & b),
+            OR => each(&|a, b, _| a | b),
+            XOR => each(&|a, b, _| a ^ b),
+            NOT => each(&|a, _, _| !a),
+            IADD => each(&|a, b, _| a.wrapping_add(b)),
+            INEG => each(&|a, _, _| a.wrapping_neg()),
+            IMUL | UMUL => each(&|a, b, _| a.wrapping_mul(b)),
+            IMAD => each(&|a, b, c| a.wrapping_mul(b).wrapping_add(c)),
+            IMAX => each(&|a, b, _| (a as i32).max(b as i32) as u32),
+            IMIN => each(&|a, b, _| (a as i32).min(b as i32) as u32),
+            UMAX => each(&|a, b, _| a.max(b)),
+            UMIN => each(&|a, b, _| a.min(b)),
+            ISHL => each(&|a, b, _| a << (b & 31)),
+            ISHR => each(&|a, b, _| ((a as i32) >> (b & 31)) as u32),
+            USHR => each(&|a, b, _| a >> (b & 31)),
+            UDIV => each(&|a, b, _| if b == 0 { u32::MAX } else { a / b }),
+            UREM => each(&|a, b, _| if b == 0 { u32::MAX } else { a % b }),
+            IEQ => each(&|a, b, _| mask(a == b)),
+            INE => each(&|a, b, _| mask(a != b)),
+            IGE => each(&|a, b, _| mask(a as i32 >= b as i32)),
+            ILT => each(&|a, b, _| mask((a as i32) < b as i32)),
+            UGE => each(&|a, b, _| mask(a >= b)),
+            ULT => each(&|a, b, _| mask(a < b)),
+            MOVC => each(&|a, b, c| if a != 0 { b } else { c }),
+            EQ => fcmp(&|a, b| a == b),
+            NE => fcmp(&|a, b| a != b),
+            LT => fcmp(&|a, b| a < b),
+            GE => fcmp(&|a, b| a >= b),
+            FTOI => from_bits(fa.map(|f| (f as i32) as u32)),
+            FTOU => from_bits(fa.map(|f| f as u32)),
+            ITOF => from_ints(&a.map(|v| v as i32)),
+            UTOF => a.map(|v| v as f32),
+            DIV => div(fa, fb),
+            DP2 => splat(fa[0] * fb[0] + fa[1] * fb[1]),
+            EXP => fa.map(exp2f),
+            LOG => fa.map(log2f),
+            RSQ => div(&ONE, &sqrt4(fa)),
+            SQRT => sqrt4(fa),
+            RCP => div(&ONE, fa),
+            ROUND_NI => floor4(fa),
+            ROUND_PI => sub(&ZERO, &floor4(&sub(&ZERO, fa))),
+            ROUND_Z => fa.map(|f| if has_fraction(f) { (f as i32) as f32 } else { f }),
+            ROUND_NE => fa.map(|f| {
+                if !has_fraction(f) {
+                    return f;
+                }
+                let lo = fl(f);
+                let d = f - lo;
+                if d > 0.5 || (d == 0.5 && (lo as i32) & 1 == 1) { lo + 1.0 } else { lo }
+            }),
+            SIN => fa.map(|f| sincosf(f).0),
+            COS => fa.map(|f| sincosf(f).1),
+            BFREV => each(&|a, _, _| a.reverse_bits()),
+            COUNTBITS => each(&|a, _, _| a.count_ones()),
+            FIRSTBIT_HI => each(&|a, _, _| if a == 0 { u32::MAX } else { a.leading_zeros() }),
+            FIRSTBIT_LO => each(&|a, _, _| if a == 0 { u32::MAX } else { a.trailing_zeros() }),
+            FIRSTBIT_SHI => each(&|a, _, _| {
+                let v = if (a as i32) < 0 { !a } else { a };
+                if v == 0 { u32::MAX } else { v.leading_zeros() }
+            }),
+            UBFE | IBFE => {
+                let signed = x.op == IBFE;
+                each(&|w, o, v| {
+                    let (w, o) = (w & 31, o & 31);
+                    if w == 0 {
+                        0
+                    } else if w + o < 32 {
+                        let l = v << (32 - w - o);
+                        if signed { ((l as i32) >> (32 - w)) as u32 } else { l >> (32 - w) }
+                    } else if signed {
+                        ((v as i32) >> o) as u32
+                    } else {
+                        v >> o
+                    }
+                })
+            }
+            F32TOF16 => from_bits(fa.map(f32_to_half)),
+            F16TOF32 => a.map(|h| half_to_f32(h & 0xFFFF)),
+            SAMPLE_D | SAMPLE_C | SAMPLE_C_LZ | LD | RESINFO | GATHER4 | LOD => self.sample_op(p, x, s, &sd[0], dd),
+            _ => ZERO,
+        }
+    }
+
+    /// The SM4 sampling operations.
+    fn sample_op(&self, p: &Pass, x: &PsIns, s: &[F4; 3], cd: &(F4, F4), dd: &[(F4, F4); PS_INPUTS]) -> F4 {
+        use sm4::*;
+        let si = (x.sampler as usize).min(SAMPLERS - 1);
+        let smp = &p.g.samplers[si];
+        let Some(t) = p.tex[si] else { return ZERO };
+        let first = (smp.max_level as usize).min(t.levels.len() - 1);
+        let l0 = &t.levels[0];
+        let (tw, th) = (l0.w as f32, l0.h as f32);
+        let c = &s[0];
+        match x.op {
+            RESINFO => {
+                let m = (s[0][0].to_bits() as usize).saturating_add(first);
+                let (w, h) = t.levels.get(m).map_or((0, 0), |l| (l.w as u32, l.h as u32));
+                let n = (t.levels.len() - first) as u32;
+                match x.ctrl & 3 {
+                    2 => from_bits([w, h, 1, n]),
+                    1 => [if w > 0 { 1.0 / w as f32 } else { 0.0 }, if h > 0 { 1.0 / h as f32 } else { 0.0 }, 1.0, n as f32],
+                    _ => [w as f32, h as f32, 1.0, n as f32],
+                }
+            }
+            LD => {
+                let i = bits(c);
+                let n = (i[3] as usize).saturating_add(first);
+                if n >= t.levels.len() {
+                    return ZERO;
+                }
+                let raw = Sampler { address: [BORDER, BORDER], border: 0, ..*smp };
+                let v = texel_at(t, &raw, n, i[0] as i32 as i64, i[1] as i32 as i64);
+                if smp.packed_depth != 0 { [packed_depth(v), 0.0, 0.0, 1.0] } else { argb_f(v) }
+            }
+            LOD => {
+                let (gx, gy) = self.coord_derivs(x.src[0], cd, dd);
+                let l = lambda_of(&gx, &gy, tw, th) as f32 / 256.0;
+                let top = (t.levels.len() - 1 - first) as f32;
+                [l.max(0.0).min(top), l, 0.0, 0.0]
+            }
+            GATHER4 | SAMPLE_C | SAMPLE_C_LZ => {
+                // The four texels of the first level's bilinear footprint,
+                // and where in it the coordinates fall.
+                let l = &t.levels[first];
+                let k = to_ints(&[c[0] * l.w as f32 * 256.0 - 128.0, c[1] * l.h as f32 * 256.0 - 128.0, 0.0, 0.0]);
+                let (x0, y0) = ((k[0] >> 8) as i64, (k[1] >> 8) as i64);
+                let (fx, fy) = ((k[0] & 255) as f32 / 256.0, (k[1] & 255) as f32 / 256.0);
+                let q = [
+                    texel_at(t, smp, first, x0, y0 + 1),
+                    texel_at(t, smp, first, x0 + 1, y0 + 1),
+                    texel_at(t, smp, first, x0 + 1, y0),
+                    texel_at(t, smp, first, x0, y0),
+                ];
+                let val = |v: u32| if smp.packed_depth != 0 { packed_depth(v) } else { argb_f(v)[0] };
+                if x.op == GATHER4 {
+                    return q.map(val);
+                }
+                // Comparison: each texel against the reference, the results
+                // filtered (percentage closer) or the nearest one taken.
+                let r = s[1][0];
+                let f = d3d_func(smp.compare);
+                let pass = |v: u32| -> f32 { if cmp_scalar(f, r, val(v)) { 1.0 } else { 0.0 } };
+                if smp.mag == FILTER_LINEAR {
+                    let top = pass(q[3]) * (1.0 - fx) + pass(q[2]) * fx;
+                    let bot = pass(q[0]) * (1.0 - fx) + pass(q[1]) * fx;
+                    splat(top * (1.0 - fy) + bot * fy)
+                } else {
+                    let n = to_ints(&[c[0] * l.w as f32, c[1] * l.h as f32, 0.0, 0.0]);
+                    splat(pass(texel_at(t, smp, first, n[0] as i64, n[1] as i64)))
+                }
+            }
+            _ => {
+                // sample_d: the level of detail from the gradients given.
+                let lambda = lambda_of(&s[1], &s[2], tw, th);
+                let u = to_ints(&[c[0] * tw * 256.0, c[1] * th * 256.0, 0.0, 0.0]);
+                let px = sample(t, smp, (u[0] as i64) << 8, (u[1] as i64) << 8, lambda, true);
+                mul(&from_ints(&px), &splat(1.0 / (255.0 * 256.0)))
+            }
+        }
     }
 }

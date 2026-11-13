@@ -645,16 +645,16 @@ pub static ID3D11DEVICECONTEXT: Vtbl<115> = Vtbl([
     crate::context::Ctx_PSSetShader as *const (),
     crate::context::Ctx_PSSetSamplers as *const (),
     crate::context::Ctx_VSSetShader as *const (),
-    stub_Ctx_DrawIndexed as *const (),
-    stub_Ctx_Draw as *const (),
+    crate::draw::Ctx_DrawIndexed as *const (),
+    crate::draw::Ctx_Draw as *const (),
     crate::res::Ctx_Map as *const (),
     crate::res::Ctx_Unmap as *const (),
     crate::context::Ctx_PSSetConstantBuffers as *const (),
     crate::context::Ctx_IASetInputLayout as *const (),
     crate::context::Ctx_IASetVertexBuffers as *const (),
     crate::context::Ctx_IASetIndexBuffer as *const (),
-    stub_Ctx_DrawIndexedInstanced as *const (),
-    stub_Ctx_DrawInstanced as *const (),
+    crate::draw::Ctx_DrawIndexedInstanced as *const (),
+    crate::draw::Ctx_DrawInstanced as *const (),
     crate::context::Ctx_GSSetConstantBuffers as *const (),
     crate::context::Ctx_GSSetShader as *const (),
     crate::context::Ctx_IASetPrimitiveTopology as *const (),
@@ -671,7 +671,7 @@ pub static ID3D11DEVICECONTEXT: Vtbl<115> = Vtbl([
     crate::context::Ctx_OMSetBlendState as *const (),
     crate::context::Ctx_OMSetDepthStencilState as *const (),
     crate::context::Ctx_SOSetTargets as *const (),
-    stub_Ctx_DrawAuto as *const (),
+    crate::draw::Ctx_DrawAuto as *const (),
     stub_Ctx_DrawIndexedInstancedIndirect as *const (),
     stub_Ctx_DrawInstancedIndirect as *const (),
     stub_Ctx_Dispatch as *const (),
@@ -763,10 +763,10 @@ pub static ID3D11DEVICE: Vtbl<43> = Vtbl([
     crate::res::Dev_CreateRenderTargetView as *const (),
     crate::res::Dev_CreateDepthStencilView as *const (),
     crate::state::Dev_CreateInputLayout as *const (),
-    stub_Dev_CreateVertexShader as *const (),
-    stub_Dev_CreateGeometryShader as *const (),
+    crate::shader::Dev_CreateVertexShader as *const (),
+    crate::shader::Dev_CreateGeometryShader as *const (),
     stub_Dev_CreateGeometryShaderWithStreamOutput as *const (),
-    stub_Dev_CreatePixelShader as *const (),
+    crate::shader::Dev_CreatePixelShader as *const (),
     stub_Dev_CreateHullShader as *const (),
     stub_Dev_CreateDomainShader as *const (),
     stub_Dev_CreateComputeShader as *const (),
@@ -908,26 +908,6 @@ unsafe extern "system" fn stub_CmdL_GetContextFlags() -> usize {
     unimplemented(b"ID3D11CommandList::GetContextFlags\0");
     0
 }
-unsafe extern "system" fn stub_Ctx_DrawIndexed() -> usize {
-    unimplemented(b"ID3D11DeviceContext::DrawIndexed\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_Draw() -> usize {
-    unimplemented(b"ID3D11DeviceContext::Draw\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_DrawIndexedInstanced() -> usize {
-    unimplemented(b"ID3D11DeviceContext::DrawIndexedInstanced\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_DrawInstanced() -> usize {
-    unimplemented(b"ID3D11DeviceContext::DrawInstanced\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_DrawAuto() -> usize {
-    unimplemented(b"ID3D11DeviceContext::DrawAuto\0");
-    0
-}
 unsafe extern "system" fn stub_Ctx_DrawIndexedInstancedIndirect() -> usize {
     unimplemented(b"ID3D11DeviceContext::DrawIndexedInstancedIndirect\0");
     0
@@ -968,20 +948,8 @@ unsafe extern "system" fn stub_Ctx_FinishCommandList() -> i32 {
     unimplemented(b"ID3D11DeviceContext::FinishCommandList\0");
     E_NOTIMPL
 }
-unsafe extern "system" fn stub_Dev_CreateVertexShader() -> i32 {
-    unimplemented(b"ID3D11Device::CreateVertexShader\0");
-    E_NOTIMPL
-}
-unsafe extern "system" fn stub_Dev_CreateGeometryShader() -> i32 {
-    unimplemented(b"ID3D11Device::CreateGeometryShader\0");
-    E_NOTIMPL
-}
 unsafe extern "system" fn stub_Dev_CreateGeometryShaderWithStreamOutput() -> i32 {
     unimplemented(b"ID3D11Device::CreateGeometryShaderWithStreamOutput\0");
-    E_NOTIMPL
-}
-unsafe extern "system" fn stub_Dev_CreatePixelShader() -> i32 {
-    unimplemented(b"ID3D11Device::CreatePixelShader\0");
     E_NOTIMPL
 }
 unsafe extern "system" fn stub_Dev_CreateHullShader() -> i32 {

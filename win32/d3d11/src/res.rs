@@ -140,6 +140,12 @@ pub fn is_resource(p: *mut Com) -> bool {
 }
 
 impl Resource {
+    /// A depth buffer (typeless ones too): its kernel target's truth is
+    /// in the depth and stencil planes.
+    pub fn holds_depth(&self) -> bool {
+        is_depth(self.format) || self.bind & BIND_DEPTH_STENCIL != 0
+    }
+
     fn flush_device(&self) {
         if !self.device.is_null() {
             crate::device::of(self.device).flush();
@@ -150,7 +156,7 @@ impl Resource {
     /// drawn there; the device's waiting draws go first).
     pub fn read_argb(&mut self, s: usize) -> Vec<u32> {
         let sub = self.subs[s];
-        if self.drawn[s] && !is_depth(self.format) {
+        if self.drawn[s] && !self.holds_depth() {
             self.flush_device();
             let mut px = vec![0u32; (sub.w * sub.h) as usize];
             let r = ReadArgs { x: 0, y: 0, w: sub.w as i32, h: sub.h as i32, dst: px.as_mut_ptr() as u64, stride: sub.w as i64 * 4 };
@@ -171,7 +177,7 @@ impl Resource {
             return;
         }
         let sub = self.subs[s];
-        if is_depth(self.format) {
+        if self.holds_depth() {
             self.flush_device();
             let mut z = vec![0u32; (sub.w * sub.h) as usize];
             let mut st = vec![0u32; (sub.w * sub.h) as usize];
@@ -223,7 +229,7 @@ impl Resource {
         }
         let sub = self.subs[s];
         let full = [0, 0, sub.w as i32, sub.h as i32];
-        if is_depth(self.format) {
+        if self.holds_depth() {
             let bpp = bytes(self.format).unwrap_or(4) as usize;
             let mut z = vec![0u32; (sub.w * sub.h) as usize];
             let mut st = vec![0u32; (sub.w * sub.h) as usize];
@@ -277,6 +283,47 @@ impl Resource {
         let mut texels = Vec::new();
         for l in 0..m {
             texels.extend(self.read_argb(slice * m + l));
+        }
+        let args = TexArgs { w: self.w, h: if self.dim == DIM_TEXTURE1D { 1 } else { self.h }, texels: texels.as_ptr() as u64, levels: m as u32 };
+        let h = gfx3d::upload_texture(self.textures[slice], &args);
+        if h != 0 {
+            self.textures[slice] = h;
+        }
+        self.dirty[slice] = false;
+        self.textures[slice]
+    }
+
+    /// Array slice `slice` of a depth buffer as a texture for shaders: each
+    /// texel its depth (24 bits) across red, green and blue.
+    pub fn depth_texture(&mut self, slice: usize) -> u64 {
+        let m = self.mips as usize;
+        if slice >= self.textures.len() {
+            return 0;
+        }
+        let drawn = (0..m).any(|l| self.drawn[slice * m + l]);
+        if self.textures[slice] != 0 && !self.dirty[slice] && !drawn {
+            return self.textures[slice];
+        }
+        let bpp = bytes(self.format).unwrap_or(4) as usize;
+        let mut texels = Vec::new();
+        for l in 0..m {
+            let s = slice * m + l;
+            self.sync(s);
+            let sub = self.subs[s];
+            for y in 0..sub.h as usize {
+                for x in 0..sub.w as usize {
+                    let at = sub.at + y * sub.pitch as usize + x * bpp;
+                    let mut b = [0u8; 4];
+                    b[..bpp.min(4)].copy_from_slice(&self.data[at..at + bpp.min(4)]);
+                    let v = u32::from_le_bytes(b);
+                    let z = match self.format {
+                        D24_UNORM_S8_UINT | R24G8_TYPELESS => v & 0xFF_FFFF,
+                        D16_UNORM | R16_TYPELESS => (v as u64 * DEPTH_MAX as u64 / 65535) as u32,
+                        _ => (f32::from_bits(v).clamp(0.0, 1.0) as f64 * DEPTH_MAX as f64) as u32,
+                    };
+                    texels.push(0xFF00_0000 | z);
+                }
+            }
         }
         let args = TexArgs { w: self.w, h: if self.dim == DIM_TEXTURE1D { 1 } else { self.h }, texels: texels.as_ptr() as u64, levels: m as u32 };
         let h = gfx3d::upload_texture(self.textures[slice], &args);

@@ -932,7 +932,7 @@ pub fn to_kernel(s: &Shader) -> Option<(Vec<PsIns>, Vec<(u8, u8)>)> {
     let mut at: Vec<usize> = Vec::with_capacity(s.ins.len() + 1);
     for x in &s.ins {
         at.push(out.len());
-        let mut k = PsIns { op: x.op, ctrl: x.ctrl, sampler: 0, dst: 0, src: [0; 3], pred: pred(&x.pred), jump: 0 };
+        let mut k = PsIns { op: x.op, ctrl: x.ctrl, sampler: 0, dst: 0, src: [0; 3], pred: pred(&x.pred), jump: 0, rel: 0 };
         match x.op {
             M4X4 | M4X3 | M3X4 | M3X3 | M3X2 => {
                 // One DP4 or DP3 a row, each writing its component.
@@ -1078,7 +1078,7 @@ fn ps1_to_kernel(s: &Shader) -> Option<(Vec<PsIns>, Vec<(u8, u8)>)> {
     let dmask = |file: u32, idx: u32, mask: u32| file | idx << 4 | mask << 16;
     let tc = |input: &mut dyn FnMut(u8, u8) -> Option<u32>, n: u16, sw: u32| -> Option<u32> { Some(op(pf::INPUT, input(U_TEXCOORD, n as u8)?, sw, 0)) };
     let mut out: Vec<PsIns> = Vec::new();
-    let ins = |o: u16, dst: u32, src: [u32; 3], sampler: u8| PsIns { op: o, ctrl: 0, sampler, dst, src, pred: 0, jump: 0 };
+    let ins = |o: u16, dst: u32, src: [u32; 3], sampler: u8| PsIns { op: o, ctrl: 0, sampler, dst, src, pred: 0, jump: 0, rel: 0 };
     let mut pads = 0u32;
     for x in &s.ins {
         // An operand of an arithmetic instruction.

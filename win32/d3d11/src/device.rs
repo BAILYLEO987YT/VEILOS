@@ -34,6 +34,9 @@ pub struct Device {
     pub ctx: *mut Com,
     pub state: crate::context::Bindings,
     pub batch: Batch,
+    /// The colour target drawn into when only depth is bound: its size
+    /// and handle.
+    pub scratch: ((u32, u32), u64),
 }
 
 pub fn of<'a>(dev: *mut Com) -> &'a mut Device {
@@ -72,6 +75,9 @@ impl Drop for Device {
     fn drop(&mut self) {
         self.state.clear();
         self.flush();
+        if self.scratch.1 != 0 {
+            gfx3d::close(self.scratch.1);
+        }
     }
 }
 
@@ -113,7 +119,7 @@ pub unsafe fn create(
     if !adapter.is_null() {
         unsafe { add_ref(ad) };
     }
-    let d = Device { level: lv, flags, ctx: core::ptr::null_mut(), state: Default::default(), batch: Batch::default() };
+    let d = Device { level: lv, flags, ctx: core::ptr::null_mut(), state: Default::default(), batch: Batch::default(), scratch: ((0, 0), 0) };
     let dev = Com::new(&ID3D11DEVICE, &DEVICE_IIDS, ad, Body::Device(Box::new(d)));
     unsafe { release(ad) };
     let c = alias(&ID3D11DEVICECONTEXT, &CONTEXT_IIDS);
