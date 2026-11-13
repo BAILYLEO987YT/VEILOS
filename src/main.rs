@@ -83,6 +83,7 @@ pub mod nt_sound;
 pub mod entropy;
 pub mod security;
 pub mod sysprof;
+pub mod aslr;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;

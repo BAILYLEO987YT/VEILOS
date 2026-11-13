@@ -431,8 +431,22 @@ impl Linker {
             base |= 0x1_0000_0000;
             crate::trace_println!("[MODULES] low image base {:#x} moved to {:#x}", pe.image_base, base);
         }
-        let size = Self::map_image(file, headers, &mut pe, base)?;
         let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+        // ASLR (aslr.rs): this boot's place for this program, if it can move
+        // and the place is free.
+        if !crate::aslr::relocs_stripped(headers) {
+            let size_of_image = {
+                let pe_off = u32::from_le_bytes(headers[0x3C..0x40].try_into().map_err(|_| "truncated PE header")?) as usize;
+                u32::from_le_bytes(headers[pe_off + 24 + 56..pe_off + 24 + 60].try_into().map_err(|_| "truncated PE header")?) as u64
+            };
+            if let Some(moved) = (0..crate::aslr::TRIES)
+                .map(|t| base + crate::aslr::exe_shift(&name, t))
+                .find(|&b| self.base_free(b, size_of_image))
+            {
+                base = moved;
+            }
+        }
+        let size = Self::map_image(file, headers, &mut pe, base)?;
         let entry = if pe.entry_point != 0 { base + pe.entry_point } else { 0 };
         self.push_module(name, String::from(path), base, size, entry, true, pe);
         Ok(base)
@@ -510,10 +524,17 @@ impl Linker {
                 return Ok(None);
             }
             lo
+        } else if let Some(b) = (0..crate::aslr::TRIES)
+            .map(|t| pe.image_base + crate::aslr::dll_shift(t))
+            .find(|&b| self.base_free(b, size))
+        {
+            // Its preferred base moved by one of this boot's ASLR shifts
+            // (aslr.rs), as Windows does: then a DLL is at the same address in
+            // every process of a boot (the MSYS2 runtime's heap, handed from
+            // parent to child, holds pointers into it) and elsewhere after a
+            // reboot.
+            b
         } else if self.base_free(pe.image_base, size) {
-            // Its preferred base, as Windows does when it's free: then a DLL
-            // is at the same address in every process (the MSYS2 runtime's
-            // heap, handed from parent to child, holds pointers into it).
             pe.image_base
         } else {
             let mut b = (self.dll_next + 0xFFFF) & !0xFFFF;

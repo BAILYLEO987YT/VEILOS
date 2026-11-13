@@ -214,8 +214,9 @@ fn load_and_spawn_pe_inner(
         r.clamp(0x10_0000, 0x400_0000).next_multiple_of(0x1_0000)
     };
     const COMMITTED_PAGES: u64 = 16;
-    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x1000_0000);
     let stack_size = reserve;
+    // Security Mode: a random place in the slot (aslr.rs).
+    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x1000_0000) + crate::aslr::stack_offset(0x1000_0000, stack_size);
     crate::nt_demand::add_zero(stack_base, stack_size - COMMITTED_PAGES * 4096);
 
     for i in (stack_size / 4096 - COMMITTED_PAGES)..stack_size / 4096 {
