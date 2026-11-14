@@ -189,6 +189,7 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
         s if s == 0xC000_00B5u32 as NtStatus => 121, // STATUS_IO_TIMEOUT: ERROR_SEM_TIMEOUT
         s if s == 0xC000_0046u32 as NtStatus => 288, // STATUS_MUTANT_NOT_OWNED: ERROR_NOT_OWNER
         s if s == 0xC000_0120u32 as NtStatus => 995, // STATUS_CANCELLED: ERROR_OPERATION_ABORTED
+        s if s == 0xC000_0604u32 as NtStatus => 1655, // STATUS_DYNAMIC_CODE_BLOCKED (W^X)
         status::NO_MORE_FILES => 18,            // ERROR_NO_MORE_FILES
         status::PARTIAL_COPY => 299,            // ERROR_PARTIAL_COPY
         status::NOT_IMPLEMENTED => 1,           // ERROR_INVALID_FUNCTION

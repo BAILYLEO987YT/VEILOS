@@ -4,6 +4,7 @@
  *   sec1 sleep      write this process's id to sec1.pid (beside it) and wait 60 s
  *   sec1 poke       read and end the process named in sec1.pid (not a relative)
  *   sec1 system     create and delete a file in \system (protected in Security Mode)
+ *   sec1 wx         writable+executable memory (refused by Security Mode's W^X)
  *   sec1 child      wait 30 s (started by sec1 itself)
  *
  * On Windows every call here succeeds for a normal user (except the
@@ -132,6 +133,22 @@ int main(int argc, char **argv) {
         if (f) { fprintf(f, "%lu\n", GetCurrentProcessId()); fclose(f); }
         printf("sleeping as %lu\n", GetCurrentProcessId());
         Sleep(60000);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "wx")) {
+        /* W^X: writable and executable at once is refused in VEILOS's
+         * Security Mode (ERROR_DYNAMIC_CODE_BLOCKED, 1655); write, then
+         * make executable, is not. */
+        static const unsigned char ret42[] = { 0xB8, 42, 0, 0, 0, 0xC3 }; /* mov eax, 42; ret */
+        DWORD old;
+        void *p = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        show("allocate writable+executable", p != NULL);
+        p = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        show("allocate writable", p != NULL);
+        show("protect writable+executable", VirtualProtect(p, 4096, PAGE_EXECUTE_READWRITE, &old));
+        memcpy(p, ret42, sizeof ret42);
+        show("protect executable (after writing)", VirtualProtect(p, 4096, PAGE_EXECUTE_READ, &old));
+        printf("generated code returned %d\n", ((int (*)(void))p)());
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "system")) {

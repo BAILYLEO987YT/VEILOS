@@ -457,6 +457,11 @@ impl Linker {
         self.modules.iter().find(|m| m.is_exe).map(|m| m.name.clone())
     }
 
+    /// Is a module of this (lower-case) name loaded?
+    pub fn has_module(&self, name: &str) -> bool {
+        self.modules.iter().any(|m| m.name == name)
+    }
+
     fn push_module(&mut self, name: String, path: String, base: u64, size: u64, entry: u64, is_exe: bool, pe: PeFile) -> usize {
         crate::trace_println!("[MODULES] {} at {:#x} ({} KiB)", name, base, size / 1024);
         self.modules.push(Module { name, path, base, size, entry, is_exe, pe, deps: Vec::new(), tls_index: None, tls_callbacks: Vec::new() });

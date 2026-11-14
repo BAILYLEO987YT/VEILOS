@@ -219,3 +219,63 @@ pub fn require_change(proc: &Process, path: &str) -> Result<(), NtStatus> {
     audit(proc.pid, &alloc::format!("changes {}", path));
     Ok(())
 }
+
+// -----| W^X (Security Mode) |-----
+//
+// No memory may be writable and executable at once: allocating, protecting
+// or mapping with PAGE_EXECUTE_READWRITE or PAGE_EXECUTE_WRITECOPY answers
+// STATUS_DYNAMIC_CODE_BLOCKED, as Windows' Arbitrary Code Guard does. Writing
+// code and then making it executable (RW, then RX) stays allowed. Programs
+// that generate code at run time (JavaScript, Java and .NET runtimes,
+// browsers) are exempt: a built-in list, and /etc/wx-exempt.txt (one program
+// name per line; /etc changes only by root's programs). So is every program
+// built on the MSYS2 or Cygwin runtime (msys-2.0.dll, cygwin1.dll): it needs
+// writable code, and Git Bash, and with it claude.exe's shell tool, run on it.
+
+const DYNAMIC_CODE_BLOCKED: NtStatus = 0xC000_0604u32 as i32;
+const WX_EXEMPT: &[&str] = &[
+    "claude.exe", "node.exe", "bun.exe", "deno.exe", "java.exe", "javaw.exe", "dotnet.exe",
+    "firefox.exe", "chrome.exe", "msedge.exe", "electron.exe", "code.exe",
+];
+static WX_FILE: Mutex<Option<alloc::vec::Vec<alloc::string::String>>> = Mutex::new(None);
+
+fn wx_exempt(name: &str) -> bool {
+    if WX_EXEMPT.contains(&name) {
+        return true;
+    }
+    let mut f = WX_FILE.lock();
+    let list = f.get_or_insert_with(|| {
+        let text = crate::vfs::VFS.read_file("/etc/wx-exempt.txt").unwrap_or_default();
+        core::str::from_utf8(&text).unwrap_or("").lines()
+            .map(|l| l.trim().to_ascii_lowercase())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    });
+    list.iter().any(|n| n == name)
+}
+
+/// Ok unless `protect` is writable and executable, in Security Mode, for a
+/// program that isn't exempt.
+pub fn wx_check(proc: &Process, protect: u32) -> Result<(), NtStatus> {
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+    if !matches!(protect & 0xFF, PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) || crate::policy::performance() {
+        return Ok(());
+    }
+    let (name, cygwin) = match proc.linker.lock().as_ref() {
+        Some(l) => (l.exe_name().unwrap_or_default(), l.has_module("msys-2.0.dll") || l.has_module("cygwin1.dll")),
+        None => (alloc::string::String::new(), false),
+    };
+    if cygwin || wx_exempt(&name) {
+        return Ok(());
+    }
+    let first = {
+        let mut d = DENIED.lock();
+        d.insert((proc.pid, u64::MAX))
+    };
+    if first {
+        crate::serial_println!("[SECURITY] pid {} ({}): writable and executable memory refused (W^X)", proc.pid, name);
+        audit(proc.pid, &alloc::format!("{}: writable and executable memory refused", name));
+    }
+    Err(DYNAMIC_CODE_BLOCKED)
+}

@@ -227,6 +227,17 @@ fn permitted(proc: &Arc<Process>, id: u32, a0: u64, a1: u64, a2: u64, a3: u64) -
             _ => None,
         }
     };
+    // W^X in Security Mode (security.rs): the protection asked for.
+    let protect = match id {
+        sys::NT_ALLOCATE_VIRTUAL_MEMORY => stack(5),
+        sys::NT_ALLOCATE_VIRTUAL_MEMORY_EX => stack(4),
+        sys::NT_PROTECT_VIRTUAL_MEMORY => Some(a3),
+        sys::NT_MAP_VIEW_OF_SECTION => stack(9),
+        _ => None,
+    };
+    if let Some(p) = protect {
+        crate::security::wx_check(proc, p as u32)?;
+    }
     match id {
         sys::NT_DELETE_FILE => {
             require(proc, C::FsModify, "deleting a file")?;
