@@ -27,7 +27,7 @@ unsafe extern "system" {
 }
 
 /// The memory a view gives a shader.
-fn view_mem(v: &View) -> Option<Mem> {
+pub fn view_mem(v: &View) -> Option<Mem> {
     let r = resource(v.res);
     let base = r.data.as_mut_ptr();
     if r.dim == DIM_BUFFER {
@@ -217,10 +217,18 @@ fn dispatch(d: &mut Device, groups: [u32; 3]) {
 }
 
 pub unsafe extern "system" fn Ctx_Dispatch(this: *mut Com, x: u32, y: u32, z: u32) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::Dispatch(x, y, z), true);
+        return;
+    }
     dispatch(crate::device::of(main_of(this)), [x, y, z]);
 }
 
 pub unsafe extern "system" fn Ctx_DispatchIndirect(this: *mut Com, args: *mut Com, offset: u32) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::DispatchIndirect(main_of(args), offset), true);
+        return;
+    }
     if !crate::res::is_resource(args) {
         return;
     }

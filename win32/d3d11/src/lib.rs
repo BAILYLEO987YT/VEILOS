@@ -14,6 +14,7 @@
 //!   state.rs   blend, depth-stencil, rasterizer and sampler states,
 //!              input layouts, queries
 //!   context.rs ID3D11DeviceContext: the pipeline's bindings
+//!   deferred.rs deferred contexts and command lists
 //!   format.rs  DXGI formats
 //!   dxbc.rs    shader bytecode (SM4/SM5) parsed
 //!   compute.rs compute shaders: Dispatch on threads of this DLL
@@ -34,6 +35,7 @@ mod dllrt;
 mod com;
 mod compute;
 mod context;
+mod deferred;
 mod device;
 mod draw;
 mod dxbc;

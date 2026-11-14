@@ -672,8 +672,8 @@ pub static ID3D11DEVICECONTEXT: Vtbl<115> = Vtbl([
     crate::context::Ctx_OMSetDepthStencilState as *const (),
     crate::context::Ctx_SOSetTargets as *const (),
     crate::draw::Ctx_DrawAuto as *const (),
-    stub_Ctx_DrawIndexedInstancedIndirect as *const (),
-    stub_Ctx_DrawInstancedIndirect as *const (),
+    crate::draw::Ctx_DrawIndexedInstancedIndirect as *const (),
+    crate::draw::Ctx_DrawInstancedIndirect as *const (),
     crate::compute::Ctx_Dispatch as *const (),
     crate::compute::Ctx_DispatchIndirect as *const (),
     crate::context::Ctx_RSSetState as *const (),
@@ -682,16 +682,16 @@ pub static ID3D11DEVICECONTEXT: Vtbl<115> = Vtbl([
     crate::res::Ctx_CopySubresourceRegion as *const (),
     crate::res::Ctx_CopyResource as *const (),
     crate::res::Ctx_UpdateSubresource as *const (),
-    stub_Ctx_CopyStructureCount as *const (),
+    crate::res::Ctx_CopyStructureCount as *const (),
     crate::res::Ctx_ClearRenderTargetView as *const (),
-    stub_Ctx_ClearUnorderedAccessViewUint as *const (),
-    stub_Ctx_ClearUnorderedAccessViewFloat as *const (),
+    crate::res::Ctx_ClearUnorderedAccessViewUint as *const (),
+    crate::res::Ctx_ClearUnorderedAccessViewFloat as *const (),
     crate::res::Ctx_ClearDepthStencilView as *const (),
     crate::res::Ctx_GenerateMips as *const (),
     crate::context::Ctx_SetResourceMinLOD as *const (),
     crate::context::Ctx_GetResourceMinLOD as *const (),
-    stub_Ctx_ResolveSubresource as *const (),
-    stub_Ctx_ExecuteCommandList as *const (),
+    crate::res::Ctx_ResolveSubresource as *const (),
+    crate::deferred::Ctx_ExecuteCommandList as *const (),
     crate::context::Ctx_HSSetShaderResources as *const (),
     crate::context::Ctx_HSSetShader as *const (),
     crate::context::Ctx_HSSetSamplers as *const (),
@@ -747,7 +747,7 @@ pub static ID3D11DEVICECONTEXT: Vtbl<115> = Vtbl([
     crate::device::Ctx_Flush as *const (),
     crate::device::Ctx_GetType as *const (),
     crate::device::Ctx_GetContextFlags as *const (),
-    stub_Ctx_FinishCommandList as *const (),
+    crate::deferred::Ctx_FinishCommandList as *const (),
 ]);
 
 pub static ID3D11DEVICE: Vtbl<43> = Vtbl([
@@ -778,7 +778,7 @@ pub static ID3D11DEVICE: Vtbl<43> = Vtbl([
     crate::state::Dev_CreateQuery as *const (),
     crate::state::Dev_CreatePredicate as *const (),
     stub_Dev_CreateCounter as *const (),
-    stub_Dev_CreateDeferredContext as *const (),
+    crate::deferred::Dev_CreateDeferredContext as *const (),
     stub_Dev_OpenSharedResource as *const (),
     crate::device::Dev_CheckFormatSupport as *const (),
     crate::device::Dev_CheckMultisampleQualityLevels as *const (),
@@ -908,48 +908,12 @@ unsafe extern "system" fn stub_CmdL_GetContextFlags() -> usize {
     unimplemented(b"ID3D11CommandList::GetContextFlags\0");
     0
 }
-unsafe extern "system" fn stub_Ctx_DrawIndexedInstancedIndirect() -> usize {
-    unimplemented(b"ID3D11DeviceContext::DrawIndexedInstancedIndirect\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_DrawInstancedIndirect() -> usize {
-    unimplemented(b"ID3D11DeviceContext::DrawInstancedIndirect\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_CopyStructureCount() -> usize {
-    unimplemented(b"ID3D11DeviceContext::CopyStructureCount\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_ClearUnorderedAccessViewUint() -> usize {
-    unimplemented(b"ID3D11DeviceContext::ClearUnorderedAccessViewUint\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_ClearUnorderedAccessViewFloat() -> usize {
-    unimplemented(b"ID3D11DeviceContext::ClearUnorderedAccessViewFloat\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_ResolveSubresource() -> usize {
-    unimplemented(b"ID3D11DeviceContext::ResolveSubresource\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_ExecuteCommandList() -> usize {
-    unimplemented(b"ID3D11DeviceContext::ExecuteCommandList\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_FinishCommandList() -> i32 {
-    unimplemented(b"ID3D11DeviceContext::FinishCommandList\0");
-    E_NOTIMPL
-}
 unsafe extern "system" fn stub_Dev_CreateClassLinkage() -> i32 {
     unimplemented(b"ID3D11Device::CreateClassLinkage\0");
     E_NOTIMPL
 }
 unsafe extern "system" fn stub_Dev_CreateCounter() -> i32 {
     unimplemented(b"ID3D11Device::CreateCounter\0");
-    E_NOTIMPL
-}
-unsafe extern "system" fn stub_Dev_CreateDeferredContext() -> i32 {
-    unimplemented(b"ID3D11Device::CreateDeferredContext\0");
     E_NOTIMPL
 }
 unsafe extern "system" fn stub_Dev_OpenSharedResource() -> i32 {

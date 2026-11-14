@@ -288,11 +288,15 @@ pub unsafe extern "system" fn DxDev1_GetMaximumFrameLatency(_this: *mut Com, n: 
 // -----| the context as a device child |-----
 
 pub unsafe extern "system" fn Ctx_GetDevice(this: *mut Com, out: *mut *mut Com) {
-    unsafe { out_ref(out, main_of(this)) };
+    match crate::deferred::of(this) {
+        Some(d) => unsafe { out_ref(out, d.device) },
+        None => unsafe { out_ref(out, main_of(this)) },
+    }
 }
 
-pub unsafe extern "system" fn Ctx_GetType(_this: *mut Com) -> u32 {
-    0
+/// 0 immediate, 1 deferred.
+pub unsafe extern "system" fn Ctx_GetType(this: *mut Com) -> u32 {
+    crate::deferred::of(this).is_some() as u32
 }
 
 pub unsafe extern "system" fn Ctx_GetContextFlags(_this: *mut Com) -> u32 {
@@ -300,5 +304,7 @@ pub unsafe extern "system" fn Ctx_GetContextFlags(_this: *mut Com) -> u32 {
 }
 
 pub unsafe extern "system" fn Ctx_Flush(this: *mut Com) {
-    of(main_of(this)).flush();
+    if let Some(d) = crate::context::immediate(this) {
+        d.flush();
+    }
 }

@@ -47,7 +47,13 @@ for e in vs50_main hs50_tri hs50_trifrac hs50_quad ds50_tri ds50_quad ps50_main 
     "$FXC" /nologo /T $p /E $e /Fh build/dx6_$e.h /Vn $e dx6.hlsl >/dev/null
 done
 
-TESTS="dx1 dx2 dx3 dx4 dx5 dx6"
+# dx7's.
+for e in vs50_main ps50_main ps50_show cs50_rings; do
+    p=$(echo $e | sed 's/^\(..\)\(.\)\(.\)_.*/\1_\2_\3/')
+    "$FXC" /nologo /T $p /E $e /Fh build/dx7_$e.h /Vn $e dx7.hlsl >/dev/null
+done
+
+TESTS="dx1 dx2 dx3 dx4 dx5 dx6 dx7"
 for t in $TESTS; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \

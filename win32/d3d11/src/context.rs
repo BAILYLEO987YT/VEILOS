@@ -14,6 +14,7 @@ pub const STAGE_CS: usize = 5;
 
 const NULL: *mut Com = core::ptr::null_mut();
 
+#[derive(Clone)]
 pub struct Stage {
     pub shader: *mut Com,
     pub cbs: [*mut Com; 14],
@@ -27,6 +28,7 @@ impl Default for Stage {
     }
 }
 
+#[derive(Clone)]
 pub struct Bindings {
     pub layout: *mut Com,
     /// Each slot: buffer, stride, offset.
@@ -78,6 +80,39 @@ impl Default for Bindings {
 }
 
 impl Bindings {
+    /// A copy holding references of its own.
+    pub fn snapshot(&self) -> Bindings {
+        let s = self.clone();
+        for p in s.refs() {
+            unsafe { add_ref(p) };
+        }
+        s
+    }
+
+    fn refs(&self) -> Vec<*mut Com> {
+        let mut all: Vec<*mut Com> = Vec::new();
+        all.push(self.layout);
+        all.extend(self.vbs.iter().map(|v| v.0));
+        all.push(self.ib.0);
+        for s in &self.stages {
+            all.push(s.shader);
+            all.extend(s.cbs);
+            all.extend(s.srvs);
+            all.extend(s.samplers);
+        }
+        all.push(self.rs);
+        all.extend(self.rtvs);
+        all.push(self.dsv);
+        all.extend(self.uavs);
+        all.extend(self.cs_uavs);
+        all.push(self.blend);
+        all.push(self.dss);
+        all.extend(self.so.iter().map(|s| s.0));
+        all.push(self.predicate.0);
+        all.retain(|p| !p.is_null());
+        all
+    }
+
     /// Every reference let go, every state back to its default.
     pub fn clear(&mut self) {
         let mut all: Vec<*mut Com> = Vec::new();
@@ -107,7 +142,18 @@ impl Bindings {
 }
 
 fn bind<'a>(this: *mut Com) -> &'a mut Bindings {
-    &mut crate::device::of(main_of(this)).state
+    match crate::deferred::of(this) {
+        Some(d) => &mut d.state,
+        None => &mut crate::device::of(main_of(this)).state,
+    }
+}
+
+/// The device behind an immediate context (None: a deferred one).
+pub fn immediate<'a>(this: *mut Com) -> Option<&'a mut crate::device::Device> {
+    match body(this) {
+        Body::Device(d) => Some(d),
+        _ => None,
+    }
 }
 
 /// Set `n` slots from `start` of `slots` to `src` (null: unbind).
@@ -138,8 +184,9 @@ unsafe fn get_slots(slots: &[*mut Com], start: u32, n: u32, out: *mut *mut Com) 
 macro_rules! stage {
     ($st:expr, $set_shader:ident, $get_shader:ident, $set_cb:ident, $get_cb:ident, $set_srv:ident, $get_srv:ident, $set_samp:ident, $get_samp:ident) => {
         pub unsafe extern "system" fn $set_shader(this: *mut Com, s: *mut Com, _ci: *const *mut Com, _n: u32) {
-            let d = crate::device::of(main_of(this));
-            d.flush_if_bound();
+            if let Some(d) = immediate(this) {
+                d.flush_if_bound();
+            }
             unsafe { set_ref(&mut bind(this).stages[$st].shader, main_of(s)) };
         }
         pub unsafe extern "system" fn $get_shader(this: *mut Com, out: *mut *mut Com, ci: *mut *mut Com, n: *mut u32) {
@@ -465,6 +512,10 @@ pub unsafe extern "system" fn Ctx_CSGetUnorderedAccessViews(this: *mut Com, star
 }
 
 pub unsafe extern "system" fn Ctx_ClearState(this: *mut Com) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.state.clear();
+        return;
+    }
     let d = crate::device::of(main_of(this));
     d.flush();
     d.state.clear();

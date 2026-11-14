@@ -58,6 +58,8 @@ pub enum Body {
     InputLayout(Box<crate::state::InputLayout>),
     Query(u32),
     ClassLinkage,
+    Deferred(Box<crate::deferred::Deferred>),
+    CommandList(Box<alloc::vec::Vec<crate::deferred::Cmd>>),
     /// An alias of its `primary`.
     Alias,
 }

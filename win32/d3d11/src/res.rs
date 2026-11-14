@@ -894,7 +894,14 @@ pub struct Mapped {
     pub depth: u32,
 }
 
-pub unsafe extern "system" fn Ctx_Map(_this: *mut Com, res: *mut Com, sub: u32, kind: u32, _flags: u32, out: *mut Mapped) -> i32 {
+pub unsafe extern "system" fn Ctx_Map(this: *mut Com, res: *mut Com, sub: u32, kind: u32, _flags: u32, out: *mut Mapped) -> i32 {
+    if let Some(d) = crate::deferred::of(this) {
+        let Some((p, row, depth)) = crate::deferred::map(d, res, sub, kind) else { return E_INVALIDARG };
+        if !out.is_null() {
+            unsafe { *out = Mapped { data: p, row, depth } };
+        }
+        return S_OK;
+    }
     if !is_resource(res) {
         return E_INVALIDARG;
     }
@@ -916,7 +923,11 @@ pub unsafe extern "system" fn Ctx_Map(_this: *mut Com, res: *mut Com, sub: u32, 
     S_OK
 }
 
-pub unsafe extern "system" fn Ctx_Unmap(_this: *mut Com, res: *mut Com, sub: u32) {
+pub unsafe extern "system" fn Ctx_Unmap(this: *mut Com, res: *mut Com, sub: u32) {
+    if let Some(d) = crate::deferred::of(this) {
+        crate::deferred::unmap(d, res, sub);
+        return;
+    }
     if !is_resource(res) {
         return;
     }
@@ -940,7 +951,17 @@ pub struct Box3 {
     pub back: u32,
 }
 
-pub unsafe extern "system" fn Ctx_UpdateSubresource(_this: *mut Com, res: *mut Com, sub: u32, b: *const Box3, src: *const u8, pitch: u32, depth_pitch: u32) {
+pub unsafe extern "system" fn Ctx_UpdateSubresource(this: *mut Com, res: *mut Com, sub: u32, b: *const Box3, src: *const u8, pitch: u32, depth_pitch: u32) {
+    if let Some(d) = crate::deferred::of(this) {
+        let bx = unsafe { b.as_ref() }.copied();
+        let n = crate::deferred::update_size(res, sub, bx.as_ref(), pitch, depth_pitch);
+        if src.is_null() || n == 0 {
+            return;
+        }
+        let data = unsafe { core::slice::from_raw_parts(src, n) }.to_vec();
+        d.record(crate::deferred::Op::Update(main_of(res), sub, bx, data, pitch, depth_pitch), false);
+        return;
+    }
     if !is_resource(res) || src.is_null() {
         return;
     }
@@ -1025,7 +1046,11 @@ fn copy_sub(dst: *mut Com, ds: usize, (x, y, z): (u32, u32, u32), src: *mut Com,
     d.changed(ds);
 }
 
-pub unsafe extern "system" fn Ctx_CopyResource(_this: *mut Com, dst: *mut Com, src: *mut Com) {
+pub unsafe extern "system" fn Ctx_CopyResource(this: *mut Com, dst: *mut Com, src: *mut Com) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::Copy(main_of(dst), main_of(src)), false);
+        return;
+    }
     if !is_resource(dst) || !is_resource(src) {
         return;
     }
@@ -1035,7 +1060,11 @@ pub unsafe extern "system" fn Ctx_CopyResource(_this: *mut Com, dst: *mut Com, s
     }
 }
 
-pub unsafe extern "system" fn Ctx_CopySubresourceRegion(_this: *mut Com, dst: *mut Com, ds: u32, x: u32, y: u32, z: u32, src: *mut Com, ss: u32, b: *const Box3) {
+pub unsafe extern "system" fn Ctx_CopySubresourceRegion(this: *mut Com, dst: *mut Com, ds: u32, x: u32, y: u32, z: u32, src: *mut Com, ss: u32, b: *const Box3) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::CopyRegion(main_of(dst), ds, [x, y, z], main_of(src), ss, unsafe { b.as_ref() }.copied()), false);
+        return;
+    }
     if !is_resource(dst) || !is_resource(src) {
         return;
     }
@@ -1053,6 +1082,13 @@ fn unorm(x: f32) -> u32 {
 }
 
 pub unsafe extern "system" fn Ctx_ClearRenderTargetView(this: *mut Com, rtv: *mut Com, color: *const [f32; 4]) {
+    if color.is_null() {
+        return;
+    }
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::ClearRtv(main_of(rtv), unsafe { *color }), false);
+        return;
+    }
     let (Some(v), false) = (view(rtv), color.is_null()) else { return };
     let c = unsafe { *color };
     crate::device::of(main_of(this)).flush();
@@ -1067,6 +1103,10 @@ pub unsafe extern "system" fn Ctx_ClearRenderTargetView(this: *mut Com, rtv: *mu
 }
 
 pub unsafe extern "system" fn Ctx_ClearDepthStencilView(this: *mut Com, dsv: *mut Com, flags: u32, depth: f32, stencil: u8) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::ClearDsv(main_of(dsv), flags, depth, stencil), false);
+        return;
+    }
     let Some(v) = view(dsv) else { return };
     crate::device::of(main_of(this)).flush();
     let r = resource(v.res);
@@ -1094,7 +1134,11 @@ pub unsafe extern "system" fn Ctx_ClearDepthStencilView(this: *mut Com, dsv: *mu
 }
 
 /// Each mip from the one above, 2x2 averaged.
-pub unsafe extern "system" fn Ctx_GenerateMips(_this: *mut Com, srv: *mut Com) {
+pub unsafe extern "system" fn Ctx_GenerateMips(this: *mut Com, srv: *mut Com) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::GenerateMips(main_of(srv)), false);
+        return;
+    }
     let Some(v) = view(srv) else { return };
     let r = resource(v.res);
     if r.dim != DIM_TEXTURE2D || is_bc(r.format) {
@@ -1126,5 +1170,85 @@ pub unsafe extern "system" fn Ctx_GenerateMips(_this: *mut Com, srv: *mut Com) {
             encode(r.format, b.w, b.h, &next, &mut r.data[b.at..], b.pitch);
             r.changed(s);
         }
+    }
+}
+
+/// ClearUnorderedAccessViewUint and ...Float: every element of the view
+/// set (raw and structured buffers: every word to the first value).
+fn clear_uav(this: *mut Com, uav: *mut Com, v: [u32; 4], float: bool) {
+    let Some(vw) = view(uav) else { return };
+    let Some(m) = crate::compute::view_mem(vw) else { return };
+    crate::device::of(main_of(this)).flush();
+    let r = resource(vw.res);
+    for s in 0..r.subs.len() {
+        r.sync(s);
+    }
+    if m.format == 0 {
+        let n = m.len / 4;
+        for i in 0..n {
+            unsafe { (m.ptr as *mut u32).add(i).write_unaligned(v[0]) };
+        }
+    } else if let Some(size) = bytes(m.format) {
+        let size = size as usize;
+        let val = if float { v } else { v };
+        let mut el = [0u8; 16];
+        crate::format::store_typed(m.format, val, &mut el[..size]);
+        for z in 0..m.d.max(1) as usize {
+            for y in 0..m.h.max(1) as usize {
+                for x in 0..m.w as usize {
+                    let at = x * size + y * m.row + z * m.slice;
+                    if at + size <= m.len {
+                        unsafe { core::ptr::copy_nonoverlapping(el.as_ptr(), m.ptr.add(at), size) };
+                    }
+                }
+            }
+        }
+    }
+    for s in 0..r.subs.len() {
+        r.changed(s);
+    }
+}
+
+pub unsafe extern "system" fn Ctx_ClearUnorderedAccessViewUint(this: *mut Com, uav: *mut Com, v: *const [u32; 4]) {
+    if v.is_null() {
+        return;
+    }
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::ClearUavUint(main_of(uav), unsafe { *v }), false);
+        return;
+    }
+    clear_uav(this, uav, unsafe { *v }, false);
+}
+
+pub unsafe extern "system" fn Ctx_ClearUnorderedAccessViewFloat(this: *mut Com, uav: *mut Com, v: *const [f32; 4]) {
+    if v.is_null() {
+        return;
+    }
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::ClearUavFloat(main_of(uav), unsafe { *v }), false);
+        return;
+    }
+    clear_uav(this, uav, unsafe { *v }.map(f32::to_bits), true);
+}
+
+/// Without multisampling, resolving is copying.
+pub unsafe extern "system" fn Ctx_ResolveSubresource(this: *mut Com, dst: *mut Com, ds: u32, src: *mut Com, ss: u32, format: u32) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::Resolve(main_of(dst), ds, main_of(src), ss, format), false);
+        return;
+    }
+    unsafe { Ctx_CopySubresourceRegion(this, dst, ds, 0, 0, 0, src, ss, core::ptr::null()) };
+}
+
+/// Append and consume counters aren't kept: the count is 0.
+pub unsafe extern "system" fn Ctx_CopyStructureCount(_this: *mut Com, dst: *mut Com, off: u32, _uav: *mut Com) {
+    if !is_resource(dst) {
+        return;
+    }
+    let r = resource(dst);
+    let o = off as usize;
+    if let Some(s) = r.data.get_mut(o..o + 4) {
+        s.copy_from_slice(&0u32.to_le_bytes());
+        r.changed(0);
     }
 }

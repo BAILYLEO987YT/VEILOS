@@ -1129,11 +1129,28 @@ fn draw(this: *mut Com, count: u32, instances: u32, start_instance: u32, index: 
     }
 }
 
+/// On a deferred context: recorded, with its bindings.
+fn deferred(this: *mut Com, op: crate::deferred::Op) -> bool {
+    match crate::deferred::of(this) {
+        Some(d) => {
+            d.record(op, true);
+            true
+        }
+        None => false,
+    }
+}
+
 pub unsafe extern "system" fn Ctx_Draw(this: *mut Com, count: u32, start: u32) {
+    if deferred(this, crate::deferred::Op::Draw(count, 1, start, 0)) {
+        return;
+    }
     draw(this, count, 1, 0, &|i| Some(Some(start as usize + i)));
 }
 
 pub unsafe extern "system" fn Ctx_DrawInstanced(this: *mut Com, count: u32, instances: u32, start: u32, start_instance: u32) {
+    if deferred(this, crate::deferred::Op::Draw(count, instances, start, start_instance)) {
+        return;
+    }
     draw(this, count, instances, start_instance, &|i| Some(Some(start as usize + i)));
 }
 
@@ -1169,17 +1186,26 @@ fn read_index(ib: (*const u8, usize, bool), i: usize, base: i32) -> Option<Optio
 }
 
 pub unsafe extern "system" fn Ctx_DrawIndexed(this: *mut Com, count: u32, start: u32, base: i32) {
+    if deferred(this, crate::deferred::Op::DrawIndexed(count, 1, start, base, 0)) {
+        return;
+    }
     let Some(ib) = indices(this) else { return };
     draw(this, count, 1, 0, &|i| read_index(ib, start as usize + i, base));
 }
 
 pub unsafe extern "system" fn Ctx_DrawIndexedInstanced(this: *mut Com, count: u32, instances: u32, start: u32, base: i32, start_instance: u32) {
+    if deferred(this, crate::deferred::Op::DrawIndexed(count, instances, start, base, start_instance)) {
+        return;
+    }
     let Some(ib) = indices(this) else { return };
     draw(this, count, instances, start_instance, &|i| read_index(ib, start as usize + i, base));
 }
 
 /// As many vertices as stream output wrote into vertex buffer 0.
 pub unsafe extern "system" fn Ctx_DrawAuto(this: *mut Com) {
+    if deferred(this, crate::deferred::Op::DrawAuto) {
+        return;
+    }
     let d = crate::device::of(main_of(this));
     let (b, stride, off) = d.state.vbs[0];
     if !crate::res::is_resource(b) || stride == 0 {
@@ -1187,4 +1213,31 @@ pub unsafe extern "system" fn Ctx_DrawAuto(this: *mut Com) {
     }
     let n = resource(b).so_filled.saturating_sub(off) / stride;
     draw(this, n, 1, 0, &|i| Some(Some(i)));
+}
+
+/// The arguments a buffer holds for an indirect draw.
+fn indirect_args<const N: usize>(b: *mut Com, off: u32) -> Option<[u32; N]> {
+    if !crate::res::is_resource(b) {
+        return None;
+    }
+    let r = resource(b);
+    let o = off as usize;
+    let s = r.data.get(o..o + 4 * N)?;
+    Some(core::array::from_fn(|k| u32::from_le_bytes(s[k * 4..k * 4 + 4].try_into().unwrap())))
+}
+
+pub unsafe extern "system" fn Ctx_DrawInstancedIndirect(this: *mut Com, b: *mut Com, off: u32) {
+    if deferred(this, crate::deferred::Op::DrawIndirect(false, main_of(b), off)) {
+        return;
+    }
+    let Some([n, inst, start, si]) = indirect_args::<4>(b, off) else { return };
+    unsafe { Ctx_DrawInstanced(this, n, inst, start, si) };
+}
+
+pub unsafe extern "system" fn Ctx_DrawIndexedInstancedIndirect(this: *mut Com, b: *mut Com, off: u32) {
+    if deferred(this, crate::deferred::Op::DrawIndirect(true, main_of(b), off)) {
+        return;
+    }
+    let Some([n, inst, start, base, si]) = indirect_args::<5>(b, off) else { return };
+    unsafe { Ctx_DrawIndexedInstanced(this, n, inst, start, base as i32, si) };
 }

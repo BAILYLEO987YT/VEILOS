@@ -337,9 +337,17 @@ pub unsafe extern "system" fn Query_GetDesc(this: *mut Com, out: *mut [u32; 2]) 
     }
 }
 
-pub unsafe extern "system" fn Ctx_Begin(_this: *mut Com, _q: *mut Com) {}
+pub unsafe extern "system" fn Ctx_Begin(this: *mut Com, q: *mut Com) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::Begin(main_of(q)), false);
+    }
+}
 
-pub unsafe extern "system" fn Ctx_End(this: *mut Com, _q: *mut Com) {
+pub unsafe extern "system" fn Ctx_End(this: *mut Com, q: *mut Com) {
+    if let Some(d) = crate::deferred::of(this) {
+        d.record(crate::deferred::Op::End(main_of(q)), false);
+        return;
+    }
     crate::device::of(main_of(this)).flush();
 }
 
