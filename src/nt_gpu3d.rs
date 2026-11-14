@@ -207,10 +207,13 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
         // contents: b = TexArgs*.
         4 => {
             let Some(ta) = read::<TexArgs>(b) else { return status::ACCESS_VIOLATION };
-            if ta.w == 0 || ta.h == 0 || ta.w > MAX_SIDE || ta.h > MAX_SIDE || ta.levels > 16 {
+            if ta.w == 0 || ta.h == 0 || ta.w > MAX_SIDE || ta.h > MAX_SIDE || ta.levels > 16 || ta.depth > 2048 || ta.layers > 2048 || ta.kind > TEX_CUBE_ARRAY {
                 return status::INVALID_PARAMETER;
             }
             let n = texel_count(&ta);
+            if n > TEXELS_MAX {
+                return status::INVALID_PARAMETER;
+            }
             if !ptr_ok(ta.texels, n * 4) {
                 return status::ACCESS_VIOLATION;
             }

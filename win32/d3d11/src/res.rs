@@ -269,48 +269,29 @@ impl Resource {
         }
     }
 
-    /// Array slice `slice`'s kernel texture (all its mips), uploaded again
-    /// if it changed or was drawn into.
-    pub fn kernel_texture(&mut self, slice: usize) -> u64 {
-        let m = self.mips as usize;
-        if slice >= self.textures.len() {
+    /// The whole resource as one kernel texture (every array slice with
+    /// all its mips; a 3D texture's slices), uploaded again if it changed
+    /// or was drawn into. A depth buffer's texels hold its depth (24 bits)
+    /// across red, green and blue.
+    pub fn kernel_texture(&mut self) -> u64 {
+        if self.textures.is_empty() || self.dim == DIM_BUFFER {
             return 0;
         }
-        let drawn = (0..m).any(|l| self.drawn[slice * m + l]);
-        if self.textures[slice] != 0 && !self.dirty[slice] && !drawn {
-            return self.textures[slice];
+        let drawn = self.drawn.iter().any(|&d| d);
+        if self.textures[0] != 0 && !self.dirty.iter().any(|&d| d) && !drawn {
+            return self.textures[0];
         }
-        let mut texels = Vec::new();
-        for l in 0..m {
-            texels.extend(self.read_argb(slice * m + l));
-        }
-        let args = TexArgs { w: self.w, h: if self.dim == DIM_TEXTURE1D { 1 } else { self.h }, texels: texels.as_ptr() as u64, levels: m as u32 };
-        let h = gfx3d::upload_texture(self.textures[slice], &args);
-        if h != 0 {
-            self.textures[slice] = h;
-        }
-        self.dirty[slice] = false;
-        self.textures[slice]
-    }
-
-    /// Array slice `slice` of a depth buffer as a texture for shaders: each
-    /// texel its depth (24 bits) across red, green and blue.
-    pub fn depth_texture(&mut self, slice: usize) -> u64 {
-        let m = self.mips as usize;
-        if slice >= self.textures.len() {
-            return 0;
-        }
-        let drawn = (0..m).any(|l| self.drawn[slice * m + l]);
-        if self.textures[slice] != 0 && !self.dirty[slice] && !drawn {
-            return self.textures[slice];
-        }
+        let depth = self.holds_depth();
         let bpp = bytes(self.format).unwrap_or(4) as usize;
         let mut texels = Vec::new();
-        for l in 0..m {
-            let s = slice * m + l;
+        for s in 0..self.subs.len() {
+            if !depth {
+                texels.extend(self.read_argb(s));
+                continue;
+            }
             self.sync(s);
             let sub = self.subs[s];
-            for y in 0..sub.h as usize {
+            for y in 0..(sub.h * sub.d) as usize {
                 for x in 0..sub.w as usize {
                     let at = sub.at + y * sub.pitch as usize + x * bpp;
                     let mut b = [0u8; 4];
@@ -325,13 +306,28 @@ impl Resource {
                 }
             }
         }
-        let args = TexArgs { w: self.w, h: if self.dim == DIM_TEXTURE1D { 1 } else { self.h }, texels: texels.as_ptr() as u64, levels: m as u32 };
-        let h = gfx3d::upload_texture(self.textures[slice], &args);
+        use gfx3d::raster3d::{TEX_1D_ARRAY, TEX_2D, TEX_2D_ARRAY, TEX_3D};
+        let (layers, kind, depth3) = match self.dim {
+            DIM_TEXTURE3D => (1, TEX_3D, self.d),
+            DIM_TEXTURE1D if self.d > 1 => (self.d, TEX_1D_ARRAY, 0),
+            _ if self.d > 1 => (self.d, TEX_2D_ARRAY, 0),
+            _ => (1, TEX_2D, 0),
+        };
+        let args = TexArgs {
+            w: self.w,
+            h: if self.dim == DIM_TEXTURE1D { 1 } else { self.h },
+            texels: texels.as_ptr() as u64,
+            levels: self.mips,
+            depth: depth3,
+            layers,
+            kind,
+        };
+        let h = gfx3d::upload_texture(self.textures[0], &args);
         if h != 0 {
-            self.textures[slice] = h;
+            self.textures[0] = h;
         }
-        self.dirty[slice] = false;
-        self.textures[slice]
+        self.dirty.iter_mut().for_each(|d| *d = false);
+        self.textures[0]
     }
 }
 

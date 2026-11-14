@@ -539,12 +539,14 @@ fn sampler(s: &SamplerDesc, first: u32, levels: u32) -> Sampler {
         mag: lin(2),
         mip: if levels > 1 && s.max_lod > 0.0 { lin(0) } else { 0 },
         address: [s.address[0].clamp(1, 5), s.address[1].clamp(1, 5)],
+        address_w: s.address[2].clamp(1, 5),
         border: argb(s.border),
         lod_bias: (s.lod_bias * 256.0) as i32,
         max_level: first + min_lod,
         gl_rules: 0,
         compare: if fl & 0x80 != 0 { s.compare } else { 0 },
         packed_depth: 0,
+        ..Default::default()
     }
 }
 
@@ -712,12 +714,25 @@ fn setup(d: &mut Device) -> Option<(Out, Vm<'static>, Inputs, Vec<[Option<(usize
             if r.dim == crate::res::DIM_BUFFER {
                 continue;
             }
-            if r.bind & crate::res::BIND_DEPTH_STENCIL != 0 {
-                g.samplers[slot].texture = r.depth_texture(v.first as usize);
-                g.samplers[slot].packed_depth = 1;
-            } else {
-                g.samplers[slot].texture = r.kernel_texture(v.first as usize);
-            }
+            let s = &mut g.samplers[slot];
+            s.texture = r.kernel_texture();
+            s.packed_depth = (r.bind & crate::res::BIND_DEPTH_STENCIL != 0) as u32;
+            // The view: how coordinates address the texture, from which layer.
+            s.view = 1 + match v.dim {
+                3 => k::TEX_1D_ARRAY,
+                5 | 7 => k::TEX_2D_ARRAY,
+                8 => k::TEX_3D,
+                9 => k::TEX_CUBE,
+                10 => k::TEX_CUBE_ARRAY,
+                _ => k::TEX_2D,
+            };
+            s.first_layer = if r.dim == crate::res::DIM_TEXTURE3D { 0 } else { v.first };
+            s.view_layers = match v.dim {
+                3 | 5 | 7 => v.slices,
+                9 => 6,
+                10 => v.slices * 6,
+                _ => 1,
+            };
         }
         // The constant file: the buffers, the immediate constant buffer
         // and immediates, then the kernel's 16 int4 (unused here).

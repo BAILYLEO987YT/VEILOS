@@ -185,6 +185,8 @@ pub struct Sampler {
     /// 0 no mipmaps, else FILTER_POINT or FILTER_LINEAR between levels.
     pub mip: u32,
     pub address: [u32; 2],
+    /// 3D textures' w.
+    pub address_w: u32,
     /// 0xAARRGGBB (BORDER).
     pub border: u32,
     /// Added to the level of detail, 1/256 of a level.
@@ -200,6 +202,13 @@ pub struct Sampler {
     /// The texture holds 24-bit depth across red, green and blue (a depth
     /// buffer as a shader resource): sampled as that depth in red.
     pub packed_depth: u32,
+    /// How a pixel shader's coordinates address the texture: 0 as its
+    /// upload says, else TEX_* + 1 (a Direct3D view: a cube of an array's
+    /// layers, say); and the view's first layer.
+    pub view: u32,
+    pub first_layer: u32,
+    /// The view's layers (0: all from `first_layer`).
+    pub view_layers: u32,
 }
 
 /// Primitives `first .. first + count` of a batch, drawn with one state.
@@ -348,7 +357,25 @@ pub struct TexArgs {
     /// following level (half the size, at least 1) for `levels` levels.
     pub texels: u64,
     pub levels: u32,
+    /// A 3D texture's depth (level 0; each level halves it, at least 1);
+    /// 0 or 1 otherwise.
+    pub depth: u32,
+    /// Array layers (a cube's six faces each a layer: +x, -x, +y, -y, +z,
+    /// -z), each with all its levels, one after another; 0 means 1.
+    pub layers: u32,
+    /// TEX_2D, TEX_CUBE, TEX_3D, TEX_2D_ARRAY, TEX_1D_ARRAY, TEX_CUBE_ARRAY:
+    /// how a pixel shader's coordinates address it.
+    pub kind: u32,
 }
+
+pub const TEX_2D: u32 = 0;
+pub const TEX_CUBE: u32 = 1;
+pub const TEX_3D: u32 = 2;
+pub const TEX_2D_ARRAY: u32 = 3;
+pub const TEX_1D_ARRAY: u32 = 4;
+pub const TEX_CUBE_ARRAY: u32 = 5;
+/// The most texels a texture may have.
+pub const TEXELS_MAX: usize = 1 << 26;
 
 pub const DEPTH_MAX: u32 = 0xFF_FFFF;
 /// Subpixel steps per pixel. Windows' software OpenGL doesn't snap vertices
@@ -393,28 +420,40 @@ const DECR_WRAP: u32 = 0x8508;
 pub struct Level {
     pub w: usize,
     pub h: usize,
-    /// Where it starts in `Texture::texels`.
+    /// Slices (3D textures; 1 otherwise), `w * h` texels apart.
+    pub d: usize,
+    /// Where it starts in its layer.
     pub at: usize,
 }
 
-/// A texture's levels; how it's sampled is each slot's own (`Sampler`).
+/// A texture's levels (each layer's, the layers `layer_size` texels
+/// apart); how it's sampled is each slot's own (`Sampler`).
 pub struct Texture {
     pub levels: Vec<Level>,
     pub texels: Vec<u32>,
+    pub layers: usize,
+    pub layer_size: usize,
+    pub kind: u32,
 }
 
 /// The levels of a `w` x `h` texture given `count` of them.
 pub fn levels(w: u32, h: u32, count: u32) -> Vec<Level> {
+    levels3(w, h, 1, count)
+}
+
+/// The levels of a `w` x `h` x `d` texture given `count` of them.
+pub fn levels3(w: u32, h: u32, d: u32, count: u32) -> Vec<Level> {
     let mut out = Vec::new();
-    let (mut w, mut h, mut at) = (w as usize, h as usize, 0);
+    let (mut w, mut h, mut d, mut at) = (w as usize, h as usize, d.max(1) as usize, 0);
     for _ in 0..count.max(1) {
-        out.push(Level { w, h, at });
-        at += w * h;
-        if w == 1 && h == 1 {
+        out.push(Level { w, h, d, at });
+        at += w * h * d;
+        if w == 1 && h == 1 && d == 1 {
             break;
         }
         w = (w / 2).max(1);
         h = (h / 2).max(1);
+        d = (d / 2).max(1);
     }
     out
 }
@@ -573,7 +612,7 @@ fn stages(p: &Pass, fr: &Frag) -> Option<[i32; 4]> {
                 let uses = |a: &[u32; 3]| a.iter().any(|x| x & 0xF == ta::TEXTURE);
                 if uses(&st.color_arg) || uses(&st.alpha_arg) {
                     let (u, v, lambda) = fr.uv[i];
-                    texel = sample(t, &g.samplers[i], u, v, lambda, false);
+                    texel = sample(t, &g.samplers[i], 0, u, v, 0, lambda, false);
                     if i == 0 && g.flags & F_TEX_MASK != 0 && texel[3] == 0 {
                         return None;
                     }
@@ -1185,10 +1224,46 @@ fn address(i: i64, n: usize, mode: u32) -> Option<usize> {
 /// fraction bits, as [r, g, b, a].
 /// `hp`: with 8 more fraction bits (0 ..= 255 x 256), for pixel shaders,
 /// whose texels may become coordinates.
-fn sample_level(t: &Texture, s: &Sampler, l: &Level, u: i64, v: i64, nearest: bool, hp: bool) -> [i32; 4] {
-    let get = |x: i64, y: i64| match (address(x, l.w, s.address[0]), address(y, l.h, s.address[1])) {
-        (Some(x), Some(y)) => argb(t.texels[l.at + y * l.w + x]),
-        _ => argb(s.border),
+fn sample_level(t: &Texture, s: &Sampler, l: &Level, base: usize, u: i64, v: i64, w: i64, nearest: bool, hp: bool) -> [i32; 4] {
+    if t.kind == TEX_3D {
+        // Two slices (or the nearest), each bilinear.
+        let plane = l.w * l.h;
+        let slice = |z: i64| match address(z, l.d, s.address_w) {
+            Some(z) => sample_plane(t, s, l, base + z * plane, u, v, nearest, hp),
+            None => {
+                let c = argb(s.border);
+                if hp { c.map(|x| x << 8) } else { c }
+            }
+        };
+        if nearest {
+            return slice(w >> 16);
+        }
+        let w = w - 0x8000;
+        let fz = ((w >> 8) & 0xFF) as i32;
+        let (a, b) = (slice(w >> 16), slice((w >> 16) + 1));
+        return core::array::from_fn(|i| (a[i] * (256 - fz) + b[i] * fz) >> 8);
+    }
+    sample_plane(t, s, l, base, u, v, nearest, hp)
+}
+
+/// One 2D plane of a level (`off`: its first texel in the layer, past the
+/// level's start).
+fn sample_plane(t: &Texture, s: &Sampler, l: &Level, off: usize, u: i64, v: i64, nearest: bool, hp: bool) -> [i32; 4] {
+    let kind = view_kind(t, s);
+    let cube = (kind == TEX_CUBE || kind == TEX_CUBE_ARRAY) && l.w == l.h && t.layer_size > 0;
+    let get = |x: i64, y: i64| {
+        if cube && (x < 0 || y < 0 || x >= l.w as i64 || y >= l.h as i64) {
+            // Off a cube face: the neighbouring face's texel.
+            let layer = off / t.layer_size;
+            let face = (layer - (s.first_layer as usize).min(layer)) % 6;
+            let (f, x, y) = cube_wrap(face, l.w, x, y);
+            let at = (layer - face + f) * t.layer_size + l.at + y as usize * l.w + x as usize;
+            return argb(t.texels.get(at).copied().unwrap_or(0));
+        }
+        match (address(x, l.w, s.address[0]), address(y, l.h, s.address[1])) {
+            (Some(x), Some(y)) => argb(t.texels.get(off + l.at + y * l.w + x).copied().unwrap_or(0)),
+            _ => argb(s.border),
+        }
     };
     if nearest {
         let c = get(u >> 16, v >> 16);
@@ -1212,11 +1287,11 @@ fn sample_level(t: &Texture, s: &Sampler, l: &Level, u: i64, v: i64, nearest: bo
 
 /// The texel colour at (u, v) in level-0 texels (16 fraction bits), with
 /// level of detail `lambda` (8 fraction bits), as the sampler says.
-fn sample(t: &Texture, s: &Sampler, u: i64, v: i64, lambda: i32, hp: bool) -> [i32; 4] {
+fn sample(t: &Texture, s: &Sampler, base: usize, u: i64, v: i64, w: i64, lambda: i32, hp: bool) -> [i32; 4] {
     let first = (s.max_level as usize).min(t.levels.len() - 1);
     let at = |n: usize, nearest: bool| {
         let n = (n + first).min(t.levels.len() - 1);
-        sample_level(t, s, &t.levels[n], u >> n, v >> n, nearest, hp)
+        sample_level(t, s, &t.levels[n], base, u >> n, v >> n, w >> n, nearest, hp)
     };
     let lambda = lambda + s.lod_bias;
     // Where magnification ends: GL's 0.5 for a linear magnification over a
@@ -1317,12 +1392,15 @@ fn blend(g: &Group, src: [i32; 4], dst: u32) -> [i32; 4] {
 
 /// How many texels TexArgs describes.
 pub fn texel_count(a: &TexArgs) -> usize {
-    levels(a.w, a.h, a.levels).iter().map(|l| l.w * l.h).sum()
+    let layer: usize = levels3(a.w, a.h, if a.kind == TEX_3D { a.depth } else { 1 }, a.levels).iter().map(|l| l.w * l.h * l.d).sum();
+    layer.saturating_mul(a.layers.max(1) as usize)
 }
 
 /// A texture from its upload: `texels` as TexArgs describes them.
 pub fn texture(a: &TexArgs, texels: Vec<u32>) -> Texture {
-    Texture { levels: levels(a.w, a.h, a.levels), texels }
+    let levels = levels3(a.w, a.h, if a.kind == TEX_3D { a.depth } else { 1 }, a.levels);
+    let layer_size = levels.iter().map(|l| l.w * l.h * l.d).sum();
+    Texture { levels, texels, layers: a.layers.max(1) as usize, layer_size, kind: a.kind }
 }
 
 /// Write `src` (`a.w` x `a.h` values, rows packed) into the target as
@@ -1504,7 +1582,9 @@ pub mod sm4 {
     pub const RSQ: u16 = 0x144;
     pub const SAMPLE_C: u16 = 0x146;
     pub const SAMPLE_C_LZ: u16 = 0x147;
+    pub const SAMPLE_L: u16 = 0x148;
     pub const SAMPLE_D: u16 = 0x149;
+    pub const SAMPLE_B: u16 = 0x14A;
     pub const SQRT: u16 = 0x14B;
     pub const UDIV: u16 = 0x14E;
     pub const ULT: u16 = 0x14F;
@@ -1638,7 +1718,7 @@ fn sources(op: u16) -> usize {
         return match op {
             IMAD | MOVC | SAMPLE_D | UBFE | IBFE => 3,
             AND | OR | XOR | DIV | DP2 | EQ | NE | LT | GE | IADD | IMUL | IMAX | IMIN | UMAX | UMIN | ISHL | ISHR | USHR | UDIV | UREM | IEQ | INE | IGE
-            | ILT | ULT | UGE | UMUL | SAMPLE_C | SAMPLE_C_LZ => 2,
+            | ILT | ULT | UGE | UMUL | SAMPLE_C | SAMPLE_C_LZ | SAMPLE_L | SAMPLE_B => 2,
             CONTINUE | LOOP | ENDLOOP => 0,
             _ => 1,
         };
@@ -1680,7 +1760,7 @@ pub fn ps_program(ins: &[PsIns], inputs: u32) -> Option<PsProgram> {
         ) || matches!(
             x.op,
             0x101 | 0x107 | 0x10E | 0x10F | 0x118..=0x12B | 0x12D | 0x12F | 0x131 | 0x137 | 0x139 | 0x13B..=0x13D | 0x140..=0x144
-                | 0x146 | 0x147 | 0x149 | 0x14B | 0x14E..=0x151 | 0x153..=0x157 | 0x16C | 0x16D | 0x181..=0x183 | 0x186..=0x18B | 0x18D
+                | 0x146..=0x14A | 0x14B | 0x14E..=0x151 | 0x153..=0x157 | 0x16C | 0x16D | 0x181..=0x183 | 0x186..=0x18B | 0x18D
                 | 0x1F0..=0x1F9
         );
         if x.rel != 0 && (x.rel >> 31 == 0 || (x.rel >> 4) & 0xFFF >= PS_TEMPS as u32) {
@@ -1706,7 +1786,7 @@ pub fn ps_program(ins: &[PsIns], inputs: u32) -> Option<PsProgram> {
             }
             writes_depth |= f == pf::DEPTH;
         }
-        if matches!(x.op, TEX | sm4::SAMPLE_C | sm4::LOD | sm4::GATHER4) {
+        if matches!(x.op, TEX | sm4::SAMPLE_C | sm4::LOD | sm4::GATHER4 | sm4::SAMPLE_B) {
             if x.src[0] & 15 == pf::INPUT && x.src[0] & (1 << 28) == 0 && (x.src[0] >> 24) & 15 == 0 {
                 deriv |= 1 << ((x.src[0] >> 4) & 0xFFF);
             } else {
@@ -2376,8 +2456,6 @@ impl PsProgram {
     fn texld(&self, p: &Pass, x: &PsIns, c: &F4, dd: &[(F4, F4); PS_INPUTS], cd: &(F4, F4)) -> F4 {
         let s = x.sampler as usize;
         let Some(t) = p.tex[s] else { return [0.0, 0.0, 0.0, 1.0] };
-        let l0 = &t.levels[0];
-        let (tw, th) = (l0.w as f32, l0.h as f32);
         let mut c = *c;
         let mut cd = *cd;
         if x.op == sio::TEX && x.ctrl & 1 != 0 && c[3] != 0.0 {
@@ -2386,38 +2464,32 @@ impl PsProgram {
             c = mul(&c, &iw);
             cd = (mul(&sub(&cd.0, &mul(&c, &splat(cd.0[3]))), &iw), mul(&sub(&cd.1, &mul(&c, &splat(cd.1[3]))), &iw));
         }
-        // Level of detail: from the input's derivatives (texels per pixel),
-        // or texldl's w.
+        // The derivatives: the input's, or carried along.
+        let src = x.src[0];
+        let direct = src & 15 == pf::INPUT && src & (1 << 28) == 0 && (src >> 24) & 15 == 0 && x.ctrl & 1 == 0;
+        let d = if direct {
+            let (ddx, ddy) = dd[(((src >> 4) & 0xFFF) as usize).min(PS_INPUTS - 1)];
+            let sw = src >> 16;
+            let pick = |v: &F4| -> F4 { core::array::from_fn(|k| v[((sw >> (2 * k)) & 3) as usize]) };
+            (pick(&ddx), pick(&ddy))
+        } else {
+            cd
+        };
+        let smp = &p.g.samplers[s];
+        let pl = place(t, smp, &c, &d);
+        // Level of detail: from the derivatives (texels per pixel), or
+        // texldl's w.
         let lambda = if x.op == sio::TEXLDL {
             (c[3] * 256.0) as i32
         } else {
-            let src = x.src[0];
-            let direct = src & 15 == pf::INPUT && src & (1 << 28) == 0 && (src >> 24) & 15 == 0 && x.ctrl & 1 == 0;
-            let (ddx, ddy) = if direct {
-                let (ddx, ddy) = dd[(((src >> 4) & 0xFFF) as usize).min(PS_INPUTS - 1)];
-                let sw = src >> 16;
-                let pick = |v: &F4| -> F4 { core::array::from_fn(|k| v[((sw >> (2 * k)) & 3) as usize]) };
-                (pick(&ddx), pick(&ddy))
-            } else {
-                cd
-            };
-            // log2 of the longer of the two steps across the texture, as
-            // GPUs work it out.
-            let (ux, vx, uy, vy) = (ddx[0] * tw, ddx[1] * th, ddy[0] * tw, ddy[1] * th);
-            let len2 = (ux * ux + vx * vx).max(uy * uy + vy * vy);
-            let base = if len2 > 0.0 { (0.5 * log2f(len2) * 256.0).max(-32768.0) as i32 } else { -32768 };
-            base + if x.ctrl & 2 != 0 { (c[3] * 256.0) as i32 } else { 0 }
+            lambda3(&pl.2, &pl.3) + if x.ctrl & 2 != 0 { (c[3] * 256.0) as i32 } else { 0 }
         };
-        let smp = &p.g.samplers[s];
         if smp.packed_depth != 0 {
             // A depth buffer read as a texture: its depth, unfiltered.
-            let k = to_ints(&[c[0] * tw, c[1] * th, 0.0, 0.0]);
-            return [packed_depth(texel_at(t, smp, 0, k[0] as i64, k[1] as i64)), 0.0, 0.0, 1.0];
+            let k = to_ints(&[pl.1[0], pl.1[1], pl.1[2], 0.0]);
+            return [packed_depth(texel_at(t, smp, pl.0, 0, k[0] as i64, k[1] as i64, k[2] as i64)), 0.0, 0.0, 1.0];
         }
-        let u = to_ints(&[c[0] * tw * 256.0, c[1] * th * 256.0, 0.0, 0.0]);
-        let px = sample(t, smp, (u[0] as i64) << 8, (u[1] as i64) << 8, lambda, true);
-        let f = from_ints(&px);
-        mul(&f, &splat(1.0 / (255.0 * 256.0)))
+        sample_at(t, smp, &pl, lambda)
     }
 }
 
@@ -2615,12 +2687,121 @@ fn f32_to_half(f: f32) -> u32 {
 }
 
 /// A texel of level `n`, as the sampler addresses it, 0xAARRGGBB.
-fn texel_at(t: &Texture, s: &Sampler, n: usize, x: i64, y: i64) -> u32 {
+fn texel_at(t: &Texture, s: &Sampler, base: usize, n: usize, x: i64, y: i64, z: i64) -> u32 {
     let l = &t.levels[n.min(t.levels.len() - 1)];
-    match (address(x, l.w, s.address[0]), address(y, l.h, s.address[1])) {
-        (Some(x), Some(y)) => t.texels[l.at + y * l.w + x],
+    let z = if t.kind == TEX_3D { address(z, l.d, s.address_w) } else { Some(0) };
+    match (address(x, l.w, s.address[0]), address(y, l.h, s.address[1]), z) {
+        (Some(x), Some(y), Some(z)) => t.texels.get(base + l.at + (z * l.h + y) * l.w + x).copied().unwrap_or(0),
         _ => s.border,
     }
+}
+
+/// Each cube face's axes: the coordinate along u (index, sign), along v,
+/// and the major axis (index, sign).
+const FACES: [(usize, f32, usize, f32, usize, f32); 6] = [
+    (2, -1.0, 1, -1.0, 0, 1.0),
+    (2, 1.0, 1, -1.0, 0, -1.0),
+    (0, 1.0, 2, 1.0, 1, 1.0),
+    (0, 1.0, 2, -1.0, 1, -1.0),
+    (0, 1.0, 1, -1.0, 2, 1.0),
+    (0, -1.0, 1, -1.0, 2, -1.0),
+];
+
+/// The face a direction points at most (z, then y, then x on ties).
+fn cube_face(c: &[f32]) -> usize {
+    let (ax, ay, az) = (fabs(c[0]), fabs(c[1]), fabs(c[2]));
+    if az >= ax && az >= ay {
+        if c[2] >= 0.0 { 4 } else { 5 }
+    } else if ay >= ax {
+        if c[1] >= 0.0 { 2 } else { 3 }
+    } else if c[0] >= 0.0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// A texel off the edge of cube face `face` (`n` across): the face and
+/// texel it lands on, so filtering runs on across the seam.
+fn cube_wrap(face: usize, n: usize, x: i64, y: i64) -> (usize, i64, i64) {
+    let (si, ss, ti, ts, mi, sg) = FACES[face];
+    let s = 2.0 * (x as f32 + 0.5) / n as f32 - 1.0;
+    let tt = 2.0 * (y as f32 + 0.5) / n as f32 - 1.0;
+    let mut d = [0.0f32; 3];
+    d[si] = ss * s;
+    d[ti] = ts * tt;
+    d[mi] = sg;
+    let f = cube_face(&d);
+    let (si, ss, ti, ts, mi, _) = FACES[f];
+    let ma = fabs(d[mi]);
+    let u = (ss * d[si] / ma + 1.0) * 0.5 * n as f32;
+    let v = (ts * d[ti] / ma + 1.0) * 0.5 * n as f32;
+    let c = |w: f32| (fl(w) as i64).clamp(0, n as i64 - 1);
+    (f, c(u), c(v))
+}
+
+fn fabs(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
+}
+
+/// Where normalized coordinates `c` (derivatives `d`) fall in `t`: the
+/// layer's first texel, and the coordinates and their derivatives in level
+/// 0's texels (u, v, w).
+fn place(t: &Texture, s: &Sampler, c: &F4, d: &(F4, F4)) -> (usize, [f32; 3], [f32; 3], [f32; 3]) {
+    let l0 = &t.levels[0];
+    let kind = view_kind(t, s);
+    let fl0 = s.first_layer as usize;
+    let (tw, th, td) = (l0.w as f32, l0.h as f32, l0.d as f32);
+    let top = view_top(t, s);
+    let layer = |i: f32| -> usize { (fl(i + 0.5).max(0.0) as usize + fl0).min(top) };
+    match kind {
+        TEX_CUBE | TEX_CUBE_ARRAY => {
+            // The face the direction points at most (z, then y, then x on
+            // ties), and the face's own axes.
+            let face = cube_face(c);
+            let (si, ss, ti, ts, mi, _) = FACES[face];
+            let ma = fabs(c[mi]);
+            let k = if ma > 0.0 { 0.5 / ma } else { 0.0 };
+            let sg = if c[mi] < 0.0 { -1.0 } else { 1.0 };
+            // u = sc / (2 |ma|) + 1/2; du = (dsc - sc d|ma| / |ma|) / (2 |ma|).
+            let du = |g: &F4| -> f32 { k * ss * (g[si] - c[si] * sg * g[mi] * 2.0 * k) * tw };
+            let dv = |g: &F4| -> f32 { k * ts * (g[ti] - c[ti] * sg * g[mi] * 2.0 * k) * th };
+            let ci = if kind == TEX_CUBE_ARRAY { (fl(c[3] + 0.5).max(0.0) as usize) * 6 } else { 0 };
+            let base = (face + (ci + fl0).min(top.saturating_sub(5))).min(t.layers.max(1) - 1) * t.layer_size;
+            let u = (ss * c[si] * k + 0.5) * tw;
+            let v = (ts * c[ti] * k + 0.5) * th;
+            (base, [u, v, 0.0], [du(&d.0), dv(&d.0), 0.0], [du(&d.1), dv(&d.1), 0.0])
+        }
+        TEX_3D => (0, [c[0] * tw, c[1] * th, c[2] * td], [d.0[0] * tw, d.0[1] * th, d.0[2] * td], [d.1[0] * tw, d.1[1] * th, d.1[2] * td]),
+        TEX_2D_ARRAY => (layer(c[2]) * t.layer_size, [c[0] * tw, c[1] * th, 0.0], [d.0[0] * tw, d.0[1] * th, 0.0], [d.1[0] * tw, d.1[1] * th, 0.0]),
+        TEX_1D_ARRAY => (layer(c[1]) * t.layer_size, [c[0] * tw, 0.5, 0.0], [d.0[0] * tw, 0.0, 0.0], [d.1[0] * tw, 0.0, 0.0]),
+        _ => (fl0.min(t.layers.max(1) - 1) * t.layer_size, [c[0] * tw, c[1] * th, 0.0], [d.0[0] * tw, d.0[1] * th, 0.0], [d.1[0] * tw, d.1[1] * th, 0.0]),
+    }
+}
+
+/// The view's last layer.
+fn view_top(t: &Texture, s: &Sampler) -> usize {
+    let all = t.layers.max(1) - 1;
+    if s.view_layers == 0 { all } else { (s.first_layer as usize + s.view_layers as usize - 1).min(all) }
+}
+
+/// How a sampler's view addresses the texture.
+fn view_kind(t: &Texture, s: &Sampler) -> u32 {
+    if s.view != 0 { s.view - 1 } else { t.kind }
+}
+
+/// log2 of the longer of the two steps across the texture (texels per
+/// pixel), 8 fraction bits, as GPUs work it out.
+fn lambda3(gx: &[f32; 3], gy: &[f32; 3]) -> i32 {
+    let len2 = (gx[0] * gx[0] + gx[1] * gx[1] + gx[2] * gx[2]).max(gy[0] * gy[0] + gy[1] * gy[1] + gy[2] * gy[2]);
+    if len2 > 0.0 { (0.5 * log2f(len2) * 256.0).max(-32768.0) as i32 } else { -32768 }
+}
+
+/// Sample at a placed position, 0 ..= 1.
+fn sample_at(t: &Texture, smp: &Sampler, pl: &(usize, [f32; 3], [f32; 3], [f32; 3]), lambda: i32) -> F4 {
+    let u = to_ints(&[pl.1[0] * 256.0, pl.1[1] * 256.0, pl.1[2] * 256.0, 0.0]);
+    let px = sample(t, smp, pl.0, (u[0] as i64) << 8, (u[1] as i64) << 8, (u[2] as i64) << 8, lambda, true);
+    mul(&from_ints(&px), &splat(1.0 / (255.0 * 256.0)))
 }
 
 /// 24-bit depth packed into red, green and blue.
@@ -2631,14 +2812,6 @@ fn packed_depth(v: u32) -> f32 {
 fn argb_f(v: u32) -> F4 {
     let k = 1.0 / 255.0;
     [(v >> 16 & 0xFF) as f32 * k, (v >> 8 & 0xFF) as f32 * k, (v & 0xFF) as f32 * k, (v >> 24) as f32 * k]
-}
-
-/// The level of detail of gradients `gx`, `gy` on a `tw` x `th` level, 8
-/// fraction bits.
-fn lambda_of(gx: &F4, gy: &F4, tw: f32, th: f32) -> i32 {
-    let (ux, vx, uy, vy) = (gx[0] * tw, gx[1] * th, gy[0] * tw, gy[1] * th);
-    let len2 = (ux * ux + vx * vx).max(uy * uy + vy * vy);
-    if len2 > 0.0 { (0.5 * log2f(len2) * 256.0).max(-32768.0) as i32 } else { -32768 }
 }
 
 /// D3D11_COMPARISON_FUNC (1 never ..= 8 always) as cmp_scalar's: the
@@ -2757,7 +2930,7 @@ impl PsProgram {
             }
             F32TOF16 => from_bits(fa.map(f32_to_half)),
             F16TOF32 => a.map(|h| half_to_f32(h & 0xFFFF)),
-            SAMPLE_D | SAMPLE_C | SAMPLE_C_LZ | LD | RESINFO | GATHER4 | LOD => self.sample_op(p, x, s, &sd[0], dd),
+            SAMPLE_D | SAMPLE_L | SAMPLE_B | SAMPLE_C | SAMPLE_C_LZ | LD | RESINFO | GATHER4 | LOD => self.sample_op(p, x, s, &sd[0], dd),
             _ => ZERO,
         }
     }
@@ -2769,18 +2942,27 @@ impl PsProgram {
         let smp = &p.g.samplers[si];
         let Some(t) = p.tex[si] else { return ZERO };
         let first = (smp.max_level as usize).min(t.levels.len() - 1);
-        let l0 = &t.levels[0];
-        let (tw, th) = (l0.w as f32, l0.h as f32);
         let c = &s[0];
+        let val = |v: u32| if smp.packed_depth != 0 { packed_depth(v) } else { argb_f(v)[0] };
+        let kind = view_kind(t, smp);
+        let layers = t.layers.max(1).saturating_sub(smp.first_layer as usize).max(1);
         match x.op {
             RESINFO => {
                 let m = (s[0][0].to_bits() as usize).saturating_add(first);
-                let (w, h) = t.levels.get(m).map_or((0, 0), |l| (l.w as u32, l.h as u32));
+                let (w, h, dd) = t.levels.get(m).map_or((0, 0, 0), |l| (l.w as u32, l.h as u32, l.d as u32));
+                let z = match kind {
+                    TEX_3D => dd,
+                    TEX_CUBE_ARRAY => (layers / 6) as u32,
+                    TEX_2D_ARRAY | TEX_1D_ARRAY => layers as u32,
+                    _ => 1,
+                };
+                let h = if kind == TEX_1D_ARRAY { layers as u32 } else { h };
                 let n = (t.levels.len() - first) as u32;
+                let r = |v: u32| if v > 0 { 1.0 / v as f32 } else { 0.0 };
                 match x.ctrl & 3 {
-                    2 => from_bits([w, h, 1, n]),
-                    1 => [if w > 0 { 1.0 / w as f32 } else { 0.0 }, if h > 0 { 1.0 / h as f32 } else { 0.0 }, 1.0, n as f32],
-                    _ => [w as f32, h as f32, 1.0, n as f32],
+                    2 => from_bits([w, h, z, n]),
+                    1 => [r(w), r(h), z as f32, n as f32],
+                    _ => [w as f32, h as f32, z as f32, n as f32],
                 }
             }
             LD => {
@@ -2789,30 +2971,42 @@ impl PsProgram {
                 if n >= t.levels.len() {
                     return ZERO;
                 }
-                let raw = Sampler { address: [BORDER, BORDER], border: 0, ..*smp };
-                let v = texel_at(t, &raw, n, i[0] as i32 as i64, i[1] as i32 as i64);
+                let top = view_top(t, smp);
+                if matches!(kind, TEX_2D_ARRAY | TEX_1D_ARRAY) && (smp.first_layer as usize + i[if kind == TEX_1D_ARRAY { 1 } else { 2 }] as usize) > top {
+                    return ZERO;
+                }
+                let li = |v: u32| (v as usize + smp.first_layer as usize).min(top) * t.layer_size;
+                let (base, y, z) = match kind {
+                    TEX_2D_ARRAY => (li(i[2]), i[1], 0),
+                    TEX_1D_ARRAY => (li(i[1]), 0, 0),
+                    TEX_3D => (0, i[1], i[2]),
+                    _ => (li(0), i[1], 0),
+                };
+                let raw = Sampler { address: [BORDER, BORDER], address_w: BORDER, border: 0, ..*smp };
+                let v = texel_at(t, &raw, base, n, i[0] as i32 as i64, y as i32 as i64, z as i32 as i64);
                 if smp.packed_depth != 0 { [packed_depth(v), 0.0, 0.0, 1.0] } else { argb_f(v) }
             }
             LOD => {
-                let (gx, gy) = self.coord_derivs(x.src[0], cd, dd);
-                let l = lambda_of(&gx, &gy, tw, th) as f32 / 256.0;
+                let d = self.coord_derivs(x.src[0], cd, dd);
+                let pl = place(t, smp, c, &d);
+                let l = lambda3(&pl.2, &pl.3) as f32 / 256.0;
                 let top = (t.levels.len() - 1 - first) as f32;
                 [l.max(0.0).min(top), l, 0.0, 0.0]
             }
             GATHER4 | SAMPLE_C | SAMPLE_C_LZ => {
                 // The four texels of the first level's bilinear footprint,
                 // and where in it the coordinates fall.
-                let l = &t.levels[first];
-                let k = to_ints(&[c[0] * l.w as f32 * 256.0 - 128.0, c[1] * l.h as f32 * 256.0 - 128.0, 0.0, 0.0]);
+                let pl = place(t, smp, c, &(ZERO, ZERO));
+                let sc = 1.0 / (1u32 << first) as f32;
+                let k = to_ints(&[pl.1[0] * sc * 256.0 - 128.0, pl.1[1] * sc * 256.0 - 128.0, 0.0, 0.0]);
                 let (x0, y0) = ((k[0] >> 8) as i64, (k[1] >> 8) as i64);
                 let (fx, fy) = ((k[0] & 255) as f32 / 256.0, (k[1] & 255) as f32 / 256.0);
                 let q = [
-                    texel_at(t, smp, first, x0, y0 + 1),
-                    texel_at(t, smp, first, x0 + 1, y0 + 1),
-                    texel_at(t, smp, first, x0 + 1, y0),
-                    texel_at(t, smp, first, x0, y0),
+                    texel_at(t, smp, pl.0, first, x0, y0 + 1, 0),
+                    texel_at(t, smp, pl.0, first, x0 + 1, y0 + 1, 0),
+                    texel_at(t, smp, pl.0, first, x0 + 1, y0, 0),
+                    texel_at(t, smp, pl.0, first, x0, y0, 0),
                 ];
-                let val = |v: u32| if smp.packed_depth != 0 { packed_depth(v) } else { argb_f(v)[0] };
                 if x.op == GATHER4 {
                     return q.map(val);
                 }
@@ -2826,17 +3020,25 @@ impl PsProgram {
                     let bot = pass(q[0]) * (1.0 - fx) + pass(q[1]) * fx;
                     splat(top * (1.0 - fy) + bot * fy)
                 } else {
-                    let n = to_ints(&[c[0] * l.w as f32, c[1] * l.h as f32, 0.0, 0.0]);
-                    splat(pass(texel_at(t, smp, first, n[0] as i64, n[1] as i64)))
+                    let n = to_ints(&[pl.1[0] * sc, pl.1[1] * sc, 0.0, 0.0]);
+                    splat(pass(texel_at(t, smp, pl.0, first, n[0] as i64, n[1] as i64, 0)))
                 }
+            }
+            SAMPLE_L => {
+                let pl = place(t, smp, c, &(ZERO, ZERO));
+                sample_at(t, smp, &pl, (s[1][0] * 256.0) as i32)
+            }
+            SAMPLE_B => {
+                let d = self.coord_derivs(x.src[0], cd, dd);
+                let pl = place(t, smp, c, &d);
+                sample_at(t, smp, &pl, lambda3(&pl.2, &pl.3) + (s[1][0] * 256.0) as i32)
             }
             _ => {
                 // sample_d: the level of detail from the gradients given.
-                let lambda = lambda_of(&s[1], &s[2], tw, th);
-                let u = to_ints(&[c[0] * tw * 256.0, c[1] * th * 256.0, 0.0, 0.0]);
-                let px = sample(t, smp, (u[0] as i64) << 8, (u[1] as i64) << 8, lambda, true);
-                mul(&from_ints(&px), &splat(1.0 / (255.0 * 256.0)))
+                let pl = place(t, smp, c, &(s[1], s[2]));
+                sample_at(t, smp, &pl, lambda3(&pl.2, &pl.3))
             }
         }
     }
 }
+

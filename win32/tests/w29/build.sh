@@ -23,7 +23,13 @@ for e in vs40_main vs40_inst ps40_color ps40_tex ps40_math ps40_loop ps40_pos ps
     "$FXC" /nologo /T $p /E $e /Fh build/dx2_$e.h /Vn $e dx2.hlsl >/dev/null
 done
 
-TESTS="dx1 dx2"
+# dx3's.
+for e in vs40_main ps40_cube ps40_cubelod ps40_vol ps40_volload ps40_arr ps40_arrload ps40_arr1 ps40_dims ps41_cubes; do
+    p=$(echo $e | sed 's/^\(..\)\(.\)\(.\)_.*/\1_\2_\3/')
+    "$FXC" /nologo /T $p /E $e /Fh build/dx3_$e.h /Vn $e dx3.hlsl >/dev/null
+done
+
+TESTS="dx1 dx2 dx3"
 for t in $TESTS; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \

@@ -1182,7 +1182,8 @@ fn group(d: &mut Device) -> (Group, Option<Group>, [(f64, f64); k::SLOTS]) {
             continue;
         }
         let t = unsafe { texture(tex) };
-        if t.cube {
+        // Cube maps need a pixel shader's direction to sample by.
+        if t.cube && ps.is_none() {
             continue;
         }
         // A texture drawn into is read back after the draws waiting; and
@@ -1202,8 +1203,10 @@ fn group(d: &mut Device) -> (Group, Option<Group>, [(f64, f64); k::SLOTS]) {
             lod_bias: (f32::from_bits(ss[ss::MIPMAPLODBIAS]) * 256.0) as i32,
             max_level: ss[ss::MAXMIPLEVEL].max(t.lod),
             gl_rules: 0,
+            address_w: 1,
             compare: 0,
             packed_depth: 0,
+            ..Default::default()
         };
         sizes[i] = (t.w as f64, t.h as f64);
     }

@@ -826,6 +826,12 @@ fn length(p: *const u32) -> usize {
             if t & 0xFFFF == COMMENT as u32 {
                 n += ((t >> 16) & 0x7FFF) as usize;
             }
+            // A constant's values could look like the end token.
+            match (t & 0xFFFF) as u16 {
+                DEF | DEFI => n += 5,
+                DEFB => n += 2,
+                _ => {}
+            }
             if n > 1 << 20 {
                 return n;
             }

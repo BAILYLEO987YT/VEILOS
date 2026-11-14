@@ -34,7 +34,6 @@ mod sio {
     pub const TEX: u16 = 66;
     pub const DSX: u16 = 91;
     pub const DSY: u16 = 92;
-    pub const TEXLDL: u16 = 95;
 }
 
 /// One kernel input's source: per component, the vertex shader output
@@ -238,14 +237,8 @@ impl Tr {
         let c = self.src(srcs.first()?, x.op == LD || x.op == RESINFO, 0)?;
         let (kop, ctrl, src) = match x.op {
             SAMPLE => (sio::TEX, 0, [c, 0, 0]),
-            SAMPLE_B | SAMPLE_L => {
-                // The bias or level in the coordinates' w.
-                let t = self.scratch;
-                self.emit(Self::ins(sio::MOV, Self::temp_dst(t, 7), [c, 0, 0]));
-                let b = self.src(srcs.get(1)?, false, 1)?;
-                self.emit(Self::ins(sio::MOV, Self::temp_dst(t, 8), [(b & !(0xFF << 16)) | ((b >> 16) & 3) * 0x55 << 16, 0, 0]));
-                if x.op == SAMPLE_B { (sio::TEX, 2, [Self::temp_src(t), 0, 0]) } else { (sio::TEXLDL, 0, [Self::temp_src(t), 0, 0]) }
-            }
+            SAMPLE_B => (sm4::SAMPLE_B, 0, [c, self.src(srcs.get(1)?, false, 1)?, 0]),
+            SAMPLE_L => (sm4::SAMPLE_L, 0, [c, self.src(srcs.get(1)?, false, 1)?, 0]),
             SAMPLE_D => (sm4::SAMPLE_D, 0, [c, self.src(srcs.get(1)?, false, 1)?, self.src(srcs.get(2)?, false, 2)?]),
             SAMPLE_C | SAMPLE_C_LZ => (if x.op == SAMPLE_C { sm4::SAMPLE_C } else { sm4::SAMPLE_C_LZ }, 0, [c, self.src(srcs.get(1)?, false, 1)?, 0]),
             LD => (sm4::LD, 0, [c, 0, 0]),

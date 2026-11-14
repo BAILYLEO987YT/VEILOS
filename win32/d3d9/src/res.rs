@@ -306,8 +306,8 @@ impl Texture {
         self.surfaces.get((face * self.levels + level) as usize).copied()
     }
 
-    /// Its kernel texture, uploaded again if it changed (face 0 of a cube
-    /// map: the kernel samples 2D textures only).
+    /// Its kernel texture, uploaded again if it changed (a cube map's six
+    /// faces as six layers).
     pub fn kernel(&mut self) -> u64 {
         let drawn = self.surfaces.iter().any(|&s| unsafe { surface(s) }.drawn);
         if self.handle != 0 && !self.dirty && !drawn {
@@ -315,37 +315,42 @@ impl Texture {
         }
         let mut texels: Vec<u32> = Vec::new();
         let mut n = 0;
-        for l in 0..self.levels {
-            let s = unsafe { surface(self.surfaces[l as usize]) };
-            s.drawn = false;
-            texels.extend(s.read_argb());
-            n += 1;
-        }
-        // Automatic mipmaps: each level from the one above, 2x2 averaged.
-        if self.usage & USAGE_AUTOGENMIPMAP != 0 {
-            let (mut w, mut h, mut at) = (self.w as usize, self.h as usize, 0usize);
-            while w > 1 || h > 1 {
-                let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
-                let mut next = vec![0u32; nw * nh];
-                for y in 0..nh {
-                    for x in 0..nw {
-                        let px = |xx: usize, yy: usize| texels[at + yy.min(h - 1) * w + xx.min(w - 1)];
-                        let q = [px(2 * x, 2 * y), px(2 * x + 1, 2 * y), px(2 * x, 2 * y + 1), px(2 * x + 1, 2 * y + 1)];
-                        let mut c = 0u32;
-                        for sh in [0, 8, 16, 24] {
-                            let sum: u32 = q.iter().map(|p| p >> sh & 0xFF).sum();
-                            c |= ((sum + 2) / 4) << sh;
-                        }
-                        next[y * nw + x] = c;
-                    }
-                }
-                at += w * h;
-                texels.extend(next);
+        for face in 0..if self.cube { 6 } else { 1 } {
+            let start = texels.len();
+            n = 0;
+            for l in 0..self.levels {
+                let s = unsafe { surface(self.surfaces[(face * self.levels + l) as usize]) };
+                s.drawn = false;
+                texels.extend(s.read_argb());
                 n += 1;
-                (w, h) = (nw, nh);
+            }
+            // Automatic mipmaps: each level from the one above, 2x2 averaged.
+            if self.usage & USAGE_AUTOGENMIPMAP != 0 {
+                let (mut w, mut h, mut at) = (self.w as usize, self.h as usize, start);
+                while w > 1 || h > 1 {
+                    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+                    let mut next = vec![0u32; nw * nh];
+                    for y in 0..nh {
+                        for x in 0..nw {
+                            let px = |xx: usize, yy: usize| texels[at + yy.min(h - 1) * w + xx.min(w - 1)];
+                            let q = [px(2 * x, 2 * y), px(2 * x + 1, 2 * y), px(2 * x, 2 * y + 1), px(2 * x + 1, 2 * y + 1)];
+                            let mut c = 0u32;
+                            for sh in [0, 8, 16, 24] {
+                                let sum: u32 = q.iter().map(|p| p >> sh & 0xFF).sum();
+                                c |= ((sum + 2) / 4) << sh;
+                            }
+                            next[y * nw + x] = c;
+                        }
+                    }
+                    at += w * h;
+                    texels.extend(next);
+                    n += 1;
+                    (w, h) = (nw, nh);
+                }
             }
         }
-        let args = TexArgs { w: self.w, h: self.h, texels: texels.as_ptr() as u64, levels: n };
+        let (layers, kind) = if self.cube { (6, gfx3d::raster3d::TEX_CUBE) } else { (1, gfx3d::raster3d::TEX_2D) };
+        let args = TexArgs { w: self.w, h: self.h, texels: texels.as_ptr() as u64, levels: n, depth: 0, layers, kind };
         let h = gfx3d::upload_texture(self.handle, &args);
         if h != 0 {
             self.handle = h;

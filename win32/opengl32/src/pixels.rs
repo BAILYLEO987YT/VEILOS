@@ -246,6 +246,9 @@ impl Ctx {
             h: h as u32,
             texels: img.as_ptr() as u64,
             levels: 1,
+            depth: 0,
+            layers: 0,
+            kind: k::TEX_2D,
         };
         let mut handle = 0u64;
         if unsafe { VeilGpu3d(4, 0, &args as *const _ as u64, &mut handle as *mut u64 as u64) } != 0 {
