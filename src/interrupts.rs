@@ -385,6 +385,9 @@ pub fn syscall_trace() -> bool {
 /// kernel stack.  Arguments follow Windows x64 ABI (rescued by thunk + asm):
 ///   id=RDI, a0=RSI, a1=RDX, a2=RCX, a3=R8  →  return value in RAX.
 extern "C" fn syscall_dispatch(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    // SMAP (smp.rs): a system call works on the caller's memory. The flag is
+    // the caller's again after SYSRET (R11), and each thread keeps its own.
+    crate::smp::user_access_begin();
     // ── Universal syscall trace (SYSCALL_TRACE) ─────────────────────────────
     // Every syscall from every subsystem (NT native, Win32, kernel32, etc.)
     // passes through here. This lets us see exactly what the EXE is calling
@@ -667,12 +670,34 @@ extern "x86-interrupt" fn double_fault_handler(
 
 // Catches memory access violations (Segfaults)
 pub(crate) extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode)
+    mut stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode)
 {
     use x86_64::registers::control::Cr2;
 
     let faulting_addr = Cr2::read();
     let in_user_mode = (stack_frame.code_segment & 0x3) == 3;
+    // SMAP (smp.rs): kernel code reading or writing a present user page with
+    // RFLAGS.AC clear. Logged. In Security Mode, with a program to blame, it
+    // goes on to the fault handling below, which ends that program. Otherwise
+    // (Performance Mode, or kernel threads) it's allowed: the flag is set in
+    // the interrupted context and the access runs again, so a place not yet
+    // marked can't stop the OS.
+    let enforce = !crate::policy::performance() && crate::loader::has_exec_context();
+    if !in_user_mode
+        && crate::smp::SMAP_ON.load(Ordering::Relaxed)
+        && error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && !error_code.contains(PageFaultErrorCode::USER_MODE)
+        && !error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH)
+        && faulting_addr.as_u64() < 0x0000_8000_0000_0000
+        && stack_frame.cpu_flags & (1 << 18) == 0
+    {
+        crate::smp::smap_violation(stack_frame.instruction_pointer.as_u64(), faulting_addr.as_u64());
+        if !enforce {
+            unsafe { stack_frame.as_mut().update(|f| f.cpu_flags |= 1 << 18) };
+            return;
+        }
+        crate::serial_println!("[SMAP] Security Mode: ending the program");
+    }
     // The kernel touching a page of an image or view that isn't in yet.
     if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
         && faulting_addr.as_u64() < 0x0000_8000_0000_0000

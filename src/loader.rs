@@ -116,7 +116,8 @@ pub fn load_and_spawn_pe_with(
     let result = crate::address_space::with(cr3, || {
         let mut mapper = unsafe { memory::get_mapper() }; // the new process's tables
         let mut scratch: Vec<u64> = Vec::new();
-        let result = load_and_spawn_pe_inner(path, args, &mut mapper, frame_allocator, &mut scratch);
+        // SMAP (smp.rs): building a process writes its image, stack, TEB and PEB.
+        let result = crate::smp::user_access(|| load_and_spawn_pe_inner(path, args, &mut mapper, frame_allocator, &mut scratch));
         if result.is_err() && !scratch.is_empty() {
             crate::trace_println!(
                 "[LOADER] Load failed — rolling back {} mapped pages", scratch.len()
