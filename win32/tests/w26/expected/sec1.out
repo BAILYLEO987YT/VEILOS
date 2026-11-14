@@ -1,0 +1,17 @@
+open for reading: ok
+read: ok
+create a file: ok
+write: ok
+create a folder: ok
+rename: ok
+delete: ok
+start a program: ok
+read own child's memory: ok
+end own child: ok
+loopback bind: ok
+loopback listen: ok
+loopback connect: ok
+network connect: allowed
+network listen: allowed
+done
+exit 0

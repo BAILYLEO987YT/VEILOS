@@ -386,6 +386,10 @@ pub enum KernelObjectRef {
     Directory(Arc<DirectoryObject>),
     Timer(Arc<TimerObject>),
     Link(Arc<LinkObject>),
+    /// A 3D render target or texture (nt_gpu3d.rs).
+    Gpu3d(Arc<crate::nt_gpu3d::Gpu3d>),
+    /// A sound stream (nt_sound.rs).
+    Sound(Arc<crate::nt_sound::SoundHandle>),
 }
 
 impl KernelObjectRef {
@@ -407,6 +411,8 @@ impl KernelObjectRef {
             Self::Directory(_) => ObjectType::Directory,
             Self::Timer(_)     => ObjectType::Event,
             Self::Link(_)      => ObjectType::Directory,
+            Self::Gpu3d(_)     => ObjectType::File,
+            Self::Sound(_)     => ObjectType::File,
         }
     }
 }

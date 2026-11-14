@@ -915,11 +915,6 @@ pub extern "system" fn RtlDestroyQueryDebugBuffer(_buffer: *mut u8) -> NtStatus 
     status::SUCCESS
 }
 
-/// Directory objects list nothing yet.
-#[no_mangle]
-pub extern "system" fn NtQueryDirectoryObject(_dir: u64, _buf: *mut u8, _len: u32, _single: u8, _restart: u8, _context: *mut u32, _ret: *mut u32) -> NtStatus {
-    STATUS_NO_MORE_ENTRIES
-}
 
 // -----| registry keys through ntdll: not yet |-----
 // (kernel32's registry calls work; these answer as for keys that aren't there.)

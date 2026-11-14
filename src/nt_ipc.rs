@@ -102,24 +102,9 @@ pub fn sys_info(op: u64, out: u64, size: u64) -> NtStatus {
     }
 }
 
-/// Random bytes: RDRAND where the CPU has it. Elsewhere (QEMU's default CPU)
-/// this is the time stamp counter stirred by a generator, good enough for hash
-/// tables and temp names but NOT for keys.
+/// Random bytes for ProcessPrng and friends: the kernel's pool (entropy.rs).
 fn fill_random(out: &mut [u8]) {
-    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let has_rdrand = unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 30) != 0;
-    for chunk in out.chunks_mut(8) {
-        let mut v = 0u64;
-        let got = has_rdrand && unsafe { core::arch::x86_64::_rdrand64_step(&mut v) } == 1;
-        if !got {
-            // SplitMix64, with the clock mixed in on every step.
-            let mut z = STATE.fetch_add(0x9E37_79B9_7F4A_7C15 ^ crate::time::rdtsc(), Ordering::Relaxed);
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            v = z ^ (z >> 31);
-        }
-        chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
-    }
+    crate::entropy::fill(out);
 }
 
 // -----| named objects |-----
@@ -346,6 +331,103 @@ pub fn query_link(proc: &Process, h: u64, target: u64, ret: u64) -> NtStatus {
         core::ptr::write_unaligned(target as *mut u16, bytes as u16);
     }
     status::SUCCESS
+}
+
+/// Windows' name for an object kind, as NtQueryDirectoryObject reports it.
+fn type_name(kind: u32) -> &'static str {
+    match kind {
+        KIND_EVENT => "Event",
+        KIND_MUTEX => "Mutant",
+        KIND_SEMAPHORE => "Semaphore",
+        KIND_SECTION => "Section",
+        KIND_DIRECTORY => "Directory",
+        KIND_TIMER => "Timer",
+        KIND_LINK => "SymbolicLink",
+        _ => "Unknown",
+    }
+}
+
+const STATUS_MORE_ENTRIES: NtStatus = 0x0000_0105;
+const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001Au32 as NtStatus;
+
+/// NtQueryDirectoryObject(dir, buffer*, length, single, restart, context*,
+/// returned*): the named objects directly in `dir`, in name order. The buffer
+/// gets OBJECT_DIRECTORY_INFORMATION entries (name and type name, two
+/// UNICODE_STRINGs) ending with an empty one, then the strings. `context` is
+/// where the next call carries on. (Cygwin lists its processes this way.)
+#[allow(clippy::too_many_arguments)]
+pub fn query_directory(proc: &Process, h: u64, buf: u64, len: u64, single: u64, restart: u64, context: u64, returned: u64) -> NtStatus {
+    let dir = match crate::nt_process::object(proc, h) {
+        Some(KernelObjectRef::Directory(d)) => d,
+        Some(_) => return STATUS_OBJECT_TYPE_MISMATCH,
+        None => return status::INVALID_HANDLE,
+    };
+    if !ptr_ok(context, 4) || (returned != 0 && !ptr_ok(returned, 4)) || (len > 0 && !ptr_ok(buf, len as usize)) {
+        return status::ACCESS_VIOLATION;
+    }
+    let start = if restart as u8 != 0 { 0 } else { (unsafe { core::ptr::read_unaligned(context as *const u32) }) as usize };
+    let prefix = if dir.name.is_empty() { String::new() } else { alloc::format!("{}\\", dir.name).to_ascii_lowercase() };
+    let entries: Vec<(Vec<u16>, &'static str)> = {
+        let mut table = NAMED.lock();
+        table.retain(|_, (_, o)| still_held(o));
+        table
+            .iter()
+            .filter_map(|(name, (kind, _))| {
+                let lower = name.to_ascii_lowercase();
+                let rest = lower.strip_prefix(prefix.as_str()).map(|_| &name[prefix.len()..])?;
+                (!rest.is_empty() && !rest.contains('\\')).then(|| (rest.encode_utf16().collect(), type_name(*kind)))
+            })
+            .collect()
+    };
+    let put_len = |n: usize| {
+        if returned != 0 {
+            unsafe { core::ptr::write_unaligned(returned as *mut u32, n as u32) };
+        }
+    };
+    if start >= entries.len() {
+        put_len(0);
+        return STATUS_NO_MORE_ENTRIES;
+    }
+    // How many fit: the entries, an empty one to end them, then the strings.
+    let string_bytes = |e: &(Vec<u16>, &str)| (e.0.len() + 1 + e.1.len() + 1) * 2;
+    let limit = if single as u8 != 0 { 1 } else { entries.len() - start };
+    let mut count = 0;
+    let mut strings = 0;
+    while count < limit {
+        let more = string_bytes(&entries[start + count]);
+        if (count + 2) * 32 + strings + more > len as usize {
+            break;
+        }
+        strings += more;
+        count += 1;
+    }
+    if count == 0 {
+        put_len(2 * 32 + string_bytes(&entries[start]));
+        return status::BUFFER_TOO_SMALL;
+    }
+    let mut at = buf + (count as u64 + 1) * 32;
+    let mut write_string = |entry: u64, units: &[u16]| unsafe {
+        let p = at as *mut u16;
+        for (i, &u) in units.iter().enumerate() {
+            core::ptr::write_unaligned(p.add(i), u);
+        }
+        core::ptr::write_unaligned(p.add(units.len()), 0);
+        core::ptr::write_unaligned(entry as *mut u16, (units.len() * 2) as u16);
+        core::ptr::write_unaligned((entry + 2) as *mut u16, (units.len() * 2 + 2) as u16);
+        core::ptr::write_unaligned((entry + 4) as *mut u32, 0);
+        core::ptr::write_unaligned((entry + 8) as *mut u64, at);
+        at += (units.len() as u64 + 1) * 2;
+    };
+    for (i, (name, kind)) in entries[start..start + count].iter().enumerate() {
+        let entry = buf + i as u64 * 32;
+        write_string(entry, name);
+        let kind: Vec<u16> = kind.encode_utf16().collect();
+        write_string(entry + 16, &kind);
+    }
+    unsafe { core::ptr::write_bytes((buf + count as u64 * 32) as *mut u8, 0, 32) };
+    unsafe { core::ptr::write_unaligned(context as *mut u32, (start + count) as u32) };
+    put_len((at - buf) as usize);
+    if single as u8 == 0 && start + count < entries.len() { STATUS_MORE_ENTRIES } else { status::SUCCESS }
 }
 
 /// NtCreateDirectoryObject(out*, access, attrs*).

@@ -1,0 +1,23 @@
+device: created, feature level 0xb000
+default feature level: 0xb000
+structured: item 3 = (343.250000, 69, 0.250000, -3.000000), item 200 = (6401.000000, 4403, 0.004975, -200.000000)
+raw: [10] = 100 4294967285, [255] = 65025 4294967040
+checksums: 340097280, 807148.2487
+reduced: 533.5000 733.7500 804.5000 977.0000
+histogram: 11 8 18 12 17 16 13 15 18 17 22 18 22 16 15 18
+last of each: 248 193 243 241 200 247 223 254 250 251 255 244 239 245 230 253
+first of each: 16 43 30 15 2 3 32 40 33 17 4 12 1 6 13 5
+old values add up (n(n-1)/2 each): yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes
+panel 0: ok
+panel 1: ok
+panel 2: ok
+panel 3: ok
+panel 4: ok
+panel 5: ok
+panel 6: ok
+panel 7: ok
+panel 8: ok
+panel 9: ok
+panel 10: ok
+panel 11: ok
+exit 0

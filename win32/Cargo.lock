@@ -11,7 +11,25 @@ name = "comdlg32"
 version = "0.1.0"
 
 [[package]]
+name = "d3d11"
+version = "0.1.0"
+dependencies = [
+ "gfx3d",
+]
+
+[[package]]
+name = "d3d9"
+version = "0.1.0"
+dependencies = [
+ "gfx3d",
+]
+
+[[package]]
 name = "gdi32"
+version = "0.1.0"
+
+[[package]]
+name = "gfx3d"
 version = "0.1.0"
 
 [[package]]
@@ -36,6 +54,13 @@ name = "ntdll"
 version = "0.1.0"
 dependencies = [
  "nt_abi",
+]
+
+[[package]]
+name = "opengl32"
+version = "0.1.0"
+dependencies = [
+ "gfx3d",
 ]
 
 [[package]]
@@ -65,6 +90,13 @@ version = "0.1.0"
 dependencies = [
  "nt_abi",
  "zune-png",
+]
+
+[[package]]
+name = "winmm"
+version = "0.1.0"
+dependencies = [
+ "nt_abi",
 ]
 
 [[package]]

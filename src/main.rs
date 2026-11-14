@@ -77,6 +77,13 @@ pub mod nt_console;
 pub mod pty;
 pub mod workers;
 pub mod lgpu;
+pub mod raster3d;
+pub mod nt_gpu3d;
+pub mod nt_sound;
+pub mod entropy;
+pub mod security;
+pub mod sysprof;
+pub mod aslr;
 pub mod virtio_net;
 pub mod game_sdk;
 pub mod network;
@@ -131,6 +138,21 @@ macro_rules! serial_print {
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+}
+
+/// Detailed serial logging (loader, modules, thread and exit details): on in
+/// Security Mode, where it is part of the audit trail, off in Performance
+/// Mode, where each byte is an I/O-port write (a VM exit in a VM).
+pub static VERBOSE_LOG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// `serial_println!` while `VERBOSE_LOG` is on.
+#[macro_export]
+macro_rules! trace_println {
+    ($($arg:tt)*) => {
+        if $crate::VERBOSE_LOG.load(core::sync::atomic::Ordering::Relaxed) {
+            $crate::serial_println!($($arg)*);
+        }
+    };
 }
 
 // -----| vga macros |-----
@@ -220,6 +242,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Calibrate the TSC against the PIT: the clock for delay_us and driver timeouts.
     crate::time::init();
+    crate::entropy::init();
 
     // Set up IDT and Hardware Interrupts (PIC)
     interrupts::init_idt();
@@ -279,6 +302,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Storage first: the filesystems are needed by most of the rest of boot.
     crate::hal::bind(crate::hal::DeviceClass::Storage);
     crate::vfs::ensure_standard_dirs();
+    crate::scheduler::load_profiles();
 
     // Phase 13: the network stack (VirtIO-net + smoltcp) starts when its NIC binds.
     crate::hal::bind(crate::hal::DeviceClass::Network);
@@ -313,6 +337,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // -----| multitasking setup |-----
 
     crate::hal::bind(crate::hal::DeviceClass::Display);
+    crate::hal::bind(crate::hal::DeviceClass::Multimedia);
     // Every class is bound: devices nobody drives can sleep.
     crate::hal::power_down_idle();
     if crate::graphics::FRAMEBUFFER.lock().is_none() {
@@ -626,6 +651,10 @@ async fn gui_refresh_task() {
         // Drive the smoltcp network stack — processes incoming Ethernet
         // frames, runs DHCP/DNS, and delivers UDP/TCP data to sockets.
         crate::network::poll();
+        // Performance Mode's lazy writer (block.rs).
+        crate::block::tick(crate::time::now_ms());
+        crate::scheduler::flush_if_due(crate::time::now_ms());
+        crate::security::flush_audit(crate::time::now_ms());
         
         // Drive the distributed mesh layer — sends LAN announcements,
         // polls the discovery UDP socket, and processes incoming packets.

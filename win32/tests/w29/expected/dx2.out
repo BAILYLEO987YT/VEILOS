@@ -1,0 +1,18 @@
+device: created, feature level 0xa100
+vertex shader from pixel shader code: 0x80070057
+pixel shader from junk: 0x80070057
+pixel shader, no out: 0x1
+VSGetShader: the one set, 0 class instances
+panel 0: ok
+panel 1: ok
+panel 2: ok
+panel 3: ok
+panel 4: ok
+panel 5: ok
+panel 6: ok
+panel 7: ok
+panel 8: ok
+panel 9: ok
+panel 10: ok
+panel 11: ok
+exit 0

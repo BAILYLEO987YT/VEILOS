@@ -537,7 +537,7 @@ impl ThreadManager {
             }
         });
         if removed > 0 {
-            crate::serial_println!("[THREAD] Removed {} thread(s) for pid {}", removed, pid);
+            crate::trace_println!("[THREAD] Removed {} thread(s) for pid {}", removed, pid);
         }
     }
 

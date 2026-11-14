@@ -1,0 +1,31 @@
+devices 1
+caps 0 channels 2 volume 1
+open 12-bit 32
+open adpcm 32
+query 16-bit 0
+open bad device 2
+close bad handle 5
+open 0 open-callback 1
+write unprepared 34
+close while playing 33
+unprepare while playing 33
+done 4, took about 1 s: 1
+position type 4 at end: 1
+position smpte answered as 4
+reset 0, position after 0
+close 0 close-callback 1
+PlaySound memory 1
+sync took about 0.5 s: 1
+PlaySound file 1
+PlaySound missing nodefault 0
+PlaySound loop sync 1 returned at once: 0
+PlaySound stop 1
+Beep 1
+Beep took about 0.3 s: 1
+Beep 10 Hz 1 error 0
+open 24-bit 0
+loop done 1, took about 0.8 s: 1
+MessageBeep 1 returned at once: 1
+timeGetTime ticks: 1
+done
+exit 0

@@ -31,6 +31,7 @@ use crate::interrupts::syscall_stack_arg as stack;
 use crate::network::{NetworkStack, NETWORK};
 use crate::nt_file::ptr_ok;
 use crate::nt_objects::KernelObjectRef;
+use crate::capability::Capability;
 use crate::process::Process;
 
 // -----| errors |-----
@@ -329,20 +330,49 @@ fn socket_of(proc: &Process, h: u64) -> Res<Arc<SocketObj>> {
     }
 }
 
+/// Security Mode (security.rs): reaching past this machine needs a
+/// capability; loopback doesn't.
+fn net_cap(proc: &Process, cap: Capability, what: &str) -> Res<()> {
+    crate::security::require(proc, cap, what).map_err(|_| WSAEACCES)
+}
+
 /// VEIL_SOCKET(op, a, b, c, [d, e]): see nt_abi.
 pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
     let d = stack(4).unwrap_or(0);
     let e = stack(5).unwrap_or(0);
     let r = match op {
         0 => create(proc, a as u32, b),
-        1 => socket_of(proc, a).and_then(|s| bind(&s, b)),
-        2 => socket_of(proc, a).and_then(|s| connect(&s, b)),
-        3 => socket_of(proc, a).and_then(|s| listen(&s, b as usize)),
+        1 => socket_of(proc, a).and_then(|s| {
+            // A UDP socket on a network address hears from outside.
+            let (ip, _) = read_sockaddr(b)?;
+            if s.kind == KIND_UDP && !is_loopback(ip) {
+                net_cap(proc, Capability::NetBind, "listening on the network")?;
+            }
+            bind(&s, b)
+        }),
+        2 => socket_of(proc, a).and_then(|s| {
+            let (ip, _) = read_sockaddr(b)?;
+            if !is_loopback(ip) {
+                net_cap(proc, Capability::NetConnect, "connecting to the network")?;
+                crate::security::audit(proc.pid, &alloc::format!("connects to {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
+            }
+            connect(&s, b)
+        }),
+        3 => socket_of(proc, a).and_then(|s| {
+            let local = s.state.lock().local;
+            if local.is_some_and(|(ip, _)| !is_loopback(ip)) {
+                net_cap(proc, Capability::NetBind, "listening on the network")?;
+            }
+            listen(&s, b as usize)
+        }),
         4 => socket_of(proc, a).and_then(|s| accept(proc, &s, b, c)),
         5 => socket_of(proc, a).and_then(|s| send(&s, b, c as usize, None)).map(|n| write_out(d, n as u64)),
         6 => socket_of(proc, a).and_then(|s| recv(&s, b, c as usize, e as u32, None)).map(|n| write_out(d, n as u64)),
         7 => socket_of(proc, a).and_then(|s| {
             let to = read_sockaddr(e)?;
+            if !is_loopback(to.0) {
+                net_cap(proc, Capability::NetConnect, "sending to the network")?;
+            }
             send(&s, b, c as usize, Some(to))
         }).map(|n| write_out(d, n as u64)),
         8 => socket_of(proc, a).and_then(|s| recv(&s, b, c as usize, 0, Some(e))).map(|n| write_out(d, n as u64)),
@@ -351,7 +381,8 @@ pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
         11 => socket_of(proc, a).and_then(|s| name(&s, b != 0).map(|n| write_sockaddr(c, n))),
         12 => socket_of(proc, a).and_then(|s| set_option(&s, b as u32, c)),
         13 => socket_of(proc, a).and_then(|s| get_option(&s, b as u32)).map(|v| write_out(c, v)),
-        14 => resolve(a, b, c as usize).map(|n| write_out(d, n as u64)),
+        14 => net_cap(proc, Capability::NetConnect, "looking up a host name")
+            .and_then(|_| resolve(a, b, c as usize)).map(|n| write_out(d, n as u64)),
         _ => Err(WSAEINVAL),
     };
     match r {
@@ -366,9 +397,6 @@ fn create(proc: &Process, kind: u32, out: u64) -> Res<()> {
     }
     if !ptr_ok(out, 8) {
         return Err(WSAEFAULT);
-    }
-    if crate::capability::CapabilityChecker::gate(proc.pid, crate::capability::Capability::NetConnect).is_err() {
-        return Err(WSAEACCES);
     }
     let obj = Arc::new(SocketObj::new(kind, Conn::Fresh));
     let h = proc.handles.lock().allocate_ref(KernelObjectRef::Socket(obj), 0x001F_01FF, 0);

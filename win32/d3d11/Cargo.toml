@@ -1,0 +1,15 @@
+[package]
+name = "d3d11"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS d3d11.dll (and, forwarded, dxgi.dll): Direct3D 11 and DXGI over the kernel's 3D rasterizer"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gfx3d = { path = "../gfx3d" }
+
+[features]
+# Run on Windows itself, for comparing with WARP and the GPU (gfx3d's host build).
+host = ["gfx3d/host"]

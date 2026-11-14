@@ -1,8 +1,8 @@
 # run_claude.ps1 -- VEILOS in a window, on the disk that has claude.exe and Git.
 #
-# The disk is %LOCALAPPDATA%\VEILOS\claude-disk.img: those programs and the
-# sign-in stay out of the repository (and out of OneDrive). What changes on it
-# persists. The kernel is this repository's latest `cargo bootimage`.
+# The disk is in %LOCALAPPDATA%\VEILOS: those programs and the sign-in stay
+# out of the repository (and out of OneDrive). What changes on it persists.
+# The kernel is this repository's latest `cargo bootimage`.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\run_claude.ps1
 #
@@ -14,7 +14,10 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $boot = Join-Path $repo 'target\x86_64-unknown-none\debug\bootimage-VEIL-OS.bin'
 $dir  = Join-Path $env:LOCALAPPDATA 'VEILOS'
-$disk = Join-Path $dir 'claude-disk.img'
+# The development disk (also the Rust toolchain, the crate registry and a
+# clone of this repository at C:\src\veilos), else the older one without them.
+$disk = Join-Path $dir 'veilos-dev.img'
+if (-not (Test-Path $disk)) { $disk = Join-Path $dir 'claude-disk.img' }
 $log  = Join-Path $dir 'serial.log'
 $qemu = 'C:\Program Files\qemu\qemu-system-x86_64.exe'
 
@@ -48,9 +51,10 @@ foreach ($try in 1..60) {
     Start-Sleep -Seconds 8
     if ($p.HasExited) { throw 'QEMU stopped at once. Is another VEILOS VM still running?' }
     if ((Get-LogLength) -gt 0) {
-        Write-Host "Booted (try $try). Log in, open MENU > Terminal, then type:"
+        Write-Host "Booted (try $try). Log in, open MENU > Terminal, then type one of:"
         Write-Host ''
-        Write-Host '    run /cmd.exe /c \claude.cmd'
+        Write-Host '    run /cmd.exe /c \claude.cmd     (Claude Code)'
+        Write-Host '    run /cmd.exe /c \bash.cmd       (Git Bash)'
         Write-Host ''
         Write-Host 'claude.exe takes about two minutes to start. Click only inside the Terminal.'
         return

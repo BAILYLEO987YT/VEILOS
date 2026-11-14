@@ -1313,7 +1313,11 @@ impl TerminalEmulator {
         }
         match ch {
             '\n' | '\r' => {
-                let cmd = self.input_buf.trim().to_uppercase();
+                let mut cmd = self.input_buf.trim().to_uppercase();
+                // Passwords and user names keep their case.
+                if cmd.starts_with("PASSWD ") {
+                    cmd = alloc::format!("PASSWD {}", self.input_buf.trim()[7..].trim());
+                }
                 self.history.push(alloc::format!("> {}", self.input_buf));
                 if cmd.starts_with("RUN ") {
                     // As typed: arguments keep their case.
@@ -1635,7 +1639,7 @@ impl AppLauncher {
             let qs_btn_w = cw / 6;
             let idx = (x - cx) / qs_btn_w as i32;
             match idx {
-                0 => { notify(NotifCategory::Warning, "POWER", "ACPI Shutdown requested"); }
+                0 => crate::shell::power_off(),
                 1 => { 
                     if self.overlay == QuickSettingOverlay::Volume { self.overlay = QuickSettingOverlay::None; }
                     else { self.overlay = QuickSettingOverlay::Volume; }

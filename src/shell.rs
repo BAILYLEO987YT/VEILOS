@@ -517,10 +517,13 @@ fn run_action(a: OsAction) {
 
 /// Emulator power-off. Real hardware needs ACPI (not implemented yet): if the
 /// machine is still running afterwards, the user is told.
-fn power_off() {
+pub fn power_off() {
     use x86_64::instructions::port::Port;
     crate::serial_println!("[SHELL] shutdown requested");
     crate::users::USER_DB.lock().save();
+    crate::scheduler::SCHEDULER.lock().flush_profiles();
+    crate::security::flush_audit(0);
+    crate::block::flush_all();
     // SAFETY: these ports are the ACPI PM1a control registers of QEMU (newer, older)
     // and VirtualBox; writing the SLP_EN|SLP_TYP value powers the VM off.
     unsafe {

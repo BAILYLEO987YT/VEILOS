@@ -213,7 +213,25 @@ pub mod sys {
     /// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*, count).
     pub const NT_ALLOCATE_VIRTUAL_MEMORY_EX: u32 = BASE + 85;
     /// One past the last number in use.
-    pub const END: u32 = BASE + 86;
+    /// NtQueryDirectoryObject(dir, buffer*, length, single, restart, context*, returned*).
+    pub const NT_QUERY_DIRECTORY_OBJECT: u32 = BASE + 86;
+    /// VEIL_GPU3D(op, a, b, c): the 3D rasterizer (src/raster3d.rs). Ops:
+    /// 0 create a target with colour, depth and stencil (width, height,
+    /// handle out*), 1 clear (target, ClearArgs*, depth target), 2 draw
+    /// (target, DrawArgs*, depth target), 3 read pixels (target,
+    /// ReadArgs*), 4 create (0, TexArgs*, handle out*) or replace (texture,
+    /// TexArgs*) a texture, 5 write pixels straight in (target,
+    /// PixelArgs*), 6 read depth or stencil (target, PixelArgs*), 7 create a
+    /// pixel shader (0, PsArgs*, handle out*). A depth
+    /// target (0: the target's own) lends its depth and stencil buffers.
+    pub const VEIL_GPU3D: u32 = BASE + 87;
+    /// VEIL_SOUND(op, a, b, c): sound streams (src/nt_sound.rs). Ops: 0 open
+    /// (rate, bits << 8 | channels, handle out*), 1 write (stream,
+    /// SoundWrite*), 2 info (stream, SoundInfo* out), 3 control (stream,
+    /// 0 pause / 1 resume / 2 flush / 3 volume, value), 4 device
+    /// (SoundDevice* out). STATUS_DEVICE_DOES_NOT_EXIST with no sound device.
+    pub const VEIL_SOUND: u32 = BASE + 88;
+    pub const END: u32 = BASE + 89;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).

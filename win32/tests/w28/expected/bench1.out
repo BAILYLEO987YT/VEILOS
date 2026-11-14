@@ -1,0 +1,11 @@
+cpu (control)            20000        0.97 us
+SetEvent                 20000        0.10 us
+GetFileAttributes        20000       26.10 us
+file create+4K+delete      300      461.29 us
+read 1 MB                   20      362.94 us
+alloc+touch+free 64K      2000       16.80 us
+thread ping-pong          2000        4.22 us
+process start+exit          10     7885.92 us
+loopback 1K send+recv     2000        5.12 us
+done
+exit 0

@@ -1,0 +1,11 @@
+[package]
+name = "winmm"
+version = "0.1.0"
+edition = "2021"
+description = "VEILOS winmm.dll: waveOut, PlaySound and the multimedia timer, over the kernel's sound streams"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nt_abi = { path = "../nt_abi" }

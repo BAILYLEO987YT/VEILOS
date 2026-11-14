@@ -429,10 +429,24 @@ impl Linker {
         let mut base = pe.image_base;
         if base < 0x1_0000_0000 {
             base |= 0x1_0000_0000;
-            crate::serial_println!("[MODULES] low image base {:#x} moved to {:#x}", pe.image_base, base);
+            crate::trace_println!("[MODULES] low image base {:#x} moved to {:#x}", pe.image_base, base);
+        }
+        let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+        // ASLR (aslr.rs): this boot's place for this program, if it can move
+        // and the place is free.
+        if !crate::aslr::relocs_stripped(headers) {
+            let size_of_image = {
+                let pe_off = u32::from_le_bytes(headers[0x3C..0x40].try_into().map_err(|_| "truncated PE header")?) as usize;
+                u32::from_le_bytes(headers[pe_off + 24 + 56..pe_off + 24 + 60].try_into().map_err(|_| "truncated PE header")?) as u64
+            };
+            if let Some(moved) = (0..crate::aslr::TRIES)
+                .map(|t| base + crate::aslr::exe_shift(&name, t))
+                .find(|&b| self.base_free(b, size_of_image))
+            {
+                base = moved;
+            }
         }
         let size = Self::map_image(file, headers, &mut pe, base)?;
-        let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
         let entry = if pe.entry_point != 0 { base + pe.entry_point } else { 0 };
         self.push_module(name, String::from(path), base, size, entry, true, pe);
         Ok(base)
@@ -443,8 +457,13 @@ impl Linker {
         self.modules.iter().find(|m| m.is_exe).map(|m| m.name.clone())
     }
 
+    /// Is a module of this (lower-case) name loaded?
+    pub fn has_module(&self, name: &str) -> bool {
+        self.modules.iter().any(|m| m.name == name)
+    }
+
     fn push_module(&mut self, name: String, path: String, base: u64, size: u64, entry: u64, is_exe: bool, pe: PeFile) -> usize {
-        crate::serial_println!("[MODULES] {} at {:#x} ({} KiB)", name, base, size / 1024);
+        crate::trace_println!("[MODULES] {} at {:#x} ({} KiB)", name, base, size / 1024);
         self.modules.push(Module { name, path, base, size, entry, is_exe, pe, deps: Vec::new(), tls_index: None, tls_callbacks: Vec::new() });
         self.modules.len() - 1
     }
@@ -491,7 +510,7 @@ impl Linker {
         let mut pe = match PeFile::parse(&data) {
             Ok(pe) => pe,
             Err(e) => {
-                crate::serial_println!("[MODULES] {}: not a usable PE ({}), using built-ins", path, e);
+                crate::trace_println!("[MODULES] {}: not a usable PE ({}), using built-ins", path, e);
                 return Ok(None);
             }
         };
@@ -506,14 +525,21 @@ impl Linker {
         let base = if stripped {
             let (lo, hi) = (pe.image_base, pe.image_base + size);
             if lo < 0x1_0000_0000 || self.modules.iter().any(|m| lo < m.base + m.size && m.base < hi) {
-                crate::serial_println!("[MODULES] {} can't move (relocations stripped) and its base {:#x} is taken", name, lo);
+                crate::trace_println!("[MODULES] {} can't move (relocations stripped) and its base {:#x} is taken", name, lo);
                 return Ok(None);
             }
             lo
+        } else if let Some(b) = (0..crate::aslr::TRIES)
+            .map(|t| pe.image_base + crate::aslr::dll_shift(t))
+            .find(|&b| self.base_free(b, size))
+        {
+            // Its preferred base moved by one of this boot's ASLR shifts
+            // (aslr.rs), as Windows does: then a DLL is at the same address in
+            // every process of a boot (the MSYS2 runtime's heap, handed from
+            // parent to child, holds pointers into it) and elsewhere after a
+            // reboot.
+            b
         } else if self.base_free(pe.image_base, size) {
-            // Its preferred base, as Windows does when it's free: then a DLL
-            // is at the same address in every process (the MSYS2 runtime's
-            // heap, handed from parent to child, holds pointers into it).
             pe.image_base
         } else {
             let mut b = (self.dll_next + 0xFFFF) & !0xFFFF;
@@ -663,7 +689,7 @@ impl Linker {
         let target = read_cstr(base + rva as u64);
         let from = module.name.clone();
         if depth >= MAX_FORWARD_DEPTH {
-            crate::serial_println!("[MODULES] {}!{}: forwarder chain too long ({})", from, sym.describe(), target);
+            crate::trace_println!("[MODULES] {}!{}: forwarder chain too long ({})", from, sym.describe(), target);
             return Ok(None);
         }
         let Some(dot) = target.rfind('.') else { return Ok(None) };
@@ -681,7 +707,7 @@ impl Linker {
         if let Some(addr) = self.builtin_address(mem, &provider, fsym)? {
             return Ok(Some(addr));
         }
-        crate::serial_println!("[MODULES] {}!{} forwards to {}, which isn't available", from, sym.describe(), target);
+        crate::trace_println!("[MODULES] {}!{} forwards to {}, which isn't available", from, sym.describe(), target);
         Ok(None)
     }
 
@@ -731,7 +757,7 @@ impl Linker {
         code[1..5].copy_from_slice(&(id as u32).to_le_bytes());
         code[5..11].copy_from_slice(&[0x49, 0x89, 0xCA, 0x0F, 0x05, 0xC3]); // mov r10, rcx; syscall; ret
         unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), addr as *mut u8, code.len()) };
-        crate::serial_println!("[MODULES] unresolved: {}", key);
+        crate::trace_println!("[MODULES] unresolved: {}", key);
         self.unresolved_by_name.insert(key.clone(), addr);
         self.unresolved.push(key);
         self.stats.unresolved += 1;
@@ -769,7 +795,7 @@ impl Linker {
                 cbs.push(cb);
             }
         }
-        crate::serial_println!("[MODULES] {}: TLS index {}, {} bytes, {} callback(s)", self.modules[i].name, index, end.saturating_sub(start), cbs.len());
+        crate::trace_println!("[MODULES] {}: TLS index {}, {} bytes, {} callback(s)", self.modules[i].name, index, end.saturating_sub(start), cbs.len());
         self.modules[i].tls_index = Some(index);
         self.modules[i].tls_callbacks = cbs;
         Some((start, end, zero_fill))
@@ -876,7 +902,7 @@ impl Linker {
         let addr = self.init.alloc(mem, code.len() as u64, 16)?;
         debug_assert_eq!(addr, INIT_ENTRY);
         unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), addr as *mut u8, code.len()) };
-        crate::serial_println!("[MODULES] startup: {} init call(s), then {} entry {:#x}", calls, exe.name, exe.entry);
+        crate::trace_println!("[MODULES] startup: {} init call(s), then {} entry {:#x}", calls, exe.name, exe.entry);
         Ok(())
     }
 
@@ -999,8 +1025,8 @@ impl Linker {
         self.write_startup(mem, &order, peb)?;
         self.protect_images(mem);
         let names: Vec<&str> = order.iter().map(|&i| self.modules[i].name.as_str()).collect();
-        crate::serial_println!("[MODULES] linked {} module(s), init order: {}", self.modules.len(), names.join(", "));
-        crate::serial_println!("[MODULES] imports: {} from modules, {} built-in, {} unresolved",
+        crate::trace_println!("[MODULES] linked {} module(s), init order: {}", self.modules.len(), names.join(", "));
+        crate::trace_println!("[MODULES] imports: {} from modules, {} built-in, {} unresolved",
             self.stats.to_modules, self.stats.to_builtin, self.stats.unresolved);
         Ok(())
     }
@@ -1061,7 +1087,7 @@ impl Linker {
             // The threads' blocks are ntdll's to make (LdrVeilTlsEnd), before these run.
             self.assign_tls(i);
             if self.tls_count as usize > nt_abi::layout::TLS_ARRAY_SLOTS {
-                crate::serial_println!("[MODULES] {}: out of TLS indexes", self.modules[i].name);
+                crate::trace_println!("[MODULES] {}: out of TLS indexes", self.modules[i].name);
                 return Err(nt_abi::status::NO_MEMORY);
             }
             let m = &self.modules[i];
@@ -1076,7 +1102,7 @@ impl Linker {
         let (ldr, init_order) = (self.ldr, self.initialized.clone());
         self.write_ldr(mem, ldr, &init_order).map_err(|_| nt_abi::status::NO_MEMORY)?;
         self.protect_images(mem);
-        crate::serial_println!("[MODULES] LoadLibrary {}: {} module(s) loaded, {} init call(s)", n, order.len(), inits.len());
+        crate::trace_println!("[MODULES] LoadLibrary {}: {} module(s) loaded, {} init call(s)", n, order.len(), inits.len());
         Ok((self.modules[idx].base, inits))
     }
 
@@ -1162,7 +1188,7 @@ pub fn apply_base_relocations(pe: &PeFile, data: &[u8], actual_base: u64) -> usi
                     core::ptr::write_unaligned(p, core::ptr::read_unaligned(p).wrapping_add(delta as u32));
                     fixups += 1;
                 },
-                other => crate::serial_println!("[MODULES] unsupported relocation type {} at {:#X}", other, target),
+                other => crate::trace_println!("[MODULES] unsupported relocation type {} at {:#X}", other, target),
             }
         }
         off += block;

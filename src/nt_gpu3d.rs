@@ -1,0 +1,286 @@
+// -----| 3D targets and textures for Win32 programs |-----
+//
+// VEIL_GPU3D(op, a, b, c): what opengl32.dll stands on (WIN32_DESIGN.md
+// G5). Render targets (colour, depth and stencil buffers) and textures are kernel
+// objects in the process's handle table; batches of window-space primitives
+// are copied in and filled by raster3d.rs on every CPU (`lgpu::execute_3d`),
+// and pixels are read back out. Kept in kernel memory because the CPUs that
+// render can't see the calling process's memory.
+
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use spin::Mutex;
+
+use nt_abi::{status, NtStatus};
+
+use crate::nt_file::ptr_ok;
+use crate::nt_objects::KernelObjectRef;
+use crate::process::Process;
+use crate::raster3d::*;
+
+/// A colour buffer (0xAARRGGBB, top row first; alpha 0 unless drawn with
+/// F_DST_ALPHA), a depth buffer and an
+/// 8-bit stencil buffer.
+pub struct Target {
+    pub w: usize,
+    pub h: usize,
+    pub color: Vec<u32>,
+    pub depth: Vec<u32>,
+    pub stencil: Vec<u8>,
+}
+
+impl Target {
+    fn buffers(&mut self) -> Buffers {
+        Buffers { color: self.color.as_mut_ptr(), depth: self.depth.as_mut_ptr(), stencil: self.stencil.as_mut_ptr(), w: self.w, h: self.h, dw: self.w, dh: self.h }
+    }
+}
+
+/// Run `f` on target `a`'s buffers, with target `d`'s depth and stencil
+/// buffers if `d` is another target (0: `a`'s own).
+fn with_targets(proc: &Process, a: u64, d: u64, f: impl FnOnce(Buffers)) -> NtStatus {
+    let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
+    let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
+    let other = if d == 0 || d == a { None } else { obj(proc, d) };
+    let Some(od) = other else {
+        if d != 0 && d != a {
+            return status::INVALID_HANDLE;
+        }
+        f(t.lock().buffers());
+        return status::SUCCESS;
+    };
+    let Gpu3d::Target(td) = &*od else { return status::INVALID_HANDLE };
+    if core::ptr::eq(t, td) {
+        f(t.lock().buffers());
+        return status::SUCCESS;
+    }
+    // Two locks: always the lower address first.
+    let (mut ga, mut gd) = if (t as *const _ as usize) < (td as *const _ as usize) {
+        let ga = t.lock();
+        (ga, td.lock())
+    } else {
+        let gd = td.lock();
+        (t.lock(), gd)
+    };
+    let mut b = ga.buffers();
+    let db = gd.buffers();
+    (b.depth, b.stencil, b.dw, b.dh) = (db.depth, db.stencil, db.w, db.h);
+    f(b);
+    status::SUCCESS
+}
+
+pub enum Gpu3d {
+    Target(Mutex<Target>),
+    /// Replaced whole on update, so a draw holds the version it started with.
+    Texture(Mutex<Arc<Texture>>),
+    /// A pixel shader (op 7), never changed once made.
+    Shader(Arc<PsProgram>),
+}
+
+fn obj(proc: &Process, h: u64) -> Option<Arc<Gpu3d>> {
+    match crate::nt_process::object(proc, h) {
+        Some(KernelObjectRef::Gpu3d(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn read<T>(p: u64) -> Option<T> {
+    ptr_ok(p, core::mem::size_of::<T>()).then(|| unsafe { core::ptr::read_unaligned(p as *const T) })
+}
+
+fn new_handle(proc: &Process, o: Gpu3d, out: u64) -> NtStatus {
+    if !ptr_ok(out, 8) {
+        return status::ACCESS_VIOLATION;
+    }
+    let h = proc.handles.lock().allocate_ref(KernelObjectRef::Gpu3d(Arc::new(o)), 0x001F_0003, 0);
+    unsafe { *(out as *mut u64) = h as u64 };
+    status::SUCCESS
+}
+
+/// The biggest target or texture side accepted.
+const MAX_SIDE: u32 = 8192;
+
+/// VEIL_GPU3D(op, a, b, c): see nt_abi.
+pub fn call(proc: &Process, op: u64, a: u64, b: u64, c: u64) -> NtStatus {
+    match op {
+        // Create a target: a = width, b = height, c = handle out.
+        0 => {
+            let (w, h) = (a as u32, b as u32);
+            if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+                return status::INVALID_PARAMETER;
+            }
+            let n = w as usize * h as usize;
+            let t = Target { w: w as usize, h: h as usize, color: vec![0; n], depth: vec![DEPTH_MAX; n], stencil: vec![0; n] };
+            new_handle(proc, Gpu3d::Target(Mutex::new(t)), c)
+        }
+        // Clear: a = target, b = ClearArgs*, c = the target whose depth and
+        // stencil buffers to clear (0: a's).
+        1 => {
+            let Some(args) = read::<ClearArgs>(b) else { return status::ACCESS_VIOLATION };
+            with_targets(proc, a, c, |buf| clear(buf, &args))
+        }
+        // Draw: a = target, b = DrawArgs*, c = the target whose depth and
+        // stencil buffers to use (0: a's).
+        2 => {
+            let Some(args) = read::<DrawArgs>(b) else { return status::ACCESS_VIOLATION };
+            let (gn, tn) = (args.group_count as usize, args.tri_count as usize);
+            let an = args.attr_len as usize;
+            if gn > 1 << 20 || tn > 1 << 22 || an > 1 << 26
+                || !ptr_ok(args.groups, gn * core::mem::size_of::<Group>())
+                || !ptr_ok(args.tris, tn * core::mem::size_of::<Tri>())
+                || (an > 0 && !ptr_ok(args.attrs, an * 4))
+            {
+                return status::ACCESS_VIOLATION;
+            }
+            let mut attrs: Vec<f32> = Vec::with_capacity(an);
+            unsafe {
+                core::ptr::copy_nonoverlapping(args.attrs as *const f32, attrs.as_mut_ptr(), an);
+                attrs.set_len(an);
+            }
+            // Copied in: the bands run on CPUs that can't see this process.
+            let groups: Vec<Group> = (0..gn).map(|i| unsafe { core::ptr::read_unaligned((args.groups as *const Group).add(i)) }).collect();
+            let mut tris: Vec<Tri> = Vec::with_capacity(tn);
+            unsafe {
+                core::ptr::copy_nonoverlapping(args.tris as *const Tri, tris.as_mut_ptr(), tn);
+                tris.set_len(tn);
+            }
+            let tex_of = |h: u64| -> Option<Arc<Texture>> {
+                if h == 0 {
+                    return None;
+                }
+                match obj(proc, h).as_deref() {
+                    Some(Gpu3d::Texture(tx)) => Some(tx.lock().clone()),
+                    _ => None,
+                }
+            };
+            // Each group's samplers' textures and its pixel shader, held for
+            // the draw.
+            let texs: Vec<[Option<Arc<Texture>>; SAMPLERS]> =
+                groups.iter().map(|g| core::array::from_fn(|i| tex_of(g.samplers[i].texture))).collect();
+            let shaders: Vec<Option<Arc<PsProgram>>> = groups
+                .iter()
+                .map(|g| match obj(proc, g.ps).as_deref() {
+                    Some(Gpu3d::Shader(s)) if g.flags & F_SHADER != 0 && s.inputs >= g.ps_inputs => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            let passes: Vec<Pass> = groups
+                .iter()
+                .zip(texs.iter().zip(shaders.iter()))
+                .map(|(g, (ts, ps))| {
+                    let mut g = *g;
+                    // A shaded group whose shader is gone isn't drawn.
+                    if g.flags & F_SHADER != 0 && ps.is_none() {
+                        g.count = 0;
+                    }
+                    Pass { g, tex: core::array::from_fn(|i| ts[i].as_deref()), ps: ps.as_deref(), attrs: &attrs }
+                })
+                .collect();
+            with_targets(proc, a, c, |buf| crate::lgpu::execute_3d(buf, &tris, &passes))
+        }
+        // Read pixels: a = target, b = ReadArgs*.
+        3 => {
+            let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
+            let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
+            let Some(r) = read::<ReadArgs>(b) else { return status::ACCESS_VIOLATION };
+            let t = t.lock();
+            let x0 = r.x.max(0) as usize;
+            let x1 = (r.x.max(0) as i64 + r.w.max(0) as i64).min(t.w as i64) as usize;
+            if r.w <= 0 || r.h <= 0 || x0 >= x1 {
+                return status::SUCCESS;
+            }
+            for row in 0..r.h as i64 {
+                let y = r.y as i64 + row;
+                if y < 0 || y >= t.h as i64 {
+                    continue;
+                }
+                let dst = (r.dst as i64 + row * r.stride) as u64 + ((x0 as i64 - r.x as i64) * 4) as u64;
+                if !ptr_ok(dst, (x1 - x0) * 4) {
+                    return status::ACCESS_VIOLATION;
+                }
+                let src = &t.color[y as usize * t.w + x0..y as usize * t.w + x1];
+                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u32, x1 - x0) };
+            }
+            status::SUCCESS
+        }
+        // Create (a = 0, c = handle out) or replace (a = texture) a texture's
+        // contents: b = TexArgs*.
+        4 => {
+            let Some(ta) = read::<TexArgs>(b) else { return status::ACCESS_VIOLATION };
+            if ta.w == 0 || ta.h == 0 || ta.w > MAX_SIDE || ta.h > MAX_SIDE || ta.levels > 16 || ta.depth > 2048 || ta.layers > 2048 || ta.kind > TEX_CUBE_ARRAY {
+                return status::INVALID_PARAMETER;
+            }
+            let n = texel_count(&ta);
+            if n > TEXELS_MAX {
+                return status::INVALID_PARAMETER;
+            }
+            if !ptr_ok(ta.texels, n * 4) {
+                return status::ACCESS_VIOLATION;
+            }
+            let mut texels = vec![0u32; n];
+            unsafe { core::ptr::copy_nonoverlapping(ta.texels as *const u32, texels.as_mut_ptr(), n) };
+            let tex = Arc::new(texture(&ta, texels));
+            if a == 0 {
+                new_handle(proc, Gpu3d::Texture(Mutex::new(tex)), c)
+            } else {
+                match obj(proc, a).as_deref() {
+                    Some(Gpu3d::Texture(t)) => {
+                        *t.lock() = tex;
+                        status::SUCCESS
+                    }
+                    _ => status::INVALID_HANDLE,
+                }
+            }
+        }
+        // A pixel shader: a = 0, b = PsArgs*, c = handle out.
+        7 => {
+            let Some(pa) = read::<PsArgs>(b) else { return status::ACCESS_VIOLATION };
+            let n = pa.count as usize;
+            if n == 0 || n > 1 << 14 || !ptr_ok(pa.code, n * core::mem::size_of::<PsIns>()) {
+                return status::INVALID_PARAMETER;
+            }
+            let ins: Vec<PsIns> = (0..n).map(|i| unsafe { core::ptr::read_unaligned((pa.code as *const PsIns).add(i)) }).collect();
+            match ps_program(&ins, pa.inputs) {
+                Some(s) => new_handle(proc, Gpu3d::Shader(Arc::new(s)), c),
+                None => status::INVALID_PARAMETER,
+            }
+        }
+        // Write pixels straight in (5) or read depth or stencil out (6):
+        // a = target, b = PixelArgs*.
+        5 | 6 => {
+            let Some(o) = obj(proc, a) else { return status::INVALID_HANDLE };
+            let Gpu3d::Target(t) = &*o else { return status::INVALID_HANDLE };
+            let Some(pa) = read::<PixelArgs>(b) else { return status::ACCESS_VIOLATION };
+            if pa.w <= 0 || pa.h <= 0 {
+                return status::SUCCESS;
+            }
+            if pa.w > MAX_SIDE as i32 || pa.h > MAX_SIDE as i32 {
+                return status::INVALID_PARAMETER;
+            }
+            let row = pa.w as usize * 4;
+            for r in 0..pa.h as i64 {
+                if !ptr_ok((pa.ptr as i64 + r * pa.stride) as u64, row) {
+                    return status::ACCESS_VIOLATION;
+                }
+            }
+            let mut vals = vec![0u32; (pa.w * pa.h) as usize];
+            let mut t = t.lock();
+            let buf = t.buffers();
+            if op == 5 {
+                for r in 0..pa.h as usize {
+                    let src = (pa.ptr as i64 + r as i64 * pa.stride) as *const u32;
+                    unsafe { core::ptr::copy_nonoverlapping(src, vals.as_mut_ptr().add(r * pa.w as usize), pa.w as usize) };
+                }
+                write_pixels(buf, &pa, &vals);
+            } else {
+                read_pixels(buf, &pa, &mut vals);
+                for r in 0..pa.h as usize {
+                    let dst = (pa.ptr as i64 + r as i64 * pa.stride) as *mut u32;
+                    unsafe { core::ptr::copy_nonoverlapping(vals.as_ptr().add(r * pa.w as usize), dst, pa.w as usize) };
+                }
+            }
+            status::SUCCESS
+        }
+        _ => status::INVALID_PARAMETER,
+    }
+}

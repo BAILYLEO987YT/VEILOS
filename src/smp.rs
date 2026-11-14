@@ -201,6 +201,101 @@ pub fn enable_sse() {
         core::arch::asm!("fninit", options(nostack, nomem));
     }
     enable_xsave_query();
+    enable_smep();
+    enable_smap();
+}
+
+/// SMAP is on (every CPU that has it turns it on in `enable_sse`).
+pub static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// CR4.SMAP (bit 21), where the CPU has it (CPUID.7.EBX bit 20): kernel code
+/// may touch user memory only with RFLAGS.AC set. System calls set it on
+/// entry (interrupts.rs); the other places that write a program's memory
+/// mark themselves with `user_access`. The page-fault handler catches the rest
+/// (`smap_violation`).
+fn enable_smap() {
+    let ebx = unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ebx;
+    if ebx & (1 << 20) == 0 {
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            "or  rax, {bit}",
+            "mov cr4, rax",
+            bit = const 1u64 << 21,
+            out("rax") _,
+            options(nostack),
+        );
+    }
+    SMAP_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Allow kernel access to user memory until `user_access_end` (STAC).
+#[inline(always)]
+pub fn user_access_begin() {
+    if SMAP_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        unsafe { core::arch::asm!("stac", options(nomem, nostack)) };
+    }
+}
+
+/// End `user_access_begin` (CLAC).
+#[inline(always)]
+pub fn user_access_end() {
+    if SMAP_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
+    }
+}
+
+/// `f` with access to user memory, as it was before afterwards.
+pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
+    let ac = x86_64::registers::rflags::read().contains(x86_64::registers::rflags::RFlags::ALIGNMENT_CHECK);
+    user_access_begin();
+    let r = f();
+    if !ac {
+        user_access_end();
+    }
+    r
+}
+
+/// Kernel code at `rip` touched user memory at `addr` without asking.
+/// Logged once per place (up to 64 places).
+pub fn smap_violation(rip: u64, addr: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+    for s in SEEN.iter() {
+        match s.compare_exchange(0, rip, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                crate::serial_println!("[SMAP] kernel code at {:#x} touched user memory at {:#x}", rip, addr);
+                return;
+            }
+            Err(v) if v == rip => return,
+            Err(_) => {}
+        }
+    }
+}
+
+/// CR4.SMEP (bit 20), where the CPU has it (CPUID.7.EBX bit 7): the kernel
+/// can't execute a user page, so a kernel bug or exploit can't jump into code
+/// a program supplied. Both modes: it costs nothing. (SMAP, which would also
+/// stop the kernel touching user data outside marked windows, needs STAC/CLAC
+/// around every user-memory access first.)
+fn enable_smep() {
+    let ebx = unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ebx;
+    if ebx & (1 << 7) == 0 {
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            "or  rax, {bit}",
+            "mov cr4, rax",
+            bit = const 1u64 << 20,
+            out("rax") _,
+            options(nostack),
+        );
+    }
+    crate::serial_println!("[SMP] SMEP on; SMAP {}", if ebx & (1 << 20) != 0 { "available" } else { "not available" });
 }
 
 /// CR4.OSXSAVE (bit 18), where the CPU has XSAVE, with XCR0 = x87 + SSE:

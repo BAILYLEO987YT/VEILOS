@@ -1023,8 +1023,39 @@ pub extern "system" fn ClipCursor(_r: *const [i32; 4]) -> Bool {
     1
 }
 
+/// The sound for a message box type, played by winmm (loaded on first use,
+/// as Windows' user32 does): MB_OK the default sound, the icons theirs.
 #[no_mangle]
-pub extern "system" fn MessageBeep(_kind: u32) -> Bool {
+pub extern "system" fn MessageBeep(kind: u32) -> Bool {
+    #[link(name = "kernel32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> u64;
+        fn GetProcAddress(module: u64, name: *const u8) -> usize;
+    }
+    static PLAY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let mut f = PLAY.load(core::sync::atomic::Ordering::Relaxed);
+    if f == 0 {
+        let name: [u16; 10] = [b'w' as u16, b'i' as u16, b'n' as u16, b'm' as u16, b'm' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0];
+        let m = unsafe { LoadLibraryW(name.as_ptr()) };
+        if m != 0 {
+            f = unsafe { GetProcAddress(m, b"PlaySoundW\0".as_ptr()) };
+            PLAY.store(f, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if f == 0 {
+        return 1;
+    }
+    // SND_ALIAS_ID ids: 'S' and a letter.
+    let id: u16 = match kind & 0xF0 {
+        0x10 => u16::from_le_bytes([b'S', b'H']),
+        0x20 => u16::from_le_bytes([b'S', b'?']),
+        0x30 => u16::from_le_bytes([b'S', b'!']),
+        0x40 => u16::from_le_bytes([b'S', b'*']),
+        _ => u16::from_le_bytes([b'S', b'D']),
+    };
+    let play: unsafe extern "system" fn(usize, u64, u32) -> Bool = unsafe { core::mem::transmute(f) };
+    // SND_ALIAS_ID | SND_ASYNC | SND_NODEFAULT
+    unsafe { play(id as usize, 0, 0x0011_0000 | 0x1 | 0x2) };
     1
 }
 

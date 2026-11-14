@@ -92,6 +92,7 @@ static DRIVERS: &[Driver] = &[
     crate::ahci::DRIVER,
     crate::network::VIRTIO_NET_DRIVER,
     crate::graphics::LFB_DISPLAY_DRIVER,
+    crate::audio::DRIVER,
 ];
 
 static DEVICES: Mutex<Vec<Device>> = Mutex::new(Vec::new());

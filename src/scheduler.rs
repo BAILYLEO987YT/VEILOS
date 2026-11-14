@@ -435,7 +435,7 @@ impl ProfileStore {
                 let profiles = Self::deserialise(&bytes);
                 let count    = profiles.len();
                 let store    = Self { profiles, dirty: false };
-                crate::println!("[SCHED] Loaded {} app profile(s) from {}.", count, PROFILES_PATH);
+                crate::serial_println!("[SCHED] Loaded {} app profile(s) from {}.", count, PROFILES_PATH);
                 store
             }
             Err(_) => {
@@ -452,13 +452,13 @@ impl ProfileStore {
         match crate::vfs::VFS.write_file(PROFILES_PATH, &bytes) {
             Ok(_) => {
                 self.dirty = false;
-                crate::println!(
+                crate::serial_println!(
                     "[SCHED] Flushed {} profile(s) to {}.",
                     self.profiles.len(), PROFILES_PATH
                 );
             }
             Err(e) => {
-                crate::println!("[SCHED] WARNING: Could not flush profiles: {:?}", e);
+                crate::serial_println!("[SCHED] WARNING: Could not flush profiles: {:?}", e);
             }
         }
     }
@@ -555,7 +555,7 @@ impl AdaptiveScheduler {
             domain:   SchedDomain::new(0),
             quantum:  QuantumConfig::default_config(),
             session:  None,
-            profiles: ProfileStore::load_from_vfs(),
+            profiles: ProfileStore::new(), // read once the disk is up (load_profiles)
         }
     }
 
@@ -775,6 +775,29 @@ pub fn init() {
     let _ = SCHEDULER.lock().domain.core_id;
     SCHEDULER_READY.store(true, Ordering::Release);
     crate::println!("[SCHED] Adaptive scheduler online.");
+}
+
+/// From the main loop: save learned profiles at most every 30 s (saving at
+/// every process exit cost a disk write each time).
+pub fn flush_if_due(now_ms: u64) {
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if now_ms.wrapping_sub(LAST.load(Ordering::Relaxed)) < 30_000 {
+        return;
+    }
+    LAST.store(now_ms, Ordering::Relaxed);
+    if let Some(mut s) = SCHEDULER.try_lock() {
+        s.flush_profiles();
+    }
+}
+
+/// Read the saved app profiles. Call once the disk is mounted: `init` runs
+/// before storage binds, when there's nothing to read yet.
+pub fn load_profiles() {
+    let store = ProfileStore::load_from_vfs();
+    let mut s = SCHEDULER.lock();
+    if !s.profiles.dirty {
+        s.profiles = store;
+    }
 }
 
 /// Thin shim called from the timer interrupt handler in interrupts.rs.

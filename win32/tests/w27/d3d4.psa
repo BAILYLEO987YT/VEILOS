@@ -1,0 +1,104 @@
+; G5e3 test shaders: ps_1_1, ps_1_3 and ps_1_4, assembled by psasm.py
+; (fxc no longer emits ps_1_x) into build/d3d4_shaders.h.
+
+shader ps11_mod
+ps_1_1
+tex t0
+mul r0, t0, v0
+end
+
+shader ps11_lrp
+ps_1_1
+def c0, 0.25, 0.5, 0.75, 0.5
+tex t0
+tex t1
+lrp r0, c0, t0, t1
+mad_d2 r0.rgb, r0, v0, v1
++ mov r0.a, c0
+end
+
+shader ps11_dot3
+ps_1_1
+def c0, 0.8, 0.7, 0.3, 1
+tex t0
+dp3_sat r1, t0_bx2, v0_bx2
+mul r0, r1, c0
+end
+
+shader ps11_cnd
+ps_1_1
+tex t0
+tex t1
+mov r0, t0
+cnd r0, r0.a, t1, v0
+end
+
+shader ps11_kill
+ps_1_1
+texkill t0
+texcoord t1
+mul r0, t1, v0
+end
+
+shader ps11_bem
+ps_1_1
+tex t0
+texbem t1, t0
+mul r0, t1, v0
+end
+
+shader ps11_reg2
+ps_1_1
+tex t0
+texreg2ar t1, t0
+texreg2gb t2, t0
+add_d2 r0, t1, t2
+end
+
+shader ps11_m3x2
+ps_1_1
+tex t0
+texm3x2pad t1, t0_bx2
+texm3x2tex t2, t0_bx2
+mov r0, t2
+end
+
+shader ps13_dp3tex
+ps_1_3
+def c0, 0.3, 0.2, 0.1, 0
+tex t0
+texdp3tex t1, t0_bx2
+dp4 r1, t0, v1
+cmp r0, t0_bias, t1, v0
+mad r0.rgb, r1, c0, r0
+end
+
+shader ps14_dep
+ps_1_4
+def c0, 0.1, 0.1, 0, 0
+texld r0, t0
+texcrd r1.xyz, t1
+mad r1.xy, r0_bx2, c0, r1
+phase
+texld r2, r1
+mul r0, r2, v0
+end
+
+shader ps14_bem
+ps_1_4
+texld r0, t0
+texcrd r1.xyz, t1
+bem r1.xy, r1, r0
+phase
+texld r1, r1
+mov r0, r1
+end
+
+shader ps14_proj
+ps_1_4
+def c0, 0.5, 0.5, 0.5, 0.5
+texld r0, t0_dw.xyw
+texcrd r1.xyz, t1
+cmp_x2 r0.rgb, r1_bias, r0, c0
++ mov_d2 r0.a, v0
+end

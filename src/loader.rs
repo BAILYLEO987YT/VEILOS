@@ -116,9 +116,10 @@ pub fn load_and_spawn_pe_with(
     let result = crate::address_space::with(cr3, || {
         let mut mapper = unsafe { memory::get_mapper() }; // the new process's tables
         let mut scratch: Vec<u64> = Vec::new();
-        let result = load_and_spawn_pe_inner(path, args, &mut mapper, frame_allocator, &mut scratch);
+        // SMAP (smp.rs): building a process writes its image, stack, TEB and PEB.
+        let result = crate::smp::user_access(|| load_and_spawn_pe_inner(path, args, &mut mapper, frame_allocator, &mut scratch));
         if result.is_err() && !scratch.is_empty() {
-            crate::serial_println!(
+            crate::trace_println!(
                 "[LOADER] Load failed — rolling back {} mapped pages", scratch.len()
             );
             for &addr in scratch.iter() {
@@ -214,8 +215,9 @@ fn load_and_spawn_pe_inner(
         r.clamp(0x10_0000, 0x400_0000).next_multiple_of(0x1_0000)
     };
     const COMMITTED_PAGES: u64 = 16;
-    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x1000_0000);
     let stack_size = reserve;
+    // Security Mode: a random place in the slot (aslr.rs).
+    let stack_base = 0x7000_0000_0000 + (proc_idx * 0x1000_0000) + crate::aslr::stack_offset(0x1000_0000, stack_size);
     crate::nt_demand::add_zero(stack_base, stack_size - COMMITTED_PAGES * 4096);
 
     for i in (stack_size / 4096 - COMMITTED_PAGES)..stack_size / 4096 {
@@ -267,7 +269,7 @@ fn load_and_spawn_pe_inner(
         *((launch_rsp + 24) as *mut u64) = 0;
         *((launch_rsp + 32) as *mut u64) = 0;
     }
-    crate::serial_println!(
+    crate::trace_println!(
         "[LOADER] Stack: base={:#X} top={:#X} launch_rsp={:#X} (ABI-adjusted, -40 bytes)",
         stack_base, stack_top, launch_rsp
     );
@@ -297,6 +299,9 @@ fn load_and_spawn_pe_inner(
         };
     }
     process_inner.parent_pid.store(options.parent_pid, core::sync::atomic::Ordering::Relaxed);
+    // Security Mode: the parent's capabilities, or the signed-in user's (security.rs).
+    *process_inner.capabilities.lock() = crate::security::caps_for_new(options.parent_pid);
+    crate::security::audit(options.parent_pid, &alloc::format!("starts pid {} ({})", pid, path));
     process_inner.stack_base = stack_base;
     // mapped_pages is transferred to the process at the very end of this
     // function, once nothing else can fail — until then the caller's rollback
@@ -707,8 +712,8 @@ fn load_and_spawn_pe_inner(
     };
     *process.nt_env.lock() = env;
 
-    crate::serial_println!("[LOADER] TEB={:#X}  PEB={:#X}  Ldr={:#X}  KUSD=0x7FFE0000", teb_base, peb_base, ldr_base);
-    crate::serial_println!("[LOADER] _initterm={:#X}  _initterm_e={:#X}", initterm_code_base, initterm_code_base + 0x40);
+    crate::trace_println!("[LOADER] TEB={:#X}  PEB={:#X}  Ldr={:#X}  KUSD=0x7FFE0000", teb_base, peb_base, ldr_base);
+    crate::trace_println!("[LOADER] _initterm={:#X}  _initterm_e={:#X}", initterm_code_base, initterm_code_base + 0x40);
 
     // ── 3c. Load DLLs and bind every import ─────────────────────────────────
     // Runs HERE, after the NT environment is built: `_initterm`/`_initterm_e`
@@ -757,18 +762,18 @@ fn load_and_spawn_pe_inner(
     mapped_pages.clear();
 
     // 8. Spawn the Process Execution Task onto the Async Executor.
-    crate::serial_println!("[LOADER] Spawning Execution Fiber for Pid={}...", pid);
+    crate::trace_println!("[LOADER] Spawning Execution Fiber for Pid={}...", pid);
     if !options.suspended {
         process.live_threads.store(1, core::sync::atomic::Ordering::Release);
         crate::vnr::spawn_fiber(process_execution_task(process.clone(), teb_base));
     }
 
-    crate::serial_println!("[LOADER] Successfully prepared Windows executable at {:#X}", mapped_image_base + exe_entry_rva);
+    crate::trace_println!("[LOADER] Successfully prepared Windows executable at {:#X}", mapped_image_base + exe_entry_rva);
     Ok(process)
 }
 
 async fn process_execution_task(process: Arc<Process>, teb_base: u64) {
-    crate::serial_println!(
+    crate::trace_println!(
         "[SCHED] Launching Pid={} ({}) → entry={:#X} stack={:#X} teb={:#X}",
         process.pid, process.name, process.entry_point, process.stack_top, teb_base
     );
@@ -826,11 +831,18 @@ pub fn on_process_exit(process: &Arc<Process>) {
             w32.destroy_window(hwnd);
         }
     } else {
-        crate::serial_println!("[EXIT] WIN32_USER busy — window teardown deferred");
+        crate::trace_println!("[EXIT] WIN32_USER busy — window teardown deferred");
     }
 
     crate::nt_user::process_exited(process.pid);
     crate::nt_registry::process_exited(process.pid as u32);
+
+    // The adaptive scheduler learns from the session that started at launch
+    // (scheduler.rs); the profiles are saved every 30 s (flush_if_due).
+    if let Some(mut s) = crate::scheduler::SCHEDULER.try_lock() {
+        let tick = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        s.on_process_exit(process.pid as u32, 0, tick);
+    }
 
     // 3. Drop the process's worker threads.
     if let Some(mut tm) = crate::process::THREAD_MANAGER.try_lock() {
@@ -844,7 +856,7 @@ pub fn on_process_exit(process: &Arc<Process>) {
     }
     match process.handles.try_lock() {
         Some(mut h) => { h.close_all(); }
-        None => crate::serial_println!("[EXIT] pid {}: handle table busy, handles left open", process.pid),
+        None => crate::trace_println!("[EXIT] pid {}: handle table busy, handles left open", process.pid),
     }
     if let Some(mut vad) = process.vad.try_lock() { vad.release_all(); }
     process.linker.lock().take();
@@ -879,7 +891,7 @@ pub fn on_process_exit(process: &Arc<Process>) {
     // alongside gui_refresh_task after clean process exit.
     crate::interrupts::LAST_USER_MODE_TICK.store(0, core::sync::atomic::Ordering::Relaxed);
 
-    crate::serial_println!(
+    crate::trace_println!(
         "[EXIT] Pid={} torn down. {} frames on free list.",
         process.pid, crate::memory::free_frame_count()
     );
@@ -903,7 +915,7 @@ pub fn release_process_memory(process: &Arc<Process>) {
         let page = Page::containing_address(VirtAddr::new(addr));
         if memory::unmap_and_free_page(page, &mut mapper).is_ok() { freed += 1; }
     }
-    crate::serial_println!("[EXIT] Released {} pages for pid {}", freed, process.pid);
+    crate::trace_println!("[EXIT] Released {} pages for pid {}", freed, process.pid);
 }
 
 // =====================================================================
@@ -973,7 +985,7 @@ pub unsafe fn return_from_usermode() -> ! {
     let user = crate::kthread::current_user();
     if crate::kthread::current_pid() == 0 || !unsafe { (*user).jump_valid } {
         // Nothing to return to.  Jumping would be worse than stopping.
-        crate::serial_println!(
+        crate::trace_println!(
             "[LOADER] return_from_usermode() on CPU {} with no valid context — halting CPU",
             cpu_id
         );
@@ -1162,7 +1174,7 @@ pub unsafe fn launch_into_usermode_with(entry: u64, stack_top: u64, teb_base: u6
     // KERNEL_GS_BASE still holds that process's TEB — fix it before ring 3.
     crate::smp::reset_kernel_gs_base();
 
-    crate::serial_println!(
+    crate::trace_println!(
         "[LOADER] iretq   entry={:#X}  rsp={:#X}  CS={:#X}  DS={:#X}  gs.base={:#X}",
         entry, stack_top, ucs, uds, teb_base
     );
