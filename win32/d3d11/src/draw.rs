@@ -487,9 +487,10 @@ fn setup(d: &mut Device) -> Option<(Out, Vm<'static>, Inputs, Vec<[Option<(usize
     // The stage the rasterizer gets vertices from: the geometry shader if
     // one is bound (a vertex shader's code with stream output passes the
     // vertex shader's on).
+    let ds = crate::shader::of(d.state.stages[crate::context::STAGE_DS].shader).filter(|s| s.sh.kind == 4);
     let last = match crate::shader::of(d.state.stages[crate::context::STAGE_GS].shader) {
         Some(g) if g.sh.kind == 2 => g,
-        _ => vs,
+        _ => ds.unwrap_or(vs),
     };
     let ps = crate::shader::of(d.state.stages[STAGE_PS].shader).filter(|p| p.ps.is_some());
     // The targets: the first render target and the depth-stencil view.
@@ -785,9 +786,130 @@ struct Run<'a> {
     so: Option<&'static crate::shader::ShaderObj>,
     raster: bool,
     prim: u32,
+    /// Tessellation: the hull and domain shaders, and their constants.
+    hs: Option<(Vm<'static>, &'static crate::shader::ShaderObj)>,
+    ds: Option<(Vm<'static>, &'static crate::shader::ShaderObj)>,
+    hs_cbs: [(*const u8, usize); 14],
+    ds_cbs: [(*const u8, usize); 14],
 }
 
 impl Run<'_> {
+    /// A patch of control points: the hull shader's phases, the
+    /// tessellator, the domain shader per point, then on as primitives.
+    fn patch(&mut self, cps: &[&Ov]) {
+        use crate::dxbc::op;
+        let (Some((hvm, hs)), Some((dvm, _))) = (&self.hs, &self.ds) else { return };
+        let sh = &hs.sh;
+        if cps.len() != sh.cp_in as usize {
+            return;
+        }
+        let henv = StageEnv { cbs: &self.hs_cbs };
+        let mut g = hvm.regs(32 * 32, 32);
+        for (i, v) in cps.iter().enumerate() {
+            for r in 0..32.min(v.len()) {
+                g.v[i * 32 + r] = v[r];
+            }
+        }
+        // The phases: where each starts, its kind and instances.
+        let mut phases: Vec<(u16, usize, u32)> = Vec::new();
+        for (i, x) in sh.ins.iter().enumerate() {
+            match x.op {
+                op::HS_CONTROL_POINT_PHASE | op::HS_FORK_PHASE | op::HS_JOIN_PHASE => phases.push((x.op, i + 1, 1)),
+                op::DCL_FORK_INSTANCE_COUNT | op::DCL_JOIN_INSTANCE_COUNT => {
+                    if let Some(p) = phases.last_mut() {
+                        p.2 = x.ops.first().map_or(1, |o| o.imm[0]).min(64);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Output control points: the control point phase's, else the input.
+        let n_out = if sh.cp_out > 0 { sh.cp_out as usize } else { cps.len() };
+        let mut ocp = vec![[0u32; 4]; n_out * 32];
+        match phases.iter().find(|p| p.0 == op::HS_CONTROL_POINT_PHASE) {
+            Some(&(_, start, _)) => {
+                for i in 0..n_out {
+                    g.o.iter_mut().for_each(|r| *r = [0; 4]);
+                    g.r.iter_mut().for_each(|r| *r = [0; 4]);
+                    g.ids[0] = [i as u32; 4];
+                    hvm.run_from(&mut g, &henv, start);
+                    ocp[i * 32..i * 32 + 32].copy_from_slice(&g.o[..32]);
+                }
+            }
+            None => {
+                for (i, v) in cps.iter().enumerate().take(n_out) {
+                    for r in 0..32.min(v.len()) {
+                        ocp[i * 32 + r] = v[r];
+                    }
+                }
+            }
+        }
+        // Patch constants: the fork phases, then the join phases.
+        g.ocp = ocp.clone();
+        g.o.iter_mut().for_each(|r| *r = [0; 4]);
+        for kind in [op::HS_FORK_PHASE, op::HS_JOIN_PHASE] {
+            if kind == op::HS_JOIN_PHASE {
+                g.pc = g.o.clone();
+            }
+            for &(_, start, n) in phases.iter().filter(|p| p.0 == kind) {
+                for inst in 0..n {
+                    g.r.iter_mut().for_each(|r| *r = [0; 4]);
+                    g.ids[1] = [inst; 4];
+                    hvm.run_from(&mut g, &henv, start);
+                }
+            }
+        }
+        let pc = g.o.clone();
+        // The tess factors, where the patch constants say they are.
+        let mut tf = [1.0f32; 6];
+        for d in &sh.outputs {
+            let slot = match d.sysval {
+                11..=16 => d.sysval - 11,
+                17..=20 => d.sysval - 17,
+                21 | 22 => d.sysval - 21,
+                _ => continue,
+            };
+            let c = d.mask.trailing_zeros() as usize & 3;
+            tf[slot as usize] = pc.get(d.reg as usize).map_or(0.0, |r| f32::from_bits(r[c]));
+        }
+        let Some(t) = crate::tess::tessellate(sh.domain, sh.partitioning, sh.max_tf, &tf) else { return };
+        // The domain shader at every point.
+        let denv = StageEnv { cbs: &self.ds_cbs };
+        let mut dg = dvm.regs(32 * 32, 32);
+        dg.v = ocp;
+        dg.pc = pc;
+        let outs: Vec<Ov> = t
+            .points
+            .iter()
+            .map(|p| {
+                dg.o.iter_mut().for_each(|r| *r = [0; 4]);
+                dg.r.iter_mut().for_each(|r| *r = [0; 4]);
+                dg.ids[2] = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), 0];
+                dvm.run(&mut dg, &denv);
+                dg.o.clone()
+            })
+            .collect();
+        let cw = sh.out_prim == 3;
+        if sh.out_prim == 1 {
+            for o in &outs {
+                self.input(&[o], false);
+            }
+            return;
+        }
+        for p in &t.prims {
+            let v: Vec<&Ov> = p.iter().map(|&i| &outs[i as usize]).collect();
+            if v.len() == 3 && cw {
+                self.input(&[v[0], v[2], v[1]], false);
+            } else if sh.out_prim == 2 && v.len() == 3 {
+                self.input(&[v[0], v[1]], false);
+                self.input(&[v[1], v[2]], false);
+                self.input(&[v[2], v[0]], false);
+            } else {
+                self.input(&v, false);
+            }
+        }
+    }
+
     /// One primitive from the input assembler (adjacent vertices too).
     fn input(&mut self, p: &[&Ov], adjacency: bool) {
         if let Some((vm, gs)) = &self.gs {
@@ -942,7 +1064,15 @@ fn draw(this: *mut Com, count: u32, instances: u32, start_instance: u32, index: 
     let raster = so.and_then(|s| s.so.as_ref()).is_none_or(|s| s.rasterized == 0);
     let env = StageEnv { cbs: &cbs };
     let mut regs = vm.regs(32, 32);
-    let mut run = Run { d, o, links, pos, gs, gs_cbs, so, raster, prim: 0 };
+    let hs_cbs = stage_cbs(d, crate::context::STAGE_HS);
+    let ds_cbs = stage_cbs(d, crate::context::STAGE_DS);
+    let stage = |st: usize, kind: u32| -> Option<(Vm<'static>, &'static crate::shader::ShaderObj)> {
+        let s = crate::shader::of(d.state.stages[st].shader).filter(|s| s.sh.kind == kind)?;
+        let s: &'static crate::shader::ShaderObj = unsafe { &*(s as *const _) };
+        Some((Vm::new(&s.sh)?, s))
+    };
+    let (hs, ds) = (stage(crate::context::STAGE_HS, 3), stage(crate::context::STAGE_DS, 4));
+    let mut run = Run { d, o, links, pos, gs, gs_cbs, so, raster, prim: 0, hs, ds, hs_cbs, ds_cbs };
     let mut cache: alloc::collections::BTreeMap<usize, Ov> = alloc::collections::BTreeMap::new();
     for inst in 0..instances as usize {
         cache.clear();
@@ -993,6 +1123,7 @@ fn draw(this: *mut Com, count: u32, instances: u32, start_instance: u32, index: 
             10 => all.chunks_exact(4).for_each(|p| run.input(p, true)),
             11 => runs.iter().for_each(|r| r.windows(4).for_each(|p| run.input(p, true))),
             12 => all.chunks_exact(6).for_each(|p| run.input(p, true)),
+            33..=64 if run.hs.is_some() && run.ds.is_some() => all.chunks_exact(topo as usize - 32).for_each(|p| run.patch(p)),
             _ => {}
         }
     }

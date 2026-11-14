@@ -28,6 +28,13 @@ pub const T_GROUP_ID: u8 = 0x21;
 pub const T_THREAD_IN_GROUP: u8 = 0x22;
 pub const T_THREAD_IN_GROUP_FLAT: u8 = 0x24;
 pub const T_UAV: u8 = 0x1e;
+pub const T_OUTPUT_CP_ID: u8 = 0x16;
+pub const T_FORK_INSTANCE: u8 = 0x17;
+pub const T_JOIN_INSTANCE: u8 = 0x18;
+pub const T_INPUT_CP: u8 = 0x19;
+pub const T_OUTPUT_CP: u8 = 0x1a;
+pub const T_PATCH_CONSTANT: u8 = 0x1b;
+pub const T_DOMAIN_POINT: u8 = 0x1c;
 pub const T_TGSM: u8 = 0x1f;
 
 // Opcodes.
@@ -198,6 +205,18 @@ pub mod op {
     pub const EMIT_STREAM: u16 = 0x75;
     pub const CUT_STREAM: u16 = 0x76;
     pub const EMITTHENCUT_STREAM: u16 = 0x77;
+    pub const HS_DECLS: u16 = 0x71;
+    pub const HS_CONTROL_POINT_PHASE: u16 = 0x72;
+    pub const HS_FORK_PHASE: u16 = 0x73;
+    pub const HS_JOIN_PHASE: u16 = 0x74;
+    pub const DCL_INPUT_CP_COUNT: u16 = 0x93;
+    pub const DCL_OUTPUT_CP_COUNT: u16 = 0x94;
+    pub const DCL_TESS_DOMAIN: u16 = 0x95;
+    pub const DCL_TESS_PARTITIONING: u16 = 0x96;
+    pub const DCL_TESS_OUTPUT_PRIMITIVE: u16 = 0x97;
+    pub const DCL_HS_MAX_TESSFACTOR: u16 = 0x98;
+    pub const DCL_FORK_INSTANCE_COUNT: u16 = 0x99;
+    pub const DCL_JOIN_INSTANCE_COUNT: u16 = 0x9a;
 }
 
 // System values (D3D_NAME).
@@ -336,6 +355,17 @@ pub struct Shader {
     pub gs_in: u32,
     pub gs_out: u32,
     pub gs_max: u32,
+    /// Hull and domain shaders: control points in and out, the domain (1
+    /// isoline, 2 triangle, 3 quad), partitioning (1 integer, 2 pow2, 3
+    /// fractional odd, 4 fractional even), output primitive (1 point, 2
+    /// line, 3 triangle clockwise, 4 counter-clockwise), the largest tess
+    /// factor.
+    pub cp_in: u32,
+    pub cp_out: u32,
+    pub domain: u32,
+    pub partitioning: u32,
+    pub out_prim: u32,
+    pub max_tf: f32,
 }
 
 struct Rd<'a> {
@@ -431,7 +461,7 @@ fn dsts(o: u16) -> u8 {
     match o {
         SINCOS | UDIV | IMUL | UMUL | SWAPC => 2,
         IMM_ATOMIC_ALLOC..=IMM_ATOMIC_UMIN => 2,
-        SYNC | EMIT_STREAM | CUT_STREAM | EMITTHENCUT_STREAM => 0,
+        SYNC | EMIT_STREAM | CUT_STREAM | EMITTHENCUT_STREAM | HS_DECLS..=HS_JOIN_PHASE | DCL_FORK_INSTANCE_COUNT | DCL_JOIN_INSTANCE_COUNT => 0,
         BREAK | BREAKC | CALL | CALLC | CASE | CONTINUE | CONTINUEC | CUT | DEFAULT | DISCARD | ELSE | EMIT | EMITTHENCUT | ENDIF | ENDLOOP | ENDSWITCH | IF
         | LABEL | LOOP | NOP | RET | RETC | SWITCH => 0,
         _ => 1,
@@ -505,6 +535,12 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
         gs_in: 0,
         gs_out: 0,
         gs_max: 0,
+        cp_in: 0,
+        cp_out: 0,
+        domain: 0,
+        partitioning: 0,
+        out_prim: 0,
+        max_tf: 64.0,
     };
     let mut at = 2;
     while at < len {
@@ -540,7 +576,7 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
         }
         let ctrl = ((t >> 11) & 0x1FFF) as u16;
         match o {
-            op::DCL_TEMPS => sh.temps = r.next()?,
+            op::DCL_TEMPS => sh.temps = sh.temps.max(r.next()?),
             op::DCL_INDEXABLE_TEMP => {
                 let reg = r.next()? as usize;
                 let size = r.next()?;
@@ -581,6 +617,20 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
                 sh.outputs.push(InDecl { reg: x.idx[0], mask: x.mask, sysval, interp: 0, special: if x.ty == T_OUTPUT { 0 } else { x.ty } });
             }
             op::DCL_THREAD_GROUP => sh.group = [r.next()?, r.next()?, r.next()?],
+            op::DCL_INPUT_CP_COUNT => sh.cp_in = (ctrl & 0x3F) as u32,
+            op::DCL_OUTPUT_CP_COUNT => sh.cp_out = (ctrl & 0x3F) as u32,
+            op::DCL_TESS_DOMAIN => sh.domain = (ctrl & 3) as u32,
+            op::DCL_TESS_PARTITIONING => sh.partitioning = (ctrl & 7) as u32,
+            op::DCL_TESS_OUTPUT_PRIMITIVE => sh.out_prim = (ctrl & 7) as u32,
+            op::DCL_HS_MAX_TESSFACTOR => sh.max_tf = f32::from_bits(r.next()?),
+            // Phases begin, and the fork and join phases' instance counts:
+            // kept in the instructions, where each phase finds its own.
+            op::HS_DECLS..=op::HS_JOIN_PHASE => sh.ins.push(Ins { op: o, ctrl, sat: false, offset: [0; 3], ndst: 0, ops: Vec::new() }),
+            op::DCL_FORK_INSTANCE_COUNT | op::DCL_JOIN_INSTANCE_COUNT => {
+                let mut x = Opnd::NULL;
+                x.imm = [r.next()?; 4];
+                sh.ins.push(Ins { op: o, ctrl, sat: false, offset: [0; 3], ndst: 0, ops: alloc::vec![x] });
+            }
             op::DCL_GS_OUTPUT_TOPOLOGY => sh.gs_out = (ctrl & 0x3F) as u32,
             op::DCL_GS_INPUT_PRIMITIVE => sh.gs_in = (ctrl & 0x3F) as u32,
             op::DCL_MAX_OUTPUT_VERTEX_COUNT => sh.gs_max = r.next()?.min(1024),

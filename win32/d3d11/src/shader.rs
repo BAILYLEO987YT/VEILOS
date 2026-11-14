@@ -49,6 +49,8 @@ pub fn of<'a>(p: *mut Com) -> Option<&'a ShaderObj> {
 static VS_IIDS: [Guid; 2] = [IID_ID3D11DEVICECHILD, IID_ID3D11VERTEXSHADER];
 static GS_IIDS: [Guid; 2] = [IID_ID3D11DEVICECHILD, IID_ID3D11GEOMETRYSHADER];
 static PS_IIDS: [Guid; 2] = [IID_ID3D11DEVICECHILD, IID_ID3D11PIXELSHADER];
+static HS_IIDS: [Guid; 2] = [IID_ID3D11DEVICECHILD, IID_ID3D11HULLSHADER];
+static DS_IIDS: [Guid; 2] = [IID_ID3D11DEVICECHILD, IID_ID3D11DOMAINSHADER];
 
 /// Make a shader of `kind` (0 pixel, 1 vertex, 2 geometry) from bytecode.
 unsafe fn make(this: *mut Com, code: *const u8, len: usize, kind: u32, out: *mut *mut Com) -> i32 {
@@ -65,7 +67,7 @@ unsafe fn make(this: *mut Com, code: *const u8, len: usize, kind: u32, out: *mut
     if sh.major >= 5 && crate::device::of(dev).level < 0xB000 {
         return E_INVALIDARG;
     }
-    if kind == 1 && crate::vm::Vm::new(&sh).is_none() {
+    if (kind >= 3 && crate::device::of(dev).level < 0xB000) || (kind >= 1 && crate::vm::Vm::new(&sh).is_none()) {
         return E_INVALIDARG;
     }
     let mut ps = None;
@@ -89,6 +91,8 @@ unsafe fn make(this: *mut Com, code: *const u8, len: usize, kind: u32, out: *mut
     let (vt, iids): (&'static Vtbl<7>, &'static [Guid]) = match kind {
         0 => (&ID3D11PIXELSHADER, &PS_IIDS),
         1 => (&ID3D11VERTEXSHADER, &VS_IIDS),
+        3 => (&ID3D11HULLSHADER, &HS_IIDS),
+        4 => (&ID3D11DOMAINSHADER, &DS_IIDS),
         _ => (&ID3D11GEOMETRYSHADER, &GS_IIDS),
     };
     unsafe { *out = Com::new(vt, iids, dev, Body::Shader(Box::new(ShaderObj { code: bytes, sh, ps, kernel, so: None }))) };
@@ -101,6 +105,15 @@ pub unsafe extern "system" fn Dev_CreateVertexShader(this: *mut Com, code: *cons
 
 pub unsafe extern "system" fn Dev_CreatePixelShader(this: *mut Com, code: *const u8, len: usize, _link: *mut Com, out: *mut *mut Com) -> i32 {
     unsafe { make(this, code, len, 0, out) }
+}
+
+/// Hull and domain shaders (feature level 11_0).
+pub unsafe extern "system" fn Dev_CreateHullShader(this: *mut Com, code: *const u8, len: usize, _link: *mut Com, out: *mut *mut Com) -> i32 {
+    unsafe { make(this, code, len, 3, out) }
+}
+
+pub unsafe extern "system" fn Dev_CreateDomainShader(this: *mut Com, code: *const u8, len: usize, _link: *mut Com, out: *mut *mut Com) -> i32 {
+    unsafe { make(this, code, len, 4, out) }
 }
 
 pub unsafe extern "system" fn Dev_CreateGeometryShader(this: *mut Com, code: *const u8, len: usize, _link: *mut Com, out: *mut *mut Com) -> i32 {

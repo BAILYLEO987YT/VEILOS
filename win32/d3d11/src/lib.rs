@@ -20,6 +20,7 @@
 //!   shader.rs  shader objects
 //!   vm.rs      the interpreter vertex shaders run on
 //!   ps.rs      pixel shaders as the kernel's programs
+//!   tess.rs    the tessellator (hull and domain shaders run in draw.rs)
 //!   draw.rs    the input assembler, clipping, the viewport, the states as
 //!              the kernel's, and the draw calls
 
@@ -42,6 +43,7 @@ mod ps;
 mod res;
 mod shader;
 mod state;
+mod tess;
 mod vm;
 mod vtbl;
 

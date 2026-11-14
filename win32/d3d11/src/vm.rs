@@ -279,6 +279,10 @@ pub struct Regs {
     /// outputs; None: a cut).
     pub prim: u32,
     pub emitted: Vec<Option<Vec<R4>>>,
+    /// Hull: the output control points (vocp[point][register]); hull and
+    /// domain: the patch constants (vpc#).
+    pub ocp: Vec<R4>,
+    pub pc: Vec<R4>,
 }
 
 impl<'a> Vm<'a> {
@@ -307,6 +311,8 @@ impl<'a> Vm<'a> {
             tgsm: core::ptr::null_mut(),
             prim: 0,
             emitted: Vec::new(),
+            ocp: Vec::new(),
+            pc: Vec::new(),
         }
     }
 
@@ -329,6 +335,13 @@ impl<'a> Vm<'a> {
             T_INPUT if o.nidx == 2 => g.v.get((self.index(g, o, 0) * 32 + self.index(g, o, 1)) as usize).copied().unwrap_or(z),
             T_INPUT => g.v.get(self.index(g, o, 0) as usize).copied().unwrap_or(z),
             crate::dxbc::T_PRIMITIVEID => [g.prim; 4],
+            // Hull and domain shaders: ids in `ids`, control points.
+            crate::dxbc::T_OUTPUT_CP_ID => g.ids[0],
+            crate::dxbc::T_FORK_INSTANCE | crate::dxbc::T_JOIN_INSTANCE => g.ids[1],
+            crate::dxbc::T_DOMAIN_POINT => g.ids[2],
+            crate::dxbc::T_INPUT_CP => g.v.get((self.index(g, o, 0) * 32 + self.index(g, o, 1)) as usize).copied().unwrap_or(z),
+            crate::dxbc::T_OUTPUT_CP => g.ocp.get((self.index(g, o, 0) * 32 + self.index(g, o, 1)) as usize).copied().unwrap_or(z),
+            crate::dxbc::T_PATCH_CONSTANT => g.pc.get(self.index(g, o, 0) as usize).copied().unwrap_or(z),
             T_OUTPUT => g.o.get(self.index(g, o, 0) as usize).copied().unwrap_or(z),
             T_INDEXABLE => g.x.get(o.idx[0] as usize).and_then(|a| a.get(self.index(g, o, 1) as usize)).copied().unwrap_or(z),
             T_IMM32 => o.imm,
@@ -612,7 +625,9 @@ impl<'a> Vm<'a> {
                     }
                     continue;
                 }
-                DISCARD => continue,
+                DISCARD | DCL_FORK_INSTANCE_COUNT | DCL_JOIN_INSTANCE_COUNT => continue,
+                // The next hull shader phase: this one is done.
+                HS_DECLS..=HS_JOIN_PHASE => return None,
                 EMIT | CUT | EMITTHENCUT | EMIT_STREAM | CUT_STREAM | EMITTHENCUT_STREAM => {
                     // Stream 0 only (the rasterized and usual one).
                     if matches!(x.op, EMIT_STREAM | CUT_STREAM | EMITTHENCUT_STREAM) && x.ops.first().is_some_and(|o| o.idx[0] != 0) {

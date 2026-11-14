@@ -767,8 +767,8 @@ pub static ID3D11DEVICE: Vtbl<43> = Vtbl([
     crate::shader::Dev_CreateGeometryShader as *const (),
     crate::shader::Dev_CreateGeometryShaderWithStreamOutput as *const (),
     crate::shader::Dev_CreatePixelShader as *const (),
-    stub_Dev_CreateHullShader as *const (),
-    stub_Dev_CreateDomainShader as *const (),
+    crate::shader::Dev_CreateHullShader as *const (),
+    crate::shader::Dev_CreateDomainShader as *const (),
     crate::compute::Dev_CreateComputeShader as *const (),
     stub_Dev_CreateClassLinkage as *const (),
     crate::state::Dev_CreateBlendState as *const (),
@@ -938,14 +938,6 @@ unsafe extern "system" fn stub_Ctx_ExecuteCommandList() -> usize {
 }
 unsafe extern "system" fn stub_Ctx_FinishCommandList() -> i32 {
     unimplemented(b"ID3D11DeviceContext::FinishCommandList\0");
-    E_NOTIMPL
-}
-unsafe extern "system" fn stub_Dev_CreateHullShader() -> i32 {
-    unimplemented(b"ID3D11Device::CreateHullShader\0");
-    E_NOTIMPL
-}
-unsafe extern "system" fn stub_Dev_CreateDomainShader() -> i32 {
-    unimplemented(b"ID3D11Device::CreateDomainShader\0");
     E_NOTIMPL
 }
 unsafe extern "system" fn stub_Dev_CreateClassLinkage() -> i32 {
