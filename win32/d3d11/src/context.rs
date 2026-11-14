@@ -40,6 +40,8 @@ pub struct Bindings {
     pub rtvs: [*mut Com; 8],
     pub dsv: *mut Com,
     pub uavs: [*mut Com; 8],
+    /// The compute stage's own UAVs.
+    pub cs_uavs: [*mut Com; 8],
     pub blend: *mut Com,
     pub blend_factor: [f32; 4],
     pub sample_mask: u32,
@@ -63,6 +65,7 @@ impl Default for Bindings {
             rtvs: [NULL; 8],
             dsv: NULL,
             uavs: [NULL; 8],
+            cs_uavs: [NULL; 8],
             blend: NULL,
             blend_factor: [1.0; 4],
             sample_mask: 0xFFFF_FFFF,
@@ -91,6 +94,7 @@ impl Bindings {
         all.extend(self.rtvs);
         all.push(self.dsv);
         all.extend(self.uavs);
+        all.extend(self.cs_uavs);
         all.push(self.blend);
         all.push(self.dss);
         all.extend(self.so.iter().map(|s| s.0));
@@ -450,11 +454,11 @@ pub unsafe extern "system" fn Ctx_GetPredication(this: *mut Com, out: *mut *mut 
 }
 
 pub unsafe extern "system" fn Ctx_CSSetUnorderedAccessViews(this: *mut Com, start: u32, n: u32, v: *const *mut Com, _counts: *const u32) {
-    unsafe { set_slots(&mut bind(this).uavs, start, n, v) };
+    unsafe { set_slots(&mut bind(this).cs_uavs, start, n, v) };
 }
 
 pub unsafe extern "system" fn Ctx_CSGetUnorderedAccessViews(this: *mut Com, start: u32, n: u32, out: *mut *mut Com) {
-    unsafe { get_slots(&bind(this).uavs, start, n, out) };
+    unsafe { get_slots(&bind(this).cs_uavs, start, n, out) };
 }
 
 pub unsafe extern "system" fn Ctx_ClearState(this: *mut Com) {

@@ -27,6 +27,8 @@ pub const T_THREAD_ID: u8 = 0x20;
 pub const T_GROUP_ID: u8 = 0x21;
 pub const T_THREAD_IN_GROUP: u8 = 0x22;
 pub const T_THREAD_IN_GROUP_FLAT: u8 = 0x24;
+pub const T_UAV: u8 = 0x1e;
+pub const T_TGSM: u8 = 0x1f;
 
 // Opcodes.
 pub mod op {
@@ -153,6 +155,43 @@ pub mod op {
     pub const BFI: u16 = 0x8c;
     pub const BFREV: u16 = 0x8d;
     pub const SWAPC: u16 = 0x8e;
+    pub const BUFINFO: u16 = 0x79;
+    pub const DCL_THREAD_GROUP: u16 = 0x9b;
+    pub const DCL_UAV_TYPED: u16 = 0x9c;
+    pub const DCL_UAV_RAW: u16 = 0x9d;
+    pub const DCL_UAV_STRUCTURED: u16 = 0x9e;
+    pub const DCL_TGSM_RAW: u16 = 0x9f;
+    pub const DCL_TGSM_STRUCTURED: u16 = 0xa0;
+    pub const DCL_RESOURCE_RAW: u16 = 0xa1;
+    pub const DCL_RESOURCE_STRUCTURED: u16 = 0xa2;
+    pub const LD_UAV_TYPED: u16 = 0xa3;
+    pub const STORE_UAV_TYPED: u16 = 0xa4;
+    pub const LD_RAW: u16 = 0xa5;
+    pub const STORE_RAW: u16 = 0xa6;
+    pub const LD_STRUCTURED: u16 = 0xa7;
+    pub const STORE_STRUCTURED: u16 = 0xa8;
+    pub const ATOMIC_AND: u16 = 0xa9;
+    pub const ATOMIC_OR: u16 = 0xaa;
+    pub const ATOMIC_XOR: u16 = 0xab;
+    pub const ATOMIC_CMP_STORE: u16 = 0xac;
+    pub const ATOMIC_IADD: u16 = 0xad;
+    pub const ATOMIC_IMAX: u16 = 0xae;
+    pub const ATOMIC_IMIN: u16 = 0xaf;
+    pub const ATOMIC_UMAX: u16 = 0xb0;
+    pub const ATOMIC_UMIN: u16 = 0xb1;
+    pub const IMM_ATOMIC_ALLOC: u16 = 0xb2;
+    pub const IMM_ATOMIC_CONSUME: u16 = 0xb3;
+    pub const IMM_ATOMIC_IADD: u16 = 0xb4;
+    pub const IMM_ATOMIC_AND: u16 = 0xb5;
+    pub const IMM_ATOMIC_OR: u16 = 0xb6;
+    pub const IMM_ATOMIC_XOR: u16 = 0xb7;
+    pub const IMM_ATOMIC_EXCH: u16 = 0xb8;
+    pub const IMM_ATOMIC_CMP_EXCH: u16 = 0xb9;
+    pub const IMM_ATOMIC_IMAX: u16 = 0xba;
+    pub const IMM_ATOMIC_IMIN: u16 = 0xbb;
+    pub const IMM_ATOMIC_UMAX: u16 = 0xbc;
+    pub const IMM_ATOMIC_UMIN: u16 = 0xbd;
+    pub const SYNC: u16 = 0xbe;
 }
 
 // System values (D3D_NAME).
@@ -276,6 +315,14 @@ pub struct Shader {
     pub samplers: Vec<(u32, u32)>,
     /// Writes SV_Depth (oDepth).
     pub depth_out: bool,
+    /// Compute shaders: threads per group.
+    pub group: [u32; 3],
+    /// u#: (register, kind: 0 typed, 1 raw, 2 structured, stride).
+    pub uavs: Vec<(u32, u32, u32)>,
+    /// g#: (register, bytes, stride (0: raw)).
+    pub tgsm: Vec<(u32, u32, u32)>,
+    /// t# that are raw (stride 0) or structured buffers.
+    pub buffers: Vec<(u32, u32)>,
 }
 
 struct Rd<'a> {
@@ -370,6 +417,8 @@ fn dsts(o: u16) -> u8 {
     use op::*;
     match o {
         SINCOS | UDIV | IMUL | UMUL | SWAPC => 2,
+        IMM_ATOMIC_ALLOC..=IMM_ATOMIC_UMIN => 2,
+        SYNC => 0,
         BREAK | BREAKC | CALL | CALLC | CASE | CONTINUE | CONTINUEC | CUT | DEFAULT | DISCARD | ELSE | EMIT | EMITTHENCUT | ENDIF | ENDLOOP | ENDSWITCH | IF
         | LABEL | LOOP | NOP | RET | RETC | SWITCH => 0,
         _ => 1,
@@ -436,6 +485,10 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
         res: Vec::new(),
         samplers: Vec::new(),
         depth_out: false,
+        group: [1; 3],
+        uavs: Vec::new(),
+        tgsm: Vec::new(),
+        buffers: Vec::new(),
     };
     let mut at = 2;
     while at < len {
@@ -511,7 +564,35 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
                 }
                 sh.outputs.push(InDecl { reg: x.idx[0], mask: x.mask, sysval, interp: 0, special: if x.ty == T_OUTPUT { 0 } else { x.ty } });
             }
-            o if o < op::DCL_RESOURCE || matches!(o, op::LOD | op::GATHER4 | op::SAMPLE_POS | op::SAMPLE_INFO) || (0x7a..=0x8e).contains(&o) => {
+            op::DCL_THREAD_GROUP => sh.group = [r.next()?, r.next()?, r.next()?],
+            op::DCL_UAV_TYPED | op::DCL_UAV_RAW | op::DCL_UAV_STRUCTURED => {
+                let x = operand(&mut r)?;
+                let stride = if o == op::DCL_UAV_STRUCTURED { r.next()? } else { 0 };
+                sh.uavs.push((x.idx[0], (o - op::DCL_UAV_TYPED) as u32, stride));
+            }
+            op::DCL_TGSM_RAW | op::DCL_TGSM_STRUCTURED => {
+                let x = operand(&mut r)?;
+                let (stride, bytes) = if o == op::DCL_TGSM_RAW {
+                    (0, r.next()?)
+                } else {
+                    let s = r.next()?;
+                    (s, s.checked_mul(r.next()?)?)
+                };
+                if bytes > 32768 {
+                    return None;
+                }
+                sh.tgsm.push((x.idx[0], bytes, stride));
+            }
+            op::DCL_RESOURCE_RAW | op::DCL_RESOURCE_STRUCTURED => {
+                let x = operand(&mut r)?;
+                let stride = if o == op::DCL_RESOURCE_STRUCTURED { r.next()? } else { 0 };
+                sh.buffers.push((x.idx[0], stride));
+            }
+            o if o < op::DCL_RESOURCE
+                || matches!(o, op::LOD | op::GATHER4 | op::SAMPLE_POS | op::SAMPLE_INFO | op::BUFINFO)
+                || (0x7a..=0x8e).contains(&o)
+                || (op::LD_UAV_TYPED..=op::SYNC).contains(&o) =>
+            {
                 let mut ops = Vec::new();
                 while r.at < end {
                     ops.push(operand(&mut r)?);

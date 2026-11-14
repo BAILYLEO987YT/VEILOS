@@ -29,7 +29,13 @@ for e in vs40_main ps40_cube ps40_cubelod ps40_vol ps40_volload ps40_arr ps40_ar
     "$FXC" /nologo /T $p /E $e /Fh build/dx3_$e.h /Vn $e dx3.hlsl >/dev/null
 done
 
-TESTS="dx1 dx2 dx3"
+# dx4's (cs50_ is cs_5_0).
+for e in cs50_pattern cs50_buffers cs50_reduce cs50_hist vs50_main ps50_show; do
+    p=$(echo $e | sed 's/^\(..\)\(.\)\(.\)_.*/\1_\2_\3/')
+    "$FXC" /nologo /T $p /E $e /Fh build/dx4_$e.h /Vn $e dx4.hlsl >/dev/null
+done
+
+TESTS="dx1 dx2 dx3 dx4"
 for t in $TESTS; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \

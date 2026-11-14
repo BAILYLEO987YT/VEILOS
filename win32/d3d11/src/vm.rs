@@ -5,7 +5,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::dxbc::{op, Ins, Opnd, Shader, T_CB, T_ICB, T_IMM32, T_INDEXABLE, T_INPUT, T_OUTPUT, T_TEMP};
+use crate::dxbc::{op, Ins, Opnd, Shader, T_CB, T_GROUP_ID, T_ICB, T_IMM32, T_INDEXABLE, T_INPUT, T_OUTPUT, T_RESOURCE, T_TEMP, T_TGSM, T_THREAD_ID, T_THREAD_IN_GROUP, T_THREAD_IN_GROUP_FLAT, T_UAV};
 
 pub type R4 = [u32; 4];
 
@@ -16,6 +16,64 @@ pub trait Env {
     /// A texture or buffer read (ld, sample_l and the like): `ins` the
     /// instruction, `c` its coordinates, `x` its other sources.
     fn fetch(&self, ins: &Ins, c: R4, x: [R4; 2]) -> R4;
+    /// The memory behind t# (`T_RESOURCE`) or u# (`T_UAV`): buffers raw,
+    /// structured or typed, and textures as typed elements.
+    fn mem(&self, _ty: u8, _reg: u32) -> Option<Mem> {
+        None
+    }
+}
+
+/// A resource's bytes as a shader addresses them: element (x, y, z) of a
+/// typed one at x * element size + y * row + z * slice, inside w x h x d;
+/// a structured one's element i at i * stride; a raw one by byte.
+#[derive(Clone, Copy)]
+pub struct Mem {
+    pub ptr: *mut u8,
+    pub len: usize,
+    /// Structured: the element size; raw: 0.
+    pub stride: u32,
+    /// Typed: the DXGI format (0: raw or structured).
+    pub format: u32,
+    pub w: u32,
+    pub h: u32,
+    pub d: u32,
+    pub row: usize,
+    pub slice: usize,
+}
+
+impl Mem {
+    fn word(&self, at: usize) -> Option<*mut u32> {
+        (at % 4 == 0 && at + 4 <= self.len).then(|| unsafe { self.ptr.add(at) } as *mut u32)
+    }
+
+    /// Coordinates past the resource's dimensions don't count.
+    fn coords(&self, c: R4) -> R4 {
+        [c[0], if self.h > 1 { c[1] } else { 0 }, if self.d > 1 { c[2] } else { 0 }, 0]
+    }
+
+    /// A typed element's bytes.
+    fn element(&self, c: R4) -> Option<&mut [u8]> {
+        let c = self.coords(c);
+        let n = crate::format::bytes(self.format)? as usize;
+        if c[0] >= self.w || c[1] >= self.h.max(1) || c[2] >= self.d.max(1) {
+            return None;
+        }
+        let at = c[0] as usize * n + c[1] as usize * self.row + c[2] as usize * self.slice;
+        (at + n <= self.len).then(|| unsafe { core::slice::from_raw_parts_mut(self.ptr.add(at), n) })
+    }
+
+    /// The byte where an atomic operation or raw/structured access goes.
+    fn address(&self, a: R4) -> Option<usize> {
+        if self.format != 0 {
+            let a = self.coords(a);
+            let n = crate::format::bytes(self.format)? as usize;
+            if a[0] >= self.w || a[1] >= self.h.max(1) || a[2] >= self.d.max(1) {
+                return None;
+            }
+            return Some(a[0] as usize * n + a[1] as usize * self.row + a[2] as usize * self.slice);
+        }
+        Some(if self.stride != 0 { a[0] as usize * self.stride as usize + a[1] as usize } else { a[0] as usize })
+    }
 }
 
 pub struct Vm<'a> {
@@ -212,6 +270,11 @@ pub struct Regs {
     pub x: Vec<Vec<R4>>,
     pub v: Vec<R4>,
     pub o: Vec<R4>,
+    /// Compute: the thread's ids (dispatch, group, in the group, and
+    /// flattened in the group).
+    pub ids: [R4; 4],
+    /// Compute: the group's shared memory (g#), shared by its threads.
+    pub tgsm: *mut Vec<Vec<u8>>,
 }
 
 impl<'a> Vm<'a> {
@@ -236,6 +299,8 @@ impl<'a> Vm<'a> {
             x: self.sh.xtemps.iter().map(|&(n, _)| vec![[0; 4]; n as usize]).collect(),
             v: vec![[0; 4]; inputs.max(32)],
             o: vec![[0; 4]; outputs.max(32)],
+            ids: [[0; 4]; 4],
+            tgsm: core::ptr::null_mut(),
         }
     }
 
@@ -259,6 +324,10 @@ impl<'a> Vm<'a> {
             T_OUTPUT => g.o.get(self.index(g, o, 0) as usize).copied().unwrap_or(z),
             T_INDEXABLE => g.x.get(o.idx[0] as usize).and_then(|a| a.get(self.index(g, o, 1) as usize)).copied().unwrap_or(z),
             T_IMM32 => o.imm,
+            T_THREAD_ID => g.ids[0],
+            T_GROUP_ID => g.ids[1],
+            T_THREAD_IN_GROUP => g.ids[2],
+            T_THREAD_IN_GROUP_FLAT => g.ids[3],
             T_CB => env.cb(o.idx[0], self.index(g, o, 1)),
             T_ICB => {
                 let i = self.index(g, o, 0);
@@ -269,6 +338,121 @@ impl<'a> Vm<'a> {
                 }
             }
             _ => z,
+        }
+    }
+
+    /// The memory an operand names: g# here, t# and u# the environment's.
+    fn mem(&self, g: &Regs, o: &Opnd, env: &dyn Env) -> Option<Mem> {
+        if o.ty == T_TGSM {
+            let &(_, _, stride) = self.sh.tgsm.iter().find(|t| t.0 == o.idx[0])?;
+            let all = unsafe { g.tgsm.as_mut()? };
+            let i = self.sh.tgsm.iter().position(|t| t.0 == o.idx[0])?;
+            let v = all.get_mut(i)?;
+            return Some(Mem { ptr: v.as_mut_ptr(), len: v.len(), stride, format: 0, w: 0, h: 0, d: 0, row: 0, slice: 0 });
+        }
+        env.mem(o.ty, o.idx[0])
+    }
+
+    /// The memory operations (SM5): loads, stores, atomics, bufinfo.
+    fn memory(&self, g: &mut Regs, x: &Ins, s: &[R4; 4], env: &dyn Env) {
+        use op::*;
+        let res = |k: usize| -> Option<Mem> { self.mem(g, x.ops.get(k)?, env) };
+        let word = |m: &Mem, at: usize| -> u32 { m.word(at).map_or(0, |p| unsafe { core::ptr::read_volatile(p) }) };
+        match x.op {
+            LD_RAW | LD_STRUCTURED | LD_UAV_TYPED => {
+                // dst, address (index and offset), the resource.
+                let ri = if x.op == LD_STRUCTURED { 3 } else { 2 };
+                let Some(o) = x.ops.get(ri) else { return };
+                let v: R4 = match res(ri) {
+                    Some(m) if x.op == LD_UAV_TYPED => m.element(s[0]).and_then(|e| crate::format::load_typed(m.format, e)).unwrap_or([0; 4]),
+                    Some(m) => {
+                        let base = if x.op == LD_STRUCTURED { m.address([s[0][0], s[1][0], 0, 0]) } else { m.address(s[0]) };
+                        match base {
+                            Some(b) => {
+                                let w: R4 = core::array::from_fn(|k| word(&m, b + 4 * k));
+                                return self.write(g, x.dst(0), core::array::from_fn(|k| w[((o.swz >> (2 * k)) & 3) as usize]), false);
+                            }
+                            None => [0; 4],
+                        }
+                    }
+                    None => [0; 4],
+                };
+                let v = if x.op == LD_UAV_TYPED { core::array::from_fn(|k| v[((o.swz >> (2 * k)) & 3) as usize]) } else { v };
+                self.write(g, x.dst(0), v, false);
+            }
+            STORE_RAW | STORE_STRUCTURED | STORE_UAV_TYPED => {
+                let Some(m) = res(0) else { return };
+                let mask = x.dst(0).mask;
+                if x.op == STORE_UAV_TYPED {
+                    if let Some(e) = m.element(s[0]) {
+                        crate::format::store_typed(m.format, s[1], e);
+                    }
+                    return;
+                }
+                let (base, v) = if x.op == STORE_STRUCTURED { (m.address([s[0][0], s[1][0], 0, 0]), s[2]) } else { (m.address(s[0]), s[1]) };
+                let Some(b) = base else { return };
+                for k in 0..4 {
+                    if mask & (1 << k) != 0 {
+                        if let Some(p) = m.word(b + 4 * k) {
+                            unsafe { core::ptr::write_volatile(p, v[k]) };
+                        }
+                    }
+                }
+            }
+            BUFINFO => {
+                let n = match res(1) {
+                    Some(m) if m.format != 0 => m.w,
+                    Some(m) if m.stride != 0 => (m.len / m.stride as usize) as u32,
+                    Some(m) => m.len as u32,
+                    None => 0,
+                };
+                self.write(g, x.dst(0), [n; 4], false);
+            }
+            ATOMIC_AND..=ATOMIC_UMIN | IMM_ATOMIC_IADD..=IMM_ATOMIC_UMIN => {
+                let imm = x.op >= IMM_ATOMIC_IADD;
+                let Some(m) = res(if imm { 1 } else { 0 }) else { return };
+                // Sources: address, then the value (cmp_store and
+                // cmp_exch: the comparand, then the value).
+                let Some(at) = m.address(s[0]) else {
+                    if imm {
+                        self.write(g, x.dst(0), [0; 4], false);
+                    }
+                    return;
+                };
+                let Some(p) = m.word(at) else { return };
+                let a = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
+                use core::sync::atomic::Ordering::SeqCst;
+                let v = s[1][0];
+                let old = match x.op {
+                    ATOMIC_AND | IMM_ATOMIC_AND => a.fetch_and(v, SeqCst),
+                    ATOMIC_OR | IMM_ATOMIC_OR => a.fetch_or(v, SeqCst),
+                    ATOMIC_XOR | IMM_ATOMIC_XOR => a.fetch_xor(v, SeqCst),
+                    ATOMIC_IADD | IMM_ATOMIC_IADD => a.fetch_add(v, SeqCst),
+                    ATOMIC_UMAX | IMM_ATOMIC_UMAX => a.fetch_max(v, SeqCst),
+                    ATOMIC_UMIN | IMM_ATOMIC_UMIN => a.fetch_min(v, SeqCst),
+                    ATOMIC_IMAX | IMM_ATOMIC_IMAX => {
+                        let a = unsafe { &*(p as *const core::sync::atomic::AtomicI32) };
+                        a.fetch_max(v as i32, SeqCst) as u32
+                    }
+                    ATOMIC_IMIN | IMM_ATOMIC_IMIN => {
+                        let a = unsafe { &*(p as *const core::sync::atomic::AtomicI32) };
+                        a.fetch_min(v as i32, SeqCst) as u32
+                    }
+                    IMM_ATOMIC_EXCH => a.swap(v, SeqCst),
+                    ATOMIC_CMP_STORE | IMM_ATOMIC_CMP_EXCH => match a.compare_exchange(s[1][0], s[2][0], SeqCst, SeqCst) {
+                        Ok(o) | Err(o) => o,
+                    },
+                    _ => 0,
+                };
+                if imm {
+                    self.write(g, x.dst(0), [old; 4], false);
+                }
+            }
+            _ => {
+                if x.ndst > 0 {
+                    self.write(g, x.dst(0), [0; 4], false);
+                }
+            }
         }
     }
 
@@ -312,15 +496,24 @@ impl<'a> Vm<'a> {
 
     /// Run one invocation.
     pub fn run(&self, g: &mut Regs, env: &dyn Env) {
+        let mut pc = Some(0);
+        while let Some(p) = pc {
+            pc = self.run_from(g, env, p);
+        }
+    }
+
+    /// Run from `pc` until the end (None) or a group sync (Some: where to
+    /// carry on once every thread of the group got there).
+    pub fn run_from(&self, g: &mut Regs, env: &dyn Env, start: usize) -> Option<usize> {
         use op::*;
         let ins = &self.sh.ins;
-        let mut pc = 0usize;
+        let mut pc = start;
         let mut calls: Vec<usize> = Vec::new();
         let mut steps = 0u32;
         while pc < ins.len() {
             steps += 1;
-            if steps > 1 << 20 {
-                return;
+            if steps > 1 << 22 {
+                return None;
             }
             let x = &ins[pc];
             pc += 1;
@@ -329,7 +522,7 @@ impl<'a> Vm<'a> {
             let mut s = [[0u32; 4]; 4];
             for k in 0..ns.min(4) {
                 let o = x.src(k);
-                if !matches!(o.ty, crate::dxbc::T_RESOURCE | crate::dxbc::T_SAMPLER | crate::dxbc::T_LABEL) {
+                if !matches!(o.ty, T_RESOURCE | crate::dxbc::T_SAMPLER | crate::dxbc::T_LABEL | T_UAV | T_TGSM) {
                     s[k] = self.read(g, o, env, int);
                 }
             }
@@ -348,7 +541,7 @@ impl<'a> Vm<'a> {
                 ENDIF | LOOP | CASE | DEFAULT | LABEL | NOP | ENDSWITCH => {
                     // A label reached in a straight line: the end of main.
                     if x.op == LABEL {
-                        return;
+                        return None;
                     }
                     continue;
                 }
@@ -396,7 +589,7 @@ impl<'a> Vm<'a> {
                     }
                     match calls.pop() {
                         Some(r) => pc = r,
-                        None => return,
+                        None => return None,
                     }
                     continue;
                 }
@@ -412,6 +605,26 @@ impl<'a> Vm<'a> {
                     continue;
                 }
                 DISCARD | EMIT | CUT | EMITTHENCUT => continue,
+                SYNC => {
+                    // Thread group sync (bit 0 of its flags): wait for the others.
+                    if x.ctrl & 1 != 0 && !g.tgsm.is_null() {
+                        return Some(pc);
+                    }
+                    continue;
+                }
+                LD_RAW | LD_STRUCTURED | LD_UAV_TYPED | STORE_RAW | STORE_STRUCTURED | STORE_UAV_TYPED | BUFINFO | ATOMIC_AND..=IMM_ATOMIC_UMIN => {
+                    self.memory(g, x, &s, env);
+                    continue;
+                }
+                LD if x.ops.get(2).is_some_and(|o| o.ty == T_RESOURCE) && env.mem(T_RESOURCE, x.ops[2].idx[0]).is_some() => {
+                    // A typed buffer or texture the environment hands over.
+                    let m = env.mem(T_RESOURCE, x.ops[2].idx[0]).unwrap();
+                    let o = x.ops[2];
+                    let c = if m.h <= 1 && m.d <= 1 { [s[0][0], 0, 0, 0] } else { s[0] };
+                    let v = m.element(c).and_then(|e| crate::format::load_typed(m.format, e)).unwrap_or([0; 4]);
+                    self.write(g, x.dst(0), core::array::from_fn(|k| v[((o.swz >> (2 * k)) & 3) as usize]), false);
+                    continue;
+                }
                 SINCOS => {
                     let a = s[0];
                     let sn = a.map(|v| u(sincos(f(v)).0));
@@ -535,5 +748,6 @@ impl<'a> Vm<'a> {
             };
             self.write(g, x.dst(0), v, x.sat);
         }
+        None
     }
 }

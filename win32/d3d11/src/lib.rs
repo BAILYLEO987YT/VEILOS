@@ -16,6 +16,7 @@
 //!   context.rs ID3D11DeviceContext: the pipeline's bindings
 //!   format.rs  DXGI formats
 //!   dxbc.rs    shader bytecode (SM4/SM5) parsed
+//!   compute.rs compute shaders: Dispatch on threads of this DLL
 //!   shader.rs  shader objects
 //!   vm.rs      the interpreter vertex shaders run on
 //!   ps.rs      pixel shaders as the kernel's programs
@@ -30,6 +31,7 @@ extern crate alloc;
 #[path = "../../dllrt.rs"]
 mod dllrt;
 mod com;
+mod compute;
 mod context;
 mod device;
 mod draw;

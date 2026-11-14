@@ -27,79 +27,8 @@ fn f(u: u32) -> f32 {
     f32::from_bits(u)
 }
 
-fn unorm(v: u32, bits: u32) -> u32 {
-    (v as f32 / ((1u64 << bits) - 1) as f32).to_bits()
-}
-
-fn snorm(v: u32, bits: u32) -> u32 {
-    let s = ((v << (32 - bits)) as i32) >> (32 - bits);
-    (s as f32 / ((1u32 << (bits - 1)) - 1) as f32).max(-1.0).to_bits()
-}
-
-fn sext(v: u32, bits: u32) -> u32 {
-    (((v << (32 - bits)) as i32) >> (32 - bits)) as u32
-}
-
-/// An element of format `fmt` at `p` as a register: floats for the float
-/// and normalized formats, integers for the others; missing components 0,
-/// and w 1.
 fn fetch(fmt: u32, p: &[u8]) -> Option<R4> {
-    let w = |i: usize| -> u32 { u32::from_le_bytes(p[i * 4..i * 4 + 4].try_into().unwrap()) };
-    let h = |i: usize| -> u32 { u16::from_le_bytes(p[i * 2..i * 2 + 2].try_into().unwrap()) as u32 };
-    let b = |i: usize| -> u32 { p[i] as u32 };
-    let one_f = 1.0f32.to_bits();
-    let half = |v: u32| crate::vm::half_to_f32(v).to_bits();
-    let need = bytes(fmt)? as usize;
-    if p.len() < need {
-        return None;
-    }
-    Some(match fmt {
-        2 | 3 | 4 => [w(0), w(1), w(2), w(3)],
-        6 => [w(0), w(1), w(2), one_f],
-        7 | 8 => [w(0), w(1), w(2), 1],
-        10 => [half(h(0)), half(h(1)), half(h(2)), half(h(3))],
-        11 => [unorm(h(0), 16), unorm(h(1), 16), unorm(h(2), 16), unorm(h(3), 16)],
-        12 => [h(0), h(1), h(2), h(3)],
-        13 => [snorm(h(0), 16), snorm(h(1), 16), snorm(h(2), 16), snorm(h(3), 16)],
-        14 => [sext(h(0), 16), sext(h(1), 16), sext(h(2), 16), sext(h(3), 16)],
-        16 => [w(0), w(1), 0, one_f],
-        17 | 18 => [w(0), w(1), 0, 1],
-        24 => {
-            let v = w(0);
-            [unorm(v & 1023, 10), unorm((v >> 10) & 1023, 10), unorm((v >> 20) & 1023, 10), unorm(v >> 30, 2)]
-        }
-        25 => {
-            let v = w(0);
-            [v & 1023, (v >> 10) & 1023, (v >> 20) & 1023, v >> 30]
-        }
-        28 | 29 => [unorm(b(0), 8), unorm(b(1), 8), unorm(b(2), 8), unorm(b(3), 8)],
-        30 => [b(0), b(1), b(2), b(3)],
-        31 => [snorm(b(0), 8), snorm(b(1), 8), snorm(b(2), 8), snorm(b(3), 8)],
-        32 => [sext(b(0), 8), sext(b(1), 8), sext(b(2), 8), sext(b(3), 8)],
-        34 => [half(h(0)), half(h(1)), 0, one_f],
-        35 => [unorm(h(0), 16), unorm(h(1), 16), 0, one_f],
-        36 => [h(0), h(1), 0, 1],
-        37 => [snorm(h(0), 16), snorm(h(1), 16), 0, one_f],
-        38 => [sext(h(0), 16), sext(h(1), 16), 0, 1],
-        41 => [w(0), 0, 0, one_f],
-        42 | 43 => [w(0), 0, 0, 1],
-        49 => [unorm(b(0), 8), unorm(b(1), 8), 0, one_f],
-        50 => [b(0), b(1), 0, 1],
-        51 => [snorm(b(0), 8), snorm(b(1), 8), 0, one_f],
-        52 => [sext(b(0), 8), sext(b(1), 8), 0, 1],
-        54 => [half(h(0)), 0, 0, one_f],
-        56 => [unorm(h(0), 16), 0, 0, one_f],
-        57 => [h(0), 0, 0, 1],
-        58 => [snorm(h(0), 16), 0, 0, one_f],
-        59 => [sext(h(0), 16), 0, 0, 1],
-        61 => [unorm(b(0), 8), 0, 0, one_f],
-        62 => [b(0), 0, 0, 1],
-        63 => [snorm(b(0), 8), 0, 0, one_f],
-        64 => [sext(b(0), 8), 0, 0, 1],
-        87 => [unorm(b(2), 8), unorm(b(1), 8), unorm(b(0), 8), unorm(b(3), 8)],
-        88 => [unorm(b(2), 8), unorm(b(1), 8), unorm(b(0), 8), one_f],
-        _ => return None,
-    })
+    crate::format::load_typed(fmt, p)
 }
 
 /// Where each of the vertex shader's inputs comes from.

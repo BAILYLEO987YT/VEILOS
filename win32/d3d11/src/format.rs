@@ -389,3 +389,157 @@ fn bc_block(f: u32, b: &[u8]) -> [u32; 16] {
         a << 24 | p[0] << 16 | p[1] << 8 | p[2]
     })
 }
+
+// -----| shader registers as elements |-----
+
+fn unorm_bits(v: u32, bits: u32) -> u32 {
+    (v as f32 / ((1u64 << bits) - 1) as f32).to_bits()
+}
+
+fn snorm(v: u32, bits: u32) -> u32 {
+    let s = ((v << (32 - bits)) as i32) >> (32 - bits);
+    (s as f32 / ((1u32 << (bits - 1)) - 1) as f32).max(-1.0).to_bits()
+}
+
+fn sext(v: u32, bits: u32) -> u32 {
+    (((v << (32 - bits)) as i32) >> (32 - bits)) as u32
+}
+
+/// An element of format `fmt` at `p` as a shader register: floats for the float
+/// and normalized formats, integers for the others; missing components 0,
+/// and w 1.
+pub fn load_typed(fmt: u32, p: &[u8]) -> Option<[u32; 4]> {
+    let w = |i: usize| -> u32 { u32::from_le_bytes(p[i * 4..i * 4 + 4].try_into().unwrap()) };
+    let h = |i: usize| -> u32 { u16::from_le_bytes(p[i * 2..i * 2 + 2].try_into().unwrap()) as u32 };
+    let b = |i: usize| -> u32 { p[i] as u32 };
+    let one_f = 1.0f32.to_bits();
+    let half = |v: u32| crate::vm::half_to_f32(v).to_bits();
+    let need = bytes(fmt)? as usize;
+    if p.len() < need {
+        return None;
+    }
+    Some(match fmt {
+        2 | 3 | 4 => [w(0), w(1), w(2), w(3)],
+        6 => [w(0), w(1), w(2), one_f],
+        7 | 8 => [w(0), w(1), w(2), 1],
+        10 => [half(h(0)), half(h(1)), half(h(2)), half(h(3))],
+        11 => [unorm_bits(h(0), 16), unorm_bits(h(1), 16), unorm_bits(h(2), 16), unorm_bits(h(3), 16)],
+        12 => [h(0), h(1), h(2), h(3)],
+        13 => [snorm(h(0), 16), snorm(h(1), 16), snorm(h(2), 16), snorm(h(3), 16)],
+        14 => [sext(h(0), 16), sext(h(1), 16), sext(h(2), 16), sext(h(3), 16)],
+        16 => [w(0), w(1), 0, one_f],
+        17 | 18 => [w(0), w(1), 0, 1],
+        24 => {
+            let v = w(0);
+            [unorm_bits(v & 1023, 10), unorm_bits((v >> 10) & 1023, 10), unorm_bits((v >> 20) & 1023, 10), unorm_bits(v >> 30, 2)]
+        }
+        25 => {
+            let v = w(0);
+            [v & 1023, (v >> 10) & 1023, (v >> 20) & 1023, v >> 30]
+        }
+        28 | 29 => [unorm_bits(b(0), 8), unorm_bits(b(1), 8), unorm_bits(b(2), 8), unorm_bits(b(3), 8)],
+        30 => [b(0), b(1), b(2), b(3)],
+        31 => [snorm(b(0), 8), snorm(b(1), 8), snorm(b(2), 8), snorm(b(3), 8)],
+        32 => [sext(b(0), 8), sext(b(1), 8), sext(b(2), 8), sext(b(3), 8)],
+        34 => [half(h(0)), half(h(1)), 0, one_f],
+        35 => [unorm_bits(h(0), 16), unorm_bits(h(1), 16), 0, one_f],
+        36 => [h(0), h(1), 0, 1],
+        37 => [snorm(h(0), 16), snorm(h(1), 16), 0, one_f],
+        38 => [sext(h(0), 16), sext(h(1), 16), 0, 1],
+        41 => [w(0), 0, 0, one_f],
+        42 | 43 => [w(0), 0, 0, 1],
+        49 => [unorm_bits(b(0), 8), unorm_bits(b(1), 8), 0, one_f],
+        50 => [b(0), b(1), 0, 1],
+        51 => [snorm(b(0), 8), snorm(b(1), 8), 0, one_f],
+        52 => [sext(b(0), 8), sext(b(1), 8), 0, 1],
+        54 => [half(h(0)), 0, 0, one_f],
+        56 => [unorm_bits(h(0), 16), 0, 0, one_f],
+        57 => [h(0), 0, 0, 1],
+        58 => [snorm(h(0), 16), 0, 0, one_f],
+        59 => [sext(h(0), 16), 0, 0, 1],
+        61 => [unorm_bits(b(0), 8), 0, 0, one_f],
+        62 => [b(0), 0, 0, 1],
+        63 => [snorm(b(0), 8), 0, 0, one_f],
+        64 => [sext(b(0), 8), 0, 0, 1],
+        87 => [unorm_bits(b(2), 8), unorm_bits(b(1), 8), unorm_bits(b(0), 8), unorm_bits(b(3), 8)],
+        88 => [unorm_bits(b(2), 8), unorm_bits(b(1), 8), unorm_bits(b(0), 8), one_f],
+        _ => return None,
+    })
+}
+
+
+/// Round to nearest, halves to even (as Direct3D converts to unorm).
+fn rne(x: f32) -> u32 {
+    let f = x as u32 as f32;
+    let d = x - f;
+    let r = x as u32;
+    if d > 0.5 || (d == 0.5 && r & 1 == 1) { r + 1 } else { r }
+}
+
+fn to_unorm(v: u32, bits: u32) -> u32 {
+    let x = f32::from_bits(v);
+    let x = if x > 0.0 { x.min(1.0) } else { 0.0 };
+    rne(x * ((1u64 << bits) - 1) as f32)
+}
+
+fn to_snorm(v: u32, bits: u32) -> u32 {
+    let x = f32::from_bits(v);
+    let x = if x > -1.0 { x.min(1.0) } else { -1.0 };
+    let m = ((1u32 << (bits - 1)) - 1) as f32;
+    let s = if x < 0.0 { -(rne(-x * m) as i32) } else { rne(x * m) as i32 };
+    (s as u32) & ((1u64 << bits) - 1) as u32
+}
+
+/// A shader register stored as an element of format `fmt` at `p` (as
+/// `load_typed` reads it); false if the format isn't one we write.
+pub fn store_typed(fmt: u32, v: [u32; 4], p: &mut [u8]) -> bool {
+    let Some(n) = bytes(fmt) else { return false };
+    if p.len() < n as usize {
+        return false;
+    }
+    let mut w = |i: usize, x: u32| p[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+    let hf = |x: u32| to_half(f32::from_bits(x)) as u32;
+    match fmt {
+        2..=4 => (0..4).for_each(|i| w(i, v[i])),
+        6..=8 => (0..3).for_each(|i| w(i, v[i])),
+        16..=18 => (0..2).for_each(|i| w(i, v[i])),
+        41..=43 => w(0, v[0]),
+        _ => {
+            let (a, b, c, d) = (v[0], v[1], v[2], v[3]);
+            let h = |p: &mut [u8], i: usize, x: u32| p[i * 2..i * 2 + 2].copy_from_slice(&(x as u16).to_le_bytes());
+            match fmt {
+                10 => [a, b, c, d].iter().enumerate().for_each(|(i, &x)| h(p, i, hf(x))),
+                11 => [a, b, c, d].iter().enumerate().for_each(|(i, &x)| h(p, i, to_unorm(x, 16))),
+                12 | 14 => [a, b, c, d].iter().enumerate().for_each(|(i, &x)| h(p, i, x)),
+                13 => [a, b, c, d].iter().enumerate().for_each(|(i, &x)| h(p, i, to_snorm(x, 16))),
+                24 => p[..4].copy_from_slice(&(to_unorm(a, 10) | to_unorm(b, 10) << 10 | to_unorm(c, 10) << 20 | to_unorm(d, 2) << 30).to_le_bytes()),
+                25 => p[..4].copy_from_slice(&((a & 1023) | (b & 1023) << 10 | (c & 1023) << 20 | (d & 3) << 30).to_le_bytes()),
+                28 | 29 => [a, b, c, d].iter().enumerate().for_each(|(i, &x)| p[i] = to_unorm(x, 8) as u8),
+                30 | 32 => [a, b, c, d].iter().enumerate().for_each(|(i, &x)| p[i] = x as u8),
+                31 => [a, b, c, d].iter().enumerate().for_each(|(i, &x)| p[i] = to_snorm(x, 8) as u8),
+                34 => [a, b].iter().enumerate().for_each(|(i, &x)| h(p, i, hf(x))),
+                35 => [a, b].iter().enumerate().for_each(|(i, &x)| h(p, i, to_unorm(x, 16))),
+                36 | 38 => [a, b].iter().enumerate().for_each(|(i, &x)| h(p, i, x)),
+                37 => [a, b].iter().enumerate().for_each(|(i, &x)| h(p, i, to_snorm(x, 16))),
+                49 => [a, b].iter().enumerate().for_each(|(i, &x)| p[i] = to_unorm(x, 8) as u8),
+                50 | 52 => [a, b].iter().enumerate().for_each(|(i, &x)| p[i] = x as u8),
+                51 => [a, b].iter().enumerate().for_each(|(i, &x)| p[i] = to_snorm(x, 8) as u8),
+                54 => h(p, 0, hf(a)),
+                56 => h(p, 0, to_unorm(a, 16)),
+                57 | 59 => h(p, 0, a),
+                58 => h(p, 0, to_snorm(a, 16)),
+                61 => p[0] = to_unorm(a, 8) as u8,
+                62 | 64 => p[0] = a as u8,
+                63 => p[0] = to_snorm(a, 8) as u8,
+                87 | 88 => {
+                    p[0] = to_unorm(c, 8) as u8;
+                    p[1] = to_unorm(b, 8) as u8;
+                    p[2] = to_unorm(a, 8) as u8;
+                    p[3] = if fmt == 87 { to_unorm(d, 8) as u8 } else { 255 };
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
+}

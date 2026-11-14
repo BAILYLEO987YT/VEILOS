@@ -674,8 +674,8 @@ pub static ID3D11DEVICECONTEXT: Vtbl<115> = Vtbl([
     crate::draw::Ctx_DrawAuto as *const (),
     stub_Ctx_DrawIndexedInstancedIndirect as *const (),
     stub_Ctx_DrawInstancedIndirect as *const (),
-    stub_Ctx_Dispatch as *const (),
-    stub_Ctx_DispatchIndirect as *const (),
+    crate::compute::Ctx_Dispatch as *const (),
+    crate::compute::Ctx_DispatchIndirect as *const (),
     crate::context::Ctx_RSSetState as *const (),
     crate::context::Ctx_RSSetViewports as *const (),
     crate::context::Ctx_RSSetScissorRects as *const (),
@@ -769,7 +769,7 @@ pub static ID3D11DEVICE: Vtbl<43> = Vtbl([
     crate::shader::Dev_CreatePixelShader as *const (),
     stub_Dev_CreateHullShader as *const (),
     stub_Dev_CreateDomainShader as *const (),
-    stub_Dev_CreateComputeShader as *const (),
+    crate::compute::Dev_CreateComputeShader as *const (),
     stub_Dev_CreateClassLinkage as *const (),
     crate::state::Dev_CreateBlendState as *const (),
     crate::state::Dev_CreateDepthStencilState as *const (),
@@ -916,14 +916,6 @@ unsafe extern "system" fn stub_Ctx_DrawInstancedIndirect() -> usize {
     unimplemented(b"ID3D11DeviceContext::DrawInstancedIndirect\0");
     0
 }
-unsafe extern "system" fn stub_Ctx_Dispatch() -> usize {
-    unimplemented(b"ID3D11DeviceContext::Dispatch\0");
-    0
-}
-unsafe extern "system" fn stub_Ctx_DispatchIndirect() -> usize {
-    unimplemented(b"ID3D11DeviceContext::DispatchIndirect\0");
-    0
-}
 unsafe extern "system" fn stub_Ctx_CopyStructureCount() -> usize {
     unimplemented(b"ID3D11DeviceContext::CopyStructureCount\0");
     0
@@ -958,10 +950,6 @@ unsafe extern "system" fn stub_Dev_CreateHullShader() -> i32 {
 }
 unsafe extern "system" fn stub_Dev_CreateDomainShader() -> i32 {
     unimplemented(b"ID3D11Device::CreateDomainShader\0");
-    E_NOTIMPL
-}
-unsafe extern "system" fn stub_Dev_CreateComputeShader() -> i32 {
-    unimplemented(b"ID3D11Device::CreateComputeShader\0");
     E_NOTIMPL
 }
 unsafe extern "system" fn stub_Dev_CreateClassLinkage() -> i32 {

@@ -15,8 +15,9 @@ use crate::vtbl::*;
 pub const LEVEL_9_1: u32 = 0x9100;
 pub const LEVEL_10_0: u32 = 0xA000;
 pub const LEVEL_10_1: u32 = 0xA100;
-/// The highest feature level here (G5f1).
-pub const LEVEL_MAX: u32 = LEVEL_10_1;
+pub const LEVEL_11_0: u32 = 0xB000;
+/// The highest feature level here (G5f2).
+pub const LEVEL_MAX: u32 = LEVEL_11_0;
 
 /// Primitives waiting to go to the kernel in one VEIL_GPU3D draw.
 #[derive(Default)]
