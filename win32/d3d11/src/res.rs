@@ -108,6 +108,9 @@ pub struct Resource {
     pub priority: u32,
     /// The device, for flushing its waiting draws.
     pub device: *mut Com,
+    /// Stream output: the bytes written (where the next write goes, and
+    /// what DrawAuto draws).
+    pub so_filled: u32,
 }
 
 impl Drop for Resource {
@@ -400,6 +403,7 @@ fn make_texture(dev: *mut Com, dim: u32, td: &Tex2DDesc, depth: u32, init: *cons
         dirty: vec![true; array as usize],
         mapped: vec![false; n],
         priority: 0,
+        so_filled: 0,
         device: dev,
     };
     if !init.is_null() {
@@ -556,6 +560,7 @@ pub unsafe extern "system" fn Dev_CreateBuffer(this: *mut Com, desc: *const Buff
         dirty: Vec::new(),
         mapped: vec![false],
         priority: 0,
+        so_filled: 0,
         device: main_of(this),
     };
     if out.is_null() {

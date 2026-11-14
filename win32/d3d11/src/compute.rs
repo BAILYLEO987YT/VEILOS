@@ -250,7 +250,7 @@ pub unsafe extern "system" fn Dev_CreateComputeShader(this: *mut Com, code: *con
     if out.is_null() {
         return S_FALSE;
     }
-    let obj = crate::shader::ShaderObj { code: bytes, sh, ps: None, kernel: 0 };
+    let obj = crate::shader::ShaderObj { code: bytes, sh, ps: None, kernel: 0, so: None };
     unsafe { *out = Com::new(&crate::vtbl::ID3D11COMPUTESHADER, &CS_IIDS, dev, Body::Shader(Box::new(obj))) };
     S_OK
 }

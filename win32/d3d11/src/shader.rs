@@ -15,6 +15,19 @@ pub struct ShaderObj {
     /// A pixel shader's translation and its kernel program.
     pub ps: Option<crate::ps::PsCode>,
     pub kernel: u64,
+    /// Stream output: its declaration.
+    pub so: Option<StreamOut>,
+}
+
+/// One D3D11_SO_DECLARATION_ENTRY: (stream, semantic (None: a gap), its
+/// index, first component, components, output slot).
+pub type SoEntry = (u32, Option<Vec<u8>>, u32, u8, u8, u8);
+
+pub struct StreamOut {
+    pub entries: Vec<SoEntry>,
+    pub strides: [u32; 4],
+    /// The stream rasterized (u32::MAX: none).
+    pub rasterized: u32,
 }
 
 impl Drop for ShaderObj {
@@ -78,7 +91,7 @@ unsafe fn make(this: *mut Com, code: *const u8, len: usize, kind: u32, out: *mut
         1 => (&ID3D11VERTEXSHADER, &VS_IIDS),
         _ => (&ID3D11GEOMETRYSHADER, &GS_IIDS),
     };
-    unsafe { *out = Com::new(vt, iids, dev, Body::Shader(Box::new(ShaderObj { code: bytes, sh, ps, kernel }))) };
+    unsafe { *out = Com::new(vt, iids, dev, Body::Shader(Box::new(ShaderObj { code: bytes, sh, ps, kernel, so: None }))) };
     S_OK
 }
 
@@ -90,7 +103,63 @@ pub unsafe extern "system" fn Dev_CreatePixelShader(this: *mut Com, code: *const
     unsafe { make(this, code, len, 0, out) }
 }
 
-/// Geometry shaders are made (and kept) but don't run yet (G5f2).
 pub unsafe extern "system" fn Dev_CreateGeometryShader(this: *mut Com, code: *const u8, len: usize, _link: *mut Com, out: *mut *mut Com) -> i32 {
     unsafe { make(this, code, len, 2, out) }
+}
+
+/// D3D11_SO_DECLARATION_ENTRY.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SoDecl {
+    pub stream: u32,
+    pub name: *const u8,
+    pub index: u32,
+    pub start: u8,
+    pub count: u8,
+    pub slot: u8,
+}
+
+/// A geometry shader with stream output, or a vertex shader's code to
+/// stream its vertices out with no geometry shader (the "geometry shader"
+/// then only passes them on).
+pub unsafe extern "system" fn Dev_CreateGeometryShaderWithStreamOutput(
+    this: *mut Com,
+    code: *const u8,
+    len: usize,
+    decls: *const SoDecl,
+    n: u32,
+    strides: *const u32,
+    nstrides: u32,
+    rasterized: u32,
+    _link: *mut Com,
+    out: *mut *mut Com,
+) -> i32 {
+    if code.is_null() || len < 32 || (decls.is_null() && n > 0) || n > 64 || nstrides > 4 {
+        return E_INVALIDARG;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(code, len) }.to_vec();
+    let Some(sh) = crate::dxbc::parse(&bytes) else { return E_INVALIDARG };
+    if !matches!(sh.kind, 1 | 2) || crate::vm::Vm::new(&sh).is_none() {
+        return E_INVALIDARG;
+    }
+    let mut entries = Vec::new();
+    for i in 0..n as usize {
+        let d = unsafe { *decls.add(i) };
+        let name = (!d.name.is_null()).then(|| unsafe { core::ffi::CStr::from_ptr(d.name as *const core::ffi::c_char) }.to_bytes().to_ascii_uppercase());
+        if d.slot > 3 || d.start as u32 + d.count as u32 > 4 && name.is_some() {
+            return E_INVALIDARG;
+        }
+        entries.push((d.stream, name, d.index, d.start, d.count, d.slot));
+    }
+    let mut st = [0u32; 4];
+    for i in 0..nstrides as usize {
+        st[i] = unsafe { *strides.add(i) };
+    }
+    if out.is_null() {
+        return S_FALSE;
+    }
+    let dev = main_of(this);
+    let so = Some(StreamOut { entries, strides: st, rasterized });
+    unsafe { *out = Com::new(&ID3D11GEOMETRYSHADER, &GS_IIDS, dev, Body::Shader(Box::new(ShaderObj { code: bytes, sh, ps: None, kernel: 0, so }))) };
+    S_OK
 }

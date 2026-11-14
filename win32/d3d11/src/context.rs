@@ -425,6 +425,9 @@ pub unsafe extern "system" fn Ctx_SOSetTargets(this: *mut Com, n: u32, b: *const
         let v = if (i as u32) < n && !b.is_null() { main_of(unsafe { *b.add(i) }) } else { NULL };
         unsafe { set_ref(&mut s.so[i].0, v) };
         s.so[i].1 = if (i as u32) < n && !offsets.is_null() { unsafe { *offsets.add(i) } } else { 0 };
+        if crate::res::is_resource(v) && s.so[i].1 != u32::MAX {
+            crate::res::resource(v).so_filled = s.so[i].1;
+        }
     }
 }
 

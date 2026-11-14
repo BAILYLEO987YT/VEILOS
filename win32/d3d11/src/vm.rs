@@ -275,6 +275,10 @@ pub struct Regs {
     pub ids: [R4; 4],
     /// Compute: the group's shared memory (g#), shared by its threads.
     pub tgsm: *mut Vec<Vec<u8>>,
+    /// Geometry: the primitive's number, and the vertices emitted (their
+    /// outputs; None: a cut).
+    pub prim: u32,
+    pub emitted: Vec<Option<Vec<R4>>>,
 }
 
 impl<'a> Vm<'a> {
@@ -301,6 +305,8 @@ impl<'a> Vm<'a> {
             o: vec![[0; 4]; outputs.max(32)],
             ids: [[0; 4]; 4],
             tgsm: core::ptr::null_mut(),
+            prim: 0,
+            emitted: Vec::new(),
         }
     }
 
@@ -320,7 +326,9 @@ impl<'a> Vm<'a> {
         let z = [0; 4];
         match o.ty {
             T_TEMP => g.r.get(self.index(g, o, 0) as usize).copied().unwrap_or(z),
+            T_INPUT if o.nidx == 2 => g.v.get((self.index(g, o, 0) * 32 + self.index(g, o, 1)) as usize).copied().unwrap_or(z),
             T_INPUT => g.v.get(self.index(g, o, 0) as usize).copied().unwrap_or(z),
+            crate::dxbc::T_PRIMITIVEID => [g.prim; 4],
             T_OUTPUT => g.o.get(self.index(g, o, 0) as usize).copied().unwrap_or(z),
             T_INDEXABLE => g.x.get(o.idx[0] as usize).and_then(|a| a.get(self.index(g, o, 1) as usize)).copied().unwrap_or(z),
             T_IMM32 => o.imm,
@@ -604,7 +612,22 @@ impl<'a> Vm<'a> {
                     }
                     continue;
                 }
-                DISCARD | EMIT | CUT | EMITTHENCUT => continue,
+                DISCARD => continue,
+                EMIT | CUT | EMITTHENCUT | EMIT_STREAM | CUT_STREAM | EMITTHENCUT_STREAM => {
+                    // Stream 0 only (the rasterized and usual one).
+                    if matches!(x.op, EMIT_STREAM | CUT_STREAM | EMITTHENCUT_STREAM) && x.ops.first().is_some_and(|o| o.idx[0] != 0) {
+                        continue;
+                    }
+                    if g.emitted.len() < 4096 {
+                        if matches!(x.op, EMIT | EMITTHENCUT | EMIT_STREAM | EMITTHENCUT_STREAM) {
+                            g.emitted.push(Some(g.o.clone()));
+                        }
+                        if matches!(x.op, CUT | EMITTHENCUT | CUT_STREAM | EMITTHENCUT_STREAM) {
+                            g.emitted.push(None);
+                        }
+                    }
+                    continue;
+                }
                 SYNC => {
                     // Thread group sync (bit 0 of its flags): wait for the others.
                     if x.ctrl & 1 != 0 && !g.tgsm.is_null() {

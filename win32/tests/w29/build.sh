@@ -35,7 +35,13 @@ for e in cs50_pattern cs50_buffers cs50_reduce cs50_hist vs50_main ps50_show; do
     "$FXC" /nologo /T $p /E $e /Fh build/dx4_$e.h /Vn $e dx4.hlsl >/dev/null
 done
 
-TESTS="dx1 dx2 dx3 dx4"
+# dx5's (gs40_ is gs_4_0).
+for e in vs40_main vs40_turn ps40_main gs40_sprite gs40_explode gs40_adj; do
+    p=$(echo $e | sed 's/^\(..\)\(.\)\(.\)_.*/\1_\2_\3/')
+    "$FXC" /nologo /T $p /E $e /Fh build/dx5_$e.h /Vn $e dx5.hlsl >/dev/null
+done
+
+TESTS="dx1 dx2 dx3 dx4 dx5"
 for t in $TESTS; do
     "$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
         "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \

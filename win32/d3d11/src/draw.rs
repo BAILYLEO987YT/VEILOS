@@ -484,6 +484,13 @@ fn setup(d: &mut Device) -> Option<(Out, Vm<'static>, Inputs, Vec<[Option<(usize
     let vs = crate::shader::of(d.state.stages[STAGE_VS].shader)?;
     // SAFETY: the shader object is held by the binding for the draw.
     let vs: &'static crate::shader::ShaderObj = unsafe { &*(vs as *const _) };
+    // The stage the rasterizer gets vertices from: the geometry shader if
+    // one is bound (a vertex shader's code with stream output passes the
+    // vertex shader's on).
+    let last = match crate::shader::of(d.state.stages[crate::context::STAGE_GS].shader) {
+        Some(g) if g.sh.kind == 2 => g,
+        _ => vs,
+    };
     let ps = crate::shader::of(d.state.stages[STAGE_PS].shader).filter(|p| p.ps.is_some());
     // The targets: the first render target and the depth-stencil view.
     let rtv = view(d.state.rtvs[0]);
@@ -606,7 +613,7 @@ fn setup(d: &mut Device) -> Option<(Out, Vm<'static>, Inputs, Vec<[Option<(usize
             }
             links.push(core::array::from_fn(|c| {
                 let (name, idx, comp) = inp.comps[c].as_ref()?;
-                let e = vs.sh.osgn.iter().find(|e| &e.name == name && e.index == *idx)?;
+                let e = last.sh.osgn.iter().find(|e| &e.name == name && e.index == *idx)?;
                 Some((e.reg as usize, e.mask.trailing_zeros() as usize + *comp as usize))
             }));
         }
@@ -750,7 +757,7 @@ fn setup(d: &mut Device) -> Option<(Out, Vm<'static>, Inputs, Vec<[Option<(usize
             }
         })
         .collect();
-    let pos = vs.sh.osgn.iter().find(|e| e.sysval == SV_POSITION || e.name == b"SV_POSITION").map(|e| e.reg as usize)?;
+    let pos = last.sh.osgn.iter().find(|e| e.sysval == SV_POSITION || e.name == b"SV_POSITION").map_or(usize::MAX, |e| e.reg as usize);
     Some((out, vm, Inputs { regs, vbs }, links, pos))
 }
 
@@ -762,6 +769,165 @@ fn ceil(x: f32) -> f32 {
     -crate::vm::floor(-x)
 }
 
+/// A vertex as a stage left it: its output registers.
+type Ov = Vec<R4>;
+
+/// A draw's primitives on their way: through the geometry shader, out to
+/// the stream output buffers, and to the rasterizer.
+struct Run<'a> {
+    d: &'a mut Device,
+    o: Out,
+    links: Vec<[Option<(usize, usize)>; 4]>,
+    pos: usize,
+    gs: Option<(Vm<'static>, &'static crate::shader::ShaderObj)>,
+    gs_cbs: [(*const u8, usize); 14],
+    /// The stream output: its declaration and the outputs it reads.
+    so: Option<&'static crate::shader::ShaderObj>,
+    raster: bool,
+    prim: u32,
+}
+
+impl Run<'_> {
+    /// One primitive from the input assembler (adjacent vertices too).
+    fn input(&mut self, p: &[&Ov], adjacency: bool) {
+        if let Some((vm, gs)) = &self.gs {
+            let env = StageEnv { cbs: &self.gs_cbs };
+            let mut g = vm.regs(32 * 6, 32);
+            for (i, v) in p.iter().enumerate() {
+                for r in 0..32.min(v.len()) {
+                    g.v[i * 32 + r] = v[r];
+                }
+            }
+            g.prim = self.prim;
+            vm.run(&mut g, &env);
+            let max = gs.sh.gs_max.max(1) as usize;
+            let mut strip: Vec<Ov> = Vec::new();
+            let mut n = 0;
+            let out = gs.sh.gs_out;
+            for e in core::mem::take(&mut g.emitted).into_iter().chain(core::iter::once(None)) {
+                match e {
+                    Some(v) if n < max => {
+                        n += 1;
+                        strip.push(v);
+                        if out == 1 {
+                            let v = strip.pop().unwrap();
+                            self.output(&[&v]);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        let s = core::mem::take(&mut strip);
+                        match out {
+                            3 => {
+                                for w in s.windows(2) {
+                                    self.output(&[&w[0], &w[1]]);
+                                }
+                            }
+                            5 => {
+                                for i in 2..s.len() {
+                                    if i % 2 == 0 {
+                                        self.output(&[&s[i - 2], &s[i - 1], &s[i]]);
+                                    } else {
+                                        self.output(&[&s[i - 1], &s[i - 2], &s[i]]);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        } else if adjacency {
+            match p.len() {
+                4 => self.output(&[p[1], p[2]]),
+                6 => self.output(&[p[0], p[2], p[4]]),
+                _ => {}
+            }
+        } else {
+            self.output(p);
+        }
+        self.prim += 1;
+    }
+
+    /// A primitive leaving the geometry stages.
+    fn output(&mut self, p: &[&Ov]) {
+        if self.so.is_some() {
+            self.stream_out(p);
+        }
+        if !self.raster || self.pos == usize::MAX {
+            return;
+        }
+        let v: Vec<V> = p
+            .iter()
+            .map(|o| V {
+                c: o.get(self.pos).copied().unwrap_or([0; 4]).map(f),
+                outs: core::array::from_fn(|i| match self.links.get(i) {
+                    Some(l) => core::array::from_fn(|c| match l[c] {
+                        Some((r, cc)) => o.get(r).map_or(0.0, |x| f(x[cc & 3])),
+                        None => 0.0,
+                    }),
+                    None => [0.0; 4],
+                }),
+            })
+            .collect();
+        match v.len() {
+            1 => point(self.d, &self.o, &v[0]),
+            2 => line(self.d, &self.o, &v[0], &v[1]),
+            3 => triangle(self.d, &self.o, &v[0], &v[1], &v[2]),
+            _ => {}
+        }
+    }
+
+    /// Write a primitive's vertices to the stream output buffers, if they
+    /// all have room for it.
+    fn stream_out(&mut self, p: &[&Ov]) {
+        let Some(sh) = self.so else { return };
+        let Some(so) = &sh.so else { return };
+        let gs = self.gs.as_ref().map_or(sh, |g| g.1);
+        // Each slot's stride: as given, else what its entries add up to.
+        let mut strides = so.strides;
+        for k in 0..4 {
+            if strides[k] == 0 {
+                strides[k] = so.entries.iter().filter(|e| e.0 == 0 && e.5 as usize == k).map(|e| e.4 as u32 * 4).sum();
+            }
+        }
+        let used: Vec<usize> = (0..4).filter(|&k| so.entries.iter().any(|e| e.0 == 0 && e.5 as usize == k)).collect();
+        for &k in &used {
+            let b = self.d.state.so[k].0;
+            if !crate::res::is_resource(b) {
+                return;
+            }
+            let r = resource(b);
+            if r.so_filled as usize + p.len() * strides[k] as usize > r.data.len() {
+                return;
+            }
+        }
+        for v in p {
+            let mut at = [0usize; 4];
+            for e in so.entries.iter().filter(|e| e.0 == 0) {
+                let k = e.5 as usize;
+                let r = resource(self.d.state.so[k].0);
+                let base = r.so_filled as usize + at[k];
+                if let Some(name) = &e.1 {
+                    if let Some(el) = gs.sh.osgn.iter().find(|x| &x.name == name && x.index == e.2) {
+                        let first = el.mask.trailing_zeros() as usize + e.3 as usize;
+                        for j in 0..e.4 as usize {
+                            let val = v.get(el.reg as usize).map_or(0, |x| x[(first + j) & 3]);
+                            if let Some(s) = r.data.get_mut(base + j * 4..base + j * 4 + 4) {
+                                s.copy_from_slice(&val.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+                at[k] += e.4 as usize * 4;
+            }
+            for &k in &used {
+                resource(self.d.state.so[k].0).so_filled += strides[k];
+            }
+        }
+    }
+}
+
 /// Draw `count` vertices of the bound topology, vertex i being `index(i)`
 /// (None: a strip cut), for each instance.
 fn draw(this: *mut Com, count: u32, instances: u32, start_instance: u32, index: &dyn Fn(usize) -> Option<Option<usize>>) {
@@ -769,17 +935,21 @@ fn draw(this: *mut Com, count: u32, instances: u32, start_instance: u32, index: 
     let topo = d.state.topology;
     let Some((o, vm, inputs, links, pos)) = setup(d) else { return };
     let cbs = stage_cbs(d, STAGE_VS);
+    let gs_cbs = stage_cbs(d, crate::context::STAGE_GS);
+    let gso = crate::shader::of(d.state.stages[crate::context::STAGE_GS].shader).map(|g| unsafe { &*(g as *const crate::shader::ShaderObj) });
+    let gs = gso.filter(|g| g.sh.kind == 2).and_then(|g| Vm::new(&g.sh).map(|v| (v, g)));
+    let so = gso.filter(|g| g.so.is_some());
+    let raster = so.and_then(|s| s.so.as_ref()).is_none_or(|s| s.rasterized == 0);
     let env = StageEnv { cbs: &cbs };
     let mut regs = vm.regs(32, 32);
-    let mut cache: alloc::collections::BTreeMap<usize, V> = alloc::collections::BTreeMap::new();
-    for inst in 0..instances.max(1) as usize {
-        if instances == 0 {
-            break;
-        }
+    let mut run = Run { d, o, links, pos, gs, gs_cbs, so, raster, prim: 0 };
+    let mut cache: alloc::collections::BTreeMap<usize, Ov> = alloc::collections::BTreeMap::new();
+    for inst in 0..instances as usize {
         cache.clear();
-        let mut shade = |vi: usize| -> V {
+        run.prim = 0;
+        let mut shade = |vi: usize| -> Ov {
             if let Some(v) = cache.get(&vi) {
-                return *v;
+                return v.clone();
             }
             for r in regs.o.iter_mut() {
                 *r = [0; 4];
@@ -789,22 +959,11 @@ fn draw(this: *mut Com, count: u32, instances: u32, start_instance: u32, index: 
             }
             inputs.fill(&mut regs.v, vi, inst, start_instance as usize);
             vm.run(&mut regs, &env);
-            let p = regs.o[pos].map(f);
-            let v = V {
-                c: p,
-                outs: core::array::from_fn(|i| match links.get(i) {
-                    Some(l) => core::array::from_fn(|c| match l[c] {
-                        Some((r, cc)) => regs.o.get(r).map_or(0.0, |x| f(x[cc & 3])),
-                        None => 0.0,
-                    }),
-                    None => [0.0; 4],
-                }),
-            };
-            cache.insert(vi, v);
-            v
+            cache.insert(vi, regs.o.clone());
+            regs.o.clone()
         };
         // The vertices in order, with strip cuts.
-        let mut verts: Vec<Option<V>> = Vec::with_capacity(count as usize);
+        let mut verts: Vec<Option<Ov>> = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
             match index(i) {
                 Some(Some(vi)) => verts.push(Some(shade(vi))),
@@ -812,49 +971,28 @@ fn draw(this: *mut Com, count: u32, instances: u32, start_instance: u32, index: 
                 None => break,
             }
         }
+        // Primitives, lists in groups and strips in runs between cuts.
+        let runs: Vec<Vec<&Ov>> = verts.split(|v| v.is_none()).map(|r| r.iter().flatten().collect()).collect();
+        let all: Vec<&Ov> = verts.iter().flatten().collect();
         match topo {
-            1 => {
-                for v in verts.iter().flatten() {
-                    point(d, &o, v);
-                }
-            }
-            2 => {
-                for p in verts.chunks_exact(2) {
-                    if let (Some(a), Some(b)) = (&p[0], &p[1]) {
-                        line(d, &o, a, b);
-                    }
-                }
-            }
-            3 => {
-                for p in verts.windows(2) {
-                    if let (Some(a), Some(b)) = (&p[0], &p[1]) {
-                        line(d, &o, a, b);
-                    }
-                }
-            }
-            4 => {
-                for t in verts.chunks_exact(3) {
-                    if let (Some(a), Some(b), Some(c)) = (&t[0], &t[1], &t[2]) {
-                        triangle(d, &o, a, b, c);
-                    }
-                }
-            }
+            1 => all.iter().for_each(|v| run.input(&[v], false)),
+            2 => all.chunks_exact(2).for_each(|p| run.input(p, false)),
+            3 => runs.iter().for_each(|r| r.windows(2).for_each(|p| run.input(p, false))),
+            4 => all.chunks_exact(3).for_each(|p| run.input(p, false)),
             5 => {
-                // Strips restart after a cut; every other triangle reversed.
-                let mut run: Vec<V> = Vec::new();
-                for v in verts.iter().chain(core::iter::once(&None)) {
-                    match v {
-                        Some(v) => run.push(*v),
-                        None => {
-                            for i in 2..run.len() {
-                                let (a, b, c) = if i % 2 == 0 { (&run[i - 2], &run[i - 1], &run[i]) } else { (&run[i - 1], &run[i - 2], &run[i]) };
-                                triangle(d, &o, a, b, c);
-                            }
-                            run.clear();
+                for r in &runs {
+                    for i in 2..r.len() {
+                        if i % 2 == 0 {
+                            run.input(&[r[i - 2], r[i - 1], r[i]], false);
+                        } else {
+                            run.input(&[r[i - 1], r[i - 2], r[i]], false);
                         }
                     }
                 }
             }
+            10 => all.chunks_exact(4).for_each(|p| run.input(p, true)),
+            11 => runs.iter().for_each(|r| r.windows(4).for_each(|p| run.input(p, true))),
+            12 => all.chunks_exact(6).for_each(|p| run.input(p, true)),
             _ => {}
         }
     }
@@ -909,5 +1047,13 @@ pub unsafe extern "system" fn Ctx_DrawIndexedInstanced(this: *mut Com, count: u3
     draw(this, count, instances, start_instance, &|i| read_index(ib, start as usize + i, base));
 }
 
-/// Stream output isn't here yet (G5f2): nothing to draw from.
-pub unsafe extern "system" fn Ctx_DrawAuto(_this: *mut Com) {}
+/// As many vertices as stream output wrote into vertex buffer 0.
+pub unsafe extern "system" fn Ctx_DrawAuto(this: *mut Com) {
+    let d = crate::device::of(main_of(this));
+    let (b, stride, off) = d.state.vbs[0];
+    if !crate::res::is_resource(b) || stride == 0 {
+        return;
+    }
+    let n = resource(b).so_filled.saturating_sub(off) / stride;
+    draw(this, n, 1, 0, &|i| Some(Some(i)));
+}

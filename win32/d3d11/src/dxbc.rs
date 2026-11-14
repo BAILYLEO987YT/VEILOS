@@ -192,6 +192,12 @@ pub mod op {
     pub const IMM_ATOMIC_UMAX: u16 = 0xbc;
     pub const IMM_ATOMIC_UMIN: u16 = 0xbd;
     pub const SYNC: u16 = 0xbe;
+    pub const DCL_GS_OUTPUT_TOPOLOGY: u16 = 0x5c;
+    pub const DCL_GS_INPUT_PRIMITIVE: u16 = 0x5d;
+    pub const DCL_MAX_OUTPUT_VERTEX_COUNT: u16 = 0x5e;
+    pub const EMIT_STREAM: u16 = 0x75;
+    pub const CUT_STREAM: u16 = 0x76;
+    pub const EMITTHENCUT_STREAM: u16 = 0x77;
 }
 
 // System values (D3D_NAME).
@@ -323,6 +329,13 @@ pub struct Shader {
     pub tgsm: Vec<(u32, u32, u32)>,
     /// t# that are raw (stride 0) or structured buffers.
     pub buffers: Vec<(u32, u32)>,
+    /// Geometry shaders: the input primitive (1 point, 2 line, 3
+    /// triangle, 6 line with adjacency, 7 triangle with adjacency), the
+    /// output topology (1 points, 3 line strip, 5 triangle strip), and the
+    /// most vertices emitted.
+    pub gs_in: u32,
+    pub gs_out: u32,
+    pub gs_max: u32,
 }
 
 struct Rd<'a> {
@@ -418,7 +431,7 @@ fn dsts(o: u16) -> u8 {
     match o {
         SINCOS | UDIV | IMUL | UMUL | SWAPC => 2,
         IMM_ATOMIC_ALLOC..=IMM_ATOMIC_UMIN => 2,
-        SYNC => 0,
+        SYNC | EMIT_STREAM | CUT_STREAM | EMITTHENCUT_STREAM => 0,
         BREAK | BREAKC | CALL | CALLC | CASE | CONTINUE | CONTINUEC | CUT | DEFAULT | DISCARD | ELSE | EMIT | EMITTHENCUT | ENDIF | ENDLOOP | ENDSWITCH | IF
         | LABEL | LOOP | NOP | RET | RETC | SWITCH => 0,
         _ => 1,
@@ -489,6 +502,9 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
         uavs: Vec::new(),
         tgsm: Vec::new(),
         buffers: Vec::new(),
+        gs_in: 0,
+        gs_out: 0,
+        gs_max: 0,
     };
     let mut at = 2;
     while at < len {
@@ -565,6 +581,9 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
                 sh.outputs.push(InDecl { reg: x.idx[0], mask: x.mask, sysval, interp: 0, special: if x.ty == T_OUTPUT { 0 } else { x.ty } });
             }
             op::DCL_THREAD_GROUP => sh.group = [r.next()?, r.next()?, r.next()?],
+            op::DCL_GS_OUTPUT_TOPOLOGY => sh.gs_out = (ctrl & 0x3F) as u32,
+            op::DCL_GS_INPUT_PRIMITIVE => sh.gs_in = (ctrl & 0x3F) as u32,
+            op::DCL_MAX_OUTPUT_VERTEX_COUNT => sh.gs_max = r.next()?.min(1024),
             op::DCL_UAV_TYPED | op::DCL_UAV_RAW | op::DCL_UAV_STRUCTURED => {
                 let x = operand(&mut r)?;
                 let stride = if o == op::DCL_UAV_STRUCTURED { r.next()? } else { 0 };
@@ -591,7 +610,8 @@ pub fn parse(b: &[u8]) -> Option<Shader> {
             o if o < op::DCL_RESOURCE
                 || matches!(o, op::LOD | op::GATHER4 | op::SAMPLE_POS | op::SAMPLE_INFO | op::BUFINFO)
                 || (0x7a..=0x8e).contains(&o)
-                || (op::LD_UAV_TYPED..=op::SYNC).contains(&o) =>
+                || (op::LD_UAV_TYPED..=op::SYNC).contains(&o)
+                || (op::EMIT_STREAM..=op::EMITTHENCUT_STREAM).contains(&o) =>
             {
                 let mut ops = Vec::new();
                 while r.at < end {
