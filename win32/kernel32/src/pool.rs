@@ -311,3 +311,23 @@ pub unsafe extern "system" fn InterlockedFlushSList(h: *mut u64) -> *mut u64 {
 pub unsafe extern "system" fn QueryDepthSList(h: *const u64) -> u16 {
     unsafe { *h.add(1) as u16 }
 }
+
+// -----| thread pool waits |-----
+//
+// Not here yet: CreateThreadpoolWait says so (NULL), and what would act on
+// one has nothing to do.
+
+#[no_mangle]
+pub extern "system" fn CreateThreadpoolWait(_callback: u64, _context: u64, _env: usize) -> *mut u8 {
+    crate::SetLastError(50);
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub extern "system" fn SetThreadpoolWait(_w: *mut u8, _h: Handle, _timeout: *const i64) {}
+
+#[no_mangle]
+pub extern "system" fn CloseThreadpoolWait(_w: *mut u8) {}
+
+#[no_mangle]
+pub extern "system" fn FreeLibraryWhenCallbackReturns(_instance: *mut u8, _module: u64) {}

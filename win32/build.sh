@@ -75,7 +75,7 @@ $(unsup VeilCngUnsupported LsaAddAccountRights LsaRemoveAccountRights)
     LsaClose=kernel32.LsaClose
     LsaQueryInformationPolicy=kernel32.LsaQueryInformationPolicy
     LsaFreeMemory=kernel32.LsaFreeMemory
-" fwd advapi32.dll CryptImportKey CryptEncrypt CryptDestroyKey IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeSid FreeSid IsWellKnownSid CheckTokenMembership ConvertSidToStringSidA ConvertSidToStringSidW SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
+" fwd advapi32.dll CredWriteW CredReadW CredEnumerateW CredDeleteW CredFree CredGetSessionTypes CryptImportKey CryptEncrypt CryptDestroyKey IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeSid FreeSid IsWellKnownSid CheckTokenMembership ConvertSidToStringSidA ConvertSidToStringSidW SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
     CryptCreateHash CryptHashData CryptGetHashParam CryptDestroyHash CreateProcessAsUserW DecryptFileW DuplicateEncryptionInfoFile GetFileSecurityW     GetSecurityDescriptorOwner GetTokenInformation GetUserNameA GetUserNameW IsTextUnicode OpenProcessToken     OpenThreadToken RevertToSelf AdjustTokenPrivileges LookupPrivilegeValueW LookupAccountSidW InitializeAcl \
     InitializeSecurityDescriptor IsValidSecurityDescriptor GetSecurityDescriptorControl GetSecurityDescriptorDacl \
     GetSecurityDescriptorGroup GetSecurityDescriptorSacl SetSecurityDescriptorDacl SetSecurityDescriptorGroup \
@@ -104,7 +104,8 @@ fwd_link bcrypt.dll
 # no certificate stores of its own yet.
 printf 'LIBRARY crypt32.dll\nEXPORTS\n' > target/forwarders/crypt32.dll.def
 for f in CertCloseStore CertEnumCertificatesInStore CertFreeCertificateContext CertDuplicateCertificateContext; do printf '    %s=secur32.%s\n' "$f" "$f" >> target/forwarders/crypt32.dll.def; done
-for f in CertGetEnhancedKeyUsage CertSerializeCertificateStoreElement CryptHashCertificate2 CertAddCertificateContextToStore CertCreateCertificateChainEngine CertFindCertificateInStore CertFindExtension CertFreeCRLContext CertFreeCTLContext CertFreeCertificateChain CertFreeCertificateChainEngine CertGetCertificateChain CertGetNameStringA CertGetNameStringW CertOpenStore CertOpenSystemStoreA CertOpenSystemStoreW CryptDecodeObjectEx CryptQueryObject CryptStringToBinaryA CryptStringToBinaryW CryptBinaryToStringA CryptBinaryToStringW PFXImportCertStore CertCreateCertificateContext CertGetCertificateContextProperty CertVerifyCertificateChainPolicy CryptProtectData CryptUnprotectData; do printf '    %s=kernel32.VeilCryptUnsupported\n' "$f" >> target/forwarders/crypt32.dll.def; done
+for f in CertGetEnhancedKeyUsage CertSerializeCertificateStoreElement CryptHashCertificate2 CertAddCertificateContextToStore CertCreateCertificateChainEngine CertFindCertificateInStore CertFindExtension CertFreeCRLContext CertFreeCTLContext CertFreeCertificateChain CertFreeCertificateChainEngine CertGetCertificateChain CertGetNameStringA CertGetNameStringW CertOpenStore CertOpenSystemStoreA CertOpenSystemStoreW CryptDecodeObjectEx CryptQueryObject CryptStringToBinaryA CryptStringToBinaryW CryptBinaryToStringA CryptBinaryToStringW PFXImportCertStore CertCreateCertificateContext CertGetCertificateContextProperty CertVerifyCertificateChainPolicy; do printf '    %s=kernel32.VeilCryptUnsupported\n' "$f" >> target/forwarders/crypt32.dll.def; done
+for f in CryptProtectData CryptUnprotectData; do printf '    %s=kernel32.%s\n' "$f" "$f" >> target/forwarders/crypt32.dll.def; done
 fwd_link crypt32.dll
 # wldap32.dll: no LDAP.
 printf 'LIBRARY wldap32.dll\nEXPORTS\n' > target/forwarders/wldap32.dll.def
@@ -191,6 +192,30 @@ EXPORTS
     DXGIDeclareAdapterRemovalSupport=d3d11.DXGIDeclareAdapterRemovalSupport
 ' > target/forwarders/dxgi.dll.def
 fwd_link dxgi.dll
+# OpenTTD's: imm32.dll (no input method editors: no contexts), usp10.dll
+# (Uniscribe: E_NOTIMPL, so text is laid out by the program itself),
+# winhttp.dll (no HTTP: no session).
+printf 'LIBRARY imm32.dll
+EXPORTS
+' > target/forwarders/imm32.dll.def
+for f in ImmGetContext ImmReleaseContext ImmGetCompositionStringW ImmSetCompositionWindow ImmSetCandidateWindow ImmNotifyIME ImmGetProperty ImmGetDefaultIMEWnd ImmAssociateContext ImmAssociateContextEx ImmIsIME ImmGetOpenStatus ImmSetOpenStatus ImmGetCompositionStringA ImmSetCompositionFontW ImmGetConversionStatus ImmSetConversionStatus; do printf '    %s=kernel32.VeilCryptUnsupported
+' "$f" >> target/forwarders/imm32.dll.def; done
+fwd_link imm32.dll
+printf 'LIBRARY usp10.dll
+EXPORTS
+' > target/forwarders/usp10.dll.def
+for f in ScriptItemize ScriptLayout ScriptShape ScriptPlace ScriptGetLogicalWidths ScriptBreak ScriptFreeCache ScriptStringAnalyse ScriptStringFree ScriptStringOut ScriptTextOut ScriptGetProperties ScriptGetFontProperties ScriptGetCMap ScriptCacheGetHeight ScriptIsComplex ScriptXtoCP ScriptCPtoX; do printf '    %s=kernel32.VeilHresultNotImpl
+' "$f" >> target/forwarders/usp10.dll.def; done
+fwd_link usp10.dll
+printf 'LIBRARY winhttp.dll
+EXPORTS
+' > target/forwarders/winhttp.dll.def
+for f in WinHttpOpen WinHttpConnect WinHttpOpenRequest WinHttpSendRequest WinHttpReceiveResponse WinHttpQueryDataAvailable WinHttpReadData WinHttpQueryHeaders WinHttpSetTimeouts WinHttpCrackUrl WinHttpAddRequestHeaders WinHttpSetOption WinHttpQueryOption WinHttpGetProxyForUrl WinHttpGetIEProxyConfigForCurrentUser WinHttpWriteData; do printf '    %s=kernel32.VeilCryptUnsupported
+' "$f" >> target/forwarders/winhttp.dll.def; done
+printf '    WinHttpCloseHandle=kernel32.VeilNothingToFree
+    WinHttpSetStatusCallback=kernel32.VeilNothingToFree
+' >> target/forwarders/winhttp.dll.def
+fwd_link winhttp.dll
 echo "installed: $(ls ../storage/system | tr '\n' ' ')"
 
 # secur32.dll: Schannel over rustls. It uses the standard library (and crates

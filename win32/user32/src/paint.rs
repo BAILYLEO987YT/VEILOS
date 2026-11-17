@@ -1150,3 +1150,76 @@ pub extern "system" fn UnionRect(d: *mut Rect, a: *const Rect, b: *const Rect) -
     SetRect(d, r[0], r[1], r[2], r[3]);
     (!empty(r)) as Bool
 }
+
+// -----| display modes: the one there is |-----
+
+/// DEVMODE's mode fields: (offset of dmBitsPerPel, of dmDisplayFrequency).
+fn mode_fields(wide: bool) -> (usize, usize) {
+    if wide { (168, 184) } else { (104, 120) }
+}
+
+/// EnumDisplaySettings: mode 0, ENUM_CURRENT_SETTINGS (-1) and
+/// ENUM_REGISTRY_SETTINGS (-2) are the screen as it is (32 bits, 60 Hz);
+/// there are no others.
+fn enum_settings(mode: u32, dm: *mut u8, wide: bool) -> Bool {
+    if dm.is_null() || !(mode == 0 || mode >= 0xFFFF_FFFE) {
+        return 0;
+    }
+    let (sw, sh) = crate::screen_size();
+    let (bpp, freq) = mode_fields(wide);
+    let fields_at = if wide { 72 } else { 40 };
+    unsafe {
+        *(dm.add(fields_at) as *mut u32) = 0x0004_0000 | 0x0008_0000 | 0x0010_0000 | 0x0040_0000;
+        *(dm.add(bpp) as *mut u32) = 32;
+        *(dm.add(bpp + 4) as *mut u32) = sw as u32;
+        *(dm.add(bpp + 8) as *mut u32) = sh as u32;
+        *(dm.add(freq - 4) as *mut u32) = 0;
+        *(dm.add(freq) as *mut u32) = 60;
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn EnumDisplaySettingsW(_dev: *const u16, mode: u32, dm: *mut u8) -> Bool {
+    enum_settings(mode, dm, true)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumDisplaySettingsA(_dev: *const u8, mode: u32, dm: *mut u8) -> Bool {
+    enum_settings(mode, dm, false)
+}
+
+#[no_mangle]
+pub extern "system" fn EnumDisplaySettingsExW(dev: *const u16, mode: u32, dm: *mut u8, _flags: u32) -> Bool {
+    EnumDisplaySettingsW(dev, mode, dm)
+}
+
+/// ChangeDisplaySettings: back to the registry's mode, or the mode it is,
+/// succeeds (DISP_CHANGE_SUCCESSFUL); any other is DISP_CHANGE_BADMODE.
+fn change_settings(dm: *const u8, wide: bool) -> i32 {
+    if dm.is_null() {
+        return 0;
+    }
+    let (sw, sh) = crate::screen_size();
+    let (bpp, _) = mode_fields(wide);
+    let fields = unsafe { *(dm.add(if wide { 72 } else { 40 }) as *const u32) };
+    let w = unsafe { *(dm.add(bpp + 4) as *const u32) };
+    let h = unsafe { *(dm.add(bpp + 8) as *const u32) };
+    let size_ok = fields & 0x0018_0000 == 0 || (w == sw as u32 && h == sh as u32);
+    if size_ok { 0 } else { -2 }
+}
+
+#[no_mangle]
+pub extern "system" fn ChangeDisplaySettingsW(dm: *const u8, _flags: u32) -> i32 {
+    change_settings(dm, true)
+}
+
+#[no_mangle]
+pub extern "system" fn ChangeDisplaySettingsA(dm: *const u8, _flags: u32) -> i32 {
+    change_settings(dm, false)
+}
+
+#[no_mangle]
+pub extern "system" fn ChangeDisplaySettingsExW(_dev: *const u16, dm: *const u8, _hwnd: u64, _flags: u32, _lp: usize) -> i32 {
+    change_settings(dm, true)
+}

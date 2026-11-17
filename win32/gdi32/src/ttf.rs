@@ -30,9 +30,12 @@ struct Library {
     faces: Vec<Face>,
     /// Each face is monospaced.
     fixed: Vec<bool>,
+    /// Faces a program added (AddFontResourceEx): their file, upper-cased,
+    /// and which face.
+    added: Vec<(Vec<u16>, usize)>,
 }
 
-static LIB: Lock<Library> = Lock::new(Library { loaded: false, faces: Vec::new(), fixed: Vec::new() });
+static LIB: Lock<Library> = Lock::new(Library { loaded: false, faces: Vec::new(), fixed: Vec::new(), added: Vec::new() });
 static GLYPHS: Lock<GlyphCache> = Lock::new(GlyphCache::new());
 
 fn wide(s: &str) -> Vec<u16> {
@@ -252,6 +255,54 @@ pub fn draw_glyph(c: &crate::draw::Canvas, r: &Realized, gid: u16, x_q6: i32, ba
             }
         }
     }
+}
+
+/// AddFontResourceEx: a .ttf file's face joins the library (once per
+/// file); its (family, weight, italic).
+pub fn add_file(path: &[u16]) -> Option<(String, i32, bool)> {
+    let mut lib = LIB.lock();
+    lib.load();
+    let key: Vec<u16> = path.iter().copied().take_while(|&c| c != 0).map(|c| if (b'a' as u16..=b'z' as u16).contains(&c) { c - 32 } else { c }).collect();
+    if let Some(i) = lib.added.iter().position(|(k, _)| *k == key) {
+        let f = &lib.faces[lib.added[i].1];
+        return Some((f.family.clone(), f.weight as i32, f.italic));
+    }
+    let mut z = key.clone();
+    z.push(0);
+    let face = read_file(&z).and_then(|d| Face::parse(d).ok())?;
+    let fixed = face.advance(face.glyph_index('i')) == face.advance(face.glyph_index('W'));
+    let out = (face.family.clone(), face.weight as i32, face.italic);
+    lib.faces.push(face);
+    lib.fixed.push(fixed);
+    let n = lib.faces.len() - 1;
+    lib.added.push((key, n));
+    Some(out)
+}
+
+/// A character's glyph in a realized font (0: none).
+pub fn glyph_index(r: &Realized, c: char) -> u16 {
+    LIB.lock().faces[r.face].glyph_index(c)
+}
+
+/// A glyph rendered at the font's size: its coverage (0 ..= 255, w x h),
+/// where its top-left is from the pen on the baseline (y down), and its
+/// advance in pixels.
+pub fn render(r: &Realized, gid: u16) -> (i32, i32, i32, i32, Vec<u8>, i32) {
+    let lib = LIB.lock();
+    let f = &lib.faces[r.face];
+    let adv = px(f.scale_q6(f.advance(gid) as i64, r.size_q6)) + r.embolden as i32;
+    let mut cache = GLYPHS.lock();
+    match cache.get(f, gid, r.size_q6, 0) {
+        Some(g) => (g.w, g.h, g.left, g.top, g.data.clone(), adv),
+        None => (0, 0, 0, 0, Vec::new(), adv),
+    }
+}
+
+/// Units per em, and the face's family and style names.
+pub fn names(r: &Realized) -> (u16, String, String) {
+    let lib = LIB.lock();
+    let f = &lib.faces[r.face];
+    (f.units_per_em, f.family.clone(), f.subfamily.clone())
 }
 
 /// Every face: (family, fixed pitch, weight, italic).

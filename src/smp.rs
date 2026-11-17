@@ -945,6 +945,28 @@ pub fn wake_aps() {
     });
 }
 
+/// At a kernel panic: an NMI to every other CPU, whose handler halts it for
+/// good once `crash::stopping()` (interrupts.rs). Waits a little at most.
+pub fn stop_others() {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 || CPU_ONLINE.load(Ordering::Acquire).count_ones() <= 1 {
+        return;
+    }
+    // ICR: "all excluding self", level assert, NMI delivery (100b).
+    unsafe {
+        lapic_write(LAPIC_ICR_HIGH, 0);
+        lapic_write(LAPIC_ICR_LOW, 0x000C_4400);
+        let mut spins = 0u32;
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 && spins < 100_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
+    // Let them reach the handler before anything they hold is taken.
+    for _ in 0..2_000_000 {
+        core::hint::spin_loop();
+    }
+}
+
 /// Each AP jumps here after the SIPI.
 ///
 /// At this point the AP is in 64-bit mode (QEMU qemu64 CPU) with:

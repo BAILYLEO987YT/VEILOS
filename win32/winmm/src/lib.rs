@@ -168,6 +168,15 @@ no_device! {
     waveInReset(a) => MMSYSERR_INVALHANDLE;
     waveInGetPosition(a, b, c) => MMSYSERR_INVALHANDLE;
     midiOutOpen(a, b, c, d, e) => MMSYSERR_BADDEVICEID;
+    midiOutClose(a) => MMSYSERR_INVALHANDLE;
+    midiOutReset(a) => MMSYSERR_INVALHANDLE;
+    midiOutShortMsg(a, b) => MMSYSERR_INVALHANDLE;
+    midiOutLongMsg(a, b, c) => MMSYSERR_INVALHANDLE;
+    midiOutPrepareHeader(a, b, c) => MMSYSERR_INVALHANDLE;
+    midiOutUnprepareHeader(a, b, c) => MMSYSERR_INVALHANDLE;
+    // Multimedia timers aren't here: no timer made, none to kill.
+    timeSetEvent(a, b, c, d, e) => 0;
+    timeKillEvent(a) => MMSYSERR_INVALPARAM;
     midiOutGetDevCapsA(a, b, c) => MMSYSERR_BADDEVICEID;
     midiOutGetDevCapsW(a, b, c) => MMSYSERR_BADDEVICEID;
     midiInOpen(a, b, c, d, e) => MMSYSERR_BADDEVICEID;

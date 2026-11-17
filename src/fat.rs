@@ -732,6 +732,15 @@ fn filetime_to_fat(ft: i64) -> (u16, u16) {
 }
 
 impl FileSystem for FatFileSystem {
+    fn file_sectors(&self, dev: &dyn BlockDevice, path: &str) -> Option<Vec<u64>> {
+        let mut f = self.open_file(dev, path).ok()?;
+        self.load_chain(dev, &mut f).ok()?;
+        let per = (self.cluster_bytes() / SECTOR) as u64;
+        let want = f.size.div_ceil(SECTOR as u64) as usize;
+        let lbas: Vec<u64> = f.chain.iter().flat_map(|&c| (0..per).map(move |i| self.cluster_lba(c) + i)).take(want).collect();
+        (lbas.len() == want).then_some(lbas)
+    }
+
     fn stat(&self, dev: &dyn BlockDevice, path: &str) -> Option<Stat> {
         let _guard = self.state.lock();
         if path.trim_end_matches('/').is_empty() {

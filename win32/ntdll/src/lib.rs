@@ -118,6 +118,7 @@ syscall_stubs! {
     VeilUserQuery, ZwVeilUserQuery => sys::VEIL_USER_QUERY;
     VeilGpu3d, ZwVeilGpu3d => sys::VEIL_GPU3D;
     VeilSound, ZwVeilSound => sys::VEIL_SOUND;
+    VeilCred, ZwVeilCred => sys::VEIL_CRED;
 }
 
 #[unsafe(naked)]
@@ -190,6 +191,9 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
         s if s == 0xC000_0046u32 as NtStatus => 288, // STATUS_MUTANT_NOT_OWNED: ERROR_NOT_OWNER
         s if s == 0xC000_0120u32 as NtStatus => 995, // STATUS_CANCELLED: ERROR_OPERATION_ABORTED
         s if s == 0xC000_0604u32 as NtStatus => 1655, // STATUS_DYNAMIC_CODE_BLOCKED (W^X)
+        s if s == 0xC000_005Fu32 as NtStatus => 1312, // STATUS_NO_SUCH_LOGON_SESSION
+        s if s == 0xC000_0225u32 as NtStatus => 1168, // STATUS_NOT_FOUND: ERROR_NOT_FOUND
+        s if s == 0xC000_00F0u32 as NtStatus => 13,   // STATUS_INVALID_PARAMETER_2 (VEIL_CRED: a blob that doesn't open): ERROR_INVALID_DATA
         status::NO_MORE_FILES => 18,            // ERROR_NO_MORE_FILES
         status::PARTIAL_COPY => 299,            // ERROR_PARTIAL_COPY
         status::NOT_IMPLEMENTED => 1,           // ERROR_INVALID_FUNCTION

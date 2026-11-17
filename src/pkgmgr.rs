@@ -607,29 +607,16 @@ impl BuildScript {
         Ok(BuildScript { package_name: name, version: ver, target, steps })
     }
 
-    /// Execute the build script.
+    /// Execute the build script. Nothing calls this yet: a native package
+    /// format (and with it how VEILOS programs are built) is an open design
+    /// decision (V1_CHECKLIST.md, "own native format").
     ///
-    /// Each step is handled as follows:
-    ///
-    /// * `Compile { source, output }` — reads the source file from the VFS,
-    ///   verifies it exists, then writes a placeholder compiled object to
-    ///   `output`.  Full in-kernel compilation is not possible; a real
-    ///   build would spawn the VEILOS toolchain process (`rustc`/`clang`)
-    ///   via the process manager.  We record the intent and produce a stub
-    ///   object file so that the `Link` step has something to consume.
-    ///
-    /// * `Link { inputs, output }` — reads each input object from the VFS,
-    ///   concatenates them (a trivial stub linker), and writes the result to
-    ///   `output`.  A real linker would need the full ELF relocator in
-    ///   `executable.rs`; this gives downstream steps a real VFS file.
-    ///
-    /// * `Sign { target }` — reads the target binary from the VFS, signs it
-    ///   with the kernel signing key using the improved HMAC-SHA256-based
-    ///   `PackageSignature::sign`, and writes a `.sig` sidecar file.
-    ///
-    /// * `Run { program, args }` — looks up the program in the VFS and
-    ///   verifies it exists.  Actual execution requires a loaded process;
-    ///   we record the intent and return success so callers can proceed.
+    /// * `Compile`, `Link`, `Run` — fail: there is no compiler, linker or
+    ///   program start behind them here. (They used to pretend to work.)
+    /// * `Sign { target }` — signs the file with `PackageSignature::sign` and
+    ///   writes a `.sig` beside it; a missing file fails the build. The key
+    ///   is a fixed one in this source, so the signature only shows the file
+    ///   wasn't damaged, not who made it.
     pub fn run(&self) -> Result<(), String> {
         println!("[BUILD] Building: {} v{}.{}.{} for {}",
             self.package_name,
@@ -654,16 +641,10 @@ impl BuildScript {
                 BuildStep::Sign { target } => {
                     println!("[BUILD]   sign {}", target);
                     let vfs = &crate::vfs::VFS;
-                    let target_bytes = match vfs.read_file(target) {
-                        Ok(b)  => b,
-                        Err(_) => {
-                            // Target binary missing (e.g. FS is read-only).
-                            // Sign a hash of the path string as a fallback so
-                            // the build pipeline can still complete.
-                            println!("[BUILD]     warning: '{}' not found on VFS, signing path stub", target);
-                            target.as_bytes().to_vec()
-                        }
-                    };
+                    // Nothing to sign is a failed build, not a signature of
+                    // the path (which the audit found passing for one).
+                    let target_bytes = vfs.read_file(target)
+                        .map_err(|_| alloc::format!("Cannot sign '{}': it doesn't exist", target))?;
 
                     let key: [u8; 32] = *b"veilos-kernel-signing-key-000000";
                     let sig = PackageSignature::sign(&target_bytes, &key);
@@ -684,21 +665,9 @@ impl BuildScript {
                 // ----------------------------------------------------------
                 BuildStep::Run { program, args } => {
                     println!("[BUILD]   run {} {}", program, args.join(" "));
-                    // Verify the program exists on the VFS.
-                    let vfs = &crate::vfs::VFS;
-                    match vfs.read_file(program) {
-                        Ok(bin) => {
-                            println!("[BUILD]     program '{}' found ({} bytes), spawning…", program, bin.len());
-                            // Full execution requires a process context and
-                            // ELF loader (executable.rs).  Record the
-                            // intent; the toolchain.rs driver can pick this
-                            // up to launch the process after the build.
-                            println!("[BUILD]     (process launch deferred to toolchain scheduler)");
-                        }
-                        Err(_) => {
-                            println!("[BUILD]     warning: program '{}' not found on VFS", program);
-                        }
-                    }
+                    // Nothing here starts programs (it used to say it did
+                    // and carry on): fail rather than pretend.
+                    return Err(alloc::format!("Build scripts can't run programs yet. Cannot run '{}'", program));
                 }
             }
         }

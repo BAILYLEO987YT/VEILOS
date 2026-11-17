@@ -922,6 +922,19 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 }
             }
         }
+        "CRASH" => {
+            // CRASH TEST: stop the system on purpose, to see the crash screen
+            // and the saved log (crash.rs). Administrators only.
+            let admin = {
+                let user = crate::users::SESSION.lock().username.clone();
+                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+            };
+            match parts.get(1).copied() {
+                Some("TEST") if admin => panic!("CRASH TEST typed in the terminal"),
+                Some("TEST") => history.push(String::from("CRASH TEST: administrators only")),
+                _ => history.push(String::from("Usage: CRASH TEST   (stops the system: the crash screen and log)")),
+            }
+        }
         "SYSPROF" => {
             // Time per NT service (sysprof.rs), dumped to the serial log.
             match parts.get(1).copied() {

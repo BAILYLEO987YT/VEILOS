@@ -80,6 +80,8 @@ pub mod lgpu;
 pub mod raster3d;
 pub mod nt_gpu3d;
 pub mod nt_sound;
+pub mod credentials;
+pub mod crash;
 pub mod entropy;
 pub mod security;
 pub mod sysprof;
@@ -303,6 +305,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     crate::hal::bind(crate::hal::DeviceClass::Storage);
     crate::vfs::ensure_standard_dirs();
     crate::scheduler::load_profiles();
+    crate::crash::prepare();
 
     // Phase 13: the network stack (VirtIO-net + smoltcp) starts when its NIC binds.
     crate::hal::bind(crate::hal::DeviceClass::Network);
@@ -423,6 +426,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 /// so the next scancode 0x5B is recognised as Left Super.
 static EXTENDED_PREFIX: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Where we are in the Pause key's E1 sequence: 0 outside it, else how many
+/// of its six bytes have arrived.
+static PAUSE_SEQ: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 // -----| Keyboard modifier state |-----
 // Tracked at the raw scancode level so they are available globally
@@ -544,10 +550,33 @@ async fn gui_refresh_task() {
                     }
                     continue;
                 }
+                // Pause is the one key with an E1 sequence, E1 1D 45 E1 9D C5,
+                // sent all at once on press (nothing on release). pc-keyboard
+                // reads it as Right Ctrl and Num Lock, so it never reached a
+                // program: take the six bytes here as Pause down (at 45) and up
+                // (at C5), and keep them from the decoder and the Ctrl state.
+                let mut pause_event = None;
+                {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let at = PAUSE_SEQ.load(Relaxed);
+                    if at == 0 && sc == 0xE1 {
+                        PAUSE_SEQ.store(1, Relaxed);
+                        continue;
+                    }
+                    if at != 0 {
+                        PAUSE_SEQ.store(if at >= 5 { 0 } else { at + 1 }, Relaxed);
+                        let state = match (at, sc) {
+                            (2, 0x45) => pc_keyboard::KeyState::Down,
+                            (5, 0xC5) => pc_keyboard::KeyState::Up,
+                            _ => continue,
+                        };
+                        pause_event = Some(pc_keyboard::KeyEvent::new(pc_keyboard::KeyCode::PauseBreak, state));
+                    }
+                }
                 let extended = EXTENDED_PREFIX.swap(false, core::sync::atomic::Ordering::Relaxed);
 
                 // -----| Track modifier key state from raw scancodes |-----
-                match sc {
+                if pause_event.is_none() { match sc {
                     0x2A | 0x36 => { SHIFT_HELD.store(true, core::sync::atomic::Ordering::Relaxed); } // LShift/RShift down
                     0xAA | 0xB6 => { SHIFT_HELD.store(false, core::sync::atomic::Ordering::Relaxed); } // LShift/RShift up
                     0x1D        => { CTRL_HELD.store(true, core::sync::atomic::Ordering::Relaxed); }  // LCtrl down (also RCtrl via 0xE0 prefix)
@@ -555,7 +584,7 @@ async fn gui_refresh_task() {
                     0x38        => { ALT_HELD.store(true, core::sync::atomic::Ordering::Relaxed); }   // LAlt down
                     0xB8        => { ALT_HELD.store(false, core::sync::atomic::Ordering::Relaxed); }  // LAlt up
                     _ => {}
-                }
+                } }
 
                 // Super+L (0xE0 0x5B) — lock the desktop.
                 if extended && sc == 0x5B {
@@ -563,8 +592,8 @@ async fn gui_refresh_task() {
                     continue;
                 }
                 // Decode and dispatch.
-                let mut maybe_event = None;
-                {
+                let mut maybe_event = pause_event.take();
+                if maybe_event.is_none() {
                     let mut kb_guard = KB.lock();
                     if let Some(kb) = kb_guard.as_mut() {
                         maybe_event = kb.add_byte(sc).ok().flatten();
@@ -888,6 +917,8 @@ async fn gui_refresh_task() {
 fn panic(info: &PanicInfo) -> ! {
     // Log reliably to the serial port
     serial_println!("\n!!! KERNEL PANIC !!!\n{}", info);
+    // Stop the other CPUs, show the crash screen, save the report (crash.rs).
+    crate::crash::on_panic(info);
 
     // Re-enable interrupts before parking. A panic can be reached with IF=0
     // (SFMASK cleared it for a syscall, or an exception gate cleared it) —

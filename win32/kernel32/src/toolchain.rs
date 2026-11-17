@@ -249,6 +249,19 @@ pub extern "system" fn VeilErrorNotSupported() -> u32 {
     50
 }
 
+/// COM-style calls that answer an HRESULT (Uniscribe's Script*):
+/// E_NOTIMPL, so callers take their own way.
+#[no_mangle]
+pub extern "system" fn VeilHresultNotImpl() -> i32 {
+    0x8000_4001u32 as i32
+}
+
+/// Named pipe transactions: not here.
+#[no_mangle]
+pub extern "system" fn TransactNamedPipe(_pipe: usize, _in: *const u8, _in_len: u32, _out: *mut u8, _out_len: u32, _read: *mut u32, _ov: usize) -> i32 {
+    VeilCryptUnsupported() as i32
+}
+
 /// Freeing what a call that isn't supported never handed out: nothing to do.
 #[no_mangle]
 pub extern "system" fn VeilNothingToFree() -> u32 {

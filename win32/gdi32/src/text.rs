@@ -511,10 +511,224 @@ pub extern "system" fn EnumFontsA(_hdc: Handle, face: *const u8, proc: usize, lp
     enumerate(family_arg(face, false, false), proc, lp, false)
 }
 
-/// Fonts can't be added at run time yet.
+fn wstr<'a>(p: *const u16) -> &'a [u16] {
+    if p.is_null() {
+        return &[];
+    }
+    let mut n = 0;
+    while unsafe { *p.add(n) } != 0 && n < 32768 {
+        n += 1;
+    }
+    unsafe { core::slice::from_raw_parts(p, n) }
+}
+
+/// A .ttf file's face added for every font request (FR_PRIVATE or not:
+/// there are no other processes' font lists here): how many faces.
 #[no_mangle]
-pub extern "system" fn AddFontResourceExW(_name: *const u16, _flags: u32, _r: usize) -> i32 {
-    0
+pub extern "system" fn AddFontResourceExW(name: *const u16, _flags: u32, _r: usize) -> i32 {
+    ttf::add_file(wstr(name)).is_some() as i32
+}
+
+#[no_mangle]
+pub extern "system" fn AddFontResourceW(name: *const u16) -> i32 {
+    AddFontResourceExW(name, 0, 0)
+}
+
+/// GetFontResourceInfoW (undocumented): type 1, the face names; type 2,
+/// a LOGFONTW per face in the file.
+#[no_mangle]
+pub extern "system" fn GetFontResourceInfoW(name: *const u16, len: *mut u32, buf: *mut u8, kind: u32) -> Bool {
+    if len.is_null() {
+        return 0;
+    }
+    let Some((family, weight, italic)) = ttf::add_file(wstr(name)) else { return 0 };
+    let fam: Vec<u16> = family.encode_utf16().take(31).collect();
+    match kind {
+        1 => {
+            let need = (fam.len() as u32 + 1) * 2;
+            if !buf.is_null() && unsafe { *len } >= need {
+                for (i, c) in fam.iter().chain(core::iter::once(&0)).enumerate() {
+                    unsafe { *(buf.add(i * 2) as *mut u16) = *c };
+                }
+            }
+            unsafe { *len = need };
+            1
+        }
+        2 => {
+            if !buf.is_null() && unsafe { *len } >= 92 {
+                let mut lf = [0u8; 92];
+                lf[16..20].copy_from_slice(&weight.to_le_bytes());
+                lf[20] = italic as u8;
+                lf[23] = 1; // DEFAULT_CHARSET
+                lf[24] = 7; // OUT_TT_ONLY_PRECIS
+                for (i, c) in fam.iter().enumerate() {
+                    lf[28 + i * 2..30 + i * 2].copy_from_slice(&c.to_le_bytes());
+                }
+                unsafe { core::ptr::copy_nonoverlapping(lf.as_ptr(), buf, 92) };
+            }
+            unsafe { *len = 92 };
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// The DC's TrueType font, if it has one.
+fn truetype(hdc: Handle) -> Option<Realized> {
+    let mut t = crate::table();
+    if !t.is_dc(hdc) {
+        return None;
+    }
+    match face(&mut t, hdc) {
+        Face::TrueType(r) => Some(r),
+        _ => None,
+    }
+}
+
+/// GetGlyphIndicesW: each character's glyph (GGI_MARK_NONEXISTING_GLYPHS:
+/// 0xFFFF where there's none, else 0).
+#[no_mangle]
+pub extern "system" fn GetGlyphIndicesW(hdc: Handle, text: *const u16, n: i32, out: *mut u16, flags: u32) -> u32 {
+    if text.is_null() || out.is_null() || n < 0 {
+        return u32::MAX;
+    }
+    let r = truetype(hdc);
+    let units = unsafe { core::slice::from_raw_parts(text, n as usize) };
+    let mut i = 0;
+    let mut k = 0;
+    for c in char::decode_utf16(units.iter().copied()) {
+        let ch = c.unwrap_or('\u{FFFD}');
+        let g = match &r {
+            Some(r) => ttf::glyph_index(r, ch),
+            None => {
+                if (0x20..=0xFF).contains(&(ch as u32)) {
+                    ch as u16
+                } else {
+                    0
+                }
+            }
+        };
+        let g = if g == 0 && flags & 1 != 0 { 0xFFFF } else { g };
+        unsafe { *out.add(i) = g };
+        i += 1;
+        k += ch.len_utf16();
+        // A surrogate pair is one glyph, the second slot 0.
+        while i < k && i < n as usize {
+            unsafe { *out.add(i) = 0 };
+            i += 1;
+        }
+    }
+    n as u32
+}
+
+/// GetOutlineTextMetricsW: the TEXTMETRICW and the outline font's numbers,
+/// the family, face, style and full names after them.
+#[no_mangle]
+pub extern "system" fn GetOutlineTextMetricsW(hdc: Handle, size: u32, out: *mut u8) -> u32 {
+    let Some(r) = truetype(hdc) else { return 0 };
+    let (upem, family, style) = ttf::names(&r);
+    let full = alloc::format!("{} {}", family, style);
+    let strings: [Vec<u16>; 4] = [&family, &family, &style, &full].map(|s| s.encode_utf16().chain(core::iter::once(0)).collect());
+    let head = 232usize;
+    let need = head + strings.iter().map(|s| s.len() * 2).sum::<usize>();
+    if out.is_null() || size == 0 {
+        return need as u32;
+    }
+    if (size as usize) < need {
+        return 0;
+    }
+    let mut b = alloc::vec![0u8; need];
+    b[0..4].copy_from_slice(&(need as u32).to_le_bytes());
+    metrics(hdc, b[4..].as_mut_ptr(), true);
+    let put = |b: &mut [u8], at: usize, v: i32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let em = r.em_px;
+    put(&mut b, 76, if r.italic { 1 } else { 0x40 }); // fsSelection
+    put(&mut b, 84, 1); // slope rise
+    put(&mut b, 96, upem as i32);
+    put(&mut b, 100, r.ascent);
+    put(&mut b, 104, -r.descent);
+    put(&mut b, 108, r.line_gap);
+    put(&mut b, 112, r.ascent * 7 / 10);
+    put(&mut b, 116, r.x_height);
+    put(&mut b, 124, r.ascent);
+    put(&mut b, 128, r.max_w);
+    put(&mut b, 132, -r.descent);
+    put(&mut b, 136, r.ascent);
+    put(&mut b, 140, -r.descent);
+    put(&mut b, 144, r.line_gap);
+    put(&mut b, 148, 9); // otmusMinimumPPEM
+    for (at, v) in [(152, em * 2 / 3), (156, em * 2 / 3), (164, em / 7), (168, em * 2 / 3), (172, em * 2 / 3), (180, em / 3)] {
+        put(&mut b, at, v);
+    }
+    put(&mut b, 184, (em / 14).max(1));
+    put(&mut b, 188, r.x_height / 2);
+    put(&mut b, 192, (em / 14).max(1));
+    put(&mut b, 196, -(em / 10).max(1));
+    let mut at = head;
+    for (k, s) in strings.iter().enumerate() {
+        b[200 + k * 8..208 + k * 8].copy_from_slice(&(at as u64).to_le_bytes());
+        for c in s {
+            b[at..at + 2].copy_from_slice(&c.to_le_bytes());
+            at += 2;
+        }
+    }
+    unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), out, need) };
+    need as u32
+}
+
+/// GetGlyphOutlineW: a glyph's metrics, and its bitmap as GGO_BITMAP (one
+/// bit a pixel) or GGO_GRAY2/4/8_BITMAP (5, 17 or 65 levels), rows a DWORD
+/// apart. Outlines (GGO_NATIVE, GGO_BEZIER) aren't given.
+#[no_mangle]
+pub extern "system" fn GetGlyphOutlineW(hdc: Handle, ch: u32, format: u32, gm: *mut u8, size: u32, buf: *mut u8, _mat: *const u8) -> u32 {
+    const GDI_ERROR: u32 = u32::MAX;
+    let Some(r) = truetype(hdc) else { return GDI_ERROR };
+    let gid = if format & 0x80 != 0 { ch as u16 } else { ttf::glyph_index(&r, char::from_u32(ch).unwrap_or('?')) };
+    let (w, h, left, top, data, adv) = ttf::render(&r, gid);
+    let kind = format & 0x7F;
+    if !gm.is_null() {
+        let mut g = [0u8; 20];
+        g[0..4].copy_from_slice(&(w.max(1) as u32).to_le_bytes());
+        g[4..8].copy_from_slice(&(h.max(1) as u32).to_le_bytes());
+        g[8..12].copy_from_slice(&left.to_le_bytes());
+        g[12..16].copy_from_slice(&(-top).to_le_bytes());
+        g[16..18].copy_from_slice(&(adv as i16).to_le_bytes());
+        unsafe { core::ptr::copy_nonoverlapping(g.as_ptr(), gm, 20) };
+    }
+    let levels = match kind {
+        0 => return 0, // GGO_METRICS
+        1 => 0,
+        4 => 4,
+        5 => 16,
+        6 => 64,
+        _ => return GDI_ERROR,
+    };
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    let pitch = if levels == 0 { ((w as usize + 7) / 8 + 3) & !3 } else { (w as usize + 3) & !3 };
+    let need = pitch * h as usize;
+    if buf.is_null() || size == 0 {
+        return need as u32;
+    }
+    if (size as usize) < need {
+        return GDI_ERROR;
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, need) };
+    out.fill(0);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let c = data[y * w as usize + x] as u32;
+            if levels == 0 {
+                if c >= 128 {
+                    out[y * pitch + x / 8] |= 0x80 >> (x % 8);
+                }
+            } else {
+                out[y * pitch + x] = ((c * levels + 127) / 255) as u8;
+            }
+        }
+    }
+    need as u32
 }
 
 #[no_mangle]

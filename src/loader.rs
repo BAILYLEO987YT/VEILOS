@@ -301,6 +301,16 @@ fn load_and_spawn_pe_inner(
     process_inner.parent_pid.store(options.parent_pid, core::sync::atomic::Ordering::Relaxed);
     // Security Mode: the parent's capabilities, or the signed-in user's (security.rs).
     *process_inner.capabilities.lock() = crate::security::caps_for_new(options.parent_pid);
+    // Security Mode: heaps and VirtualAlloc start at a random place, or
+    // where the parent's did (aslr.rs).
+    {
+        let parent = (options.parent_pid != 0)
+            .then(|| PROCESSOR.lock().find(options.parent_pid))
+            .flatten()
+            .map(|p| p.vad.lock().bottom_up_offset());
+        let offset = crate::aslr::bottom_up_offset(parent, crate::aslr::high_entropy(&data));
+        process_inner.vad.lock().set_bottom_up(offset);
+    }
     crate::security::audit(options.parent_pid, &alloc::format!("starts pid {} ({})", pid, path));
     process_inner.stack_base = stack_base;
     // mapped_pages is transferred to the process at the very end of this

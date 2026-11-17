@@ -70,6 +70,32 @@ pub fn stack_offset(slot: u64, size: u64) -> u64 {
     (u64::from_le_bytes(b) % ((slot - size) / STEP)) * STEP
 }
 
+/// Security Mode: how far above the lowest user address a new process's
+/// heaps and other bottom-up allocations begin, as Windows' bottom-up
+/// randomization: 256 steps of 64 KiB (16 MiB), or 2^24 steps (1 TiB) for a
+/// program marked IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA. A child takes
+/// its parent's (`parent`), so Git Bash's fork finds the same layout.
+pub fn bottom_up_offset(parent: Option<u64>, high_entropy: bool) -> u64 {
+    if let Some(p) = parent {
+        return p;
+    }
+    if crate::policy::performance() {
+        return 0;
+    }
+    let mut b = [0u8; 8];
+    crate::entropy::fill(&mut b);
+    let steps: u64 = if high_entropy { 1 << 24 } else { 256 };
+    (u64::from_le_bytes(b) % steps) * STEP
+}
+
+/// IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA in a PE's headers.
+pub fn high_entropy(headers: &[u8]) -> bool {
+    let Some(b) = headers.get(0x3C..0x40) else { return false };
+    let opt = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize + 24;
+    headers.get(opt..opt + 2) == Some(&[0x0B, 0x02][..])
+        && headers.get(opt + 70..opt + 72).is_some_and(|c| u16::from_le_bytes([c[0], c[1]]) & 0x20 != 0)
+}
+
 /// IMAGE_FILE_RELOCS_STRIPPED in a PE's headers: it can't move.
 pub fn relocs_stripped(headers: &[u8]) -> bool {
     let Some(b) = headers.get(0x3C..0x40) else { return true };

@@ -220,6 +220,34 @@ pub fn require_change(proc: &Process, path: &str) -> Result<(), NtStatus> {
     Ok(())
 }
 
+/// The desktop changing `path` for the signed-in user (drag-and-drop copies
+/// and moves in desktop.rs): what that user's programs could do. A role
+/// without fs.write (or fs.modify, to delete) can't, and in Security Mode
+/// the system folders need the root account. False is shown as a
+/// notification, once per call.
+pub fn user_may_change(path: &str, deleting: bool) -> bool {
+    let (user, logged_in) = {
+        let s = crate::users::SESSION.lock();
+        (s.username.clone(), s.logged_in)
+    };
+    if !logged_in {
+        return true;
+    }
+    let caps = crate::users::USER_DB.lock().capability_set_for(&user);
+    let cap = if deleting { Capability::FsModify } else { Capability::FsWrite };
+    let ok = caps.has(cap)
+        && (crate::policy::performance() || !system_path(path) || caps.has(Capability::KernelModule));
+    if !ok {
+        audit(0, &alloc::format!("desktop: {} may not change {}", user, path));
+        crate::desktop::notify(
+            crate::desktop::NotifCategory::Warning,
+            "SECURITY",
+            &alloc::format!("{} can't change {}", user, path),
+        );
+    }
+    ok
+}
+
 // -----| W^X (Security Mode) |-----
 //
 // No memory may be writable and executable at once: allocating, protecting

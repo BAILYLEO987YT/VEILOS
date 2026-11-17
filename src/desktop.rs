@@ -2494,7 +2494,9 @@ pub fn poll_input() {
                         ContextAction::CopyToDesktop(src) => {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
-                            if let Ok(data) = crate::vfs::VFS.read_file(&src) {
+                            if !crate::security::user_may_change(&dest, false) {
+                                // (told in a notification)
+                            } else if let Ok(data) = crate::vfs::VFS.read_file(&src) {
                                 let _ = crate::vfs::VFS.write_file(&dest, &data);
                             }
                         }
@@ -2502,7 +2504,9 @@ pub fn poll_input() {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
                             let vfs = &crate::vfs::VFS;
-                            if let Ok(data) = vfs.read_file(&src) {
+                            if !crate::security::user_may_change(&dest, false) || !crate::security::user_may_change(&src, true) {
+                                // (told in a notification)
+                            } else if let Ok(data) = vfs.read_file(&src) {
                                 if vfs.write_file(&dest, &data).is_ok() {
                                     let _ = vfs.delete_file(&src);
                                 }
@@ -2715,7 +2719,7 @@ pub fn handle_drop(source_path: alloc::string::String, x: i32, y: i32) {
                 alloc::format!("{}/{}", target_cwd, source_filename)
             };
             
-            if target_path != source_path {
+            if target_path != source_path && crate::security::user_may_change(&target_path, false) {
                 let vfs = &crate::vfs::VFS;
                 if let Ok(data) = vfs.read_file(&source_path) {
                     if vfs.write_file(&target_path, &data).is_ok() {

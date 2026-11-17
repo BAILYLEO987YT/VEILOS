@@ -27,7 +27,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | **1.0** | NVMe | ❌ | Most current PCs boot from NVMe. Only AHCI/SATA is supported. |
 | ✅ | SATA (AHCI), several disks, GPT/MBR | ✅ | |
 | **1.0** | A common real Ethernet NIC (Intel e1000e/I219 and/or Realtek r8169) | ❌ | Only virtio-net is supported (and bonded). |
-| | Wi-Fi | ❌ | The networks listed in Quick Settings are hard-coded in `apps.rs`. |
+| | Wi-Fi | ❌ | No Wi-Fi driver. Since 2026-11-17 Quick Settings' network panel shows what's really there (the wired connection, its address and adapters) and says there's no Wi-Fi adapter, instead of four made-up networks. |
 | **1.0** | Audio output (Intel HD Audio) | ⚠️ | Done 2026-11-11 in QEMU (`intel-hda` + `hda-output`): `audio.rs` drives the controller and its codec and mixes any number of streams at 48 kHz. The volume slider and the `SOUND` command set the master volume. Real codecs (Realtek etc.) are untested, and there's no input or headphone-jack switching. |
 | | Laptop: battery, brightness, lid, touchpad | ❌ | Since 2026-11-11 the brightness slider dims the picture on its way to the screen (`ui.rs`, never below 10%, on every CPU). There's still no backlight control, and nothing for battery, lid or touchpad. |
 | ✅ | Several displays, runtime resolution | ✅ | In a VM. Set in `/etc/display.cfg`, with no GUI for it. |
@@ -45,7 +45,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | | Swap / pagefile, demand-zero memory | ⚠️ | Images page in from disk. Nothing pages out. |
 | **1.0** | Runs for days without leaking or hanging (soak test) | ⚠️ | Never measured. |
 | **1.0** | Fast enough to use on one CPU / a normal PC | ⚠️ | The S6 notes say building in the VM is too slow, and a small `hello.rs` takes about 36 s. Measure this on real hardware. |
-| | Kernel panic screen + saved crash log | ⚠️ | Logs go to serial only. |
+| | Kernel panic screen + saved crash log | ✅ | Since 2026-11-17 (`crash.rs`): a panic stops the other CPUs (NMI), paints a crash screen with the report straight onto the display, and writes the report to `/var/log/crash.log` through sectors set aside at start-up (past the filesystem and the cache, as Windows writes its dump). The next start keeps it as `/var/log/crash-N.log` and says so in a notification. `CRASH TEST` in the terminal (administrators) checks it; checked in QEMU, report kept across the restart. No memory dump, and the machine waits for a restart rather than restarting itself. |
 
 ## 4. Files and data safety
 
@@ -63,7 +63,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 |---|---|---|---|
 | ✅ | Login with hashed passwords, lock screen, sign out | ✅ | PBKDF-SHA256 with 100k rounds. |
 | **1.0** | Security Mode actually enforced on Win32 programs | ✅ | Done 2026-11-12 (`src/security.rs`; WIN32_DESIGN.md A3). Each Windows program gets the signed-in user's role capabilities, and its children get its own. The NT services check them: writing, creating and deleting files, starting programs, ending another program or touching its memory outside its own family, the network beyond loopback, windows and 3D. Denials answer ERROR_ACCESS_DENIED / WSAEACCES and show a notification. Checked in QEMU with `win32/tests/w26/sec1.c`: as admin the output is identical to Windows (only an unrelated program's memory is refused), and as guest writes, deletes, new processes and the network are refused while reading and loopback work. git (add, commit, rm, log, status through cmd) runs as admin with no denials. Git Bash's fork wasn't run (no Git Bash on the test disk). Files have no owners yet, so this is per role, not per folder. |
-| **1.0** | Credential storage (`CredWriteW` etc.) | ❌ | claude.exe's login sits in a plain file. The key ledger (§5 below, done 2026-11-12) is what it can be built on: per-user, unlocked by the sign-in password. |
+| **1.0** | Credential storage (`CredWriteW` etc.) | ✅ | Done 2026-11-17: the Credential Manager functions and DPAPI, sealed by the signed-in user's master key from the key ledger (WIN32_DESIGN.md A5). Checked against Windows 11 and across a reboot. claude.exe still keeps its login in a plain file, as it does on Windows; Git Credential Manager and programs using DPAPI now have somewhere safe. |
 | | Encrypted keys persist across reboots | ✅ | Done 2026-11-12. Rechecked first: `cen_persist_key` did write, but `cen_init` was never called (so there was no master key and every save failed). The master key was also re-derived from a timer at each boot, `cen_load_keys` parsed nothing, keys and nonces came from counters (predictable keys, and nonces that repeat after a reboot) and nothing ever saved a key. Now each user has a random master key in `/etc/keys/<user>/master.vmk`, encrypted with a key derived from their sign-in password. It's unlocked at sign-in, when their saved keys load, and forgotten at sign-out. A password change re-wraps it; an admin reset removes that user's saved keys, which can't be opened any more. Keys, salts and nonces come from a new kernel random pool (`entropy.rs`). Checked in QEMU with the `KEYS TEST` / `KEYS CHECK` terminal commands: a key saved in one boot decrypts its file after a reboot, and again after a password change. No feature saves keys yet: the clipboard's keys are per entry and stay in memory. |
 | | Firewall / per-app network permission | ❌ | |
 | | TLS certificate revocation | ❌ | |
@@ -77,7 +77,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | ✅ | Terminal, cmd.exe, Git Bash | ✅ | |
 | ✅ | Text editor (own + Windows Notepad), image viewer | ✅ | |
 | **1.0** | File manager that can copy, move, rename, delete, make folders, and drag-and-drop | ⚠️ | Browses and opens files only. Everything else is done in the terminal. |
-| **1.0** | Settings app with working controls (display, network, sound, users, date/time) | ⚠️ | Mostly `config.vsh` edits. The Wi-Fi list is fake and the power button does nothing. |
+| **1.0** | Settings app with working controls (display, network, sound, users, date/time) | ⚠️ | Mostly `config.vsh` edits. Since 2026-11-17 the network panel shows the real wired connection (no made-up Wi-Fi list); the power button powers off since 2026-11-11. |
 | **1.0** | Keyboard layouts other than US | ❌ | Hard-coded `Us104Key`. (Matters if you're in the UK.) |
 | **1.0** | Time zone / local time | ⚠️ | The CMOS clock is treated as UTC. |
 | **1.0** | Unicode text: box drawing, symbols, accents, emoji fallback | ⚠️ | Bitmap font gaps (`√`, `╌`). No CJK or emoji. |
@@ -93,7 +93,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | **1.0** | Play music/video | ⚠️ | Sound and `winmm` (waveOut, PlaySound, Beep, MessageBeep) work since 2026-11-11. A Windows player (e.g. VLC or mpv) would also want WASAPI or DirectSound, which aren't there yet. |
 | | PDF viewer, zip/unzip in the GUI | ❌ | SumatraPDF or 7-Zip through Win32 would cover them. |
 | ✅ | Classic Win32 GUI programs, console programs | ✅ | Notepad, regedit, cmd, git, cargo, curl, claude.exe. |
-| **1.0** | Install software: run common Windows installers (NSIS/Inno setup.exe, MSI) or a package manager that works | ⚠️ | Portable copy-and-run works. Installers are untested. The October audit found `pkgmgr.rs` faked its build steps. |
+| **1.0** | Install software: run common Windows installers (NSIS/Inno setup.exe, MSI) or a package manager that works | ⚠️ | Portable copy-and-run works. Installers are untested. `pkgmgr.rs` (checked 2026-11-17): nothing calls its build-script runner; compile and link already failed honestly, and sign (it signed the path of a missing file) and run (it said it started the program) now fail too. Installing a package only marks it installed in a list: no payload is unpacked, the five "built-in" SDK packages it lists don't exist on disk, and signing uses a key written in the source. A real one needs the native package format decided first. |
 | **1.0** | Update VEILOS itself | ❌ | GitHub builds a release zip. Nothing updates from inside the OS. |
 | | Games (D3D/OpenGL) | ❌ | G5, next on the Win32 plan. |
 
@@ -146,7 +146,7 @@ Steps 1-4 can be tested in QEMU (OVMF for UEFI, `-device qemu-xhci`, `-device nv
 - [x] Consistent window manager: tile snapping, snap lines, magnetic edges *(`WindowSnapMode` Magnetic/Sticky/Slippery/Off, `WINDOW_TILES`)*
 - [ ] Global search palette
 - [~] Notification centre *(toasts with categories exist; no grouped history or per-app controls)*
-- [~] Package manager GUI *(`pkgmgr.rs`/`app_repo.rs` exist; the audit found them faking work)*
+- [~] Package manager GUI *(`pkgmgr.rs`/`app_repo.rs` keep a list of packages but install nothing; see §8, "Install software")*
 - [~] User profiles and permissions *(users, roles and login are real; per-app permissions aren't enforced on Win32)*
 
 **Premium UX**
@@ -193,7 +193,7 @@ Steps 1-4 can be tested in QEMU (OVMF for UEFI, `-device qemu-xhci`, `-device nv
 
 **Clipboard and data safety**
 - [x] Secure clipboard channels: Public, Private, Sensitive, App-restricted
-- [ ] Secure drag-and-drop channels *(you marked it done, but I couldn't find channel code for drag-and-drop: `GLOBAL_DRAG_DROP` in `apps.rs` only carries a path. It may have been lost; worth checking)*
+- [ ] Secure drag-and-drop channels *(checked 2026-11-17: there never was drag-and-drop channel code, in the tree or its history. The channels (PUBLIC, PRIVATE, SENSITIVE, APP_RESTRICTED) are the clipboard's (`clipboard.rs`, encrypted). Drag-and-drop is the desktop copying a file between File Manager windows or to the desktop; since 2026-11-17 it checks the signed-in user may write there (a guest can't, and in Security Mode only root changes /system and /etc), as their programs must. Windows programs' OLE drag-and-drop (`RegisterDragDrop`) is a stub.)*
 
 **Smart security UX**
 - [~] Smart error explanations *(missing-import errors name the function; nothing more general)*
