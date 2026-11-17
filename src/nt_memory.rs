@@ -169,6 +169,8 @@ pub struct VadSpace {
     entries: Vec<VadEntry>,
     /// The next address the bump allocator will try (grows upward).
     next_alloc: u64,
+    /// Where it began (USER_SPACE_START, or above it in Security Mode).
+    start: u64,
 }
 
 // Starts at 4 GiB: the low 4 GiB holds the kernel image (GiB 0) and
@@ -180,7 +182,20 @@ const USER_SPACE_END:   u64 = 0x0000_7FFF_FFFF_F000; // Top of user address spac
 
 impl VadSpace {
     pub fn new() -> Self {
-        Self { entries: Vec::new(), next_alloc: USER_SPACE_START }
+        Self { entries: Vec::new(), next_alloc: USER_SPACE_START, start: USER_SPACE_START }
+    }
+
+    /// Where bottom-up allocations (heaps, VirtualAlloc with no address)
+    /// begin: the lowest user address plus `offset` (aslr.rs). Set once,
+    /// when the process is built.
+    pub fn set_bottom_up(&mut self, offset: u64) {
+        self.start = USER_SPACE_START + align_up_u64(offset, GRANULARITY);
+        self.next_alloc = self.next_alloc.max(self.start);
+    }
+
+    /// That offset, for a child to take (aslr.rs).
+    pub fn bottom_up_offset(&self) -> u64 {
+        self.start - USER_SPACE_START
     }
 
     // ----- Lookup -----
