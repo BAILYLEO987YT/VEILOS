@@ -191,6 +191,30 @@ EXPORTS
     DXGIDeclareAdapterRemovalSupport=d3d11.DXGIDeclareAdapterRemovalSupport
 ' > target/forwarders/dxgi.dll.def
 fwd_link dxgi.dll
+# OpenTTD's: imm32.dll (no input method editors: no contexts), usp10.dll
+# (Uniscribe: E_NOTIMPL, so text is laid out by the program itself),
+# winhttp.dll (no HTTP: no session).
+printf 'LIBRARY imm32.dll
+EXPORTS
+' > target/forwarders/imm32.dll.def
+for f in ImmGetContext ImmReleaseContext ImmGetCompositionStringW ImmSetCompositionWindow ImmSetCandidateWindow ImmNotifyIME ImmGetProperty ImmGetDefaultIMEWnd ImmAssociateContext ImmAssociateContextEx ImmIsIME ImmGetOpenStatus ImmSetOpenStatus ImmGetCompositionStringA ImmSetCompositionFontW ImmGetConversionStatus ImmSetConversionStatus; do printf '    %s=kernel32.VeilCryptUnsupported
+' "$f" >> target/forwarders/imm32.dll.def; done
+fwd_link imm32.dll
+printf 'LIBRARY usp10.dll
+EXPORTS
+' > target/forwarders/usp10.dll.def
+for f in ScriptItemize ScriptLayout ScriptShape ScriptPlace ScriptGetLogicalWidths ScriptBreak ScriptFreeCache ScriptStringAnalyse ScriptStringFree ScriptStringOut ScriptTextOut ScriptGetProperties ScriptGetFontProperties ScriptGetCMap ScriptCacheGetHeight ScriptIsComplex ScriptXtoCP ScriptCPtoX; do printf '    %s=kernel32.VeilHresultNotImpl
+' "$f" >> target/forwarders/usp10.dll.def; done
+fwd_link usp10.dll
+printf 'LIBRARY winhttp.dll
+EXPORTS
+' > target/forwarders/winhttp.dll.def
+for f in WinHttpOpen WinHttpConnect WinHttpOpenRequest WinHttpSendRequest WinHttpReceiveResponse WinHttpQueryDataAvailable WinHttpReadData WinHttpQueryHeaders WinHttpSetTimeouts WinHttpCrackUrl WinHttpAddRequestHeaders WinHttpSetOption WinHttpQueryOption WinHttpGetProxyForUrl WinHttpGetIEProxyConfigForCurrentUser WinHttpWriteData; do printf '    %s=kernel32.VeilCryptUnsupported
+' "$f" >> target/forwarders/winhttp.dll.def; done
+printf '    WinHttpCloseHandle=kernel32.VeilNothingToFree
+    WinHttpSetStatusCallback=kernel32.VeilNothingToFree
+' >> target/forwarders/winhttp.dll.def
+fwd_link winhttp.dll
 echo "installed: $(ls ../storage/system | tr '\n' ' ')"
 
 # secur32.dll: Schannel over rustls. It uses the standard library (and crates

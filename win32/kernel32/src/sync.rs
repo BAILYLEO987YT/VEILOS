@@ -403,3 +403,21 @@ pub extern "system" fn FlsGetValue(index: u32) -> usize {
 pub extern "system" fn FlsSetValue(index: u32, value: usize) -> Bool {
     TlsSetValue(index, value)
 }
+
+/// Signal one object (an event, a mutex released, a semaphore by one) and
+/// wait on another.
+#[no_mangle]
+pub extern "system" fn SignalObjectAndWait(signal: Handle, wait: Handle, ms: u32, alertable: Bool) -> u32 {
+    let ok = SetEvent(signal) != 0 || crate::system::ReleaseMutex(signal) != 0 || unsafe { crate::support::ReleaseSemaphore(signal, 1, core::ptr::null_mut()) } != 0;
+    if !ok {
+        return WAIT_FAILED;
+    }
+    WaitForSingleObjectEx(wait, ms, alertable)
+}
+
+/// Every CPU's writes seen by the others: a full fence here, where every
+/// thread's view is the same memory.
+#[no_mangle]
+pub extern "system" fn FlushProcessWriteBuffers() {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
