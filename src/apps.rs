@@ -1601,22 +1601,30 @@ impl AppLauncher {
                 r.draw_text(&alloc::format!("{}%", bri), rx, ry + 54, p.text_primary);
             }
             QuickSettingOverlay::Network => {
-                r.draw_text("AVAILABLE NETWORKS", rx, ry, p.success);
+                // What's really there: the wired connection and its
+                // adapters (the list used to be made-up Wi-Fi names).
+                r.draw_text("NETWORK", rx, ry, p.success);
                 r.fill_rect(Rect::new(rx, ry + 20, cw.saturating_sub(336), 2), p.border);
-                let networks = [
-                    ("Home_Network_5G", true),
-                    ("Guest_WiFi", false),
-                    ("Coffee_Shop_Free", false),
-                    ("Wired Ethernet (VirtIO)", true),
-                ];
-                for (i, (name, secured)) in networks.iter().enumerate() {
-                    let ny = ry + 30 + (i as i32 * 30);
-                    r.draw_text(name, rx, ny, p.text_primary);
-                    if *secured {
-                        r.draw_text("[SECURE]", rx + 160, ny, p.text_secondary);
-                    } else {
-                        r.draw_text("[OPEN]", rx + 160, ny, p.danger);
+                let mut lines: alloc::vec::Vec<(String, crate::graphics::Color)> = alloc::vec::Vec::new();
+                if crate::network::is_ready() {
+                    let cfg = crate::network::NETWORK_CONFIG.lock();
+                    lines.push((String::from("Wired: connected"), p.success));
+                    lines.push((alloc::format!("Address {}/{}", cfg.ip.address(), cfg.ip.prefix_len()), p.text_primary));
+                    if let Some(gw) = cfg.gateway {
+                        lines.push((alloc::format!("Gateway {}", gw), p.text_secondary));
                     }
+                    drop(cfg);
+                    for l in crate::network::nic_status() {
+                        lines.push((String::from(l.trim()), p.text_secondary));
+                    }
+                } else {
+                    lines.push((String::from("Wired: not connected"), p.danger));
+                }
+                lines.push((String::from("Wi-Fi: no adapter"), p.text_secondary));
+                for (i, (text, colour)) in lines.iter().enumerate().take(8) {
+                    let mut t = text.clone();
+                    if t.len() > 40 { t.truncate(37); t.push_str("..."); }
+                    r.draw_text(&t, rx, ry + 30 + (i as i32 * 22), *colour);
                 }
             }
         }
