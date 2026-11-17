@@ -17,6 +17,12 @@ if [ "${VEILOS_ACCEL:-}" = kvm ] && [ "$(uname -s)" = Linux ] && [ -r /dev/kvm ]
     ACCEL="-accel kvm $ACCEL"
 fi
 
+# Sound: an Intel HD Audio card played through the host's sound system
+# (PulseAudio, which PipeWire also serves, on Linux; Core Audio on macOS).
+# For none:  VEILOS_AUDIO=none sh run.sh
+AUDIO=${VEILOS_AUDIO:-pa}
+[ "$(uname -s)" = Darwin ] && AUDIO=${VEILOS_AUDIO:-coreaudio}
+
 echo "Starting VEILOS. The first boot can take a minute or two."
 echo 'Log in as "admin" with password "veilos" (or "root" with no password).'
 # shellcheck disable=SC2086
@@ -27,5 +33,6 @@ exec "$QEMU" -cpu qemu64 -smp 4 -m 1G $ACCEL \
     -drive id=disk,file=veilos-storage.img,if=none,format=raw \
     -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+    -audiodev "$AUDIO",id=snd0 -device intel-hda -device hda-output,audiodev=snd0 \
     -serial file:serial.log \
     "$@"

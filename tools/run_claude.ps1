@@ -34,7 +34,8 @@ $qargs = @(
     '-vga', 'none', '-device', 'bochs-display',
     '-drive', "id=disk,file=`"$disk`",if=none,format=raw",
     '-device', 'ide-hd,drive=disk,bus=ide.1',
-    '-netdev', 'user,id=net0', '-device', 'virtio-net-pci,netdev=net0'
+    '-netdev', 'user,id=net0', '-device', 'virtio-net-pci,netdev=net0',
+    '-audiodev', 'dsound,id=snd0', '-device', 'intel-hda', '-device', 'hda-output,audiodev=snd0'
 )
 
 # The size QEMU has written so far (the directory entry lags behind an open file).

@@ -26,5 +26,6 @@ echo Log in as "admin" with password "veilos" (or "root" with no password).
   -drive id=disk,file=veilos-storage.img,if=none,format=raw ^
   -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 ^
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0 ^
+  -audiodev dsound,id=snd0 -device intel-hda -device hda-output,audiodev=snd0 ^
   -serial file:serial.log %*
 if errorlevel 1 pause
