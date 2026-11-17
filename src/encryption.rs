@@ -407,6 +407,35 @@ fn open(key: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
     cipher.decrypt(Nonce::from_slice(&sealed[..12]), &sealed[12..]).ok()
 }
 
+/// `seal`/`open` with associated data (credentials.rs: DPAPI's entropy).
+pub(crate) fn seal_aad(key: &[u8; 32], plain: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+    let nonce: [u8; 12] = random();
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    let mut out = nonce.to_vec();
+    out.extend(cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad }).ok()?);
+    Some(out)
+}
+
+pub(crate) fn open_aad(key: &[u8; 32], sealed: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+    if sealed.len() < 12 + 16 {
+        return None;
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    cipher.decrypt(Nonce::from_slice(&sealed[..12]), Payload { msg: &sealed[12..], aad }).ok()
+}
+
+/// The signed-in user's master key and name (credentials.rs), or None.
+pub(crate) fn signed_in() -> Option<([u8; 32], String)> {
+    MASTER.lock().clone()
+}
+
+/// The folder of `user`'s keys, with a trailing slash.
+pub(crate) fn keys_dir(user: &str) -> String {
+    user_dir(user)
+}
+
 fn wrap_key(password: &str, salt: &[u8], rounds: u32) -> [u8; 32] {
     let mut k = [0u8; 32];
     pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, rounds, &mut k);
@@ -497,6 +526,7 @@ pub fn cen_lock_user() {
     if let Some((mut m, user)) = had {
         m.iter_mut().for_each(|b| *b = 0);
         KEY_REGISTRY.lock().retain(|_, e| !e.persisted);
+        crate::credentials::forget();
         crate::serial_println!("[CEN] {}: locked", user);
     }
 }

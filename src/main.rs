@@ -80,6 +80,7 @@ pub mod lgpu;
 pub mod raster3d;
 pub mod nt_gpu3d;
 pub mod nt_sound;
+pub mod credentials;
 pub mod entropy;
 pub mod security;
 pub mod sysprof;

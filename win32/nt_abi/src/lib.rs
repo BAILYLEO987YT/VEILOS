@@ -231,7 +231,13 @@ pub mod sys {
     /// 0 pause / 1 resume / 2 flush / 3 volume, value), 4 device
     /// (SoundDevice* out). STATUS_DEVICE_DOES_NOT_EXIST with no sound device.
     pub const VEIL_SOUND: u32 = BASE + 88;
-    pub const END: u32 = BASE + 89;
+    /// VEIL_CRED(op, a, b, c): the signed-in user's saved credentials and
+    /// DPAPI (src/credentials.rs). Ops: 0 seal, 1 open (ProtectArgs*), 2
+    /// write (CredKey*, record, length), 3 read (CredKey*, CredOut*), 4
+    /// delete (CredKey*), 5 list (CredOut*). STATUS_NO_SUCH_LOGON_SESSION
+    /// with nobody signed in.
+    pub const VEIL_CRED: u32 = BASE + 89;
+    pub const END: u32 = BASE + 90;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).

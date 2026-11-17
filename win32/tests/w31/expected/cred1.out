@@ -1,0 +1,54 @@
+write one: ok
+read veilos-test/one:
+  type 1 persist 2 flags 0 target veilos-test/one user alice comment a comment alias (null)
+  blob 7 bytes "secret1" written set
+  attribute veilos:kind flags 0 "token"
+write one again: ok
+read veilos-test/one:
+  type 1 persist 2 flags 0 target veilos-test/one user alice comment a comment alias (null)
+  blob 6 bytes "second" written set
+  attribute veilos:kind flags 0 "token"
+write one, keeping the blob: ok
+read VEILOS-TEST/ONE:
+  type 1 persist 3 flags 0 target veilos-test/one user alice comment a comment alias (null)
+  blob 6 bytes "second" written set
+  attribute veilos:kind flags 0 "token"
+write two: ok
+write other: ok
+enumerate veilos-test/*: 2
+  veilos-test/one persist 3
+  veilos-test/two persist 1
+enumerate veilos-test*: 3
+  veilos-test/one persist 3
+  veilos-test/two persist 1
+  veilos-testother persist 1
+enumerate VEILOS-TEST/T*: 1
+  veilos-test/two persist 1
+enumerate veilos-test/two: 1
+  veilos-test/two persist 1
+enumerate veilos-nothing*: error 1168
+read veilos-test/none (type 1): error 1168
+read veilos-test/one (type 2): error 87
+read with flags: 1 0
+write persist 0: 0 87
+write persist 4: 0 87
+write 2561 bytes: 0 1783
+write 2560 bytes: 1 0
+read big: 2560 bytes
+write NULL: 0 87
+read NULL target: 0 87
+delete with flags: 1 0
+delete veilos-test/one: ok
+delete veilos-test/two: ok
+delete veilos-testother: ok
+delete veilos-test/big: error 1168
+delete veilos-test/one: error 1168
+enumerate veilos-test*: error 1168
+protect: ok, not plain, longer 1
+unprotect: "hello, world" description "what it is"
+unprotect, wrong entropy: 0 13
+unprotect, no entropy: 0 13
+unprotect, damaged: 0 13
+protect empty: ok, same twice 0
+unprotect empty: 0 bytes, description ""
+exit 0

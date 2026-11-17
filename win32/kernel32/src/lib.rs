@@ -20,6 +20,7 @@ mod atom;
 mod bun;
 mod com;
 mod crypt;
+mod cred;
 mod console;
 mod env;
 mod legacy;

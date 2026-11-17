@@ -118,6 +118,7 @@ fn dispatch_inner(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         sys::VEIL_CONSOLE => crate::nt_console::call(&proc, a0, a1, a2, a3),
         sys::VEIL_GPU3D => crate::nt_gpu3d::call(&proc, a0, a1, a2, a3),
         sys::VEIL_SOUND => crate::nt_sound::call(&proc, a0, a1, a2, a3),
+        sys::VEIL_CRED => crate::credentials::call(&proc, a0, a1, a2, a3),
         sys::VEIL_CREATE_THREAD => crate::nt_process::create_thread(&proc, a0, a1, a2, a3),
         sys::VEIL_CREATE_PROCESS => crate::nt_process::create_process(&proc, a0, a1),
         sys::VEIL_CREATE_PIPE => crate::nt_process::create_pipe(&proc, a0, a1, a2),

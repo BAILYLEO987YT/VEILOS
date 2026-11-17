@@ -75,7 +75,7 @@ $(unsup VeilCngUnsupported LsaAddAccountRights LsaRemoveAccountRights)
     LsaClose=kernel32.LsaClose
     LsaQueryInformationPolicy=kernel32.LsaQueryInformationPolicy
     LsaFreeMemory=kernel32.LsaFreeMemory
-" fwd advapi32.dll CryptImportKey CryptEncrypt CryptDestroyKey IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeSid FreeSid IsWellKnownSid CheckTokenMembership ConvertSidToStringSidA ConvertSidToStringSidW SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
+" fwd advapi32.dll CredWriteW CredReadW CredEnumerateW CredDeleteW CredFree CredGetSessionTypes CryptImportKey CryptEncrypt CryptDestroyKey IsValidSid GetLengthSid EqualSid CopySid AllocateAndInitializeSid FreeSid IsWellKnownSid CheckTokenMembership ConvertSidToStringSidA ConvertSidToStringSidW SystemFunction036 CryptAcquireContextA CryptAcquireContextW CryptReleaseContext CryptGenRandom \
     CryptCreateHash CryptHashData CryptGetHashParam CryptDestroyHash CreateProcessAsUserW DecryptFileW DuplicateEncryptionInfoFile GetFileSecurityW     GetSecurityDescriptorOwner GetTokenInformation GetUserNameA GetUserNameW IsTextUnicode OpenProcessToken     OpenThreadToken RevertToSelf AdjustTokenPrivileges LookupPrivilegeValueW LookupAccountSidW InitializeAcl \
     InitializeSecurityDescriptor IsValidSecurityDescriptor GetSecurityDescriptorControl GetSecurityDescriptorDacl \
     GetSecurityDescriptorGroup GetSecurityDescriptorSacl SetSecurityDescriptorDacl SetSecurityDescriptorGroup \
@@ -104,7 +104,8 @@ fwd_link bcrypt.dll
 # no certificate stores of its own yet.
 printf 'LIBRARY crypt32.dll\nEXPORTS\n' > target/forwarders/crypt32.dll.def
 for f in CertCloseStore CertEnumCertificatesInStore CertFreeCertificateContext CertDuplicateCertificateContext; do printf '    %s=secur32.%s\n' "$f" "$f" >> target/forwarders/crypt32.dll.def; done
-for f in CertGetEnhancedKeyUsage CertSerializeCertificateStoreElement CryptHashCertificate2 CertAddCertificateContextToStore CertCreateCertificateChainEngine CertFindCertificateInStore CertFindExtension CertFreeCRLContext CertFreeCTLContext CertFreeCertificateChain CertFreeCertificateChainEngine CertGetCertificateChain CertGetNameStringA CertGetNameStringW CertOpenStore CertOpenSystemStoreA CertOpenSystemStoreW CryptDecodeObjectEx CryptQueryObject CryptStringToBinaryA CryptStringToBinaryW CryptBinaryToStringA CryptBinaryToStringW PFXImportCertStore CertCreateCertificateContext CertGetCertificateContextProperty CertVerifyCertificateChainPolicy CryptProtectData CryptUnprotectData; do printf '    %s=kernel32.VeilCryptUnsupported\n' "$f" >> target/forwarders/crypt32.dll.def; done
+for f in CertGetEnhancedKeyUsage CertSerializeCertificateStoreElement CryptHashCertificate2 CertAddCertificateContextToStore CertCreateCertificateChainEngine CertFindCertificateInStore CertFindExtension CertFreeCRLContext CertFreeCTLContext CertFreeCertificateChain CertFreeCertificateChainEngine CertGetCertificateChain CertGetNameStringA CertGetNameStringW CertOpenStore CertOpenSystemStoreA CertOpenSystemStoreW CryptDecodeObjectEx CryptQueryObject CryptStringToBinaryA CryptStringToBinaryW CryptBinaryToStringA CryptBinaryToStringW PFXImportCertStore CertCreateCertificateContext CertGetCertificateContextProperty CertVerifyCertificateChainPolicy; do printf '    %s=kernel32.VeilCryptUnsupported\n' "$f" >> target/forwarders/crypt32.dll.def; done
+for f in CryptProtectData CryptUnprotectData; do printf '    %s=kernel32.%s\n' "$f" "$f" >> target/forwarders/crypt32.dll.def; done
 fwd_link crypt32.dll
 # wldap32.dll: no LDAP.
 printf 'LIBRARY wldap32.dll\nEXPORTS\n' > target/forwarders/wldap32.dll.def
