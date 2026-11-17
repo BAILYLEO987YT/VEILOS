@@ -172,6 +172,13 @@ fn get_font_offset(c: char) -> usize {
     }
 }
 
+/// The 8x8 bitmap of `c` (rows top to bottom, bit 7 the left column), for
+/// drawing with nothing else running (crash.rs).
+pub fn glyph(c: char) -> &'static [u8] {
+    let at = get_font_offset(c);
+    &FONT[at..at + 8]
+}
+
 pub fn draw_char(c: char, x: usize, y: usize, color: Color) {
     let mut fb_lock = FRAMEBUFFER.lock();
     if let Some(ref mut fb) = *fb_lock {

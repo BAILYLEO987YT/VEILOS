@@ -65,9 +65,20 @@ pub struct FileState {
 pub trait BlockDevice: Send + Sync {
     fn read_sectors(&self, lba: u64, count: u32, buffer_virt: u64) -> bool;
     fn write_sectors(&self, lba: u64, count: u32, buffer_virt: u64) -> bool;
+    /// The disk under this device and where the device starts on it, for
+    /// writing with nothing else running (crash.rs). None if it isn't one.
+    fn on_disk(&self) -> Option<(alloc::sync::Arc<crate::block::Disk>, u64)> {
+        None
+    }
 }
 
 pub trait FileSystem: Send + Sync {
+    /// The device sectors holding a file's bytes, in order (crash.rs writes
+    /// a reserved file through them). None where it can't say.
+    fn file_sectors(&self, device: &dyn BlockDevice, path: &str) -> Option<Vec<u64>> {
+        let _ = (device, path);
+        None
+    }
     fn read_file(&self, device: &dyn BlockDevice, path: &str) -> Result<Vec<u8>, VfsError>;
     fn list_dir(&self, device: &dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>, VfsError>;
     /// Create or overwrite a file with the given data.
@@ -271,6 +282,14 @@ impl VfsManager {
             .clone();
         let relative = String::from(Self::strip_mount_prefix(path, &mount.path));
         Some((mount, relative))
+    }
+
+    /// The disk and absolute sectors holding `path`'s bytes (crash.rs).
+    pub fn file_sectors(&self, path: &str) -> Option<(alloc::sync::Arc<crate::block::Disk>, Vec<u64>)> {
+        let (m, rel) = self.resolve(path)?;
+        let (disk, start) = m.device.on_disk()?;
+        let lbas = m.fs.file_sectors(&*m.device, &rel)?;
+        Some((disk, lbas.into_iter().map(|l| start + l).collect()))
     }
 
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>, VfsError> {

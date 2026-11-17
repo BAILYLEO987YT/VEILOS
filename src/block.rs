@@ -345,6 +345,19 @@ impl Disk {
         true
     }
 
+    /// At a kernel panic, with the other CPUs stopped: write straight to the
+    /// disk, past the cache (whose memory may be in any state), taking the
+    /// disk even if it was held when everything stopped.
+    pub fn panic_write(&self, lba: u64, data: &[u8]) -> bool {
+        if self.inner.try_lock().is_none() {
+            unsafe { self.inner.force_unlock() };
+        }
+        match self.inner.try_lock() {
+            Some(mut d) => d.write_disk(lba, data),
+            None => false,
+        }
+    }
+
     /// (hits, misses) of the sector cache, for diagnostics.
     pub fn cache_stats(&self) -> (u64, u64) {
         let d = self.inner.lock();
@@ -383,6 +396,10 @@ impl BlockDevice for Partition {
         }
         let buf = unsafe { core::slice::from_raw_parts(buffer_virt as *const u8, count as usize * SECTOR) };
         self.disk.write(self.start + lba, buf)
+    }
+
+    fn on_disk(&self) -> Option<(Arc<Disk>, u64)> {
+        Some((self.disk.clone(), self.start))
     }
 }
 

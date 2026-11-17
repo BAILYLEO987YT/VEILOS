@@ -81,6 +81,7 @@ pub mod raster3d;
 pub mod nt_gpu3d;
 pub mod nt_sound;
 pub mod credentials;
+pub mod crash;
 pub mod entropy;
 pub mod security;
 pub mod sysprof;
@@ -304,6 +305,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     crate::hal::bind(crate::hal::DeviceClass::Storage);
     crate::vfs::ensure_standard_dirs();
     crate::scheduler::load_profiles();
+    crate::crash::prepare();
 
     // Phase 13: the network stack (VirtIO-net + smoltcp) starts when its NIC binds.
     crate::hal::bind(crate::hal::DeviceClass::Network);
@@ -915,6 +917,8 @@ async fn gui_refresh_task() {
 fn panic(info: &PanicInfo) -> ! {
     // Log reliably to the serial port
     serial_println!("\n!!! KERNEL PANIC !!!\n{}", info);
+    // Stop the other CPUs, show the crash screen, save the report (crash.rs).
+    crate::crash::on_panic(info);
 
     // Re-enable interrupts before parking. A panic can be reached with IF=0
     // (SFMASK cleared it for a syscall, or an exception gate cleared it) —

@@ -126,6 +126,11 @@ lazy_static! {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+            // Its own known-good stack too: an NMI can arrive anywhere,
+            // even just after SYSCALL on the user's stack.
+            idt.non_maskable_interrupt
+                .set_handler_fn(nmi_handler)
+                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
         
         // ── Hardware interrupt handlers ───────────────────────────────────────
@@ -648,6 +653,16 @@ pub(crate) extern "x86-interrupt" fn breakpoint_handler(
     crate::serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 
+}
+
+/// An NMI: at a kernel panic, the panicking CPU stops every other one with
+/// it (smp::stop_others), and they halt here for good.
+extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+    if crate::crash::stopping() {
+        loop {
+            unsafe { core::arch::asm!("cli; hlt") };
+        }
+    }
 }
 
 // Catches crashes that fail to catch themselves (e.g., stack overflows)
