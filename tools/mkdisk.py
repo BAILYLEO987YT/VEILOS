@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mkdisk.py OUT [--size 8G] [--from storage] [--add HOST=GUEST ...] [--no-marker]
+"""mkdisk.py OUT [--size 8G] [--from storage] [--add HOST=GUEST ...] [--no-marker] [--boot BOOTIMG]
 
 Build a FAT32 disk image holding a folder, for a QEMU run with room to work:
 
@@ -12,6 +12,12 @@ shouldn't be in the repository (toolchains and the like). Times are the host's.
 The disk gets VEILOS.VOL at its root (storage/ has it; it is added if the
 folder doesn't), the marker VEILOS needs before it mounts a volume as `/` and
 writes to it (src/block.rs). --no-marker makes a data disk VEILOS only reads.
+
+--boot BOOTIMG makes one bootable disk (a USB stick, or a VM's only disk):
+the bootloader's image from tools/build.sh, then this volume as a partition
+after it. A GPT image (veilos-uefi.img) gets a GPT entry of VEILOS's own type
+(VEILOS_TYPE: Windows leaves such a partition alone), an MBR image
+(veilos-bios.img) a FAT32 entry in slot 3. --size is then the volume's size.
 QEMU's fat:rw: folder disk is limited to about 500 MB and can't take a rename.
 """
 import argparse
@@ -19,6 +25,8 @@ import os
 import struct
 import sys
 import time
+import uuid
+import zlib
 
 SECTOR = 512
 RESERVED = 32
@@ -28,6 +36,9 @@ ATTR_DIR = 0x10
 ATTR_ARCHIVE = 0x20
 ATTR_LFN = 0x0F
 EOC = 0x0FFFFFFF
+# GPT partition type of a VEILOS system volume (made up for VEILOS; the
+# kernel still goes by VEILOS.VOL, this keeps other systems off it).
+VEILOS_TYPE = "700EFA60-219D-4B2F-9F39-B2EA24D56442"
 MARKER_NAME = "VEILOS.VOL"
 MARKER = (
     b"VEILOS SYSTEM VOLUME\r\n"
@@ -101,19 +112,30 @@ def short_entry(short, attr, cluster, size, mtime):
 
 
 class Disk:
-    def __init__(self, path, size):
-        self.f = open(path, "w+b")
-        self.f.truncate(size)
+    """A FAT32 volume of `size` bytes at byte `base` of the file at `path`
+    (0: the whole file, made anew)."""
+
+    def __init__(self, path, size, base=0):
+        if base:
+            self.f = open(path, "r+b")
+            self.f.seek(0, 2)
+            if self.f.tell() < base + size:
+                self.f.truncate(base + size)
+        else:
+            self.f = open(path, "w+b")
+            self.f.truncate(size)
+        self.base = base
         total = size // SECTOR
-        # Clusters of 4 KiB to 8 GiB, as Windows formats; larger disks, larger ones.
-        self.spc = 8 if size <= 8 << 30 else 16 if size <= 16 << 30 else 32
+        # Clusters as Windows formats: 512 bytes below 260 MiB (a small RAM
+        # disk), 4 KiB to 8 GiB, larger ones above.
+        self.spc = 1 if size < 260 << 20 else 8 if size <= 8 << 30 else 16 if size <= 16 << 30 else 32
         self.cb = self.spc * SECTOR
         clusters = total // self.spc
         self.spf = (clusters + 2) * 4 // SECTOR + 1
         self.data_start = RESERVED + FATS * self.spf
         self.clusters = (total - self.data_start) // self.spc
         if self.clusters < 65525:
-            raise SystemExit("too small for FAT32: at least 300M")
+            raise SystemExit("too small for FAT32: at least 34M")
         self.total = total
         self.fat = bytearray((self.clusters + 2) * 4)
         struct.pack_into("<II", self.fat, 0, 0x0FFFFFF8, EOC)
@@ -132,7 +154,7 @@ class Disk:
         return first
 
     def seek(self, cluster):
-        self.f.seek((self.data_start + (cluster - 2) * self.spc) * SECTOR)
+        self.f.seek(self.base + (self.data_start + (cluster - 2) * self.spc) * SECTOR)
 
     def put_file(self, path):
         if isinstance(path, bytes):
@@ -155,14 +177,14 @@ class Disk:
 
     def finish(self):
         for k in range(FATS):
-            self.f.seek((RESERVED + k * self.spf) * SECTOR)
+            self.f.seek(self.base + (RESERVED + k * self.spf) * SECTOR)
             self.f.write(self.fat)
         boot = bytearray(SECTOR)
         boot[0:3] = b"\xEB\x58\x90"
         boot[3:11] = b"VEILOS  "
         struct.pack_into("<HBHBHH", boot, 11, SECTOR, self.spc, RESERVED, FATS, 0, 0)
         boot[21] = 0xF8
-        struct.pack_into("<HHHII", boot, 22, 0, 63, 255, 0, self.total)
+        struct.pack_into("<HHHII", boot, 22, 0, 63, 255, self.base // SECTOR, self.total)
         struct.pack_into("<IHHIHH", boot, 36, self.spf, 0, 0, 2, 1, 6)
         boot[64] = 0x80
         boot[66] = 0x29
@@ -175,7 +197,7 @@ class Disk:
         struct.pack_into("<III", info, 484, 0x61417272, 0xFFFFFFFF, 0xFFFFFFFF)
         struct.pack_into("<I", info, 508, 0xAA550000)
         for at in (0, 6):
-            self.f.seek(at * SECTOR)
+            self.f.seek(self.base + at * SECTOR)
             self.f.write(boot)
             self.f.write(info)
         self.f.close()
@@ -247,6 +269,60 @@ def dir_entry_count(node):
     return n
 
 
+def copy_boot_image(boot, out, size):
+    """Copy the bootloader's image to `out` and add a partition for the
+    VEILOS volume after its last one. Returns the volume's byte offset."""
+    with open(boot, "rb") as f:
+        img = bytearray(f.read())
+    if img[510:512] != b"\x55\xAA":
+        sys.exit("%s: no partition table" % boot)
+    gpt = img[512:520] == b"EFI PART"
+    if gpt:
+        entries_lba, count, esize = struct.unpack_from("<QII", img, 512 + 72)
+        table = img[entries_lba * SECTOR:entries_lba * SECTOR + count * esize]
+        used = [table[i * esize:(i + 1) * esize] for i in range(count) if any(table[i * esize:i * esize + 16])]
+        last = max(struct.unpack_from("<Q", e, 40)[0] for e in used)
+    else:
+        parts = [struct.unpack_from("<II", img, 446 + i * 16 + 8) for i in range(4) if img[446 + i * 16 + 4]]
+        last = max(s + n - 1 for s, n in parts)
+        if len(parts) > 3:
+            sys.exit("%s: no free MBR slot" % boot)
+    start = (last + 1 + 2047) // 2048 * 2048
+    sectors = size // SECTOR
+    total = start + sectors + (2048 if gpt else 0)
+
+    # The boot image's partitions, as they were; nothing past them.
+    img = img[:(last + 1) * SECTOR]
+    with open(out, "wb") as f:
+        f.truncate(total * SECTOR)
+        f.write(img)
+        if gpt:
+            entry = (uuid.UUID(VEILOS_TYPE).bytes_le + uuid.uuid4().bytes_le
+                     + struct.pack("<QQQ", start, start + sectors - 1, 0) + "VEILOS".encode("utf-16le").ljust(72, b"\0"))
+            table = (b"".join(used) + entry).ljust(128 * 128, b"\0")
+            crc = zlib.crc32(table)
+            disk_guid = uuid.uuid4().bytes_le
+
+            def header(cur, alt, at):
+                h = bytearray(struct.pack("<8sIIIIQQQQ16sQIII", b"EFI PART", 0x10000, 92, 0, 0, cur, alt,
+                                          34, total - 34, disk_guid, at, 128, 128, crc))
+                struct.pack_into("<I", h, 16, zlib.crc32(h))
+                return bytes(h).ljust(SECTOR, b"\0")
+
+            mbr = bytearray(img[:SECTOR])
+            mbr[446:512] = b"\0" * 64 + b"\x55\xAA"
+            mbr[446:462] = struct.pack("<B3sB3sII", 0, b"\0\x02\0", 0xEE, b"\xff\xff\xff", 1, min(total - 1, 0xFFFFFFFF))
+            f.seek(0)
+            f.write(mbr + header(1, total - 1, 2) + table)
+            f.seek((total - 33) * SECTOR)
+            f.write(table + header(total - 1, 1, total - 33))
+        else:
+            slot = next(i for i in range(4) if not img[446 + i * 16 + 4])
+            f.seek(446 + slot * 16)
+            f.write(struct.pack("<B3sB3sII", 0, b"\xfe\xff\xff", 0x0C, b"\xfe\xff\xff", start, sectors))
+    return start * SECTOR
+
+
 def main():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -255,6 +331,7 @@ def main():
     ap.add_argument("--from", dest="root", default=os.path.join(repo, "storage"))
     ap.add_argument("--add", action="append", default=[], metavar="HOST=GUEST")
     ap.add_argument("--no-marker", action="store_true", help="a data disk: leave out VEILOS.VOL")
+    ap.add_argument("--boot", metavar="BOOTIMG", help="one bootable disk: this image's partitions, then the volume")
     args = ap.parse_args()
 
     root = Node()
@@ -280,7 +357,9 @@ def main():
     elif MARKER_NAME.lower() not in root.children:
         root.children[MARKER_NAME.lower()] = (MARKER_NAME, MARKER)
 
-    disk = Disk(args.out, parse_size(args.size))
+    size = parse_size(args.size)
+    base = copy_boot_image(args.boot, args.out, size) if args.boot else 0
+    disk = Disk(args.out, size, base)
     root_clusters = max(1, (dir_entry_count(root) * ENTRY + disk.cb - 1) // disk.cb)
     write_dir(disk, root, disk.alloc(root_clusters), None)
     used = disk.next - 2

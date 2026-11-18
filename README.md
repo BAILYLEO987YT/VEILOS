@@ -63,6 +63,12 @@ sh tools/run.sh --uefi     # UEFI (QEMU's OVMF)
 # Build the boot images only: target/x86_64-unknown-none/debug/veilos-{bios,uefi}.img
 sh tools/build.sh
 
+# One bootable disk (bootloader, kernel and a 1 GB VEILOS volume from storage/):
+# veilos-{bios,uefi}-disk.img. Or the volume loaded into memory with the kernel,
+# for a USB stick until VEILOS drives USB storage: veilos-{bios,uefi}-ram.img.
+sh tools/build.sh --disk 1G
+sh tools/build.sh --ramdisk 64M
+
 # Build the release zip (dist/VEILOS.zip), as CI does
 bash tools/package_release.sh
 ```

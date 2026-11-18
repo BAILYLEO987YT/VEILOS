@@ -162,8 +162,12 @@ fn setup_port(
         // and stop probing once anything was mounted, so a second partition
         // or disk was never seen.
         let port_static: &'static mut HbaPort = unsafe { &mut *(port as *mut HbaPort) };
-        match crate::block::Disk::new(port_static, port_num, sectors) {
-            Some(disk) => crate::block::mount_disk(disk),
+        match crate::block::AhciTransport::new(port_static) {
+            Some(t) => crate::block::mount_disk(crate::block::Disk::new(
+                alloc::boxed::Box::new(t),
+                alloc::format!("d{}", port_num),
+                sectors,
+            )),
             None => crate::serial_println!("[AHCI] Port {}: no DMA memory for the disk buffer.", port_num),
         }
     }

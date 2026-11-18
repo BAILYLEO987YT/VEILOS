@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # package_release.sh [STORAGE_DIR] -- build VEILOS into dist/VEILOS.zip
 #
-# The zip holds what someone needs to try VEILOS without Rust: the boot image
-# (BIOS, for QEMU's SeaBIOS; the UEFI one beside it for UEFI machines), a FAT32
-# disk made from storage/, the launch scripts in tools/release/, and
+# The zip holds what someone needs to try VEILOS without Rust: one disk with
+# the bootloader, the kernel and a FAT32 VEILOS volume made from storage/
+# (veilos.img boots through the BIOS, for QEMU's SeaBIOS; veilos-uefi.img is
+# the same for UEFI machines), the launch scripts in tools/release/, and
 # VERSION.txt. GitHub Actions runs this on every push (.github/workflows/release.yml).
 # STORAGE_DIR defaults to storage/; pass a clean copy to leave out local files.
 set -euo pipefail
@@ -18,11 +19,12 @@ rm -rf dist
 mkdir -p "$out"
 
 sh tools/build.sh
-cp target/x86_64-unknown-none/debug/veilos-bios.img "$out/veilos-boot.img"
-cp target/x86_64-unknown-none/debug/veilos-uefi.img "$out/veilos-uefi.img"
-
 # Room to work, and still small once zipped (empty space compresses to nothing).
-"$python" tools/mkdisk.py "$out/veilos-storage.img" --size 512M --from "$storage"
+for kind in bios uefi; do
+    "$python" tools/mkdisk.py "$out/veilos-$kind.img" --size 512M --from "$storage" \
+        --boot target/x86_64-unknown-none/debug/veilos-$kind.img
+done
+mv "$out/veilos-bios.img" "$out/veilos.img"
 
 cp tools/release/README.txt tools/release/run-windows.bat tools/release/run.sh "$out/"
 {

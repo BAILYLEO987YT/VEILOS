@@ -224,6 +224,9 @@ fn take_boot_info(boot_info: &mut BootInfo) {
     if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
         crate::smp::set_rsdp(rsdp);
     }
+    if let Some(addr) = boot_info.ramdisk_addr.into_option() {
+        crate::block::set_ram_disk(addr, boot_info.ramdisk_len as usize);
+    }
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
         let virt = fb.buffer_mut().as_mut_ptr() as u64;
@@ -405,6 +408,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::hotplug::init();
 
     // Storage first: the filesystems are needed by most of the rest of boot.
+    crate::block::mount_ram_disk();
     crate::hal::bind(crate::hal::DeviceClass::Storage);
     if !crate::block::root_mounted() {
         no_system_volume();
@@ -412,6 +416,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::vfs::ensure_standard_dirs();
     crate::scheduler::load_profiles();
     crate::crash::prepare();
+    if crate::block::root_on_ram_disk() {
+        crate::desktop::notify(
+            crate::desktop::NotifCategory::Warning,
+            "VEILOS",
+            "Running from memory (RAM disk): nothing you change is kept after a restart",
+        );
+    }
 
     // Phase 13: the network stack (VirtIO-net + smoltcp) starts when its NIC binds.
     crate::hal::bind(crate::hal::DeviceClass::Network);

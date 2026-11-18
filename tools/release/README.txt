@@ -21,11 +21,11 @@ The first boot can take a minute or two; VEILOS runs emulated, so it's slower
 than it would be on real hardware. VirtualBox and VMware aren't supported yet:
 VEILOS only has a driver for QEMU's display.
 
-Files you make inside VEILOS are saved in veilos-storage.img. To start over,
-unzip a fresh copy. If something goes wrong, serial.log in this folder has the
+Files you make inside VEILOS are saved in veilos.img, which is the whole
+system on one disk. To start over, unzip a fresh copy. If something goes wrong, serial.log in this folder has the
 boot messages; send it along with your report.
 
-veilos-uefi.img boots the same system on UEFI firmware (QEMU with OVMF, or a
-PC). The launch scripts don't need it: they boot veilos-boot.img (BIOS).
+veilos-uefi.img is the same disk for UEFI firmware (QEMU with OVMF, or a PC);
+veilos.img boots through the BIOS. The launch scripts use veilos.img.
 
 Built from commit: see VERSION.txt
