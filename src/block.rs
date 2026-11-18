@@ -15,8 +15,22 @@
 // On top of a disk sit `Partition`s (MBR primary entries, GPT entries, or
 // the whole disk for a superfloppy). Each is a `vfs::BlockDevice` with
 // partition-relative LBAs and bounds checking. `mount_disk` probes every
-// partition for a filesystem and mounts what it finds: the first one at `/`,
-// the rest at `/mnt/d<port>p<n>`.
+// partition for a filesystem and mounts what it finds. Only a volume that
+// names itself VEILOS's (`VOLUME_MARKER` at its root) becomes `/`; every other
+// filesystem goes to `/mnt/d<port>p<n>` read-only.
+//
+// Root-volume safety. On a real PC the first filesystem is usually the EFI
+// System Partition (FAT32), and before this the kernel made it `/` and wrote
+// its registry, users, logs and caches there. Now a volume must say it is
+// VEILOS's: a marker file is the test because it works the same on every
+// layout VEILOS meets (a superfloppy, MBR, GPT, QEMU's vvfat folder, a USB
+// stick), nothing else puts that file there by accident, and it needs no
+// filesystem driver beyond reading. A volume label is too easy to collide
+// with and a GPT type GUID exists only on GPT. Writes are refused twice: the
+// mount is read-only (callers get an error) and each `Disk` accepts writes
+// only inside the ranges `allow_writes` opened, which is only ever the root
+// volume's partition, so no driver, cache or crash path can write elsewhere.
+// With no VEILOS volume the kernel stops at boot (main.rs) and writes nothing.
 //
 // Buffers passed to `BlockDevice` are kernel virtual addresses (heap,
 // stack); the bounce buffer handles the DMA side.
@@ -120,9 +134,17 @@ struct DiskInner {
     bounce_phys: u64,
     bounce_virt: *mut u8,
     cache: SectorCache,
+    /// Absolute sector ranges [start, end) writes may touch: the root
+    /// volume's partition, or nothing.
+    writable: Vec<(u64, u64)>,
 }
 
 impl DiskInner {
+    fn may_write(&self, lba: u64, count: u64) -> bool {
+        let Some(end) = lba.checked_add(count) else { return false };
+        self.writable.iter().any(|&(s, e)| lba >= s && end <= e)
+    }
+
     fn write_disk(&mut self, lba: u64, src: &[u8]) -> bool {
         let count = (src.len() / SECTOR) as u32;
         let mut done = 0u32;
@@ -216,6 +238,16 @@ pub struct Disk {
 unsafe impl Send for Disk {}
 unsafe impl Sync for Disk {}
 
+/// A write outside the root volume, refused. Logged a limited number of
+/// times so a driver retrying in a loop can't flood the serial port.
+fn refused(port: usize, lba: u64, count: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+        crate::serial_println!("[BLOCK] refused write: disk {} lba {} +{} is not the VEILOS volume", port, lba, count);
+    }
+}
+
 /// Every disk, for write-back.
 static DISKS: Mutex<Vec<Arc<Disk>>> = Mutex::new(Vec::new());
 static LAST_FLUSH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -259,6 +291,7 @@ impl Disk {
                 bounce_phys,
                 bounce_virt,
                 cache: SectorCache::new(),
+                writable: Vec::new(),
             }),
         });
         DISKS.lock().push(disk.clone());
@@ -324,6 +357,11 @@ impl Disk {
         let count = (buf.len() / SECTOR) as u32;
         let perf = performance();
         let mut d = self.inner.lock();
+        if !d.may_write(lba, count as u64) {
+            drop(d);
+            refused(self.port_num, lba, count);
+            return false;
+        }
         if perf {
             for i in 0..count as usize {
                 d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], true, false);
@@ -353,9 +391,14 @@ impl Disk {
             unsafe { self.inner.force_unlock() };
         }
         match self.inner.try_lock() {
-            Some(mut d) => d.write_disk(lba, data),
-            None => false,
+            Some(mut d) if d.may_write(lba, (data.len() / SECTOR) as u64) => d.write_disk(lba, data),
+            _ => false,
         }
+    }
+
+    /// Let writes reach sectors [start, start + sectors): the root volume.
+    fn allow_writes(&self, start: u64, sectors: u64) {
+        self.inner.lock().writable.push((start, start + sectors));
     }
 
     /// (hits, misses) of the sector cache, for diagnostics.
@@ -494,8 +537,37 @@ fn read_gpt(disk: &Disk) -> Option<Vec<PartitionInfo>> {
 
 // -----| mounting |-----
 
-/// Probe every partition of `disk` and mount each filesystem found.
+/// The file at the root of a VEILOS system volume, and how it starts.
+/// tools/mkdisk.py writes it; storage/ carries it for QEMU's vvfat disk.
+pub const VOLUME_MARKER: &str = "/VEILOS.VOL";
+const MARKER_MAGIC: &[u8] = b"VEILOS SYSTEM VOLUME";
+
+static ROOT_FOUND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Every filesystem seen, for the no-system-volume screen (main.rs).
+static FOUND: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// What was found on each disk: "NTFS, disk 1 partition 2 (64 MiB) at ...".
+pub fn found_volumes() -> Vec<String> {
+    FOUND.lock().clone()
+}
+
+/// Whether a VEILOS volume is mounted at `/`.
+pub fn root_mounted() -> bool {
+    ROOT_FOUND.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Does this filesystem carry the VEILOS marker? Reads only.
+fn is_veilos_volume(fs: &dyn crate::vfs::FileSystem, device: &Partition) -> bool {
+    match fs.read_file(device, VOLUME_MARKER) {
+        Ok(data) => data.starts_with(MARKER_MAGIC),
+        Err(_) => false,
+    }
+}
+
+/// Probe every partition of `disk` and mount each filesystem found: the
+/// first VEILOS volume writable at `/`, everything else read-only.
 pub fn mount_disk(disk: Arc<Disk>) {
+    use core::sync::atomic::Ordering;
     let parts = read_partitions(&disk);
     crate::println!("     - {} partition(s)", parts.len());
     for (n, p) in parts.iter().enumerate() {
@@ -508,13 +580,21 @@ pub fn mount_disk(disk: Arc<Disk>) {
             crate::serial_println!("[BLOCK]   no filesystem recognised");
             continue;
         };
-        let path = if crate::vfs::VFS.mount_count() == 0 {
-            String::from("/")
+        let veilos = is_veilos_volume(&*fs, &device);
+        let root = veilos && !ROOT_FOUND.swap(true, Ordering::AcqRel);
+        let (path, how) = if root {
+            disk.allow_writes(p.start, p.sectors);
+            (String::from("/"), "writable: the VEILOS volume")
+        } else if veilos {
+            (format!("/mnt/d{}p{}", disk.port_num, n), "read-only: another VEILOS volume")
         } else {
-            format!("/mnt/d{}p{}", disk.port_num, n)
+            (format!("/mnt/d{}p{}", disk.port_num, n), "read-only: not VEILOS's")
         };
-        crate::println!("  -> Mounted {} (disk {} partition {}) at {}", name, disk.port_num, n, path);
-        crate::vfs::VFS.mount(path, fs, Box::new(device));
+        let line = format!("{} on disk {} partition {} ({} MiB) at {}, {}", name, disk.port_num, n, p.sectors / 2048, path, how);
+        crate::println!("  -> Mounted {}", line);
+        crate::serial_println!("[BLOCK]   mounted {}", line);
+        FOUND.lock().push(line);
+        crate::vfs::VFS.mount(path, fs, Box::new(device), !root);
     }
 }
 

@@ -1,0 +1,3 @@
+VEILOS SYSTEM VOLUME
+This file marks the volume VEILOS boots from and writes to. Without it at the
+root of a volume, VEILOS mounts that volume read-only.

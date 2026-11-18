@@ -52,6 +52,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | | Requirement | Status | Notes |
 |---|---|---|---|
 | ✅ | Read/write FAT32 with long names, rename, handles, seek | ✅ | |
+| **1.0** | Never writes to a volume that isn't VEILOS's (an ESP, Windows, a USB stick) | ✅ | Done 2026-11-18 (`block.rs`). Only a volume with `VEILOS.VOL` at its root becomes `/` and is writable; every other filesystem mounts read-only at `/mnt/d<port>p<n>`, and each disk refuses writes outside the root volume's partition. With no VEILOS volume, boot stops on a screen listing what it found and writes nothing. `tools/mkdisk.py` and `storage/` carry the marker. Checked in QEMU with `tools/mkwindisk.py` (a GPT disk with an ESP, MSR and NTFS, attached before the VEILOS disk): signed in as admin, `MKDIR`/`RM` on both Windows volumes fail in Security and Performance Mode, reads work, and the image's SHA-256 is unchanged. Older disk images need `VEILOS.VOL` copied to their root. |
 | **1.0** | Survives a power cut without corrupting the disk | ❌ | FAT has no journal. Needs a journaled or copy-on-write native FS, or at least fsck-on-boot. |
 | | Write NTFS / exFAT (read Windows disks *and* USB sticks) | ⚠️ | Both are read-only. |
 | **1.0** | File ownership and permissions between users | ❌ | FAT stores none ("everything is the user's"). |

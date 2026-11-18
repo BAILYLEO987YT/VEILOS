@@ -202,6 +202,49 @@ macro_rules! boot_assert {
     };
 }
 
+/// No disk holds a VEILOS volume (block.rs: the `VEILOS.VOL` marker). Stop
+/// here, before anything is written: every other volume stays untouched.
+fn no_system_volume() -> ! {
+    vga_buffer::VGA_WRITER.lock().set_colour(vga_buffer::VgaColour::White, vga_buffer::VgaColour::Red);
+    println!();
+    println!(" VEILOS could not find its system volume.                                       ");
+    vga_buffer::VGA_WRITER.lock().set_colour(vga_buffer::VgaColour::LightGray, vga_buffer::VgaColour::Black);
+    println!();
+    println!(" No disk has a filesystem with {} at its root, so VEILOS has", crate::block::VOLUME_MARKER);
+    println!(" stopped here. It has written nothing to any disk. The volumes it found");
+    println!(" are listed above; they were only read.");
+    println!();
+    println!(" Make a VEILOS disk with tools/mkdisk.py, or copy storage/VEILOS.VOL to the");
+    println!(" root of the FAT32 volume VEILOS should use, then restart.");
+    serial_println!("[BOOT] no VEILOS system volume ({} not found on any disk): stopped, nothing written", crate::block::VOLUME_MARKER);
+    // The same on a framebuffer, for machines with no VGA text mode (UEFI,
+    // a display with no VGA core). Binding the display writes to no disk.
+    crate::hal::bind(crate::hal::DeviceClass::Display);
+    let volumes = crate::block::found_volumes();
+    let mut body = alloc::string::String::from("Volumes found (each was only read):\n");
+    if volumes.is_empty() {
+        body.push_str("  none\n");
+    }
+    for v in &volumes {
+        body.push_str("  ");
+        body.push_str(v);
+        body.push('\n');
+    }
+    crate::crash::paint_stop(
+        b"VEILOS COULD NOT FIND ITS SYSTEM VOLUME.",
+        &[
+            b"NO DISK HAS A FILESYSTEM WITH VEILOS.VOL AT ITS ROOT, SO VEILOS STOPPED HERE.",
+            b"IT HAS WRITTEN NOTHING TO ANY DISK.",
+            b"MAKE A VEILOS DISK WITH TOOLS/MKDISK.PY, OR COPY STORAGE/VEILOS.VOL TO THE ROOT",
+            b"OF THE FAT32 VOLUME VEILOS SHOULD USE, THEN RESTART.",
+        ],
+        body.as_bytes(),
+    );
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // -----| initialization |-----
     SERIAL_WRITER.lock().init();
@@ -303,6 +346,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Storage first: the filesystems are needed by most of the rest of boot.
     crate::hal::bind(crate::hal::DeviceClass::Storage);
+    if !crate::block::root_mounted() {
+        no_system_volume();
+    }
     crate::vfs::ensure_standard_dirs();
     crate::scheduler::load_profiles();
     crate::crash::prepare();

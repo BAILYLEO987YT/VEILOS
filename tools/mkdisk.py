@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mkdisk.py OUT [--size 8G] [--from storage] [--add HOST=GUEST ...]
+"""mkdisk.py OUT [--size 8G] [--from storage] [--add HOST=GUEST ...] [--no-marker]
 
 Build a FAT32 disk image holding a folder, for a QEMU run with room to work:
 
@@ -8,6 +8,10 @@ Build a FAT32 disk image holding a folder, for a QEMU run with room to work:
 `--from` is the root of the disk (default storage/ beside this script's repo);
 each `--add` copies a host file or folder to a path on the disk, for what
 shouldn't be in the repository (toolchains and the like). Times are the host's.
+
+The disk gets VEILOS.VOL at its root (storage/ has it; it is added if the
+folder doesn't), the marker VEILOS needs before it mounts a volume as `/` and
+writes to it (src/block.rs). --no-marker makes a data disk VEILOS only reads.
 QEMU's fat:rw: folder disk is limited to about 500 MB and can't take a rename.
 """
 import argparse
@@ -24,6 +28,12 @@ ATTR_DIR = 0x10
 ATTR_ARCHIVE = 0x20
 ATTR_LFN = 0x0F
 EOC = 0x0FFFFFFF
+MARKER_NAME = "VEILOS.VOL"
+MARKER = (
+    b"VEILOS SYSTEM VOLUME\r\n"
+    b"This file marks the volume VEILOS boots from and writes to. Without it at the\r\n"
+    b"root of a volume, VEILOS mounts that volume read-only.\r\n"
+)
 
 
 def parse_size(s):
@@ -125,6 +135,12 @@ class Disk:
         self.f.seek((self.data_start + (cluster - 2) * self.spc) * SECTOR)
 
     def put_file(self, path):
+        if isinstance(path, bytes):
+            first = self.alloc((len(path) + self.cb - 1) // self.cb)
+            if first:
+                self.seek(first)
+                self.f.write(path)
+            return first, len(path)
         size = os.path.getsize(path)
         first = self.alloc((size + self.cb - 1) // self.cb)
         if first:
@@ -206,7 +222,8 @@ def write_dir(disk, node, cluster, parent):
             subdirs.append((at, short, item))
         else:
             first, size = disk.put_file(item)
-            entries.append(short_entry(short, ATTR_ARCHIVE, first, size, os.path.getmtime(item)))
+            mtime = time.time() if isinstance(item, bytes) else os.path.getmtime(item)
+            entries.append(short_entry(short, ATTR_ARCHIVE, first, size, mtime))
     # Each folder needs its own clusters before its children can name them.
     allocated = {}
     for at, short, item in subdirs:
@@ -237,6 +254,7 @@ def main():
     ap.add_argument("--size", default="8G")
     ap.add_argument("--from", dest="root", default=os.path.join(repo, "storage"))
     ap.add_argument("--add", action="append", default=[], metavar="HOST=GUEST")
+    ap.add_argument("--no-marker", action="store_true", help="a data disk: leave out VEILOS.VOL")
     args = ap.parse_args()
 
     root = Node()
@@ -256,6 +274,11 @@ def main():
             for p in parts[:-1]:
                 node = node.child(p)
             node.children[parts[-1].lower()] = (parts[-1], host)
+
+    if args.no_marker:
+        root.children.pop(MARKER_NAME.lower(), None)
+    elif MARKER_NAME.lower() not in root.children:
+        root.children[MARKER_NAME.lower()] = (MARKER_NAME, MARKER)
 
     disk = Disk(args.out, parse_size(args.size))
     root_clusters = max(1, (dir_entry_count(root) * ENTRY + disk.cb - 1) // disk.cb)

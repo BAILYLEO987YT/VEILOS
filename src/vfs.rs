@@ -19,6 +19,8 @@ pub enum VfsError {
     ReadError,
     WriteError,
     GenericError,
+    /// The volume is mounted read-only (it isn't VEILOS's; see block.rs).
+    ReadOnly,
 }
 
 pub struct DirEntry {
@@ -177,6 +179,14 @@ pub struct MountedFileSystem {
     pub path: String,
     pub fs: Box<dyn FileSystem>,
     pub device: Box<dyn BlockDevice>,
+    /// Nothing may change on it.
+    pub read_only: bool,
+}
+
+impl MountedFileSystem {
+    fn writable(&self) -> Result<(), VfsError> {
+        if self.read_only { Err(VfsError::ReadOnly) } else { Ok(()) }
+    }
 }
 
 /// An open file. Reads and writes reach the disk without passing through a
@@ -197,15 +207,21 @@ impl VfsFile {
         self.mount.fs.read_at(&*self.mount.device, &mut self.state.lock(), off, buf)
     }
     pub fn write_at(&self, off: u64, data: &[u8]) -> Result<(), VfsError> {
+        self.mount.writable()?;
         self.mount.fs.write_at(&*self.mount.device, &mut self.state.lock(), off, data)
     }
     pub fn set_len(&self, len: u64) -> Result<(), VfsError> {
+        self.mount.writable()?;
         self.mount.fs.set_len(&*self.mount.device, &mut self.state.lock(), len)
     }
     pub fn sync(&self) -> Result<(), VfsError> {
+        if self.mount.read_only {
+            return Ok(()); // nothing was written
+        }
         self.mount.fs.sync(&*self.mount.device, &mut self.state.lock())
     }
     pub fn set_mtime(&self, mtime: i64) -> Result<(), VfsError> {
+        self.mount.writable()?;
         self.mount.fs.set_mtime(&*self.mount.device, &mut self.state.lock(), mtime)
     }
     /// The file now lives at the volume path of VFS path `path`: look it up
@@ -232,8 +248,8 @@ impl VfsManager {
         Self { mounts: spin::Mutex::new(Vec::new()) }
     }
 
-    pub fn mount(&self, path: String, fs: Box<dyn FileSystem>, device: Box<dyn BlockDevice>) {
-        self.mounts.lock().push(Arc::new(MountedFileSystem { path, fs, device }));
+    pub fn mount(&self, path: String, fs: Box<dyn FileSystem>, device: Box<dyn BlockDevice>, read_only: bool) {
+        self.mounts.lock().push(Arc::new(MountedFileSystem { path, fs, device, read_only }));
     }
 
     pub fn mount_count(&self) -> usize {
@@ -287,6 +303,9 @@ impl VfsManager {
     /// The disk and absolute sectors holding `path`'s bytes (crash.rs).
     pub fn file_sectors(&self, path: &str) -> Option<(alloc::sync::Arc<crate::block::Disk>, Vec<u64>)> {
         let (m, rel) = self.resolve(path)?;
+        if m.read_only {
+            return None;
+        }
         let (disk, start) = m.device.on_disk()?;
         let lbas = m.fs.file_sectors(&*m.device, &rel)?;
         Some((disk, lbas.into_iter().map(|l| start + l).collect()))
@@ -367,6 +386,7 @@ impl VfsManager {
         if !Arc::ptr_eq(&m, &n) {
             return Err(VfsError::GenericError);
         }
+        m.writable()?;
         m.fs.rename(&*m.device, &f, &t)
     }
 
@@ -374,7 +394,7 @@ impl VfsManager {
     /// that owns the path prefix, then delegates to its `write_file` impl.
     pub fn write_file(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
         match self.resolve(path) {
-            Some((m, rel)) => m.fs.write_file(&*m.device, &rel, data),
+            Some((m, rel)) => m.writable().and_then(|_| m.fs.write_file(&*m.device, &rel, data)),
             None => Err(VfsError::FileNotFound),
         }
     }
@@ -382,7 +402,7 @@ impl VfsManager {
     /// Delete a file (or empty directory) at `path`. Routes to the mounted filesystem.
     pub fn delete_file(&self, path: &str) -> Result<(), VfsError> {
         match self.resolve(path) {
-            Some((m, rel)) => m.fs.delete_file(&*m.device, &rel),
+            Some((m, rel)) => m.writable().and_then(|_| m.fs.delete_file(&*m.device, &rel)),
             None => Err(VfsError::FileNotFound),
         }
     }
@@ -390,7 +410,7 @@ impl VfsManager {
     /// Create a directory at `path` (its parent must exist).
     pub fn create_dir(&self, path: &str) -> Result<(), VfsError> {
         match self.resolve(path) {
-            Some((m, rel)) => m.fs.create_dir(&*m.device, &rel),
+            Some((m, rel)) => m.writable().and_then(|_| m.fs.create_dir(&*m.device, &rel)),
             None => Err(VfsError::FileNotFound),
         }
     }
