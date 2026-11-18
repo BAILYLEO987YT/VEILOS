@@ -1797,7 +1797,7 @@ impl Fnv {
 
 /// Functions that act on the OS. They are allowed in handlers and events, never
 /// inside a live property (a property must not have side effects).
-pub const ACTION_FUNCTIONS: &[&str] = &["launch", "focus_window", "lock_session", "shutdown", "destroy", "print"];
+pub const ACTION_FUNCTIONS: &[&str] = &["launch", "focus_window", "lock_session", "shutdown", "restart", "destroy", "print"];
 
 /// Host used while evaluating live properties: reads only.
 pub struct ReadOnlyHost<'a> {

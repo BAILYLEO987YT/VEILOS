@@ -15,7 +15,7 @@
 //   * `set` values are stored, so scripts can read them back (THEME[accent]).
 //
 // Element functions (add, destroy, ref[...], time, launch, focus_window,
-// lock_session, shutdown) are implemented in shell.rs.
+// lock_session, shutdown, restart) are implemented in shell.rs.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -132,7 +132,7 @@ impl Host for KernelHost {
                 notify(NotifCategory::Info, "VSCRIPT", &out);
                 Some(Ok(VValue::None))
             }
-            // time, launch, focus_window, lock_session, shutdown, destroy
+            // time, launch, focus_window, lock_session, shutdown, restart, destroy
             _ => crate::shell::host_call(name, args),
         }
     }

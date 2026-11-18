@@ -17,7 +17,8 @@
 // At the next start `prepare` finds a report in crash.log, keeps it as
 // /var/log/crash-N.log, says so in a notification, and clears crash.log
 // for next time. CRASH TEST in the terminal (administrators) panics on
-// purpose.
+// purpose. Any key on the crash screen restarts (power.rs; main.rs's panic
+// handler waits for it).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -139,7 +140,7 @@ pub fn on_panic(info: &core::panic::PanicInfo) {
 
     paint(
         b"VEILOS RAN INTO A PROBLEM AND STOPPED.",
-        &[b"THE REPORT BELOW WAS SAVED TO /VAR/LOG/CRASH.LOG AND IS KEPT AT THE NEXT START.", b"RESTART THE COMPUTER TO CONTINUE."],
+        &[b"THE REPORT BELOW WAS SAVED TO /VAR/LOG/CRASH.LOG AND IS KEPT AT THE NEXT START.", b"PRESS ANY KEY TO RESTART."],
         r.bytes(),
     );
 

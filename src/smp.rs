@@ -765,10 +765,9 @@ fn find_rsdp() -> Option<u64> {
     scan(0xE0000, 0x100000)
 }
 
-/// Parse the MADT (signature "APIC") reachable from the RSDP: the APIC ID of
-/// every enabled processor, plus the I/O APICs and ISA interrupt overrides.
-/// Returns `None` if there is no MADT or it lists no enabled processor.
-pub fn parse_madt() -> Option<Madt> {
+/// The physical address of the ACPI table with signature `sig` ("APIC",
+/// "FACP", ...), found through the RSDP's XSDT or RSDT.
+pub fn acpi_table(sig: &[u8; 4]) -> Option<u64> {
     let rsdp_addr = find_rsdp()?;
 
     let revision: u8 = unsafe { read_phys(rsdp_addr + 15) };
@@ -793,7 +792,7 @@ pub fn parse_madt() -> Option<Madt> {
     if (sdt_len as usize) < 36 { return None; }
     let entry_count = (sdt_len as usize - 36) / entry_size;
 
-    let mut madt_addr: Option<u64> = None;
+    let mut found: Option<u64> = None;
     for i in 0..entry_count {
         let ptr_addr = sdt_addr + 36 + (i * entry_size) as u64;
         let table_addr: u64 = if is_xsdt {
@@ -802,13 +801,19 @@ pub fn parse_madt() -> Option<Madt> {
             unsafe { read_phys::<u32>(ptr_addr) as u64 }
         };
         if table_addr == 0 { continue; }
-        let sig = unsafe { read_phys_bytes(table_addr, 4) };
-        if sig == b"APIC" {
-            madt_addr = Some(table_addr);
+        if unsafe { read_phys_bytes(table_addr, 4) } == sig {
+            found = Some(table_addr);
             break;
         }
     }
-    let madt_addr = madt_addr?;
+    found
+}
+
+/// Parse the MADT (signature "APIC") reachable from the RSDP: the APIC ID of
+/// every enabled processor, plus the I/O APICs and ISA interrupt overrides.
+/// Returns `None` if there is no MADT or it lists no enabled processor.
+pub fn parse_madt() -> Option<Madt> {
+    let madt_addr = acpi_table(b"APIC")?;
 
     let madt_len: u32 = unsafe { read_phys(madt_addr + 4) };
     if (madt_len as usize) < 44 { return None; }

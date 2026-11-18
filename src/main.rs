@@ -10,6 +10,7 @@ extern crate alloc;
 #[macro_use]
 pub mod encryption;
 pub mod vga_buffer;
+pub mod power;
 pub mod interrupts;
 pub mod gdt;
 pub mod allocator;
@@ -215,7 +216,7 @@ fn no_system_volume() -> ! {
     println!(" are listed above; they were only read.");
     println!();
     println!(" Make a VEILOS disk with tools/mkdisk.py, or copy storage/VEILOS.VOL to the");
-    println!(" root of the FAT32 volume VEILOS should use, then restart.");
+    println!(" root of the FAT32 volume VEILOS should use. Press any key to restart.");
     serial_println!("[BOOT] no VEILOS system volume ({} not found on any disk): stopped, nothing written", crate::block::VOLUME_MARKER);
     // The same on a framebuffer, for machines with no VGA text mode (UEFI,
     // a display with no VGA core). Binding the display writes to no disk.
@@ -236,13 +237,11 @@ fn no_system_volume() -> ! {
             b"NO DISK HAS A FILESYSTEM WITH VEILOS.VOL AT ITS ROOT, SO VEILOS STOPPED HERE.",
             b"IT HAS WRITTEN NOTHING TO ANY DISK.",
             b"MAKE A VEILOS DISK WITH TOOLS/MKDISK.PY, OR COPY STORAGE/VEILOS.VOL TO THE ROOT",
-            b"OF THE FAT32 VOLUME VEILOS SHOULD USE, THEN RESTART.",
+            b"OF THE FAT32 VOLUME VEILOS SHOULD USE. PRESS ANY KEY TO RESTART.",
         ],
         body.as_bytes(),
     );
-    loop {
-        x86_64::instructions::hlt();
-    }
+    crate::power::wait_key_then_reset()
 }
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
@@ -966,14 +965,6 @@ fn panic(info: &PanicInfo) -> ! {
     // Stop the other CPUs, show the crash screen, save the report (crash.rs).
     crate::crash::on_panic(info);
 
-    // Re-enable interrupts before parking. A panic can be reached with IF=0
-    // (SFMASK cleared it for a syscall, or an exception gate cleared it) —
-    // without this, the timer/mouse ISRs never fire again and the machine
-    // looks totally dead instead of "kernel panicked, but still breathing"
-    // (cursor still moves, clock still ticks), which is far easier to debug
-    // from the screen alone when serial isn't being watched live.
-    unsafe { core::arch::asm!("sti"); }
-
     // Tell the user on the screen! (best-effort: if VGA_WRITER is itself the
     // thing that was locked when we panicked, this could still hang here —
     // but the serial_println! above already got the diagnostic out.)
@@ -984,19 +975,9 @@ fn panic(info: &PanicInfo) -> ! {
         );
     }
     println!("\n[KERNEL PANIC]\n{}", info);
+    println!("Press any key to restart.");
 
-    loop {
-        x86_64_hlt();
-    }
-}
-
-// -----| architecture utilities |-----
-
-/// Issues an x86_64 HLT instruction to halt the CPU until the next interrupt.
-/// This is preferable to a busy-loop as it reduces power consumption.
-#[inline(always)]
-fn x86_64_hlt() {
-    unsafe {
-        core::arch::asm!("hlt");
-    }
+    // The crash screen says any key restarts: poll the keyboard with
+    // interrupts off (power.rs), then reset without saving anything.
+    crate::power::wait_key_then_reset()
 }
