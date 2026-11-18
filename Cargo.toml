@@ -6,7 +6,9 @@ authors = ["Baily Hyslop"]
 
 # -----| dependencies |-----
 [dependencies]
-bootloader = { version = "0.9", features = ["map_physical_memory"] }
+# The kernel's side of bootloader 0.11 (BIOS and UEFI); the disk images are
+# made by tools/mkimage.
+bootloader_api = "0.11.17"
 # Syscall numbers and layouts shared with VEILOS's ntdll.dll (win32/).
 nt_abi = { path = "win32/nt_abi" }
 conquer-once = { version = "0.2.0", default-features = false }
@@ -66,22 +68,4 @@ opt-level = 2
 [profile.release]
 panic = "abort"
 
-# -----| bootimage configuration |-----
-[package.metadata.bootimage]
-test-args = ["-serial", "stdio"]
-run-args = [
-    "-serial", "stdio",
-    "-cpu", "qemu64",
-    "-smp", "4",
-    "-m", "512M",
-    "-accel", "tcg,thread=multi",
-    "-device", "usb-ehci,id=usb",
-    "-device", "usb-tablet,bus=usb.0",
-    "-vga", "none",
-    "-device", "bochs-display",
-    "-drive", "id=disk,file=fat:rw:storage,if=none,format=raw",
-    "-device", "ahci,id=ahci",
-    "-device", "ide-hd,drive=disk,bus=ahci.0",
-    "-netdev", "socket,id=net0,udp=127.0.0.1:1235,localaddr=127.0.0.1:1234",
-    "-device", "virtio-net-pci,netdev=net0"
-]
+# Boot images: tools/build.sh (tools/mkimage, bootloader 0.11); QEMU: tools/run.sh.

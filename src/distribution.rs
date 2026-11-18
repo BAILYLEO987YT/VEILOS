@@ -646,14 +646,13 @@ VEILOS DEVELOPER GUIDE
 Prerequisites
   - Rust nightly (see rust-toolchain.toml)
   - QEMU for emulation
-  - bootimage tool: cargo install bootimage
+  - a nightly from 2026-07-10 on for the boot image builder (tools/mkimage)
 
 Building
-  cargo build --target x86_64-veilos.json
-  cargo bootimage
+  sh tools/build.sh   (kernel, then BIOS and UEFI boot images)
 
 Running in QEMU
-  cargo run  (uses run-args from Cargo.toml)
+  sh tools/run.sh [--uefi]
   Serial output: piped to stdout
 
 Target spec: x86_64-veilos

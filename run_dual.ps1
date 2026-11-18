@@ -16,11 +16,11 @@ Write-Host "=== VEILOS Dual-VM Launcher ===" -ForegroundColor Cyan
 # Determine build mode
 $buildMode = "debug"
 $targetDir = "target\x86_64-unknown-none\debug"
-$bootImage = "$targetDir\bootimage-VEIL-OS.bin"
+$bootImage = "$targetDir\veilos-bios.img"
 
 if ($Build -or (-not $NoBuild -and -not (Test-Path $bootImage))) {
     Write-Host "[BUILD] Building VEILOS..." -ForegroundColor Yellow
-    cargo build 2>&1
+    sh tools/build.sh --bios 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ERROR] Build failed!" -ForegroundColor Red
         exit 1
@@ -33,7 +33,7 @@ else {
 
 if (-not (Test-Path $bootImage)) {
     Write-Host "[ERROR] Boot image not found at $bootImage" -ForegroundColor Red
-    Write-Host "        Run 'cargo build' first, or use -Build flag." -ForegroundColor Yellow
+    Write-Host "        Run 'sh tools/build.sh' first, or use -Build flag." -ForegroundColor Yellow
     exit 1
 }
 

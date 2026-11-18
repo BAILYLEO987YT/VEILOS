@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # package_release.sh [STORAGE_DIR] -- build VEILOS into dist/VEILOS.zip
 #
-# The zip holds what someone needs to try VEILOS without Rust: the boot image,
-# a FAT32 disk made from storage/, the launch scripts in tools/release/, and
+# The zip holds what someone needs to try VEILOS without Rust: the boot image
+# (BIOS, for QEMU's SeaBIOS; the UEFI one beside it for UEFI machines), a FAT32
+# disk made from storage/, the launch scripts in tools/release/, and
 # VERSION.txt. GitHub Actions runs this on every push (.github/workflows/release.yml).
 # STORAGE_DIR defaults to storage/; pass a clean copy to leave out local files.
 set -euo pipefail
@@ -16,8 +17,9 @@ out=dist/VEILOS
 rm -rf dist
 mkdir -p "$out"
 
-cargo bootimage
-cp target/x86_64-unknown-none/debug/bootimage-VEIL-OS.bin "$out/veilos-boot.img"
+sh tools/build.sh
+cp target/x86_64-unknown-none/debug/veilos-bios.img "$out/veilos-boot.img"
+cp target/x86_64-unknown-none/debug/veilos-uefi.img "$out/veilos-uefi.img"
 
 # Room to work, and still small once zipped (empty space compresses to nothing).
 "$python" tools/mkdisk.py "$out/veilos-storage.img" --size 512M --from "$storage"

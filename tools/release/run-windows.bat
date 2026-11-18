@@ -21,7 +21,7 @@ echo Starting VEILOS. The first boot can take a minute or two.
 echo Log in as "admin" with password "veilos" (or "root" with no password).
 "%QEMU%" -cpu qemu64 -smp 4 -m 1G -accel tcg,thread=multi ^
   -drive format=raw,file=veilos-boot.img ^
-  -vga none -device bochs-display ^
+  -vga std ^
   -device usb-ehci,id=usb -device usb-tablet,bus=usb.0 ^
   -drive id=disk,file=veilos-storage.img,if=none,format=raw ^
   -device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 ^

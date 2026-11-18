@@ -25,4 +25,7 @@ Files you make inside VEILOS are saved in veilos-storage.img. To start over,
 unzip a fresh copy. If something goes wrong, serial.log in this folder has the
 boot messages; send it along with your report.
 
+veilos-uefi.img boots the same system on UEFI firmware (QEMU with OVMF, or a
+PC). The launch scripts don't need it: they boot veilos-boot.img (BIOS).
+
 Built from commit: see VERSION.txt

@@ -1,0 +1,13 @@
+[package]
+name = "mkimage"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Not part of the kernel's build: run from the repo root as
+#   cargo run --manifest-path tools/mkimage/Cargo.toml -- ...
+[workspace]
+
+[dependencies]
+bootloader = "0.11.17"
+anyhow = "1"

@@ -120,6 +120,11 @@ pub fn bind(class: DeviceClass) {
     for (id, pci) in candidates {
         bind_one(id, &pci);
     }
+    // No driver for any display adapter: the framebuffer the firmware set
+    // up still works, at the mode it chose, on any GPU.
+    if class == DeviceClass::Display && crate::graphics::HEADS.lock().is_empty() {
+        crate::graphics::bind_firmware_framebuffer();
+    }
 }
 
 fn bind_one(id: usize, pci: &PciDevice) {

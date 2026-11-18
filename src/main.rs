@@ -113,7 +113,7 @@ use core::fmt::{self, Write};
 use spin::Mutex;
 use uart_16550::SerialPort;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
-use bootloader::{BootInfo, entry_point};
+use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 
 /// Persistent keyboard decoder state — shared across all frames of the
 /// gui_refresh_task so that modifier keys (Shift, Caps-Lock) are remembered.
@@ -181,7 +181,20 @@ pub fn _serial_print(args: fmt::Arguments) {
 
 // -----| kernel entry point |-----
 
-entry_point!(kernel_main);
+/// What the bootloader (0.11) sets up before kernel_main. The physical-memory
+/// map and the bootloader's other mappings (stack, boot info, framebuffer)
+/// go in the upper half: the low 512 GiB holds the kernel image and every
+/// process's user space (address_space.rs).
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    use bootloader_api::config::Mapping;
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.mappings.dynamic_range_start = Some(0xFFFF_8000_0000_0000);
+    config.kernel_stack_size = 1024 * 1024;
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Halt with a fatal message on critical boot failures.
 /// Unlike panic!, this is intentionally minimal — it runs before the heap
@@ -201,6 +214,45 @@ macro_rules! boot_assert {
             }
         }
     };
+}
+
+/// Keep what the bootloader found that the rest of boot needs: the
+/// framebuffer (the boot console draws on it from here on) and the ACPI RSDP
+/// (UEFI machines have none where smp.rs used to look).
+fn take_boot_info(boot_info: &mut BootInfo) {
+    use bootloader_api::info::PixelFormat;
+    if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
+        crate::smp::set_rsdp(rsdp);
+    }
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let info = fb.info();
+        let virt = fb.buffer_mut().as_mut_ptr() as u64;
+        let pixels = match info.pixel_format {
+            PixelFormat::Rgb => Some(vga_buffer::Pixels::Rgb),
+            PixelFormat::Bgr => Some(vga_buffer::Pixels::Bgr),
+            PixelFormat::U8 => Some(vga_buffer::Pixels::Grey),
+            _ => None,
+        };
+        serial_println!(
+            "[BOOT] framebuffer {}x{}, {} bytes/pixel, {:?}, stride {}",
+            info.width, info.height, info.bytes_per_pixel, info.pixel_format, info.stride
+        );
+        if let Some(pixels) = pixels {
+            // The bootloader maps the framebuffer at `virt`; its physical
+            // address is found again once paging is known (graphics.rs).
+            vga_buffer::init_framebuffer(vga_buffer::FirmwareFb {
+                virt,
+                byte_len: info.byte_len,
+                width: info.width,
+                height: info.height,
+                stride: info.stride,
+                bytes_per_pixel: info.bytes_per_pixel,
+                pixels,
+            });
+        }
+    } else {
+        serial_println!("[BOOT] no framebuffer from the firmware");
+    }
 }
 
 /// No disk holds a VEILOS volume (block.rs: the `VEILOS.VOL` marker). Stop
@@ -244,9 +296,11 @@ fn no_system_volume() -> ! {
     crate::power::wait_key_then_reset()
 }
 
-fn kernel_main(boot_info: &'static BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // -----| initialization |-----
     SERIAL_WRITER.lock().init();
+    take_boot_info(boot_info);
+    let boot_info: &'static BootInfo = boot_info;
     
     // Welcome message to Serial Terminal
     serial_println!("\n\n\n");
@@ -291,14 +345,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Set up IDT and Hardware Interrupts (PIC)
     interrupts::init_idt();
     unsafe { interrupts::PICS.lock().initialize() };
+    // Which lines start enabled: the timer, the keyboard and the cascade (the
+    // mouse enables IRQ 12 itself). `initialize` keeps the firmware's masks,
+    // and the I/O APIC set-up copies them: a BIOS leaves these open, but UEFI
+    // firmware masks every line, and then no timer tick or key ever arrived.
+    unsafe { interrupts::PICS.lock().write_masks(0xF8, 0xFF) };
     x86_64::instructions::interrupts::enable();
     
     // Set up Advanced Memory Management (Paging and Frame Allocation)
     use x86_64::VirtAddr;
     
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let phys_mem_offset = VirtAddr::new(
+        boot_info.physical_memory_offset.into_option().expect("the bootloader didn't map physical memory"),
+    );
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    memory::init_frame_allocator(&boot_info.memory_map);
+    memory::init_frame_allocator(&boot_info.memory_regions);
     let mut frame_allocator = memory::GlobalFrameAllocator;
     
     println!("Memory Map loaded.");

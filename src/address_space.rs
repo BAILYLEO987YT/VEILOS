@@ -7,12 +7,15 @@
 // belong to the process alone, so processes can't see each other's memory
 // and two EXEs with the same preferred base (0x140000000) no longer collide.
 //
-// The kernel and user code both live in the low 512 GiB (PML4 slot 0): the
-// kernel image, identity-mapped MMIO (framebuffer, LAPIC, IOAPIC, AHCI) and,
-// on the user side, KUSER_SHARED_DATA (0x7FFE0000), PE images (0x140000000),
-// DLLs and pools (0x2_0000_0000+). So sharing happens one level down there:
+// The kernel image is in the top 2 GiB (PML4 slot 511) and the bootloader's
+// mappings (physical memory, boot info) in the upper half. The low 512 GiB
+// (PML4 slot 0) holds both kernel and user things: identity-mapped MMIO
+// (framebuffer, LAPIC, IOAPIC, AHCI), the AP trampoline, pages the bootloader
+// identity-maps (its GDT and hand-over code) and, on the user side,
+// KUSER_SHARED_DATA (0x7FFE0000), PE images (0x140000000), DLLs and pools
+// (0x2_0000_0000+). So sharing happens one level down there:
 //
-//   process PML4[1..512] = kernel PML4[1..512]     (heap, physical map, ...)
+//   process PML4[1..512] = kernel PML4[1..512]     (kernel, heap, physical map, ...)
 //   process PML4[0]      = a private PDPT whose 1 GiB slots the kernel uses
 //                          point at the kernel's tables; the rest are private.
 //

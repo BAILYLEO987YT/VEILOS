@@ -580,18 +580,15 @@ const AP_TRAMPOLINE_PHYS: u64 = 0x8000;
 const AP_TR_PARAMS_OFF: u64 = 0x0C0;
 
 /// Copy the trampoline blob to its fixed physical address and identity-map the page.
+/// The copy goes through the physical-memory map: low memory isn't
+/// identity-mapped until the page is mapped below (bootloader 0.11 maps
+/// nothing there; 0.9 did). The bootloader leaves the first MiB alone for
+/// exactly this (SIPI), and memory.rs never hands it out.
 fn install_ap_trampoline(mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+    let copy = (crate::memory::get_phys_mem_offset().as_u64() + AP_TRAMPOLINE_PHYS) as *mut u8;
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            AP_TRAMPOLINE_BYTES.as_ptr(),
-            AP_TRAMPOLINE_PHYS as *mut u8,
-            AP_TRAMPOLINE_BYTES.len(),
-        );
-        core::ptr::write_bytes(
-            (AP_TRAMPOLINE_PHYS as *mut u8).add(AP_TRAMPOLINE_BYTES.len()),
-            0u8,
-            AP_TRAMPOLINE_SIZE - AP_TRAMPOLINE_BYTES.len(),
-        );
+        core::ptr::copy_nonoverlapping(AP_TRAMPOLINE_BYTES.as_ptr(), copy, AP_TRAMPOLINE_BYTES.len());
+        core::ptr::write_bytes(copy.add(AP_TRAMPOLINE_BYTES.len()), 0u8, AP_TRAMPOLINE_SIZE - AP_TRAMPOLINE_BYTES.len());
     }
 
     let page  = Page::<Size4KiB>::containing_address(VirtAddr::new(AP_TRAMPOLINE_PHYS));
@@ -732,12 +729,25 @@ unsafe fn read_phys_bytes(phys_addr: u64, len: usize) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(virt as *const u8, len) }
 }
 
+static RSDP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The RSDP the bootloader found (main.rs, from BootInfo).
+pub fn set_rsdp(phys: u64) {
+    RSDP.store(phys, core::sync::atomic::Ordering::Release);
+}
+
 /// Locate the RSDP by scanning the two regions the ACPI spec guarantees it
 /// lives in on a BIOS boot: the first 1 KiB of the Extended BIOS Data Area,
 /// and the BIOS read-only memory space 0xE0000–0xFFFFF. Both are scanned on
 /// 16-byte boundaries for the 8-byte signature "RSD PTR ".
 fn find_rsdp() -> Option<u64> {
     const SIG: &[u8; 8] = b"RSD PTR ";
+    // The bootloader's, when it has one: on UEFI the RSDP is found through
+    // the firmware's configuration table, and there is no EBDA to scan.
+    match RSDP.load(core::sync::atomic::Ordering::Acquire) {
+        0 => {}
+        addr => return Some(addr),
+    }
 
     let checksum_ok = |addr: u64, len: usize| -> bool {
         let bytes = unsafe { read_phys_bytes(addr, len) };

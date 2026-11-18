@@ -12,10 +12,10 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 
 | | Requirement | Status | Notes |
 |---|---|---|---|
-| **1.0** | UEFI boot | ❌ | `bootloader 0.9` is BIOS-only. Most PCs since about 2020 have CSM (legacy boot) off or removed. |
+| **1.0** | UEFI boot | ⚠️ | Since 2026-11-18 VEILOS boots through `bootloader` 0.11 (`tools/build.sh` makes `veilos-bios.img` and `veilos-uefi.img` from one build). Both reach the desktop in QEMU (UEFI with OVMF under WHPX, BIOS with SeaBIOS). Not tried on a real PC yet, and the system volume is still a separate disk (single-disk layout is next). |
 | **1.0** | Boots and runs on at least one real machine | ⚠️ | Only QEMU (TCG/WHPX) is tested so far. |
 | **1.0** | Installer: partition a disk, copy the system, set up boot | ❌ | Today it runs from a disk image built by `tools/mkdisk.py`. |
-| **1.0** | Graphics from the firmware framebuffer (GOP/VBE) on any GPU | ❌ | Only the Bochs/QEMU display adapter is driven, and the bootloader's framebuffer isn't used. |
+| **1.0** | Graphics from the firmware framebuffer (GOP/VBE) on any GPU | ⚠️ | Since 2026-11-18: boot messages draw on the firmware's framebuffer (no VGA text mode needed), and with no driver for the adapter the desktop runs on it at the firmware's mode (`graphics::bind_firmware_framebuffer`). Only 32-bit BGRX modes carry the desktop; a 24-bit VBE mode keeps the text console. The mode can't be changed. |
 | | Recovery / safe boot when something breaks | ❌ | |
 
 ## 2. Hardware drivers
