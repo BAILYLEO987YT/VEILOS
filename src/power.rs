@@ -175,21 +175,36 @@ fn fadt_reset_register() -> Option<ResetRegister> {
     Some(ResetRegister { space, address, value: byte(128) })
 }
 
-/// Wait for a key on the PS/2 keyboard (USB keyboards too, where the
-/// firmware emulates PS/2), polling with interrupts off, then reset. Keys
-/// already held or queued when this starts don't count.
+/// Wait for a key, polling with interrupts off, then reset: on the PS/2
+/// keyboard (and USB keyboards the firmware emulates as PS/2), and on USB
+/// keyboards VEILOS drives (usb::poll puts their keys in the same queue).
+/// Keys already held or queued when this starts don't count.
 pub fn wait_key_then_reset() -> ! {
     x86_64::instructions::interrupts::disable();
     // SAFETY: the 8042's status and data ports, read only.
     let mut status: Port<u8> = Port::new(0x64);
     let mut data: Port<u8> = Port::new(0x60);
+    // No 8042 reads as 0xFF: then only USB.
+    let ps2 = unsafe { status.read() } != 0xFF;
     let drain_until = crate::time::now_ms() + 500;
     while crate::time::now_ms() < drain_until {
-        if unsafe { status.read() } & 0x01 != 0 {
+        if ps2 && unsafe { status.read() } & 0x01 != 0 {
             let _ = unsafe { data.read() };
         }
+        crate::usb::poll();
+        while crate::task::keyboard::pop_scancode().is_some() {}
     }
     loop {
+        crate::usb::poll();
+        if let Some(b) = crate::task::keyboard::pop_scancode() {
+            if b != 0xE0 && b < 0x80 {
+                crate::serial_println!("[POWER] key {:#04x} (USB): restarting", b);
+                reset(Method::Any);
+            }
+        }
+        if !ps2 {
+            continue;
+        }
         let s = unsafe { status.read() };
         if s & 0x01 == 0 {
             core::hint::spin_loop();

@@ -42,7 +42,7 @@ VEILOS can currently do the following, in QEMU:
 | **Hardware** | SATA (AHCI) with GPT/MBR, FAT32 read/write, NTFS and exFAT read-only, virtio-net (with NIC bonding), Intel HD Audio, PCIe hot-plug |
 | **Networking** | DHCP, TCP/UDP, DNS and TLS |
 
-It cannot yet run on real hardware. The main gaps are UEFI boot, USB, NVMe, a real network card driver, ACPI power control, an installer, a crash-safe filesystem and a web browser. [V1_CHECKLIST.md](V1_CHECKLIST.md) tracks every item with its status.
+It hasn't run on real hardware yet. It now boots on BIOS and UEFI, from one disk or a USB stick, with USB keyboards and mice; the main gaps are NVMe, a real network card driver, ACPI power-off, an installer, a crash-safe filesystem and a web browser. [V1_CHECKLIST.md](V1_CHECKLIST.md) tracks every item with its status.
 
 Some modules are scaffolds, not finished features. These include the native app format, parts of Cluster Mode and the hypervisor and anti-cheat support. The audit notes ([AUDIT_2026-10.md](AUDIT_2026-10.md)) say honestly which pieces are real and which are not.
 

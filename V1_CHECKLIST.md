@@ -22,8 +22,8 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 
 | | Requirement | Status | Notes |
 |---|---|---|---|
-| **1.0** | USB (xHCI) with HID keyboard and mouse | ❌ | Input is PS/2 only. Laptops and most desktops need USB HID, or I2C HID for touchpads. |
-| **1.0** | USB mass storage (flash drives) | ❌ | Needs xHCI first. |
+| **1.0** | USB (xHCI) with HID keyboard and mouse | ⚠️ | Since 2026-11-18 (`src/usb/`): an xHCI driver (firmware handoff, reset, rings, every root port), and boot-protocol keyboards and mice, whose reports become the same scancodes and mouse state as PS/2. Polled from the BSP's timer tick. Checked in QEMU (`qemu-xhci`, `usb-kbd`, `usb-mouse`) with the PS/2 controller removed (`i8042=off`): signing in, the mouse and the terminal all work through USB. Not yet: devices behind hubs, hot-plug, EHCI-only machines, I2C touchpads, a real PC. |
+| **1.0** | USB mass storage (flash drives) | ⚠️ | Since 2026-11-18: bulk-only transport with SCSI commands (`usb/msc.rs`), a block transport like AHCI, so a stick's VEILOS volume can be `/` and other sticks mount read-only. Checked in QEMU (`usb-storage` on xHCI) as the root volume, running Win32 programs from it. Not yet: 4 KiB-sector drives, UAS, a real stick. |
 | **1.0** | NVMe | ❌ | Most current PCs boot from NVMe. Only AHCI/SATA is supported. |
 | ✅ | SATA (AHCI), several disks, GPT/MBR | ✅ | Since 2026-11-18 also what real controllers need: AHCI mode enabled, BIOS/OS handoff, staggered spin-up and COMRESET for a link that isn't up, waking a sleeping link, waiting for a busy device, and skipping optical drives and port multipliers. Checked in QEMU only, which needs none of it. |
 | **1.0** | A common real Ethernet NIC (Intel e1000e/I219 and/or Realtek r8169) | ❌ | Only virtio-net is supported (and bonded). |

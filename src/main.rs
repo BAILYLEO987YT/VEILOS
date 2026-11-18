@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod encryption;
 pub mod vga_buffer;
 pub mod power;
+pub mod usb;
 pub mod interrupts;
 pub mod gdt;
 pub mod allocator;
@@ -412,6 +413,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Storage first: the filesystems are needed by most of the rest of boot.
     crate::block::mount_ram_disk();
     crate::hal::bind(crate::hal::DeviceClass::Storage);
+    // USB too before the root volume is settled: it may be on a USB stick.
+    crate::hal::bind(crate::hal::DeviceClass::SerialBus);
     if !crate::block::root_mounted() {
         no_system_volume();
     }
