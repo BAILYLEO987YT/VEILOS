@@ -986,9 +986,31 @@ extern "x86-interrupt" fn pic_spurious_irq15_handler(_stack_frame: InterruptStac
     unsafe { x86_64::instructions::port::Port::<u8>::new(0x20).write(0x20); }
 }
 
+/// Timer interrupts on vector 32 so far (`check_tick_source`).
+static TIMER_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// After `init_pit`: is IRQ 0 arriving? Chipsets can gate the 8254 off (and
+/// QEMU can leave it out), and then the BSP would never tick: no sleeps
+/// ending, no scheduling. If nothing came in 50 ms, the BSP's LAPIC timer
+/// drives vector 32 instead, as the APs' timers drive theirs.
+pub fn check_tick_source() {
+    let before = TIMER_IRQS.load(Ordering::Relaxed);
+    crate::time::delay_ms(50);
+    if TIMER_IRQS.load(Ordering::Relaxed) != before {
+        return;
+    }
+    if !crate::ioapic::is_active() || !crate::smp::start_bsp_tick() {
+        crate::serial_println!("[TIME] WARN: no PIT interrupt and no LAPIC to replace it: the BSP doesn't tick");
+        return;
+    }
+    mask_irq(0);
+    crate::serial_println!("[TIME] no PIT interrupt in 50 ms: the BSP ticks from its LAPIC timer");
+}
+
 extern "x86-interrupt" fn timer_interrupt_handler(
     stack_frame: InterruptStackFrame)
 {
+    TIMER_IRQS.fetch_add(1, Ordering::Relaxed);
     crate::sampler::sample(stack_frame.instruction_pointer.as_u64());
     
     let tick = if crate::time::is_calibrated() {

@@ -25,7 +25,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | **1.0** | USB (xHCI) with HID keyboard and mouse | ❌ | Input is PS/2 only. Laptops and most desktops need USB HID, or I2C HID for touchpads. |
 | **1.0** | USB mass storage (flash drives) | ❌ | Needs xHCI first. |
 | **1.0** | NVMe | ❌ | Most current PCs boot from NVMe. Only AHCI/SATA is supported. |
-| ✅ | SATA (AHCI), several disks, GPT/MBR | ✅ | |
+| ✅ | SATA (AHCI), several disks, GPT/MBR | ✅ | Since 2026-11-18 also what real controllers need: AHCI mode enabled, BIOS/OS handoff, staggered spin-up and COMRESET for a link that isn't up, waking a sleeping link, waiting for a busy device, and skipping optical drives and port multipliers. Checked in QEMU only, which needs none of it. |
 | **1.0** | A common real Ethernet NIC (Intel e1000e/I219 and/or Realtek r8169) | ❌ | Only virtio-net is supported (and bonded). |
 | | Wi-Fi | ❌ | No Wi-Fi driver. Since 2026-11-17 Quick Settings' network panel shows what's really there (the wired connection, its address and adapters) and says there's no Wi-Fi adapter, instead of four made-up networks. |
 | **1.0** | Audio output (Intel HD Audio) | ⚠️ | Done 2026-11-11 in QEMU (`intel-hda` + `hda-output`): `audio.rs` drives the controller and its codec and mixes any number of streams at 48 kHz. The volume slider and the `SOUND` command set the master volume. Real codecs (Realtek etc.) are untested, and there's no input or headphone-jack switching. |
@@ -38,6 +38,7 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | | Requirement | Status | Notes |
 |---|---|---|---|
 | ✅ | Preemptive multitasking, SMP, threads | ✅ | |
+| **1.0** | Starts on a modern PC's CPU and timers: x2APIC, no 8254, AMD, many cores | ✅ | Done 2026-11-18 (`smp.rs`, `time.rs`). x2APIC mode when the firmware hands over in it or an APIC ID needs it (MADT type-9 entries, 32-bit IDs); up to 64 CPUs (was 8). With no 8254 the TSC rate comes from CPUID 0x15/0x16 or the HPET and the BSP ticks from its LAPIC timer. Checked in QEMU under TCG with 4 CPUs: `pit=off`, an AMD EPYC model, and x2APIC (forced with `VEILOS_X2APIC=1`, as no QEMU firmware hands over in it). |
 | ✅ | Per-process address spaces, memory protection | ✅ | |
 | ✅ | A crashing program doesn't take the OS down | ✅ | Win32 exceptions end the process. |
 | **1.0** | ACPI: real power-off, reboot, power button | ⚠️ | Restart done 2026-11-18 (`power.rs`): the FADT's reset register, then port 0xCF9, the 8042's reset line, and a triple fault. `REBOOT` in the terminal (`REBOOT ACPI|CF9|KBD|TRIPLE` tries one), Restart in the Start menu, and any key on the crash screen or the no-system-volume screen. Each method checked in QEMU under TCG, signed in as admin (WHPX itself stops QEMU on any guest reset: "Unexpected VP exit code 4"). Power-off only works through QEMU's and VirtualBox's ports (`shell.rs`, `power_off`). Since 2026-11-11 the Quick Settings power button calls it too (checked in QEMU: the VM powers off), so it now does the same as the menu's Shut down. Real hardware still needs ACPI. |

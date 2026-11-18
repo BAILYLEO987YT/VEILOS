@@ -376,6 +376,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Heap is now live — safe to initialise the adaptive scheduler.
     crate::scheduler::init();
     println!("Heap Initialized with Physical RAM Paging.");
+    // Without PIT channel 2 or a CPUID rate: the TSC against the HPET.
+    crate::time::calibrate_late();
 
     // Register kernel process (PID 0) with full capabilities for system services.
     crate::process::PROCESSOR.lock().register_kernel();
@@ -510,6 +512,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Register Windows in WM
     crate::interrupts::init_pit();
+    crate::interrupts::check_tick_source();
     crate::ui::init_back_buffer();
 
     // Initialize Input Subsystems
