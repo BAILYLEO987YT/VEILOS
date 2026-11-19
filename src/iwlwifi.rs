@@ -181,11 +181,26 @@ const REPLY_RX_PHY_CMD: u8 = 0xC0;
 const REPLY_RX_MPDU_CMD: u8 = 0xC1;
 const MCC_UPDATE_CMD: u8 = 0xC8;
 const SCAN_ITERATION_COMPLETE: u8 = 0xE7;
+const ADD_STA_KEY: u8 = 0x17;
+const TX_CMD: u8 = 0x1C;
+const PHY_CONTEXT_CMD: u8 = 0x08;
+const TIME_EVENT_CMD: u8 = 0x29;
+const TIME_EVENT_NOTIFICATION: u8 = 0x2A;
+const BINDING_CONTEXT_CMD: u8 = 0x2B;
+const TIME_QUOTA_CMD: u8 = 0x2C;
+const MISSED_BEACONS_NOTIFICATION: u8 = 0xA2;
 const DATA_PATH_GROUP: u8 = 0x5;
 const DQA_ENABLE_CMD: u8 = 0x0;
 
 const CMD_QUEUE: usize = 0; // IWL_MVM_DQA_CMD_QUEUE
 const AUX_QUEUE: usize = 1; // IWL_MVM_DQA_AUX_QUEUE
+/// The AP's queue (IWL_MVM_DQA_BSS_CLIENT_QUEUE): management frames and,
+/// since this driver associates without QoS, all data too.
+const BSS_QUEUE: usize = 4;
+const BSS_QUEUE_SLOTS: usize = 64;
+const TX_FIFO_VO: u8 = 3;
+const AP_STA_ID: u8 = 1;
+const PHY_ID: u32 = 0;
 const TX_FIFO_MCAST: u8 = 5;
 const TX_FIFO_CMD: u32 = 7;
 const MAC_INDEX_AUX: u32 = 4;
@@ -228,6 +243,7 @@ fn probe(dev: &crate::pci::PciDevice) -> Result<(), String> {
     map_mmio(base, bar.size.max(0x2000));
     let subsystem = dev.address().read_u16(0x2E);
     let iwl = Iwl::new(base, dev.device_id, subsystem)?;
+    wlog!("WPA crypto self-test {}", if crate::wpa::self_test() { "ok" } else { "FAILED" });
     wlog!("{:02x}:{:02x}.{} {:04x}:{:04x} sub {:04x} at {:#x}, HW rev {:#x} ({})",
         dev.bus, dev.device, dev.function, dev.vendor_id, dev.device_id, subsystem, base,
         iwl.hw_rev, iwl.model());
@@ -449,7 +465,7 @@ struct TxQueue {
 }
 
 pub struct Iwl {
-    base: u64,
+    pub base: u64,
     device_id: u16,
     subsystem: u16,
     pub hw_rev: u32,
@@ -477,6 +493,19 @@ pub struct Iwl {
     pub scan_results: Vec<Bss>,
     last_phy: Vec<u8>,
     pub rx_frames: u64,
+    /// The network joined (or being joined).
+    pub link: Option<Link>,
+    /// Management frames for us (authentication, association, deauth).
+    mgmt_rx: VecDeque<Vec<u8>>,
+    /// EAPOL frames from the AP (after the LLC header).
+    eapol_rx: VecDeque<Vec<u8>>,
+    /// Ethernet frames for the network stack.
+    pub eth_rx: VecDeque<Vec<u8>>,
+    phy_added: bool,
+    pub tx_ok: u64,
+    pub tx_failed: u64,
+    pub rx_data: u64,
+    pub rx_dropped: u64,
 }
 
 // MMIO and DMA owned by the driver, used under WIFI's lock.
@@ -510,6 +539,15 @@ impl Iwl {
             scan_results: Vec::new(),
             last_phy: Vec::new(),
             rx_frames: 0,
+            link: None,
+            mgmt_rx: VecDeque::new(),
+            eapol_rx: VecDeque::new(),
+            eth_rx: VecDeque::new(),
+            phy_added: false,
+            tx_ok: 0,
+            tx_failed: 0,
+            rx_data: 0,
+            rx_dropped: 0,
         };
         iwl.hw_rev = iwl.r32(CSR_HW_REV);
         if iwl.hw_rev == 0xFFFF_FFFF {
@@ -732,9 +770,13 @@ impl Iwl {
     fn tx_init(&mut self) -> Result<(), String> {
         self.write_prph(SCD_TXFACT, 0);
         self.w32(FH_KW_MEM_ADDR_REG, (self.kw.phys >> 4) as u32);
-        for q in [CMD_QUEUE, AUX_QUEUE] {
+        for q in [CMD_QUEUE, AUX_QUEUE, BSS_QUEUE] {
             if self.txq[q].is_none() {
-                let (slots, buf_size) = if q == CMD_QUEUE { (CMD_SLOTS, CMD_BUF) } else { (1, 4096) };
+                let (slots, buf_size) = match q {
+                    CMD_QUEUE => (CMD_SLOTS, CMD_BUF),
+                    BSS_QUEUE => (BSS_QUEUE_SLOTS, 4096),
+                    _ => (1, 4096),
+                };
                 self.txq[q] = Some(TxQueue {
                     tfds: Dma::new(TFD_QUEUE_SIZE * TFD_SIZE)?,
                     bufs: Dma::new(slots * buf_size)?,
@@ -958,6 +1000,22 @@ impl Iwl {
         }
         if handed_back > 0 {
             self.w32(FH_RSCSR_CHNL0_WPTR, (self.rx_write & !7) as u32);
+        }
+        // Frames' TX status frees their slot on the AP's queue.
+        for p in &out {
+            if p.cmd == TX_CMD && p.seq & 0x8000 == 0 && (p.seq >> 8) as usize & 0x1F == BSS_QUEUE {
+                if let Some(t) = self.txq[BSS_QUEUE].as_mut() {
+                    t.read = ((p.seq & 0xFF) as usize + 1) % TFD_QUEUE_SIZE;
+                }
+                let st = if p.data.len() >= 38 { le16(&p.data, 36) & 0xFF } else { 0 };
+                if st == 1 || st == 2 {
+                    self.tx_ok += 1;
+                    if let Some(l) = self.link.as_mut() { l.tx_fail_run = 0; }
+                } else {
+                    self.tx_failed += 1;
+                    if let Some(l) = self.link.as_mut() { l.tx_fail_run += 1; l.last_tx_status = st; }
+                }
+            }
         }
         // Replies free their command slot.
         for p in &out {
@@ -1487,6 +1545,14 @@ impl Iwl {
             let signal = self.signal();
             let phy_ch = if self.last_phy.len() >= 24 { le16(&self.last_phy, 22) as u8 } else { 0 };
             self.add_bss(frame, signal, phy_ch);
+        } else if ty == 0 && frame[4..10] == self.mac && matches!(sub, 1 | 3 | 10 | 11 | 12) {
+            if sub == 10 || sub == 12 {
+                self.lost_link(frame);
+            } else if self.mgmt_rx.len() < 16 {
+                self.mgmt_rx.push_back(frame.to_vec());
+            }
+        } else if ty == 2 {
+            self.rx_data_frame(frame, status);
         }
     }
 
@@ -1544,8 +1610,875 @@ impl Iwl {
             v.push(format!("  MAC {}, antennas TX {:#x} RX {:#x}, RF kill {}", mac_text(&self.mac),
                 self.valid_tx_ant, self.valid_rx_ant, if self.rf_kill() { "ON" } else { "off" }));
         }
+        if let Some(l) = &self.link {
+            v.push(format!("  network '{}' {} ch {}, {}, {}", l.bss.ssid_text(), mac_text(&l.bss.bssid), l.bss.channel,
+                if l.wpa { "WPA2" } else { "open" }, if l.authorized { "link UP" } else if l.associated { "associated, keys pending" } else { "joining" }));
+            v.push(format!("  rate {} Mb/s; TX ok {} failed {}; RX {} dropped {}", l.rate_500k as f32 / 2.0,
+                self.tx_ok, self.tx_failed, self.rx_data, self.rx_dropped));
+        }
         v
     }
+}
+
+// ---- Joining a network --------------------------------------------------------------
+
+/// The network joined (or being joined).
+pub struct Link {
+    pub bss: Bss,
+    pub aid: u16,
+    pub associated: bool,
+    /// Data may flow: open network associated, or WPA2 keys installed.
+    pub authorized: bool,
+    pub wpa: bool,
+    /// Data rate (rate_n_flags), from the AP's rates and the signal.
+    pub rate: u32,
+    rate_500k: u8,
+    pub tx_fail_run: u32,
+    pub last_tx_status: u16,
+    pmk: [u8; 32],
+    ptk: Option<crate::wpa::Ptk>,
+    anonce: [u8; 32],
+    snonce: [u8; 32],
+    replay: Option<u64>,
+    /// Our RSN element as sent in the association request.
+    rsn_ie: Vec<u8>,
+    tx_pn: u64,
+    gtk_id: u8,
+    last_rx_seq: u16,
+    pub since_ms: u64,
+}
+
+/// Words of a command line, "double quotes" keeping spaces in one word.
+pub fn quoted_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut any) = (false, false);
+    for c in s.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            ' ' | '\t' if !quoted => {
+                if any {
+                    out.push(core::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+/// Legacy rate (500 kb/s units) to the firmware's PLCP value, CCK flag.
+fn plcp(rate: u8) -> Option<(u32, bool)> {
+    Some(match rate {
+        2 => (10, true),
+        4 => (20, true),
+        11 => (55, true),
+        22 => (110, true),
+        12 => (13, false),
+        18 => (15, false),
+        24 => (5, false),
+        36 => (7, false),
+        48 => (9, false),
+        72 => (11, false),
+        96 => (1, false),
+        108 => (3, false),
+        _ => return None,
+    })
+}
+
+impl Iwl {
+    fn rate_n_flags(&self, rate: u8) -> u32 {
+        let (p, cck) = plcp(rate).unwrap_or((13, false));
+        p | if cck { 1 << 9 } else { 0 } | (self.first_tx_ant() as u32) << 14
+    }
+
+    /// Lowest basic rate for management frames: 1 Mb/s on 2.4 GHz, 6 on 5.
+    fn mgmt_rate(&self, channel: u8) -> u32 {
+        self.rate_n_flags(if channel <= 14 { 2 } else { 12 })
+    }
+
+    /// A data rate from what the AP supports and how loud it is.
+    fn pick_rate(bss: &Bss) -> u8 {
+        let want = match bss.signal {
+            s if s >= -62 => 108,
+            s if s >= -68 => 72,
+            s if s >= -74 => 48,
+            s if s >= -80 => 24,
+            s if s >= -85 => 12,
+            _ => 2,
+        };
+        let mut rates: Vec<u8> = bss.rates.iter().map(|r| r & 0x7F).filter(|&r| plcp(r).is_some()).collect();
+        if rates.is_empty() {
+            rates = if bss.channel <= 14 { vec![2, 4, 11, 22] } else { vec![12, 24, 48] };
+        }
+        rates.sort();
+        rates.iter().rev().find(|&&r| r <= want).copied().unwrap_or(rates[0])
+    }
+
+    /// Step the data rate down after repeated losses (and keep a floor).
+    fn adapt_rate(&mut self) {
+        let Some(l) = self.link.as_ref() else { return };
+        if l.tx_fail_run < 4 {
+            return;
+        }
+        let mut rates: Vec<u8> = l.bss.rates.iter().map(|r| r & 0x7F).filter(|&r| plcp(r).is_some()).collect();
+        rates.sort();
+        let cur = l.rate_500k;
+        if let Some(&lower) = rates.iter().rev().find(|&&r| r < cur) {
+            let rnf = self.rate_n_flags(lower);
+            let l = self.link.as_mut().unwrap();
+            wlog!("TX: {} losses in a row (status {:#x}); rate {} -> {} Mb/s", l.tx_fail_run, l.last_tx_status,
+                cur as f32 / 2.0, lower as f32 / 2.0);
+            l.rate_500k = lower;
+            l.rate = rnf;
+            l.tx_fail_run = 0;
+        }
+    }
+
+    /// Queue an 802.11 frame on the AP's queue. `key`: CCMP with this TK
+    /// (the frame already has its CCMP header).
+    fn tx_frame(&mut self, frame: &[u8], hdr_len: usize, rate: u32, tid: u8, pm_timeout: u16, key: Option<[u8; 16]>) -> Result<(), String> {
+        let t = self.txq[BSS_QUEUE].as_mut().ok_or("no AP queue")?;
+        let used = (t.write + TFD_QUEUE_SIZE - t.read) % TFD_QUEUE_SIZE;
+        if used >= BSS_QUEUE_SLOTS - 1 {
+            return Err(String::from("TX queue full"));
+        }
+        let idx = t.write;
+        let slot = idx % BSS_QUEUE_SLOTS;
+        let buf = t.bufs.at(slot * t.buf_size);
+        let buf_phys = t.bufs.phys + (slot * t.buf_size) as u64;
+        let padded = (hdr_len + 3) & !3;
+        let total = 4 + 56 + padded + (frame.len() - hdr_len);
+        if total > t.buf_size {
+            return Err(String::from("frame too big"));
+        }
+        let unicast = frame[4] & 1 == 0;
+        let mut flags: u32 = 1 << 13; // the firmware numbers the frames (SEQ_CTL)
+        if unicast {
+            flags |= 1 << 3; // ACK
+        }
+        if padded != hdr_len {
+            flags |= 1 << 20; // MH_PAD
+        }
+        let mut c = [0u8; 56];
+        c[0..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
+        c[4..8].copy_from_slice(&flags.to_le_bytes());
+        c[12..16].copy_from_slice(&rate.to_le_bytes());
+        c[16] = AP_STA_ID;
+        if let Some(k) = key {
+            c[17] = 2; // TX_CMD_SEC_CCM
+            c[20..36].copy_from_slice(&k);
+        }
+        c[40..44].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // lifetime: infinite
+        let scratch = buf_phys + 4 + 8;
+        c[44..48].copy_from_slice(&(scratch as u32).to_le_bytes());
+        c[48] = (scratch >> 32) as u8;
+        c[49] = 60; // RTS retries
+        c[50] = 15; // data retries
+        c[51] = tid;
+        c[52..54].copy_from_slice(&pm_timeout.to_le_bytes());
+        let seq = ((BSS_QUEUE as u16) << 8) | idx as u16;
+        unsafe {
+            let h = [TX_CMD, 0, seq as u8, (seq >> 8) as u8];
+            core::ptr::copy_nonoverlapping(h.as_ptr(), buf, 4);
+            core::ptr::copy_nonoverlapping(c.as_ptr(), buf.add(4), 56);
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(60), hdr_len);
+            core::ptr::write_bytes(buf.add(60 + hdr_len), 0, padded - hdr_len);
+            core::ptr::copy_nonoverlapping(frame.as_ptr().add(hdr_len), buf.add(60 + padded), frame.len() - hdr_len);
+        }
+        let tfd = t.tfds.at(idx * TFD_SIZE);
+        unsafe { core::ptr::write_bytes(tfd, 0, TFD_SIZE) };
+        let mut tbs = vec![(buf_phys, FIRST_TB_SIZE), (buf_phys + FIRST_TB_SIZE as u64, 60 + padded - FIRST_TB_SIZE)];
+        if frame.len() > hdr_len {
+            tbs.push((buf_phys + (60 + padded) as u64, frame.len() - hdr_len));
+        }
+        write_tfd(tfd, &tbs);
+        // Byte count for the scheduler: frame + CRC + delimiter (+ MIC).
+        let bc = (frame.len() + 8 + if key.is_some() { 8 } else { 0 }) as u16 | (AP_STA_ID as u16) << 12;
+        let tbl = self.bc_tbls.at(BSS_QUEUE * BC_TABLE_BYTES);
+        unsafe {
+            (tbl.add(idx * 2) as *mut u16).write_volatile(bc);
+            if idx < 64 {
+                (tbl.add((TFD_QUEUE_SIZE + idx) * 2) as *mut u16).write_volatile(bc);
+            }
+        }
+        let t = self.txq[BSS_QUEUE].as_mut().unwrap();
+        t.write = (idx + 1) % TFD_QUEUE_SIZE;
+        let wr = t.write as u32;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.w32(HBUS_TARG_WRPTR, wr | (BSS_QUEUE as u32) << 8);
+        Ok(())
+    }
+
+    fn mgmt_header(&self, subtype: u16, bssid: &[u8; 6]) -> Vec<u8> {
+        let mut f = Vec::with_capacity(128);
+        f.extend_from_slice(&(subtype << 4).to_le_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(bssid);
+        f.extend_from_slice(&self.mac);
+        f.extend_from_slice(bssid);
+        f.extend_from_slice(&[0, 0]);
+        f
+    }
+
+    /// Wait for a management frame of `subtype` from `bssid`.
+    fn wait_mgmt(&mut self, subtype: u16, bssid: &[u8; 6], timeout_us: u64) -> Option<Vec<u8>> {
+        let deadline = crate::time::Deadline::after_us(timeout_us);
+        loop {
+            for p in self.rx_poll() {
+                self.note(p);
+            }
+            while let Some(f) = self.mgmt_rx.pop_front() {
+                if le16(&f, 0) >> 4 & 0xF == subtype && f[10..16] == bssid[..] {
+                    return Some(f);
+                }
+            }
+            if deadline.expired() || !self.running {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Join `ssid`: open, or WPA2-PSK with `pass`. Blocks until the link is
+    /// up (keys installed) or it fails.
+    pub fn connect(&mut self, ssid: &[u8], pass: Option<&[u8]>) -> Result<(), String> {
+        if !self.running {
+            return Err(format!("card not up ({})", self.state));
+        }
+        if self.link.is_some() {
+            self.disconnect("joining another network");
+        }
+        let mut found = self.best_bss(ssid);
+        if found.is_none() {
+            self.scan()?;
+            found = self.best_bss(ssid);
+        }
+        let bss = found.ok_or_else(|| format!("no network '{}' found by the scan", String::from_utf8_lossy(ssid)))?;
+        let wpa = match bss.security() {
+            "open" => false,
+            "WPA2-PSK" => true,
+            other => return Err(format!("'{}' uses {}; only open and WPA2-Personal are supported", bss.ssid_text(), other)),
+        };
+        let mut rsn_ie = Vec::new();
+        let mut pmk = [0u8; 32];
+        if wpa {
+            let rsn = bss.rsn.clone().unwrap_or_default();
+            let group = rsn.get(2..6).map(|g| g.to_vec()).unwrap_or_default();
+            if group != [0x00, 0x0F, 0xAC, 0x04] {
+                return Err(format!("the network's group cipher is {:02x?}, not AES-CCMP (set the router to WPA2-AES)", group));
+            }
+            if !rsn_pairwise_has(&rsn, 4) {
+                return Err(String::from("the network doesn't offer AES-CCMP (set the router to WPA2-AES)"));
+            }
+            let pass = pass.ok_or("this network needs a password: WIFI CONNECT <ssid> <password>")?;
+            if pass.len() == 64 && pass.iter().all(|c| c.is_ascii_hexdigit()) {
+                for i in 0..32 {
+                    let h = core::str::from_utf8(&pass[2 * i..2 * i + 2]).unwrap_or("00");
+                    pmk[i] = u8::from_str_radix(h, 16).unwrap_or(0);
+                }
+            } else if (8..=63).contains(&pass.len()) {
+                pmk = crate::wpa::pmk(pass, &bss.ssid);
+            } else {
+                return Err(String::from("a WPA2 password is 8 to 63 characters"));
+            }
+            // version 1, group CCMP, 1 pairwise CCMP, 1 AKM PSK, capabilities 0
+            rsn_ie = vec![48, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 2, 0, 0];
+        }
+        let rate_500k = Self::pick_rate(&bss);
+        let mut snonce = [0u8; 32];
+        crate::entropy::fill(&mut snonce);
+        wlog!("joining '{}' {} ch {} {} dBm, {}; data rate {} Mb/s", bss.ssid_text(), mac_text(&bss.bssid),
+            bss.channel, bss.signal, if wpa { "WPA2-PSK" } else { "open" }, rate_500k as f32 / 2.0);
+        self.link = Some(Link {
+            rate: self.rate_n_flags(rate_500k),
+            rate_500k, bss: bss.clone(), aid: 0, associated: false, authorized: false, wpa,
+            tx_fail_run: 0, last_tx_status: 0, pmk, ptk: None, anonce: [0; 32], snonce,
+            replay: None, rsn_ie, tx_pn: 1, gtk_id: 0, last_rx_seq: 0xFFFF, since_ms: crate::time::now_ms(),
+        });
+        self.state = format!("joining {}", bss.ssid_text());
+        let r = self.join(&bss);
+        match &r {
+            Ok(()) => {
+                self.state = format!("connected to {}", bss.ssid_text());
+                wlog!("connected to '{}' (AID {})", bss.ssid_text(), self.link.as_ref().map_or(0, |l| l.aid));
+            }
+            Err(e) => {
+                wlog!("join failed: {}", e);
+                self.disconnect("join failed");
+            }
+        }
+        r
+    }
+
+    fn best_bss(&self, ssid: &[u8]) -> Option<Bss> {
+        self.scan_results.iter().filter(|b| b.ssid == ssid).max_by_key(|b| b.signal).cloned()
+    }
+
+    fn join(&mut self, bss: &Bss) -> Result<(), String> {
+        // Firmware side: the channel (PHY context), the MAC bound to it, the
+        // BSSID, the AP as station 1 with queue 4, time on the channel.
+        let band = if bss.channel <= 14 { 1u8 } else { 0 };
+        let mut c = [0u8; 32];
+        c[0..4].copy_from_slice(&PHY_ID.to_le_bytes());
+        c[4..8].copy_from_slice(&(if self.phy_added { 2u32 } else { 1 }).to_le_bytes());
+        c[16] = band;
+        c[17] = bss.channel;
+        c[18] = 0; // 20 MHz
+        c[19] = 0;
+        c[20..24].copy_from_slice(&(self.valid_tx_ant as u32).to_le_bytes());
+        let rx = self.valid_rx_ant as u32;
+        c[24..28].copy_from_slice(&(rx << 1 | 2 << 10 | 2 << 12).to_le_bytes());
+        self.send_cmd(PHY_CONTEXT_CMD, 0, &c)?;
+        self.phy_added = true;
+
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&PHY_ID.to_le_bytes());
+        b[4..8].copy_from_slice(&1u32.to_le_bytes()); // add
+        b[8..12].copy_from_slice(&MAC_ID.to_le_bytes());
+        b[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        b[16..20].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        b[20..24].copy_from_slice(&PHY_ID.to_le_bytes());
+        let r = self.send_cmd(BINDING_CONTEXT_CMD, 0, &b)?;
+        if r.len() >= 4 && le32(&r, 0) != 0 {
+            return Err(format!("binding refused (status {:#x})", le32(&r, 0)));
+        }
+
+        let m = self.mac_context_cmd(2, Some(bss.bssid), false, 0, bss.beacon_int, 1);
+        self.send_cmd(MAC_CONTEXT_CMD, 0, &m)?;
+
+        self.enable_txq(BSS_QUEUE, AP_STA_ID, 8, TX_FIFO_VO)?;
+        self.add_ap_sta(&bss.bssid, false, 0)?;
+
+        // Stay on the channel through authentication and association.
+        let mut te = [0u8; 36];
+        te[0..4].copy_from_slice(&MAC_ID.to_le_bytes());
+        te[4..8].copy_from_slice(&1u32.to_le_bytes()); // add
+        te[8..12].copy_from_slice(&0u32.to_le_bytes()); // TE_BSS_STA_AGGRESSIVE_ASSOC
+        te[16..20].copy_from_slice(&500u32.to_le_bytes()); // max delay (TU)
+        te[24..28].copy_from_slice(&1u32.to_le_bytes()); // interval
+        te[28..32].copy_from_slice(&1500u32.to_le_bytes()); // duration (TU)
+        te[32] = 1; // repeat
+        te[34..36].copy_from_slice(&(1u16 | 2 | 1 << 11).to_le_bytes()); // notify start/end, start now
+        let r = self.send_cmd(TIME_EVENT_CMD, 0, &te)?;
+        if r.len() >= 4 && le32(&r, 0) != 0 {
+            wlog!("time event refused (status {:#x})", le32(&r, 0));
+        }
+        match self.wait_for(&[TIME_EVENT_NOTIFICATION], 700_000) {
+            Some(n) if n.data.len() >= 24 => wlog!("on channel {}: time event action {:#x} status {}", bss.channel,
+                le32(&n.data, 16), le32(&n.data, 20)),
+            _ => wlog!("no time event start; trying anyway"),
+        }
+
+        // 802.11 open-system authentication.
+        let mgmt_rate = self.mgmt_rate(bss.channel);
+        let mut auth = None;
+        for attempt in 1..=3 {
+            let mut f = self.mgmt_header(11, &bss.bssid);
+            f.extend_from_slice(&[0, 0, 1, 0, 0, 0]); // algorithm 0, transaction 1, status 0
+            self.tx_frame(&f, 24, mgmt_rate, 8, 2, None)?;
+            if let Some(r) = self.wait_mgmt(11, &bss.bssid, 400_000) {
+                auth = Some(r);
+                break;
+            }
+            wlog!("no authentication reply (try {}, TX ok {} failed {})", attempt, self.tx_ok, self.tx_failed);
+        }
+        let auth = auth.ok_or("the AP didn't answer authentication")?;
+        let status = if auth.len() >= 30 { le16(&auth, 28) } else { 0xFFFF };
+        if status != 0 {
+            return Err(format!("authentication refused (status {})", status));
+        }
+        wlog!("authenticated");
+
+        // Association: no QoS, no HT (legacy rates), RSN if WPA2.
+        let mut f = self.mgmt_header(0, &bss.bssid);
+        let mut cap: u16 = 0x0001 | 0x0020; // ESS, short preamble
+        if bss.channel <= 14 {
+            cap |= 0x0400; // short slot time
+        }
+        if bss.privacy {
+            cap |= 0x0010;
+        }
+        f.extend_from_slice(&cap.to_le_bytes());
+        f.extend_from_slice(&10u16.to_le_bytes()); // listen interval
+        f.push(0);
+        f.push(bss.ssid.len() as u8);
+        f.extend_from_slice(&bss.ssid);
+        let rates: Vec<u8> = if bss.rates.is_empty() {
+            if bss.channel <= 14 { vec![0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6C] }
+            else { vec![0x8C, 0x12, 0x98, 0x24, 0xB0, 0x48, 0x60, 0x6C] }
+        } else {
+            bss.rates.clone()
+        };
+        f.push(1);
+        f.push(rates.len().min(8) as u8);
+        f.extend_from_slice(&rates[..rates.len().min(8)]);
+        if rates.len() > 8 {
+            f.push(50);
+            f.push((rates.len() - 8) as u8);
+            f.extend_from_slice(&rates[8..]);
+        }
+        let rsn_ie = self.link.as_ref().map(|l| l.rsn_ie.clone()).unwrap_or_default();
+        f.extend_from_slice(&rsn_ie);
+        let mut assoc = None;
+        for attempt in 1..=3 {
+            self.tx_frame(&f, 24, mgmt_rate, 8, 3, None)?;
+            if let Some(r) = self.wait_mgmt(1, &bss.bssid, 600_000) {
+                assoc = Some(r);
+                break;
+            }
+            wlog!("no association reply (try {})", attempt);
+        }
+        let assoc = assoc.ok_or("the AP didn't answer association")?;
+        if assoc.len() < 30 {
+            return Err(String::from("short association reply"));
+        }
+        let status = le16(&assoc, 26);
+        if status != 0 {
+            return Err(format!("association refused (status {}{})", status,
+                match status { 17 => ": AP full", 18 => ": rates", 27 | 45 => ": needs HT/VHT", 40 | 41 | 42 => ": RSN/cipher", 43 => ": AKM", _ => "" }));
+        }
+        let aid = le16(&assoc, 28) & 0x3FFF;
+        wlog!("associated, AID {}", aid);
+
+        // The firmware: associated (no beacons to the host), AID, air time.
+        let m = self.mac_context_cmd(2, Some(bss.bssid), true, aid, bss.beacon_int, 1);
+        self.send_cmd(MAC_CONTEXT_CMD, 0, &m)?;
+        self.add_ap_sta(&bss.bssid, true, aid)?;
+        let mut q = [0u8; 48];
+        q[0..4].copy_from_slice(&PHY_ID.to_le_bytes()); // binding id = PHY id
+        q[4..8].copy_from_slice(&128u32.to_le_bytes());
+        q[8..12].copy_from_slice(&128u32.to_le_bytes());
+        for i in 1..4 {
+            q[i * 12..i * 12 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        }
+        self.send_cmd(TIME_QUOTA_CMD, 0, &q)?;
+        if let Some(l) = self.link.as_mut() {
+            l.aid = aid;
+            l.associated = true;
+        }
+
+        let wpa = self.link.as_ref().is_some_and(|l| l.wpa);
+        if !wpa {
+            if let Some(l) = self.link.as_mut() {
+                l.authorized = true;
+            }
+            return Ok(());
+        }
+        // The 4-way handshake: the AP starts it.
+        let deadline = crate::time::Deadline::after_us(8_000_000);
+        loop {
+            for p in self.rx_poll() {
+                self.note(p);
+            }
+            while let Some(e) = self.eapol_rx.pop_front() {
+                self.handle_eapol(&e);
+            }
+            if self.link.as_ref().is_some_and(|l| l.authorized) {
+                return Ok(());
+            }
+            if self.link.is_none() {
+                return Err(String::from("the AP dropped us during the handshake (wrong password?)"));
+            }
+            if deadline.expired() {
+                let got = self.link.as_ref().map_or(0, |l| if l.ptk.is_some() { 1 } else { 0 });
+                return Err(if got == 0 {
+                    String::from("no WPA handshake from the AP")
+                } else {
+                    String::from("handshake not finished (wrong password?)")
+                });
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    fn add_ap_sta(&mut self, bssid: &[u8; 6], modify: bool, aid: u16) -> Result<(), String> {
+        let mut c = [0u8; 44];
+        c[0] = modify as u8;
+        c[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes()); // no aggregation
+        c[4..8].copy_from_slice(&MAC_ID.to_le_bytes());
+        c[8..14].copy_from_slice(bssid);
+        c[16] = AP_STA_ID;
+        let msk: u32 = 3 << 26 | 3 << 28 | 1 << 17;
+        c[24..28].copy_from_slice(&msk.to_le_bytes());
+        c[36..38].copy_from_slice(&aid.to_le_bytes());
+        c[40..44].copy_from_slice(&(1u32 << BSS_QUEUE).to_le_bytes());
+        self.send_cmd_status(ADD_STA, &c, 1)
+    }
+
+    /// An EAPOL-Key frame from the AP (4-way and group key handshakes).
+    fn handle_eapol(&mut self, e: &[u8]) {
+        if e.len() < 99 || e[1] != 3 || e[4] != 2 {
+            return;
+        }
+        let info = u16::from_be_bytes([e[5], e[6]]);
+        let replay = u64::from_be_bytes(e[9..17].try_into().unwrap());
+        let data_len = u16::from_be_bytes([e[97], e[98]]) as usize;
+        let Some(key_data) = e.get(99..99 + data_len) else { return };
+        let Some(link) = self.link.as_ref() else { return };
+        if info & 7 != 2 {
+            wlog!("EAPOL: key descriptor version {} not supported", info & 7);
+            return;
+        }
+        if link.replay.is_some_and(|r| replay < r) {
+            return; // old
+        }
+        let pairwise = info & 0x08 != 0;
+        let has_mic = info & 0x100 != 0;
+        let ack = info & 0x80 != 0;
+        if pairwise && ack && !has_mic {
+            // Message 1: our nonce, the PTK, message 2.
+            let mut anonce = [0u8; 32];
+            anonce.copy_from_slice(&e[17..49]);
+            let ptk = crate::wpa::ptk(&link.pmk, &link.bss.bssid, &self.mac, &anonce, &link.snonce);
+            let kck = ptk.kck;
+            let rsn = link.rsn_ie.clone();
+            let snonce = link.snonce;
+            let l = self.link.as_mut().unwrap();
+            l.anonce = anonce;
+            l.ptk = Some(ptk);
+            l.replay = Some(replay);
+            let msg2 = eapol_key(0x010A, replay, &snonce, &rsn, &kck);
+            wlog!("EAPOL 1/4 received; sending 2/4");
+            let _ = self.send_eapol(&msg2, false);
+        } else if pairwise && ack && has_mic {
+            // Message 3: check the MIC, unwrap the GTK, message 4, keys.
+            let Some(ptk) = link.ptk.as_ref() else { return };
+            if !mic_ok(e, &ptk.kck) {
+                wlog!("EAPOL 3/4: bad MIC (wrong password?)");
+                return;
+            }
+            if e[17..49] != link.anonce {
+                wlog!("EAPOL 3/4: ANonce differs from 1/4");
+                return;
+            }
+            let (kek, kck, tk) = (ptk.kek, ptk.kck, ptk.tk);
+            let gtk = if info & 0x1000 != 0 {
+                crate::wpa::aes_unwrap(&kek, key_data).and_then(|d| crate::wpa::find_gtk(&d))
+            } else {
+                crate::wpa::find_gtk(key_data)
+            };
+            self.link.as_mut().unwrap().replay = Some(replay);
+            let msg4 = eapol_key(0x030A, replay, &[0; 32], &[], &kck);
+            wlog!("EAPOL 3/4 ok (GTK {}); sending 4/4", if gtk.is_some() { "found" } else { "MISSING" });
+            let _ = self.send_eapol(&msg4, false);
+            // Let 4/4 leave unencrypted before the pairwise key is in.
+            crate::time::delay_ms(5);
+            for p in self.rx_poll() {
+                self.note(p);
+            }
+            if let Err(err) = self.install_key(0, 0, &tk, false) {
+                wlog!("installing the pairwise key failed: {}", err);
+                return;
+            }
+            if let Some((id, key)) = gtk {
+                if let Err(err) = self.install_gtk(id, &key, &e[65..73]) {
+                    wlog!("installing the group key failed: {}", err);
+                }
+            }
+            if let Some(l) = self.link.as_mut() {
+                l.authorized = true;
+                wlog!("WPA2 keys installed: link up");
+            }
+        } else if !pairwise && ack && has_mic {
+            // Group key handshake (the router changing its group key).
+            let Some(ptk) = link.ptk.as_ref() else { return };
+            if !mic_ok(e, &ptk.kck) {
+                wlog!("EAPOL group 1/2: bad MIC");
+                return;
+            }
+            let (kek, kck) = (ptk.kek, ptk.kck);
+            let gtk = crate::wpa::aes_unwrap(&kek, key_data).and_then(|d| crate::wpa::find_gtk(&d));
+            self.link.as_mut().unwrap().replay = Some(replay);
+            let msg = eapol_key(0x0302, replay, &[0; 32], &[], &kck);
+            let _ = self.send_eapol(&msg, true);
+            if let Some((id, key)) = gtk {
+                match self.install_gtk(id, &key, &e[65..73]) {
+                    Ok(()) => wlog!("new group key {} installed", id),
+                    Err(err) => wlog!("installing the new group key failed: {}", err),
+                }
+            }
+        }
+    }
+
+    fn install_gtk(&mut self, id: u8, key: &[u8], rsc: &[u8]) -> Result<(), String> {
+        if key.len() != 16 {
+            return Err(format!("group key of {} bytes (not CCMP)", key.len()));
+        }
+        let mut k = [0u8; 16];
+        k.copy_from_slice(key);
+        let mut seq = [0u8; 6];
+        seq.copy_from_slice(&rsc[..6]);
+        self.install_key(4 + id, id, &k, true)?;
+        let _ = seq;
+        if let Some(l) = self.link.as_mut() {
+            l.gtk_id = id;
+        }
+        Ok(())
+    }
+
+    /// ADD_STA_KEY (version 1): a CCMP key for the AP's station.
+    fn install_key(&mut self, offset: u8, id: u8, key: &[u8; 16], group: bool) -> Result<(), String> {
+        let mut c = [0u8; 64];
+        c[0] = AP_STA_ID;
+        c[1] = offset;
+        let flags: u16 = 2 | 1 << 3 | (id as u16 & 3) << 8 | if group { 1 << 14 } else { 0 };
+        c[2..4].copy_from_slice(&flags.to_le_bytes());
+        c[4..20].copy_from_slice(key);
+        self.send_cmd_status(ADD_STA_KEY, &c, 1)
+    }
+
+    /// Send an EAPOL frame to the AP (encrypted once the PTK is in).
+    fn send_eapol(&mut self, eapol: &[u8], encrypt: bool) -> Result<(), String> {
+        let bssid = self.link.as_ref().ok_or("no link")?.bss.bssid;
+        self.send_data(&bssid, 0x888E, eapol, encrypt, 2)
+    }
+
+    /// An Ethernet payload to `dst` through the AP: 802.11 data header
+    /// (to DS), CCMP header if encrypting, LLC/SNAP, payload.
+    fn send_data(&mut self, dst: &[u8; 6], ethertype: u16, payload: &[u8], encrypt: bool, pm_timeout: u16) -> Result<(), String> {
+        let link = self.link.as_mut().ok_or("no link")?;
+        let tk = if encrypt { link.ptk.as_ref().map(|p| p.tk) } else { None };
+        let mut f = Vec::with_capacity(payload.len() + 48);
+        let fc: u16 = 0x0008 | 0x0100 | if tk.is_some() { 0x4000 } else { 0 };
+        f.extend_from_slice(&fc.to_le_bytes());
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&link.bss.bssid);
+        f.extend_from_slice(&self.mac);
+        f.extend_from_slice(dst);
+        f.extend_from_slice(&[0, 0]);
+        if tk.is_some() {
+            let pn = link.tx_pn;
+            link.tx_pn += 1;
+            f.extend_from_slice(&[pn as u8, (pn >> 8) as u8, 0, 0x20, (pn >> 16) as u8, (pn >> 24) as u8, (pn >> 32) as u8, (pn >> 40) as u8]);
+        }
+        f.extend_from_slice(&[0xAA, 0xAA, 0x03, 0, 0, 0]);
+        f.extend_from_slice(&ethertype.to_be_bytes());
+        f.extend_from_slice(payload);
+        let rate = link.rate;
+        self.tx_frame(&f, 24, rate, 0, pm_timeout, tk)
+    }
+
+    /// A data frame from the air: the AP's frames for us become Ethernet
+    /// frames (or EAPOL for the handshake).
+    fn rx_data_frame(&mut self, frame: &[u8], status: u32) {
+        let fc = le16(frame, 0);
+        let Some(link) = self.link.as_mut() else { return };
+        if fc & 0x0300 != 0x0200 || frame[10..16] != link.bss.bssid {
+            return; // not from our AP (from DS only)
+        }
+        let sub = fc >> 4 & 0xF;
+        if sub & 4 != 0 {
+            return; // no data (null frames)
+        }
+        let hdr = if sub & 8 != 0 { 26 } else { 24 } + if fc & 0x8000 != 0 && sub & 8 != 0 { 4 } else { 0 };
+        let seq = le16(frame, 22);
+        if fc & 0x0800 != 0 && seq == link.last_rx_seq {
+            return; // a retry of what we had
+        }
+        link.last_rx_seq = seq;
+        let body = if fc & 0x4000 != 0 {
+            // Decrypted by the card: CCM, MIC checked; the CCMP header stays,
+            // the MIC is still on the end.
+            if status & 0x700 != 0x200 || status & (1 << 6) == 0 || frame.len() < hdr + 16 {
+                self.rx_dropped += 1;
+                return;
+            }
+            &frame[hdr + 8..frame.len() - 8]
+        } else {
+            if frame.len() < hdr {
+                return;
+            }
+            &frame[hdr..]
+        };
+        if body.len() < 8 || body[..6] != [0xAA, 0xAA, 0x03, 0, 0, 0] {
+            self.rx_dropped += 1;
+            return;
+        }
+        let ethertype = u16::from_be_bytes([body[6], body[7]]);
+        let payload = &body[8..];
+        if ethertype == 0x888E {
+            if self.eapol_rx.len() < 8 {
+                self.eapol_rx.push_back(payload.to_vec());
+            }
+            return;
+        }
+        // Until the keys are in, only EAPOL; after, nothing unencrypted.
+        if !link.authorized || (link.wpa && fc & 0x4000 == 0) {
+            self.rx_dropped += 1;
+            return;
+        }
+        if frame[16..22] == self.mac {
+            return; // our own broadcast, relayed back by the AP
+        }
+        let mut eth = Vec::with_capacity(payload.len() + 14);
+        eth.extend_from_slice(&frame[4..10]); // DA
+        eth.extend_from_slice(&frame[16..22]); // SA
+        eth.extend_from_slice(&ethertype.to_be_bytes());
+        eth.extend_from_slice(payload);
+        self.rx_data += 1;
+        if self.eth_rx.len() >= 256 {
+            self.eth_rx.pop_front();
+        }
+        self.eth_rx.push_back(eth);
+    }
+
+    /// Deauthentication or disassociation from the AP.
+    fn lost_link(&mut self, frame: &[u8]) {
+        let Some(link) = self.link.as_ref() else { return };
+        if frame[10..16] != link.bss.bssid {
+            return;
+        }
+        let reason = if frame.len() >= 26 { le16(frame, 24) } else { 0 };
+        wlog!("{} by the AP, reason {}{}", if le16(frame, 0) >> 4 & 0xF == 12 { "deauthenticated" } else { "disassociated" },
+            reason, match reason { 2 | 15 => " (handshake timeout: wrong password?)", 14 => " (MIC failure)", 23 => " (802.1X failed)", _ => "" });
+        self.drop_link();
+        self.state = format!("disconnected by the AP (reason {})", reason);
+    }
+
+    /// Leave the network: tell the AP, then undo the firmware's state.
+    pub fn disconnect(&mut self, why: &str) {
+        let Some(link) = self.link.as_ref() else { return };
+        if link.associated && self.running {
+            let mut f = self.mgmt_header(12, &link.bss.bssid);
+            f.extend_from_slice(&3u16.to_le_bytes()); // leaving
+            let rate = self.mgmt_rate(link.bss.channel);
+            let _ = self.tx_frame(&f, 24, rate, 8, 2, None);
+            crate::time::delay_ms(20);
+        }
+        wlog!("leaving the network ({})", why);
+        self.drop_link();
+        self.state = String::from("ready (not connected)");
+    }
+
+    fn drop_link(&mut self) {
+        let Some(link) = self.link.take() else { return };
+        self.eth_rx.clear();
+        self.eapol_rx.clear();
+        if !self.running {
+            return;
+        }
+        // Undo in reverse: quota, station, MAC back to unassociated, binding.
+        let mut q = [0u8; 48];
+        for i in 0..4 {
+            q[i * 12..i * 12 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        }
+        let _ = self.send_cmd(TIME_QUOTA_CMD, 0, &q);
+        let mut r = [0u8; 4];
+        r[0] = AP_STA_ID;
+        let _ = self.send_cmd(0x19, 0, &r); // REMOVE_STA
+        let m = self.mac_context_cmd(2, None, false, 0, 0, 0);
+        let _ = self.send_cmd(MAC_CONTEXT_CMD, 0, &m);
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&PHY_ID.to_le_bytes());
+        b[4..8].copy_from_slice(&3u32.to_le_bytes()); // remove
+        b[8..12].copy_from_slice(&MAC_ID.to_le_bytes());
+        b[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        b[16..20].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        b[20..24].copy_from_slice(&PHY_ID.to_le_bytes());
+        let _ = self.send_cmd(BINDING_CONTEXT_CMD, 0, &b);
+        // The AP's queue: the firmware stops scheduling it.
+        let cmd = [0, AP_STA_ID, 8, BSS_QUEUE as u8, 0, 0, TX_FIFO_VO, 64, 0, 0, 0, 0];
+        let _ = self.send_cmd(SCD_QUEUE_CFG, 0, &cmd);
+        let _ = link;
+    }
+
+    /// Keep things moving while connected (called from the network poll):
+    /// received frames, the group key handshake, missed beacons.
+    pub fn service(&mut self) {
+        if !self.running {
+            return;
+        }
+        for p in self.rx_poll() {
+            if p.cmd == MISSED_BEACONS_NOTIFICATION && p.data.len() >= 12 {
+                // mac_id, missed since the last frame received, missed in a row
+                let consecutive = le32(&p.data, 4);
+                if consecutive >= 30 && self.link.is_some() {
+                    wlog!("{} beacons missed in a row: link lost", consecutive);
+                    self.drop_link();
+                    self.state = String::from("link lost (AP out of range?)");
+                }
+                continue;
+            }
+            self.note(p);
+        }
+        while let Some(e) = self.eapol_rx.pop_front() {
+            self.handle_eapol(&e);
+        }
+        self.adapt_rate();
+        // Old notifications nobody waits for.
+        while self.pending.len() > 16 {
+            self.pending.pop_front();
+        }
+    }
+
+    /// An Ethernet frame from the network stack, out to the AP.
+    pub fn transmit_eth(&mut self, eth: &[u8]) {
+        if eth.len() < 14 || !self.link.as_ref().is_some_and(|l| l.authorized) {
+            return;
+        }
+        let mut dst = [0u8; 6];
+        dst.copy_from_slice(&eth[0..6]);
+        let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
+        let encrypt = self.link.as_ref().is_some_and(|l| l.wpa);
+        if self.send_data(&dst, ethertype, &eth[14..], encrypt, 0).is_err() {
+            self.tx_failed += 1;
+        }
+    }
+
+    pub fn link_up(&self) -> bool {
+        self.running && self.link.as_ref().is_some_and(|l| l.authorized)
+    }
+}
+
+/// An RSN element's pairwise cipher list contains 00-0F-AC:`suite`.
+fn rsn_pairwise_has(rsn: &[u8], suite: u8) -> bool {
+    if rsn.len() < 8 {
+        return false;
+    }
+    let n = le16(rsn, 6) as usize;
+    (0..n).any(|i| rsn.get(8 + 4 * i..12 + 4 * i) == Some(&[0x00, 0x0F, 0xAC, suite][..]))
+}
+
+/// An EAPOL-Key frame (RSN descriptor, version 2) with its MIC.
+fn eapol_key(info: u16, replay: u64, nonce: &[u8; 32], key_data: &[u8], kck: &[u8; 16]) -> Vec<u8> {
+    let body_len = 95 + key_data.len();
+    let mut e = Vec::with_capacity(4 + body_len);
+    e.push(1); // 802.1X-2001
+    e.push(3); // EAPOL-Key
+    e.extend_from_slice(&(body_len as u16).to_be_bytes());
+    e.push(2); // RSN key descriptor
+    e.extend_from_slice(&info.to_be_bytes());
+    e.extend_from_slice(&0u16.to_be_bytes()); // key length
+    e.extend_from_slice(&replay.to_be_bytes());
+    e.extend_from_slice(nonce);
+    e.extend_from_slice(&[0; 16]); // IV
+    e.extend_from_slice(&[0; 8]); // RSC
+    e.extend_from_slice(&[0; 8]); // reserved
+    e.extend_from_slice(&[0; 16]); // MIC
+    e.extend_from_slice(&(key_data.len() as u16).to_be_bytes());
+    e.extend_from_slice(key_data);
+    let m = crate::wpa::mic(kck, &e);
+    e[81..97].copy_from_slice(&m);
+    e
+}
+
+fn mic_ok(e: &[u8], kck: &[u8; 16]) -> bool {
+    let body_len = u16::from_be_bytes([e[2], e[3]]) as usize;
+    let Some(frame) = e.get(..4 + body_len) else { return false };
+    let mut copy = frame.to_vec();
+    copy[81..97].fill(0);
+    crate::wpa::mic(kck, &copy) == e[81..97]
 }
 
 fn write_tfd(tfd: *mut u8, tbs: &[(u64, usize)]) {
@@ -1556,6 +2489,86 @@ fn write_tfd(tfd: *mut u8, tbs: &[(u64, usize)]) {
             (tb as *mut u32).write_unaligned(addr as u32);
             let hi_n_len = ((addr >> 32) as u16 & 0xF) | (len as u16) << 4;
             (tb.add(4) as *mut u16).write_unaligned(hi_n_len);
+        }
+    }
+}
+
+// ---- The network stack's view: a NIC ------------------------------------------------
+
+static ATTACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The first time a network is joined, the card joins the network stack
+/// as a NIC (the logical NIC fails over to it while the wired NIC has no
+/// link; the interface takes its MAC and DHCP restarts).
+fn attach_to_network(mac: [u8; 6], base: u64) {
+    if ATTACHED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::network::attach_nic(alloc::boxed::Box::new(WifiNic { mac, base, rx: 0, tx: 0, up: true }));
+}
+
+/// The card as a `network::Nic`. Frames go through `WIFI`; if the driver is
+/// busy (a scan or a join in the terminal), this poll skips it.
+pub struct WifiNic {
+    mac: [u8; 6],
+    base: u64,
+    rx: u64,
+    tx: u64,
+    up: bool,
+}
+
+impl crate::network::Nic for WifiNic {
+    fn mac(&self) -> smoltcp::wire::EthernetAddress {
+        smoltcp::wire::EthernetAddress(self.mac)
+    }
+
+    fn link_up(&self) -> bool {
+        WIFI.try_lock().map_or(self.up, |w| w.as_ref().is_some_and(|i| i.link_up()))
+    }
+
+    fn poll_rx(&mut self, out: &mut Vec<crate::virtio_net::PacketBuf>) {
+        let Some(mut guard) = WIFI.try_lock() else { return };
+        let Some(iwl) = guard.as_mut() else { return };
+        iwl.service();
+        self.up = iwl.link_up();
+        while let Some(f) = iwl.eth_rx.pop_front() {
+            let mut pkt = crate::virtio_net::PacketBuf::new();
+            let n = f.len().min(crate::virtio_net::MTU);
+            pkt.data[..n].copy_from_slice(&f[..n]);
+            pkt.len = n;
+            out.push(pkt);
+            self.rx += 1;
+        }
+    }
+
+    fn transmit(&mut self, frame: &[u8]) {
+        let mut guard = WIFI.lock();
+        if let Some(iwl) = guard.as_mut() {
+            iwl.transmit_eth(frame);
+            self.tx += 1;
+        }
+    }
+
+    fn counts(&self) -> (u64, u64) {
+        (self.rx, self.tx)
+    }
+
+    fn key(&self) -> u64 {
+        self.base
+    }
+
+    fn kind(&self) -> &'static str {
+        "iwlwifi"
+    }
+
+    fn detail(&self) -> String {
+        let Some(guard) = WIFI.try_lock() else { return String::from("Wi-Fi (busy)") };
+        let Some(iwl) = guard.as_ref() else { return String::new() };
+        match &iwl.link {
+            Some(l) => format!("Wi-Fi '{}' ch {} {} dBm, {} Mb/s, TX ok {} failed {}, RX {} dropped {}",
+                l.bss.ssid_text(), l.bss.channel, l.bss.signal, l.rate_500k as f32 / 2.0,
+                iwl.tx_ok, iwl.tx_failed, iwl.rx_data, iwl.rx_dropped),
+            None => format!("Wi-Fi not connected ({})", iwl.state),
         }
     }
 }
@@ -1592,7 +2605,29 @@ pub fn command(args: &[&str]) -> Vec<String> {
             }
             Err(e) => out.push(format!("  Scan failed: {}", e)),
         },
-        _ => out.push(String::from("Usage: WIFI [STATUS|UP|SCAN]")),
+        "CONNECT" => {
+            let words = quoted_words(&args[1..].join(" "));
+            let Some(ssid) = words.first() else {
+                out.push(String::from("Usage: WIFI CONNECT <ssid> [password]   (\"quotes\" around an SSID with spaces)"));
+                return out;
+            };
+            let pass = words.get(1);
+            match iwl.connect(ssid.as_bytes(), pass.map(|p| p.as_bytes())) {
+                Ok(()) => {
+                    out.push(format!("  Connected to {}. Getting an address (DHCP): see NET STATUS.", ssid));
+                    let mac = iwl.mac;
+                    let base = iwl.base;
+                    drop(guard);
+                    attach_to_network(mac, base);
+                }
+                Err(e) => out.push(format!("  Connect failed: {}", e)),
+            }
+        }
+        "DISCONNECT" => {
+            iwl.disconnect("by request");
+            out.push(String::from("  Disconnected."));
+        }
+        _ => out.push(String::from("Usage: WIFI [STATUS|UP|SCAN|CONNECT <ssid> [password]|DISCONNECT]")),
     }
     out
 }

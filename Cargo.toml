@@ -48,6 +48,9 @@ embedded-io = { version = "0.7", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 x509-cert = { version = "0.2.5", default-features = false }
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+# Wi-Fi WPA2 (wpa.rs): HMAC-SHA1 for the PMK, PTK and EAPOL MICs; AES for key unwrap.
+sha1 = { version = "0.10", default-features = false, features = ["force-soft"] }
+aes = { version = "0.8", default-features = false }
 tinybmp = { version = "0.7.0", default-features = false }
 zune-jpeg = { version = "0.5.15", default-features = false }
 zune-png = { version = "0.5.2", default-features = false }
