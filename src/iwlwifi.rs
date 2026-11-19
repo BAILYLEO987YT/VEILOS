@@ -63,6 +63,7 @@ const HW_IF_RADIO_SI: u32 = 0x0000_0200;
 const HW_IF_MAC_SI: u32 = 0x0000_0100;
 
 const INT_HW_ERR: u32 = 1 << 29;
+const INT_FH_RX_ALL: u32 = 1 << 31 | 1 << 28; // FH_RX, RX_PERIODIC
 const INT_FH_TX: u32 = 1 << 27;
 const INT_SW_ERR: u32 = 1 << 25;
 const INT_RF_KILL: u32 = 1 << 7;
@@ -237,6 +238,10 @@ fn probe(dev: &crate::pci::PciDevice) -> Result<(), String> {
     let bar = dev.bar(0);
     let base = bar.mem_base().filter(|&b| b != 0).ok_or("no memory BAR0")?;
     dev.enable_for_driver();
+    // INTx off at the PCI level: the card's interrupt causes are enabled as
+    // Linux and OpenBSD do (the firmware may look at them), but VEILOS
+    // polls, so none may reach the CPU.
+    dev.set_command_bits(1 << 10);
     // As Linux: no PCI retry timeout (config 0x41), else the card's RX
     // DMA can stall the CPU's C3 state.
     dev.address().write_u8(0x41, 0);
@@ -866,6 +871,9 @@ impl Iwl {
             a += 4;
         }
         self.write_prph(SCD_DRAM_BASE_ADDR, (self.bc_tbls.phys >> 10) as u32);
+        // The scheduler's chain extension (on by default) misbehaves; OpenBSD
+        // turns it off on every family.
+        self.write_prph(SCD_BASE + 0x244, 0); // SCD_CHAINEXT_EN
         // The command queue: inactive, no aggregation, pointers 0, window 64,
         // active on the command FIFO.
         let q = CMD_QUEUE as u32;
@@ -964,6 +972,10 @@ impl Iwl {
         for sec in &image.sections {
             // CPU1/CPU2 or paging separator: this card has one CPU.
             if sec.offset == 0xFFFF_CCCC || sec.offset == 0xAAAA_BBBB {
+                // OpenBSD's iwm loads this 32-byte section too (WIFI UP X).
+                if self.skip.contains('X') {
+                    let _ = self.load_section(sec);
+                }
                 break;
             }
             if let Err(e) = self.load_section(sec) {
@@ -974,6 +986,12 @@ impl Iwl {
         }
         self.fw = Some(fw);
         result?;
+        // Interrupt causes on (as Linux's iwl_enable_interrupts and iwm's
+        // iwm_enable_interrupts before releasing the CPU); INTx is off at
+        // the PCI level, so this only lets the causes through to CSR_INT.
+        if !self.skip.contains('I') {
+            self.w32(CSR_INT_MASK, INT_FH_RX_ALL | INT_HW_ERR | INT_FH_TX | INT_SW_ERR | INT_RF_KILL | 1 << 6 | 1 << 3 | 1 << 1 | 1);
+        }
         // Release the CPU.
         self.w32(CSR_RESET, 0);
         let alive = self.wait_for(&[UCODE_ALIVE_NTFY], 1_000_000)
@@ -1284,6 +1302,15 @@ impl Iwl {
         write_tfd(tfd, &tbs);
         t.write = (idx + 1) % TFD_QUEUE_SIZE;
         let wr = t.write as u32;
+        // The scheduler's byte count for the slot (OpenBSD writes one for
+        // commands too: CRC + delimiter, station 0).
+        let tbl = self.bc_tbls.at(CMD_QUEUE * BC_TABLE_BYTES);
+        unsafe {
+            (tbl.add(idx * 2) as *mut u16).write_volatile(8);
+            if idx < 64 {
+                (tbl.add((TFD_QUEUE_SIZE + idx) * 2) as *mut u16).write_volatile(8);
+            }
+        }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.int_seen = 0;
         self.fh_seen = 0;
@@ -1405,7 +1432,8 @@ impl Iwl {
         // find which one the firmware objects to: S smart FIFO, B Bluetooth,
         // D DQA, A aux station, P PHY contexts, M regulatory, C MAC context;
         // 1: antenna A only; O: PHY contexts before the aux station; N no
-        // PHY DB; E/F: PHY_CONFIGURATION without event/flow calibrations.
+        // PHY DB; E/F: PHY_CONFIGURATION without event/flow calibrations;
+        // X: load the separator section too; I: interrupt causes masked.
         let skip = self.skip.clone();
         let has = |c: char| skip.contains(c);
         if has('1') {
