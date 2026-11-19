@@ -506,6 +506,7 @@ pub struct Iwl {
     /// Ethernet frames for the network stack.
     pub eth_rx: VecDeque<Vec<u8>>,
     phy_added: bool,
+    mac_added: bool,
     pub tx_ok: u64,
     pub tx_failed: u64,
     pub rx_data: u64,
@@ -551,6 +552,7 @@ impl Iwl {
             eapol_rx: VecDeque::new(),
             eth_rx: VecDeque::new(),
             phy_added: false,
+            mac_added: false,
             tx_ok: 0,
             tx_failed: 0,
             rx_data: 0,
@@ -1060,7 +1062,13 @@ impl Iwl {
         for p in &out {
             if p.seq & 0x8000 == 0 && (p.seq >> 8) as usize & 0x1F == CMD_QUEUE {
                 if let Some(t) = self.txq[CMD_QUEUE].as_mut() {
-                    t.read = ((p.seq & 0xFF) as usize + 1) % TFD_QUEUE_SIZE;
+                    // Only a reply to a command still outstanding (some
+                    // notifications come without the RX-frame bit).
+                    let idx = (p.seq & 0xFF) as usize;
+                    let outstanding = (t.write + TFD_QUEUE_SIZE - t.read) % TFD_QUEUE_SIZE;
+                    if (idx + TFD_QUEUE_SIZE - t.read) % TFD_QUEUE_SIZE < outstanding {
+                        t.read = (idx + 1) % TFD_QUEUE_SIZE;
+                    }
                 }
             }
         }
@@ -1108,10 +1116,7 @@ impl Iwl {
             }
             REPLY_ERROR => {
                 let d = &p.data;
-                if d.len() >= 16 {
-                    wlog!("REPLY_ERROR: type {:#x} cmd {:#x} seq {:#x} data {:#x}",
-                        le32(d, 0), d[4], le16(d, 6), le32(d, 8));
-                }
+                wlog!("REPLY_ERROR (seq {:#06x}): {:02x?}", p.seq, &d[..d.len().min(24)]);
             }
             _ => {
                 if self.pending.len() >= 64 {
@@ -1284,7 +1289,7 @@ impl Iwl {
         self.add_aux_sta()?;
         self.send_cmd(POWER_TABLE_CMD, 0, &[0, 0, 0, 0])?; // always awake (CAM)
         self.update_mcc()?;
-        self.add_mac_context()?;
+        self.mac_added = false;
         wlog!("runtime firmware up: MAC {}, NVM {:#x}, antennas TX {:#x} RX {:#x}",
             mac_text(&self.mac), self.nvm_version, self.valid_tx_ant, self.valid_rx_ant);
         Ok(())
@@ -1422,8 +1427,13 @@ impl Iwl {
 
     /// The station interface (MAC context 0), not associated.
     fn add_mac_context(&mut self) -> Result<(), String> {
-        let c = self.mac_context_cmd(1, None, false, 0, 0, 0);
-        self.send_cmd(MAC_CONTEXT_CMD, 0, &c)?;
+        let c = self.mac_context_cmd(1, None, false, 0, 100, 1);
+        if let Err(e) = self.send_cmd(MAC_CONTEXT_CMD, 0, &c) {
+            for (i, chunk) in c.chunks(32).enumerate() {
+                wlog!("MAC ctx +{:3}: {:02x?}", i * 32, chunk);
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1970,6 +1980,10 @@ impl Iwl {
     fn join(&mut self, bss: &Bss) -> Result<(), String> {
         // Firmware side: the channel (PHY context), the MAC bound to it, the
         // BSSID, the AP as station 1 with queue 4, time on the channel.
+        if !self.mac_added {
+            self.add_mac_context()?;
+            self.mac_added = true;
+        }
         let band = if bss.channel <= 14 { 1u8 } else { 0 };
         let mut c = [0u8; 32];
         c[0..4].copy_from_slice(&PHY_ID.to_le_bytes());
