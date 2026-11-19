@@ -9,12 +9,19 @@
 //
 // Start-up follows what every RTL8168 revision accepts: reset, unlock the
 // config registers, receive/transmit sizes, descriptor rings, enable RX/TX,
-// receive and transmit configuration, lock. Linux also applies per-revision
-// PHY and "EPHY" tweaks (a few hundred of them); none are here, so this
-// relies on the PHY as the firmware left it, and restarts auto-negotiation
-// (powering the PHY up if needed) when no link comes. The chip revision
-// (XID) and PHY status are logged and shown by NET STATUS, so a machine that
-// needs more says which.
+// receive and transmit configuration, lock. From the RTL8168G on (XID 0x4C0
+// and later, Linux's MAC version 40+) three things differ, and the first
+// real test (an RTL8168G, XID 0x4C0) had no link without them:
+//   * the PHY's registers are reached through the OCP window (GPHY_OCP,
+//     0xB8; standard MII register r at 0xA400 + 2r), not PHYAR;
+//   * the PHY's PLL must be powered up (PMCH, 0x6F, bits 7:6), as Linux's
+//     rtl_pll_power_up does;
+//   * the PHY's link-down power saving (ALDPS) is turned off, as Linux does
+//     for these chips, so the PHY keeps looking for a link partner.
+// Linux also applies per-revision PHY and "EPHY" tweaks and PHY firmware;
+// none are here. The PHY is powered up (BMCR power-down cleared) and
+// auto-negotiation restarted at every start. The chip revision (XID) and the
+// PHY's status are logged and shown by NET STATUS.
 //
 // QEMU emulates none of these chips: this is tested on real hardware.
 
@@ -38,6 +45,18 @@ const RX_MAX_SIZE: u64 = 0xDA;
 const CPLUS_CMD: u64 = 0xE0;
 const RDSAR: u64 = 0xE4; // receive descriptor start, 64-bit
 const MAX_TX_PACKET: u64 = 0xEC;
+const MAR0: u64 = 0x08; // multicast filter, 8 bytes
+const PMCH: u64 = 0x6F; // power management (8168G+: PLL power)
+const GPHY_OCP: u64 = 0xB8; // PHY registers through OCP (8168G+)
+const OCP_STD_PHY: u32 = 0xA400; // MII register r at OCP_STD_PHY + 2r
+const OCP_ALDPS: u32 = 0xA430; // PHY page 0xA43, register 0x10: bit 2 = ALDPS
+
+// MII registers.
+const BMCR: u32 = 0;
+const BMSR: u32 = 1;
+const BMCR_ANENABLE: u16 = 1 << 12;
+const BMCR_PDOWN: u16 = 1 << 11;
+const BMCR_ANRESTART: u16 = 1 << 9;
 
 const CMD_RESET: u8 = 1 << 4;
 const CMD_RX_ENABLE: u8 = 1 << 3;
@@ -120,6 +139,12 @@ pub struct Rtl {
 // MMIO and DMA memory owned by this NIC, used under the network lock.
 unsafe impl Send for Rtl {}
 
+/// RTL8168G and later (Linux's MAC version 40 on): PHY through OCP, PLL
+/// power in PMCH. The older chips' XIDs are all below 0x4C0.
+fn is_8168g_or_later(xid: u32) -> bool {
+    xid & 0x7CF >= 0x4C0
+}
+
 impl Rtl {
     fn r8(&self, reg: u64) -> u8 {
         unsafe { ((self.base + reg) as *const u8).read_volatile() }
@@ -156,6 +181,12 @@ impl Rtl {
             return Err(format!("no MAC address (chip XID {:#x})", nic.xid));
         }
         nic.mac = EthernetAddress(mac);
+        let newer = is_8168g_or_later(nic.xid);
+        if newer {
+            // The PHY's PLL on (Linux: rtl_pll_power_up for MAC version 40+).
+            nic.w8(PMCH, nic.r8(PMCH) | 0xC0);
+            crate::time::delay_ms(10);
+        }
 
         // Interrupts off; reset.
         nic.w16(IMR, 0);
@@ -189,23 +220,43 @@ impl Rtl {
         nic.w32(RDSAR, rx as u32);
         nic.w32(RDSAR + 4, (rx >> 32) as u32);
         nic.w8(CHIP_CMD, CMD_RX_ENABLE | CMD_TX_ENABLE);
-        // Receive: no FIFO threshold, unlimited DMA burst, broadcast,
-        // multicast and our own address. Transmit: standard gap, unlimited burst.
-        nic.w32(RX_CONFIG, 7 << 13 | 7 << 8 | 1 << 3 | 1 << 2 | 1 << 1);
+        // Receive: unlimited DMA burst; broadcast, multicast (every group: the
+        // filter all ones) and our own address. The top bits differ by
+        // generation: a FIFO threshold before the 8168G, then 128-descriptor
+        // interrupts, multiple-descriptor fetch and early-receive off (as
+        // Linux's rtl_init_rxcfg). Transmit: standard gap, unlimited burst.
+        let accept = 1 << 3 | 1 << 2 | 1 << 1;
+        let rxcfg = if newer { 1 << 15 | 1 << 14 | 1 << 11 | 7 << 8 } else { 7 << 13 | 7 << 8 };
+        nic.w32(RX_CONFIG, rxcfg | accept);
+        for i in 0..8 {
+            nic.w8(MAR0 + i, 0xFF);
+        }
         nic.w32(TX_CONFIG, (txc & !0x0300_0700) | 3 << 24 | 7 << 8);
         nic.w8(CFG9346, 0x00); // lock
 
-        // Link: as the firmware left the PHY; else power it up and restart
-        // auto-negotiation.
-        let mut up = crate::time::spin_until(3_000_000, || nic.r8(PHY_STATUS) & 0x02 != 0);
-        if !up {
-            let bmcr = nic.phy_read(0).unwrap_or(0);
-            crate::serial_println!("[RTL] no link in 3 s (BMCR {:#06x}): powering the PHY up, restarting auto-negotiation", bmcr);
-            nic.phy_write(0, (bmcr & !(1 << 11)) | 1 << 12 | 1 << 9);
-            up = crate::time::spin_until(5_000_000, || nic.r8(PHY_STATUS) & 0x02 != 0);
+        // The PHY: who it is (proves the register path works), ALDPS off on
+        // the newer chips, powered up, auto-negotiation restarted.
+        let id = (nic.phy_read(2), nic.phy_read(3));
+        let bmcr = nic.phy_read(BMCR);
+        crate::serial_println!(
+            "[RTL] chip XID {:#x} ({}), PMCH {:#04x}, PHY id {:04x?}/{:04x?}, BMCR {:04x?}",
+            nic.xid, if newer { "8168G or later: PHY via OCP" } else { "PHY via PHYAR" },
+            nic.r8(PMCH), id.0, id.1, bmcr
+        );
+        if newer {
+            if let Some(v) = nic.ocp_read(OCP_ALDPS) {
+                nic.ocp_write(OCP_ALDPS, v & !(1 << 2));
+            }
         }
+        let bmcr = bmcr.unwrap_or(BMCR_ANENABLE);
+        nic.phy_write(BMCR, (bmcr & !BMCR_PDOWN) | BMCR_ANENABLE | BMCR_ANRESTART);
+        // Auto-negotiation takes up to about 3 s at gigabit.
+        let up = crate::time::spin_until(6_000_000, || nic.r8(PHY_STATUS) & 0x02 != 0);
         nic.link_was_up = up;
-        crate::serial_println!("[RTL] chip XID {:#x}, MAC {}, link {}", nic.xid, nic.mac, nic.link_text());
+        crate::serial_println!(
+            "[RTL] MAC {}, link {} (PHY status {:#04x}, BMSR {:04x?})",
+            nic.mac, nic.link_text(), nic.r8(PHY_STATUS), nic.phy_read(BMSR)
+        );
         Ok(nic)
     }
 
@@ -230,7 +281,27 @@ impl Rtl {
         }
     }
 
+    /// A PHY register through OCP (8168G and later).
+    fn ocp_read(&self, addr: u32) -> Option<u16> {
+        self.w32(GPHY_OCP, addr << 15);
+        let mut v = 0;
+        crate::time::spin_until(10_000, || {
+            v = self.r32(GPHY_OCP);
+            v & (1 << 31) != 0
+        })
+        .then_some(v as u16)
+    }
+
+    fn ocp_write(&self, addr: u32, value: u16) {
+        self.w32(GPHY_OCP, 1 << 31 | addr << 15 | value as u32);
+        crate::time::spin_until(10_000, || self.r32(GPHY_OCP) & (1 << 31) == 0);
+    }
+
+    /// A standard MII register of the PHY, whichever way this chip reaches it.
     fn phy_read(&self, reg: u32) -> Option<u16> {
+        if is_8168g_or_later(self.xid) {
+            return self.ocp_read(OCP_STD_PHY + reg * 2);
+        }
         self.w32(PHYAR, (reg & 0x1F) << 16);
         let mut v = 0;
         crate::time::spin_until(10_000, || {
@@ -241,6 +312,9 @@ impl Rtl {
     }
 
     fn phy_write(&self, reg: u32, value: u16) {
+        if is_8168g_or_later(self.xid) {
+            return self.ocp_write(OCP_STD_PHY + reg * 2, value);
+        }
         self.w32(PHYAR, 1 << 31 | (reg & 0x1F) << 16 | value as u32);
         crate::time::spin_until(10_000, || self.r32(PHYAR) & (1 << 31) == 0);
     }
@@ -327,7 +401,7 @@ impl crate::network::Nic for Rtl {
     }
 
     fn detail(&self) -> String {
-        format!("chip XID {:#x}, {}, PHY status {:#04x}, rx errors {}",
-            self.xid, self.link_text(), self.r8(PHY_STATUS), self.rx_errors)
+        format!("chip XID {:#x}, {}, PHY status {:#04x}, BMSR {:04x?}, rx errors {}",
+            self.xid, self.link_text(), self.r8(PHY_STATUS), self.phy_read(BMSR), self.rx_errors)
     }
 }

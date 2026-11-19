@@ -718,7 +718,11 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             match sub {
                 "STATUS" => {
                     if crate::network::is_ready() {
-                        history.push(String::from("  Network: ONLINE"));
+                        history.push(String::from(if crate::network::on_fallback_address() {
+                            "  Network: NO DHCP ANSWER (fallback address; still asking)"
+                        } else {
+                            "  Network: ONLINE"
+                        }));
                         let cfg = crate::network::NETWORK_CONFIG.lock();
                         history.push(alloc::format!("  IP:      {}/{}", cfg.ip.address(), cfg.ip.prefix_len()));
                         if let Some(gw) = cfg.gateway { history.push(alloc::format!("  Gateway: {}", gw)); }
