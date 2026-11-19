@@ -1,0 +1,107 @@
+# Test disk images for a branch, without merging it into main or touching
+# the "latest" release: for trying a change on real hardware first.
+#
+# Runs on every push to a branch other than main, and by hand (Actions tab >
+# Test images > Run workflow > pick the branch). The images are attached to
+# the run as an artifact: open the run, scroll down to "Artifacts", download
+# the zip, and write one image with Rufus (DD) or dd:
+#
+#   veilos-uefi-disk.img   UEFI PCs (Secure Boot off): system on the stick
+#   veilos-bios-disk.img   BIOS / CSM PCs
+#   veilos-uefi-ram.img    UEFI, system loaded into memory (changes are lost;
+#   veilos-bios-ram.img    for when VEILOS can't reach the stick)
+#
+# The QEMU boot test runs too, but the images are uploaded whether it passes
+# or not: a change can be meant for hardware QEMU doesn't have.
+name: Test images
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-images-${{ github.ref }}
+  cancel-in-progress: true # a newer push to the branch replaces a build still running
+
+env:
+  RUSTUP_TOOLCHAIN: nightly-2026-05-11 # as release.yml
+  MKIMAGE_TOOLCHAIN: nightly-2026-11-01
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src,llvm-tools-preview
+          rustup toolchain install "$MKIMAGE_TOOLCHAIN" --profile minimal --component rust-src,llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tools/mkimage
+
+      - name: Build the disk images
+        id: build
+        run: |
+          sh tools/build.sh --disk 1G --ramdisk 128M
+          mkdir -p out
+          for f in uefi-disk bios-disk uefi-ram bios-ram; do
+            cp "target/x86_64-unknown-none/debug/veilos-$f.img" out/
+          done
+          short=$(git rev-parse --short HEAD)
+          {
+            echo "VEILOS test images: branch $GITHUB_REF_NAME, commit $short"
+            git log -1 --format='%s%n%cd' --date=iso
+          } > out/VERSION.txt
+          # Artifact names can't hold "/" (branch names like claude/r8169 do).
+          echo "name=veilos-test-$(echo "$GITHUB_REF_NAME" | tr '/' '-')-$short" >> "$GITHUB_OUTPUT"
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86
+
+      - name: Boot test (QEMU)
+        id: boot
+        continue-on-error: true
+        run: |
+          # As the release's: the BIOS disk with the zip's launch script.
+          dir="$RUNNER_TEMP/boot-test"
+          mkdir -p "$dir"
+          cp tools/release/run.sh "$dir/"
+          cp out/veilos-bios-disk.img "$dir/veilos.img"
+          bash tools/boot_test.sh "$dir" tcg
+
+      - name: Upload the images
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: out/
+          retention-days: 14
+          compression-level: 9 # the volumes are mostly empty space
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### VEILOS test images"
+            echo
+            echo "Branch \`$GITHUB_REF_NAME\`, artifact **${{ steps.build.outputs.name }}** (below, under Artifacts; kept 14 days)."
+            echo
+            echo "QEMU boot test: **${{ steps.boot.outcome }}**"
+            echo
+            echo "| Image | For |"
+            echo "|---|---|"
+            echo "| veilos-uefi-disk.img | UEFI PCs (Secure Boot off) |"
+            echo "| veilos-bios-disk.img | BIOS / CSM PCs |"
+            echo "| veilos-uefi-ram.img, veilos-bios-ram.img | the system in memory; changes are lost |"
+          } >> "$GITHUB_STEP_SUMMARY"

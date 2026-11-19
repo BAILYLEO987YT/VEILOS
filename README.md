@@ -77,6 +77,16 @@ The kernel targets `x86_64-unknown-none` with `build-std`, linked in the top 2 G
 
 To test the mesh/cluster networking, [`run_dual.ps1`](run_dual.ps1) starts two VEILOS VMs connected by a socket network (Windows PowerShell).
 
+### Trying a change on a real PC
+
+Every push to a branch other than `main` builds test disk images: the **Test images** workflow ([`test-images.yml`](.github/workflows/test-images.yml)), which also runs by hand from the Actions tab for any branch. Open the run, download the artifact under *Artifacts* (or `gh run download -R BAILYLEO987YT/VEILOS <run-id>`), and write one image to a USB stick with Rufus (DD mode) or `dd`:
+
+- `veilos-uefi-disk.img`: UEFI PCs, with Secure Boot off;
+- `veilos-bios-disk.img`: BIOS/CSM PCs;
+- `veilos-uefi-ram.img`, `veilos-bios-ram.img`: the system loaded into memory (changes are lost), for when VEILOS can't reach the stick.
+
+Nothing reaches `main` or the release until the branch is merged. To build the same images locally: `sh tools/build.sh --disk 4G` (and `--ramdisk 128M`), output in `target/x86_64-unknown-none/debug/`.
+
 ### Windows system DLLs
 
 VEILOS's own `ntdll.dll`, `kernel32.dll`, `user32.dll` and the rest are built from the [`win32/`](win32) workspace. Prebuilt copies are committed to [`storage/system`](storage/system), so you only need to rebuild them if you change that code. [`win32/build.sh`](win32/build.sh) does it. It's written for Git Bash on Windows and needs LLVM (`clang-cl`, `lld-link`) installed. The Win32 test programs are under [`win32/tests`](win32/tests), with prebuilt binaries in [`storage/tests`](storage/tests).
