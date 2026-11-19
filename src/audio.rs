@@ -554,10 +554,29 @@ pub fn tick(now_ms: u64) {
 pub const DRIVER: crate::hal::Driver = crate::hal::Driver {
     name: "hda",
     class: crate::hal::DeviceClass::Multimedia,
-    matches: |dev| dev.class == 0x04 && dev.subclass == 0x03,
+    matches: |dev| dev.class == 0x04 && dev.subclass == 0x03 && !(is_gpu_audio(dev) && other_hda_exists(dev)),
     probe,
     remove: None,
 };
+
+/// A graphics card's own sound function (HDMI/DisplayPort audio): another
+/// function of a PCI device whose function 0 is a display controller, as on
+/// NVIDIA and AMD cards. Its codec has only digital outputs to the monitor.
+fn is_gpu_audio(dev: &PciDevice) -> bool {
+    crate::pci::find(|d| d.bus == dev.bus && d.device == dev.device && d.function == 0 && d.class == 0x03)
+        .first()
+        .is_some()
+}
+
+/// Another HDA controller that isn't a graphics card's: the chipset's
+/// onboard sound, with the speaker and headphone jacks. VEILOS drives one
+/// sound device, and that one is preferred, whatever the order the PCI
+/// scan found them in (a GPU behind a root port comes first on Intel boards).
+fn other_hda_exists(dev: &PciDevice) -> bool {
+    crate::pci::find(|d| d.class == 0x04 && d.subclass == 0x03 && (d.bus, d.device, d.function) != (dev.bus, dev.device, dev.function))
+        .iter()
+        .any(|d| !is_gpu_audio(d))
+}
 
 fn map_mmio(phys: u64, bytes: u64) {
     use x86_64::structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
