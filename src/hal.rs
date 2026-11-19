@@ -91,6 +91,7 @@ pub struct Driver {
 static DRIVERS: &[Driver] = &[
     crate::ahci::DRIVER,
     crate::network::VIRTIO_NET_DRIVER,
+    crate::e1000::DRIVER,
     crate::graphics::LFB_DISPLAY_DRIVER,
     crate::audio::DRIVER,
     crate::usb::XHCI_DRIVER,
