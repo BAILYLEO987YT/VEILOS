@@ -1687,7 +1687,9 @@ impl Iwl {
 
     /// PHY context `id` (a radio channel configuration) on `channel`, 20 MHz.
     fn phy_context(&mut self, id: u32, action: u32, channel: u8) -> Result<(), String> {
-        let mut c = [0u8; 32];
+        // 36 bytes (PHY_CONTEXT_CMD_API_VER_1): header, apply time, TX
+        // param color, channel info v1, TX/RX chains, acquisition, DSP flags.
+        let mut c = [0u8; 36];
         c[0..4].copy_from_slice(&id.to_le_bytes());
         c[4..8].copy_from_slice(&action.to_le_bytes());
         c[16] = if channel <= 14 { 1 } else { 0 }; // band: 2.4 / 5 GHz
