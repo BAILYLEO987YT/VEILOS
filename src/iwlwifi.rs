@@ -814,7 +814,9 @@ impl Iwl {
     fn tx_init(&mut self) -> Result<(), String> {
         self.write_prph(SCD_TXFACT, 0);
         self.w32(FH_KW_MEM_ADDR_REG, (self.kw.phys >> 4) as u32);
-        for q in [CMD_QUEUE, AUX_QUEUE, BSS_QUEUE] {
+        // Every queue gets a ring, as Linux: the scheduler and firmware may
+        // look at any of them (one page of buffer for the unused ones).
+        for q in 0..NUM_QUEUES {
             if self.txq[q].is_none() {
                 let (slots, buf_size) = match q {
                     CMD_QUEUE => (CMD_SLOTS, CMD_BUF),
@@ -1335,6 +1337,7 @@ impl Iwl {
         self.stop_device();
         self.start_hw()?;
         self.start_fw(false)?;
+        self.send_sf_config()?;
         self.send_cmd(TX_ANT_CONFIGURATION_CMD, 0, &(self.valid_tx_ant as u32).to_le_bytes())?;
         self.send_phy_db()?;
         let (flow, event) = self.fw.as_ref().map_or((0, 0), |f| f.calib[0]);
@@ -1356,6 +1359,25 @@ impl Iwl {
         self.mac_added = true;
         wlog!("runtime firmware up: MAC {}, NVM {:#x}, antennas TX {:#x} RX {:#x}",
             mac_text(&self.mac), self.nvm_version, self.valid_tx_ant, self.valid_rx_ant);
+        Ok(())
+    }
+
+    /// Smart FIFO, state INIT_OFF (no interface associated), with Linux's
+    /// default watermarks and timers (iwl_mvm_sf_update at start-up).
+    fn send_sf_config(&mut self) -> Result<(), String> {
+        let mut c = Vec::with_capacity(92);
+        let mut put = |v: u32| c.extend_from_slice(&v.to_le_bytes());
+        put(3); // SF_INIT_OFF
+        put(4096); // watermark[LONG_DELAY_ON]: SF_W_MARK_SCAN
+        put(8192); // watermark[FULL_ON]: SF_W_MARK_MIMO2 (not associated)
+        for _ in 0..10 {
+            put(1_000_000); // long delay timeouts: SF_LONG_DELAY_AGING_TIMER
+        }
+        for _ in 0..5 {
+            put(400); // aging timer (default)
+            put(160); // idle timer (default)
+        }
+        self.send_cmd(0xD1, 0, &c)?;
         Ok(())
     }
 
