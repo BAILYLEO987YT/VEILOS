@@ -1335,7 +1335,9 @@ impl Iwl {
         // INIT image: calibrations, the NVM.
         self.phy_db.clear();
         self.start_fw(true)?;
-        self.send_bt_config()?;
+        if !self.skip.contains('B') {
+            self.send_bt_config()?;
+        }
         self.read_nvm()?;
         let (flow, event) = self.fw.as_ref().map_or((0, 0), |f| f.calib[1]);
         self.send_cmd(TX_ANT_CONFIGURATION_CMD, 0, &(self.valid_tx_ant as u32).to_le_bytes())?;
@@ -1352,7 +1354,8 @@ impl Iwl {
         // Runtime image. `skip` (WIFI UP <letters>) leaves steps out, to
         // find which one the firmware objects to: S smart FIFO, B Bluetooth,
         // D DQA, A aux station, P PHY contexts, M regulatory, C MAC context;
-        // 1: antenna A only; O: PHY contexts before the aux station.
+        // 1: antenna A only; O: PHY contexts before the aux station; N no
+        // PHY DB; E/F: PHY_CONFIGURATION without event/flow calibrations.
         let skip = self.skip.clone();
         let has = |c: char| skip.contains(c);
         if has('1') {
@@ -1369,11 +1372,31 @@ impl Iwl {
         }
         self.step("TXANT");
         self.send_cmd(TX_ANT_CONFIGURATION_CMD, 0, &(self.valid_tx_ant as u32).to_le_bytes())?;
-        self.step("PHYDB");
-        self.send_phy_db()?;
-        let (flow, event) = self.fw.as_ref().map_or((0, 0), |f| f.calib[0]);
+        if !has('N') {
+            self.step("PHYDB");
+            self.send_phy_db()?;
+        }
+        let (mut flow, mut event) = self.fw.as_ref().map_or((0, 0), |f| f.calib[0]);
+        if has('E') {
+            event = 0;
+        }
+        if has('F') {
+            flow = 0;
+        }
         self.step("PHYCFG");
         self.send_phy_cfg(flow, event)?;
+        // Does the firmware survive what PHY_CONFIGURATION starts (runtime
+        // calibrations) on its own, before anything touches the radio?
+        let deadline = crate::time::Deadline::after_us(1_500_000);
+        while !deadline.expired() && self.running {
+            for p in self.rx_poll() {
+                self.note(p);
+            }
+        }
+        if !self.running {
+            return Err(format!("firmware died after PHY_CONFIGURATION (flow {:#x} event {:#x}), nothing sent", flow, event));
+        }
+        wlog!("alive 1.5 s after PHY_CONFIGURATION (flow {:#x} event {:#x})", flow, event);
         if !has('B') {
             self.step("BT");
             self.send_bt_config()?;
