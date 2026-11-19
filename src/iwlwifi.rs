@@ -238,10 +238,6 @@ fn probe(dev: &crate::pci::PciDevice) -> Result<(), String> {
     let bar = dev.bar(0);
     let base = bar.mem_base().filter(|&b| b != 0).ok_or("no memory BAR0")?;
     dev.enable_for_driver();
-    // INTx off at the PCI level: the card's interrupt causes are enabled as
-    // Linux and OpenBSD do (the firmware may look at them), but VEILOS
-    // polls, so none may reach the CPU.
-    dev.set_command_bits(1 << 10);
     // As Linux: no PCI retry timeout (config 0x41), else the card's RX
     // DMA can stall the CPU's C3 state.
     dev.address().write_u8(0x41, 0);
@@ -989,7 +985,9 @@ impl Iwl {
         // Interrupt causes on (as Linux's iwl_enable_interrupts and iwm's
         // iwm_enable_interrupts before releasing the CPU); INTx is off at
         // the PCI level, so this only lets the causes through to CSR_INT.
-        if !self.skip.contains('I') {
+        // Off by default (VEILOS polls; OpenBSD calls PCI INTx-disable on this
+        // card a hardware bug, so it can't be used to block them): WIFI UP Q.
+        if self.skip.contains('Q') {
             self.w32(CSR_INT_MASK, INT_FH_RX_ALL | INT_HW_ERR | INT_FH_TX | INT_SW_ERR | INT_RF_KILL | 1 << 6 | 1 << 3 | 1 << 1 | 1);
         }
         // Release the CPU.
@@ -1433,7 +1431,9 @@ impl Iwl {
         // D DQA, A aux station, P PHY contexts, M regulatory, C MAC context;
         // 1: antenna A only; O: PHY contexts before the aux station; N no
         // PHY DB; E/F: PHY_CONFIGURATION without event/flow calibrations;
-        // X: load the separator section too; I: interrupt causes masked.
+        // X: load the separator section too; Q: interrupt causes on;
+        // R: PHY context chains 1/1; G: PHY DB without channel groups;
+        // H: PHY contexts on channel 36.
         let skip = self.skip.clone();
         let has = |c: char| skip.contains(c);
         if has('1') {
@@ -1489,9 +1489,10 @@ impl Iwl {
         }
         // As Linux's iwl_mvm_up: every PHY context, on the first channel.
         if !has('P') {
+            let ch = if has('H') { 36 } else { 1 };
             for id in 0..3 {
                 self.step("PHYCTX");
-                self.phy_context(id, 1, 1)?;
+                self.phy_context(id, 1, ch)?;
             }
             self.phy_added = true;
         }
@@ -1577,9 +1578,13 @@ impl Iwl {
     /// PAPD and TX power tables.
     fn send_phy_db(&mut self) -> Result<(), String> {
         let mut db = core::mem::take(&mut self.phy_db);
+        let only_base = self.skip.contains('G');
         db.sort_by_key(|(t, g, _)| (match t { 1 => 0, 2 => 1, 4 => 2, 5 => 3, _ => 4 }, *g));
         let mut sent = 0;
         for (ty, _, data) in &db {
+            if only_base && *ty > 2 {
+                continue; // WIFI UP G: configuration and NCH only
+            }
             let hdr = [*ty as u8, (*ty >> 8) as u8, data.len() as u8, (data.len() >> 8) as u8];
             self.send_cmd_parts(PHY_DB_CMD, 0, &[&hdr, data])?;
             sent += 1;
@@ -1691,7 +1696,9 @@ impl Iwl {
         c[19] = 0;
         c[20..24].copy_from_slice(&(self.valid_tx_ant as u32).to_le_bytes());
         let rx = self.valid_rx_ant as u32;
-        c[24..28].copy_from_slice(&(rx << 1 | 2 << 10 | 2 << 12).to_le_bytes());
+        // Idle/active chain counts 2/2 (Linux's diversity); WIFI UP R: 1/1 as iwm.
+        let cnt = if self.skip.contains('R') { 1 } else { 2 };
+        c[24..28].copy_from_slice(&(rx << 1 | cnt << 10 | cnt << 12).to_le_bytes());
         self.send_cmd(PHY_CONTEXT_CMD, 0, &c)?;
         Ok(())
     }
