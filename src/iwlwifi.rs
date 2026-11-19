@@ -1500,6 +1500,12 @@ impl Iwl {
             self.step("AUX");
             self.add_aux_sta()?;
         }
+        // WIFI UP K: the MAC context before POWER and MCC.
+        if has('K') && !has('C') {
+            self.step("MAC");
+            self.add_mac_context()?;
+            self.mac_added = true;
+        }
         self.step("POWER");
         self.send_cmd(POWER_TABLE_CMD, 0, &[0, 0, 0, 0])?; // always awake (CAM)
         if !has('M') {
@@ -1507,7 +1513,7 @@ impl Iwl {
             self.update_mcc()?;
         }
         // The interface coming up (mac80211's add_interface): MAC context 0.
-        if !has('C') {
+        if !has('C') && !has('K') {
             self.step("MAC");
             self.add_mac_context()?;
             self.mac_added = true;
@@ -1671,7 +1677,8 @@ impl Iwl {
         if !self.fw.as_ref().is_some_and(|f| f.capa(1)) {
             return Ok(());
         }
-        let mut c = [0u8; 32];
+        // 28 bytes (LAR_UPDATE_MCC_CMD_API_S_VER_2), as Linux sends.
+        let mut c = [0u8; 28];
         c[0..2].copy_from_slice(&((b'Z' as u16) << 8 | b'Z' as u16).to_le_bytes());
         c[2] = 0x10; // MCC_SOURCE_GET_CURRENT
         match self.send_cmd(MCC_UPDATE_CMD, 0, &c) {
