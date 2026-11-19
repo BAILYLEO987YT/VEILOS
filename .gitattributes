@@ -3,3 +3,5 @@
 *.sh text eol=lf
 # Test reference images (PPM): bytes, never line endings.
 *.ref binary
+# Device firmware (storage/lib/firmware): bytes.
+*.ucode binary

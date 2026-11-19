@@ -94,6 +94,7 @@ static DRIVERS: &[Driver] = &[
     crate::network::VIRTIO_NET_DRIVER,
     crate::e1000::DRIVER,
     crate::r8169::DRIVER,
+    crate::iwlwifi::DRIVER,
     crate::graphics::LFB_DISPLAY_DRIVER,
     crate::audio::DRIVER,
     crate::usb::XHCI_DRIVER,
