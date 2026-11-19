@@ -1077,14 +1077,14 @@ impl Iwl {
 
     /// Wait for a notification (one of `cmds`), keeping everything else.
     fn wait_for(&mut self, cmds: &[u8], timeout_us: u64) -> Option<Packet> {
-        if let Some(i) = self.pending.iter().position(|p| p.group == 0 && cmds.contains(&p.cmd)) {
+        if let Some(i) = self.pending.iter().position(|p| p.group <= 1 && cmds.contains(&p.cmd)) {
             return self.pending.remove(i);
         }
         let deadline = crate::time::Deadline::after_us(timeout_us);
         loop {
             let mut found = None;
             for p in self.rx_poll() {
-                if found.is_none() && cmds.contains(&p.cmd) && p.group == 0 {
+                if found.is_none() && cmds.contains(&p.cmd) && p.group <= 1 {
                     found = Some(p);
                 } else {
                     self.note(p);
@@ -1103,6 +1103,13 @@ impl Iwl {
     /// Handle a packet that isn't what's being waited for: scan results and
     /// PHY data are kept, anything else queued.
     fn note(&mut self, p: Packet) {
+        if p.group > 1 {
+            if self.pending.len() >= 64 {
+                self.pending.pop_front();
+            }
+            self.pending.push_back(p);
+            return;
+        }
         match p.cmd {
             REPLY_RX_PHY_CMD => self.last_phy = p.data,
             REPLY_RX_MPDU_CMD => self.rx_mpdu(&p.data),
@@ -1136,7 +1143,11 @@ impl Iwl {
 
     fn send_cmd_parts(&mut self, cmd: u8, group: u8, parts: &[&[u8]]) -> Result<Vec<u8>, String> {
         let len: usize = parts.iter().map(|p| p.len()).sum();
-        let hdr_len = if group != 0 { 8 } else { 4 };
+        // Always the wide header (with the length), legacy commands in
+        // LONG_GROUP: Linux's mvm does (wide_cmd_header, DEF_ID), and the
+        // firmware refuses some commands with the short one.
+        let group = if group == 0 { 1 } else { group };
+        let hdr_len = 8;
         let total = hdr_len + len;
         let t = self.txq[CMD_QUEUE].as_mut().ok_or("no command queue")?;
         if total > t.buf_size {
