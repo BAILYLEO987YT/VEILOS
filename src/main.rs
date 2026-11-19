@@ -393,6 +393,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Move device IRQs from the 8259 to the I/O APIC (needs the LAPIC from smp::init).
     crate::ioapic::init(&mut mapper, &mut frame_allocator);
+    // ACPI power management: FADT, \_S5, ACPI mode, the power button.
+    crate::power::init();
 
     // -----| Hardware Enumeration |-----
     vga_buffer::VGA_WRITER.lock().set_colour(
@@ -624,6 +626,11 @@ async fn gui_refresh_task() {
 
     loop {
         let ms = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        // The power button: shut down, saving what power-off saves.
+        if crate::power::take_button_press() {
+            crate::serial_println!("[POWER] power button pressed");
+            crate::shell::power_off();
+        }
         diag_iters += 1;
         let mut ui_dirty = false;
         // Separate flag: only the panel clock needs repainting, not the whole scene.

@@ -1026,6 +1026,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     crate::debugger::profiler_tick(tick);
     crate::audio::tick(tick);
     crate::usb::poll();
+    crate::power::poll_button();
     crate::entropy::stir(stack_frame.instruction_pointer.as_u64());
 
     // Wake any SleepFutures whose deadline has been reached.

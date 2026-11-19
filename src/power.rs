@@ -1,4 +1,14 @@
-// -----| Restart |-----
+// -----| Power: off, the power button, restart |-----
+//
+// Power-off is ACPI's S5: the sleep type comes from the `\_S5` package in the
+// DSDT (scanned for, without an AML interpreter: it is a constant package on
+// every PC), written with SLP_EN to the FADT's PM1a (and PM1b) control
+// registers. The firmware is first put in ACPI mode (SMI_CMD <- ACPI_ENABLE)
+// if it isn't. The power button sets PWRBTN_STS in the PM1 status register;
+// `poll_button` (from the BSP's timer tick; the SCI isn't routed) clears it and
+// the GUI loop shuts down, as Windows does by default.
+//
+// Restart:
 //
 // `reboot` saves what power-off saves, then resets the machine. `reset` tries
 // the ways a PC can be reset, in the order that works on the most machines
@@ -15,7 +25,189 @@
 // reset without saving (`wait_key_then_reset`): what's in memory can't be
 // trusted there.
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use spin::Mutex;
 use x86_64::instructions::port::Port;
+
+/// What the FADT and DSDT say about power management (I/O ports).
+#[derive(Clone, Copy, Debug)]
+struct Pm {
+    pm1a_cnt: u16,
+    pm1b_cnt: u16,
+    pm1a_evt: u16,
+    pm1b_evt: u16,
+    /// Bytes of the PM1 event block: status then enable, half each.
+    evt_len: u8,
+    /// \_S5's SLP_TYPa and SLP_TYPb, if the DSDT has it.
+    s5: Option<(u8, u8)>,
+}
+
+static PM: Mutex<Option<Pm>> = Mutex::new(None);
+static BUTTON_PRESSED: AtomicBool = AtomicBool::new(false);
+static BUTTON_POLL: AtomicU32 = AtomicU32::new(0);
+
+const PWRBTN: u16 = 1 << 8;
+const SCI_EN: u16 = 1 << 0;
+const SLP_EN: u16 = 1 << 13;
+
+/// Read the FADT and the DSDT's \_S5, put the firmware in ACPI mode, and
+/// leave the power button's event disabled (it is polled). Call once after
+/// the ACPI tables are reachable (smp::init has found the RSDP).
+pub fn init() {
+    let Some(fadt) = crate::smp::acpi_table(b"FACP") else {
+        crate::serial_println!("[POWER] no FADT: ACPI power-off unavailable");
+        return;
+    };
+    let off = crate::memory::get_phys_mem_offset().as_u64();
+    let at = |p: u64| unsafe { core::ptr::read_unaligned((off + p) as *const u8) };
+    let u32_at = |p: u64| u32::from_le_bytes([at(p), at(p + 1), at(p + 2), at(p + 3)]);
+    let u64_at = |p: u64| u32_at(p) as u64 | (u32_at(p + 4) as u64) << 32;
+    let len = u32_at(fadt + 4) as u64;
+    // An I/O-space GAS (ACPI 2.0+ X_ fields) when the old 32-bit field is 0.
+    let port = |legacy: u64, gas: u64| -> u16 {
+        let p = u32_at(fadt + legacy);
+        if p != 0 {
+            return p as u16;
+        }
+        if len >= gas + 12 && at(fadt + gas) == 1 {
+            return u64_at(fadt + gas + 4) as u16;
+        }
+        0
+    };
+    let pm1a_evt = port(56, 148);
+    let pm1b_evt = port(60, 160);
+    let pm1a_cnt = port(64, 172);
+    let pm1b_cnt = port(68, 184);
+    let evt_len = at(fadt + 88);
+    let smi_cmd = u32_at(fadt + 48) as u16;
+    let acpi_enable = at(fadt + 52);
+    let flags = if len >= 116 { u32_at(fadt + 112) } else { 0 };
+    if flags & (1 << 20) != 0 || pm1a_cnt == 0 {
+        crate::serial_println!("[POWER] hardware-reduced ACPI or no PM1 control block: ACPI power-off unavailable");
+        return;
+    }
+    let dsdt = if len >= 148 && u64_at(fadt + 140) != 0 { u64_at(fadt + 140) } else { u32_at(fadt + 40) as u64 };
+    let s5 = if dsdt != 0 {
+        let dlen = u32_at(dsdt + 4) as usize;
+        let bytes = unsafe { core::slice::from_raw_parts((off + dsdt) as *const u8, dlen) };
+        find_s5(bytes)
+    } else {
+        None
+    };
+
+    // ACPI mode: SCI_EN set. Firmware that starts in legacy mode switches
+    // when asked through SMI_CMD.
+    unsafe {
+        let mut cnt: Port<u16> = Port::new(pm1a_cnt);
+        if cnt.read() & SCI_EN == 0 && smi_cmd != 0 && acpi_enable != 0 {
+            Port::<u8>::new(smi_cmd).write(acpi_enable);
+            if !crate::time::spin_until(3_000_000, || cnt.read() & SCI_EN != 0) {
+                crate::serial_println!("[POWER] WARN: the firmware didn't enter ACPI mode");
+            }
+        }
+        // The button's status is polled: clear it and enable the event.
+        // Real chipsets set the status bit regardless of the enable bit, but
+        // QEMU only when it is set. The SCI it raises goes nowhere: IRQ 9
+        // isn't routed (ioapic.rs), so nothing but this polling sees it.
+        for evt in [pm1a_evt, pm1b_evt] {
+            if evt != 0 && evt_len >= 4 {
+                Port::<u16>::new(evt).write(PWRBTN);
+                let mut en: Port<u16> = Port::new(evt + evt_len as u16 / 2);
+                let v = en.read();
+                en.write(v | PWRBTN);
+            }
+        }
+    }
+    crate::serial_println!(
+        "[POWER] ACPI: PM1a_CNT {:#x}, PM1b_CNT {:#x}, PM1a_EVT {:#x}, S5 {:?}",
+        pm1a_cnt, pm1b_cnt, pm1a_evt, s5
+    );
+    *PM.lock() = Some(Pm { pm1a_cnt, pm1b_cnt, pm1a_evt, pm1b_evt, evt_len, s5 });
+}
+
+/// Find `Name(\_S5, Package(n) { SLP_TYPa, SLP_TYPb, ... })` in AML.
+fn find_s5(aml: &[u8]) -> Option<(u8, u8)> {
+    for i in 1..aml.len().saturating_sub(8) {
+        if &aml[i..i + 4] != b"_S5_" {
+            continue;
+        }
+        let named = aml[i - 1] == 0x08 || (i >= 2 && aml[i - 1] == b'\\' && aml[i - 2] == 0x08);
+        if !named || aml[i + 4] != 0x12 {
+            continue; // not a NameOp with a PackageOp
+        }
+        let mut p = i + 5;
+        p += (aml[p] >> 6) as usize + 1; // PkgLength
+        p += 1; // NumElements
+        let mut value = || -> Option<u8> {
+            let op = *aml.get(p)?;
+            let v = match op {
+                0x0A => {
+                    p += 1;
+                    *aml.get(p)? // BytePrefix
+                }
+                0x00 => 0,
+                0x01 => 1,
+                0xFF => 0xFF,
+                v => v,
+            };
+            p += 1;
+            Some(v)
+        };
+        let a = value()?;
+        let b = value()?;
+        return Some((a, b));
+    }
+    None
+}
+
+/// ACPI S5. Returns only if the machine is still on afterwards.
+pub fn acpi_power_off() {
+    let Some(pm) = *PM.lock() else { return };
+    let Some((a, b)) = pm.s5 else {
+        crate::serial_println!("[POWER] no \\_S5 in the DSDT: can't power off through ACPI");
+        return;
+    };
+    crate::serial_println!("[POWER] ACPI S5: SLP_TYP {}/{}", a, b);
+    x86_64::instructions::interrupts::disable();
+    unsafe {
+        if pm.pm1b_cnt != 0 {
+            let mut c: Port<u16> = Port::new(pm.pm1b_cnt);
+            let v = c.read() & !(0x7 << 10);
+            c.write(v | (b as u16 & 7) << 10 | SLP_EN);
+        }
+        let mut c: Port<u16> = Port::new(pm.pm1a_cnt);
+        let v = c.read() & !(0x7 << 10);
+        c.write(v | (a as u16 & 7) << 10 | SLP_EN);
+    }
+    crate::time::delay_ms(500);
+    x86_64::instructions::interrupts::enable();
+    crate::serial_println!("[POWER] WARN: still on after ACPI S5");
+}
+
+/// From the BSP's timer tick, every 50 ms: the power button.
+pub fn poll_button() {
+    if BUTTON_POLL.fetch_add(1, Ordering::Relaxed) % 50 != 0 {
+        return;
+    }
+    let Some(pm) = PM.try_lock().and_then(|p| *p) else { return };
+    for evt in [pm.pm1a_evt, pm.pm1b_evt] {
+        if evt == 0 || pm.evt_len < 4 {
+            continue;
+        }
+        let mut sts: Port<u16> = Port::new(evt);
+        unsafe {
+            if sts.read() & PWRBTN != 0 {
+                sts.write(PWRBTN); // write 1 to clear
+                BUTTON_PRESSED.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Was the power button pressed since the last call? (GUI loop.)
+pub fn take_button_press() -> bool {
+    BUTTON_PRESSED.swap(false, Ordering::AcqRel)
+}
 
 /// Which reset to use: `Any` tries them all in order; the others try only
 /// that one (then the triple fault), for checking a machine (REBOOT CF9...).
