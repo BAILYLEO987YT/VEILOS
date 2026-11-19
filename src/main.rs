@@ -13,6 +13,7 @@ pub mod vga_buffer;
 pub mod power;
 pub mod usb;
 pub mod e1000;
+pub mod nvme;
 pub mod interrupts;
 pub mod gdt;
 pub mod allocator;

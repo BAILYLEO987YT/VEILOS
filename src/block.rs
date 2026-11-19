@@ -50,6 +50,10 @@ pub trait Transport: Send {
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
     /// Write `buf.len() / 512` sectors starting at `lba`.
     fn write(&mut self, lba: u64, buf: &[u8]) -> bool;
+    /// Make what was written durable (the device's own write cache).
+    fn flush(&mut self) -> bool {
+        true
+    }
 }
 
 /// An AHCI port. Commands go through a DMA bounce buffer: callers' buffers
@@ -341,7 +345,9 @@ static LAST_FLUSH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 pub fn flush_all() {
     let disks: Vec<Arc<Disk>> = DISKS.lock().clone();
     for d in disks {
-        d.inner.lock().flush();
+        let mut inner = d.inner.lock();
+        inner.flush();
+        inner.transport.flush();
     }
 }
 

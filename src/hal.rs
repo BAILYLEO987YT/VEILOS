@@ -90,6 +90,7 @@ pub struct Driver {
 /// Every driver the kernel has, in match priority order.
 static DRIVERS: &[Driver] = &[
     crate::ahci::DRIVER,
+    crate::nvme::DRIVER,
     crate::network::VIRTIO_NET_DRIVER,
     crate::e1000::DRIVER,
     crate::graphics::LFB_DISPLAY_DRIVER,
