@@ -222,13 +222,18 @@ unsafe fn vmwrite(field: u32, value: u64) {
 }
 
 /// Execute VMXON with the given physical address of the VMXON region.
+/// Returns false on VMfail (CF or ZF set).
 #[inline]
-unsafe fn vmxon(phys_addr: u64) {
+unsafe fn vmxon(phys_addr: u64) -> bool {
+    let failed: u8;
     unsafe { core::arch::asm!(
         "vmxon [{addr}]",
+        "setbe {failed}",
         addr = in(reg) &phys_addr,
+        failed = out(reg_byte) failed,
         options(nostack),
     ); }
+    failed == 0
 }
 
 /// Execute VMXOFF — leave VMX root operation.
@@ -238,23 +243,33 @@ unsafe fn vmxoff() {
 }
 
 /// Load (make active) the VMCS at the given physical address.
+/// Returns false on VMfail (CF or ZF set).
 #[inline]
-unsafe fn vmptrld(phys_addr: u64) {
+unsafe fn vmptrld(phys_addr: u64) -> bool {
+    let failed: u8;
     unsafe { core::arch::asm!(
         "vmptrld [{addr}]",
+        "setbe {failed}",
         addr = in(reg) &phys_addr,
+        failed = out(reg_byte) failed,
         options(nostack),
     ); }
+    failed == 0
 }
 
 /// Clear the VMCS at the given physical address.
+/// Returns false on VMfail (CF or ZF set).
 #[inline]
-unsafe fn vmclear(phys_addr: u64) {
+unsafe fn vmclear(phys_addr: u64) -> bool {
+    let failed: u8;
     unsafe { core::arch::asm!(
         "vmclear [{addr}]",
+        "setbe {failed}",
         addr = in(reg) &phys_addr,
+        failed = out(reg_byte) failed,
         options(nostack),
     ); }
+    failed == 0
 }
 
 /// Read an MSR.
@@ -288,79 +303,97 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 // -----| Part 3 — VMX capability check & enablement |-----
 // =====================================================================
 
-/// Check that the CPU and firmware support VMX, then enter VMX root mode.
+/// CPUID.1:ECX bit 5: the CPU (or the hypervisor we run under) offers VMX.
+/// AMD CPUs report 0 here. Touches no MSR, so it's safe anywhere.
+fn cpu_has_vmx() -> bool {
+    core::arch::x86_64::__cpuid(1).ecx & (1 << 5) != 0
+}
+
+/// Enter VMX root mode on this CPU, unless root mode is already on. Called
+/// when a VM is started, never at boot.
 pub fn enable_vmx() -> HvResult<()> {
-    // 1. Check CPUID leaf 1 ECX bit 5 (VMX support).
-    let ecx: u32;
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "pop rbx",
-            inout("eax") 1u32 => _,
-            out("ecx") ecx,
-            out("edx") _,
-            options(nostack, nomem),
-        );
+    let mut state = VMX_STATE.lock();
+    if state.enabled() {
+        return Ok(());
     }
-    if ecx & (1 << 5) == 0 {
+
+    // 1. Check CPUID leaf 1 ECX bit 5 (VMX support).
+    if !cpu_has_vmx() {
         return Err(HvError::VmxNotSupported);
     }
 
-    // 2. Check IA32_FEATURE_CONTROL MSR — VMX must be enabled by firmware.
-    let feature_ctl = unsafe { rdmsr(IA32_FEATURE_CONTROL) };
-    let vmx_outside_smx = feature_ctl & (1 << 2) != 0;
-    let locked           = feature_ctl & 0x1 != 0;
-    if locked && !vmx_outside_smx {
-        return Err(HvError::VmxLockedDisabled);
-    }
-    if !locked {
-        // Unlock and enable VMX outside SMX.
-        unsafe { wrmsr(IA32_FEATURE_CONTROL, feature_ctl | (1 << 2) | 1); }
-    }
+    // Allocate first: a failure here has changed nothing.
+    let vmxon_phys = alloc_phys_page()?;
 
-    // 3. Set CR4.VMXE.
-    unsafe {
-        use x86_64::registers::control::{Cr4, Cr4Flags};
-        Cr4::update(|f| f.insert(Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS));
-    }
-
-    // 4. Adjust CR0 and CR4 per IA32_VMX_CR0_FIXED{0,1} / CR4_FIXED{0,1}.
-    unsafe {
+    // CR4.VMXE and VMXON are per-CPU, so nothing may migrate us part way.
+    let result = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         use x86_64::registers::control::{Cr0, Cr4};
+
+        // 2. Check IA32_FEATURE_CONTROL MSR — VMX must be enabled by firmware.
+        let feature_ctl = rdmsr(IA32_FEATURE_CONTROL);
+        let vmx_outside_smx = feature_ctl & (1 << 2) != 0;
+        let locked          = feature_ctl & 0x1 != 0;
+        if locked && !vmx_outside_smx {
+            return Err(HvError::VmxLockedDisabled);
+        }
+        if !locked {
+            // Unlock and enable VMX outside SMX.
+            wrmsr(IA32_FEATURE_CONTROL, feature_ctl | (1 << 2) | 1);
+        }
+
+        let saved_cr0 = Cr0::read_raw();
+        let saved_cr4 = Cr4::read_raw();
+
+        // 3. Set CR4.VMXE, and 4. adjust CR0 and CR4 per
+        //    IA32_VMX_CR0_FIXED{0,1} / CR4_FIXED{0,1}.
         let cr0_fixed0 = rdmsr(IA32_VMX_CR0_FIXED0) as u32;
         let cr0_fixed1 = rdmsr(IA32_VMX_CR0_FIXED1) as u32;
-        let mut cr0 = Cr0::read_raw();
+        let mut cr0 = saved_cr0;
         cr0 |=  cr0_fixed0 as u64;
         cr0 &= cr0_fixed1 as u64 | !0xFFFF_FFFFu64;
         Cr0::write_raw(cr0);
 
         let cr4_fixed0 = rdmsr(IA32_VMX_CR4_FIXED0) as u32;
         let cr4_fixed1 = rdmsr(IA32_VMX_CR4_FIXED1) as u32;
-        let mut cr4 = Cr4::read_raw();
+        let mut cr4 = saved_cr4 | (1 << 13); // CR4.VMXE
         cr4 |=  cr4_fixed0 as u64;
         cr4 &= cr4_fixed1 as u64 | !0xFFFF_FFFFu64;
         Cr4::write_raw(cr4);
-    }
 
-    // 5. Allocate and initialise the VMXON region.
-    let vmxon_phys = alloc_phys_page();
-    unsafe {
-        // Write the VMCS revision identifier into the first 4 bytes.
+        // 5. Write the VMCS revision identifier into the first 4 bytes of the
+        //    VMXON region, and enter root mode.
         let rev = (rdmsr(IA32_VMX_BASIC) & 0x7FFF_FFFF) as u32;
-        let ptr = vmxon_phys as *mut u32;
-        ptr.write_volatile(rev);
-        vmxon(vmxon_phys);
+        phys_ptr::<u32>(vmxon_phys).write_volatile(rev);
+        if vmxon(vmxon_phys) {
+            Ok(())
+        } else {
+            Cr4::write_raw(saved_cr4);
+            Cr0::write_raw(saved_cr0);
+            Err(HvError::VmxonFailed)
+        }
+    });
+
+    if let Err(e) = result {
+        free_phys_page(vmxon_phys);
+        return Err(e);
     }
 
-    VMX_STATE.lock().vmxon_phys = Some(vmxon_phys);
+    state.vmxon_phys = Some(vmxon_phys);
+    drop(state);
     println!("[HV] VMX root mode enabled.");
     Ok(())
 }
 
-/// Disable VMX root mode (call on shutdown).
+/// Disable VMX root mode. Does nothing if it was never entered, since VMXOFF
+/// outside VMX operation is #UD.
 pub fn disable_vmx() {
-    unsafe { vmxoff(); }
+    let Some(vmxon_phys) = VMX_STATE.lock().vmxon_phys.take() else { return };
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        use x86_64::registers::control::{Cr4, Cr4Flags};
+        vmxoff();
+        Cr4::update(|f| f.remove(Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS));
+    });
+    free_phys_page(vmxon_phys);
     println!("[HV] VMX root mode disabled.");
 }
 
@@ -374,103 +407,115 @@ const EPT_WRITE:   u64 = 1 << 1;
 const EPT_EXEC:    u64 = 1 << 2;
 const EPT_LARGE:   u64 = 1 << 7;  // 2 MiB or 1 GiB page
 const EPT_MEMTYPE_WB: u64 = 6 << 3; // Write-back memory type for leaf entries
+const EPT_ADDR_MASK:  u64 = 0x000F_FFFF_FFFF_F000;
 
 /// EPT table — one 4 KiB page = 512 × 8-byte entries.
 #[repr(C, align(4096))]
 struct EptPage([u64; 512]);
-
-impl EptPage {
-    const fn zeroed() -> Self { Self([0u64; 512]) }
-}
 
 /// A minimal EPT hierarchy: one PML4 → one PDPT → 512 PDs (identity map).
 /// Covers the first 512 GiB; we only populate the first 4 GiB.
 pub struct EptTable {
     /// Physical address of the PML4 — written into VMCS EPTP field.
     pub pml4_phys: u64,
-    /// Backing storage (kept alive for the VM lifetime).
-    pages: Vec<Box<EptPage>>,
+    /// Physical addresses of every table page (freed on drop).
+    pages: Vec<u64>,
 }
 
 impl EptTable {
     /// Allocate and identity-map the first `gib` GiB of guest-physical space.
-    pub fn new(gib: usize) -> Self {
-        let mut pages: Vec<Box<EptPage>> = Vec::new();
-
+    pub fn new(gib: usize) -> HvResult<Self> {
         // PML4
-        let mut pml4 = Box::new(EptPage::zeroed());
+        let pml4_phys = alloc_phys_page()?;
         // PDPT (one per PML4 entry — we only need one for <512 GiB)
-        let mut pdpt = Box::new(EptPage::zeroed());
+        let pdpt_phys = match alloc_phys_page() {
+            Ok(p) => p,
+            Err(e) => {
+                free_phys_page(pml4_phys);
+                return Err(e);
+            }
+        };
 
-        let pdpt_phys = page_phys(&*pdpt);
+        unsafe {
+            let pdpt = &mut *phys_ptr::<EptPage>(pdpt_phys);
+            // Fill PDPT with 1 GiB identity-mapped pages.
+            for g in 0..gib.min(512) {
+                // Use 1 GiB large pages (EPT_LARGE in the PDPT).
+                let gpa = (g as u64) * (1 << 30);
+                pdpt.0[g] = gpa | EPT_READ | EPT_WRITE | EPT_EXEC | EPT_LARGE | EPT_MEMTYPE_WB;
+            }
 
-        // Fill PDPT with 1 GiB identity-mapped pages.
-        for g in 0..gib.min(512) {
-            // Use 1 GiB large pages (EPT_LARGE in the PDPT).
-            let gpa = (g as u64) * (1 << 30);
-            pdpt.0[g] = gpa | EPT_READ | EPT_WRITE | EPT_EXEC | EPT_LARGE | EPT_MEMTYPE_WB;
+            // Wire PML4[0] → PDPT.
+            let pml4 = &mut *phys_ptr::<EptPage>(pml4_phys);
+            pml4.0[0] = pdpt_phys | EPT_READ | EPT_WRITE | EPT_EXEC;
         }
 
-        // Wire PML4[0] → PDPT.
-        pml4.0[0] = pdpt_phys | EPT_READ | EPT_WRITE | EPT_EXEC;
-        let pml4_phys = page_phys(&*pml4);
-
-        pages.push(pml4);
-        pages.push(pdpt);
-
         println!("[HV] EPT: identity-mapped {} GiB (1 GiB huge pages)", gib);
-        Self { pml4_phys, pages }
+        Ok(Self { pml4_phys, pages: vec![pml4_phys, pdpt_phys] })
     }
 
     /// Build the 64-bit EPT pointer value for the VMCS EPTP field.
-    /// Bits [2:0] = walk length - 1 (3 for 4-level), bits [5:3] = memory type (6=WB).
+    /// Bits [2:0] = memory type (6=WB), bits [5:3] = walk length - 1 (3 for 4-level).
     pub fn eptp(&self) -> u64 {
         self.pml4_phys | (3 << 3) | 6 // 4-level walk, WB memory type
     }
 
-    /// Dynamically map a 4 KiB page (demand paging).
-    pub fn map_4k_page(&mut self, gpa: u64, hpa: u64, flags: u64) {
-        let pml4_idx = ((gpa >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((gpa >> 30) & 0x1FF) as usize;
-        let pd_idx   = ((gpa >> 21) & 0x1FF) as usize;
-        let pt_idx   = ((gpa >> 12) & 0x1FF) as usize;
+    /// Dynamically map a 4 KiB page (demand paging). Fails if the GPA already
+    /// lies in a huge page: that entry points at guest memory, not a table.
+    pub fn map_4k_page(&mut self, gpa: u64, hpa: u64, flags: u64) -> HvResult<()> {
+        let indices = [
+            ((gpa >> 39) & 0x1FF) as usize,
+            ((gpa >> 30) & 0x1FF) as usize,
+            ((gpa >> 21) & 0x1FF) as usize,
+        ];
+        let pt_idx = ((gpa >> 12) & 0x1FF) as usize;
 
-        let pml4 = unsafe { &mut *(self.pml4_phys as *mut EptPage) };
-
-        let next_table = |entry: &mut u64| -> &mut EptPage {
-            if (*entry & EPT_READ) == 0 {
-                if let Some(frame) = crate::memory::allocate_frame() {
-                    let addr = frame.start_address().as_u64();
-                    unsafe { core::ptr::write_bytes(addr as *mut u8, 0, 4096); }
-                    *entry = addr | EPT_READ | EPT_WRITE | EPT_EXEC;
-                } else {
-                    panic!("OOM during EPT demand paging");
-                }
+        let mut table_phys = self.pml4_phys;
+        for idx in indices {
+            let entry = unsafe { &mut (*phys_ptr::<EptPage>(table_phys)).0[idx] };
+            if *entry & EPT_LARGE != 0 {
+                return Err(HvError::EptHugePageConflict);
             }
-            let addr = *entry & 0x000F_FFFF_FFFF_F000;
-            unsafe { &mut *(addr as *mut EptPage) }
-        };
+            if *entry & EPT_READ == 0 {
+                let next = alloc_phys_page()?;
+                self.pages.push(next);
+                *entry = next | EPT_READ | EPT_WRITE | EPT_EXEC;
+            }
+            table_phys = *entry & EPT_ADDR_MASK;
+        }
 
-        let pdpt = next_table(&mut pml4.0[pml4_idx]);
-        let pd = next_table(&mut pdpt.0[pdpt_idx]);
-        let pt = next_table(&mut pd.0[pd_idx]);
-
+        let pt = unsafe { &mut *phys_ptr::<EptPage>(table_phys) };
         pt.0[pt_idx] = hpa | flags | EPT_MEMTYPE_WB;
+        Ok(())
     }
 }
 
-/// Get the physical address of a heap-allocated page-aligned struct.
-/// Works because the bootloader identity-maps all physical RAM.
-fn page_phys<T>(p: &T) -> u64 {
-    p as *const T as u64
+impl Drop for EptTable {
+    fn drop(&mut self) {
+        for &phys in &self.pages {
+            free_phys_page(phys);
+        }
+    }
 }
 
-/// Allocate a 4 KiB page from the frame allocator and return its physical address.
-fn alloc_phys_page() -> u64 {
-    match crate::memory::allocate_frame() {
-        Some(frame) => frame.start_address().as_u64(),
-        None        => panic!("[HV] Out of physical frames"),
-    }
+/// CPU pointer to a physical address, through the physical-memory mapping.
+fn phys_ptr<T>(phys: u64) -> *mut T {
+    (crate::memory::get_phys_mem_offset() + phys).as_mut_ptr::<T>()
+}
+
+/// Allocate a zeroed 4 KiB page and return its physical address. The result
+/// is not a usable pointer: reach it through `phys_ptr`.
+fn alloc_phys_page() -> HvResult<u64> {
+    let frame = crate::memory::allocate_frame().ok_or(HvError::AllocFailed)?;
+    let phys = frame.start_address().as_u64();
+    // Never-used frames hold whatever was there at boot.
+    unsafe { core::ptr::write_bytes(phys_ptr::<u8>(phys), 0, 4096); }
+    Ok(phys)
+}
+
+fn free_phys_page(phys: u64) {
+    use x86_64::{structures::paging::PhysFrame, PhysAddr};
+    crate::memory::deallocate_frame(PhysFrame::containing_address(PhysAddr::new(phys)));
 }
 
 // =====================================================================
@@ -486,14 +531,17 @@ pub struct Vmcs {
 impl Vmcs {
     /// Allocate, clear, and load (VMPTRLD) a new VMCS.
     pub fn new() -> HvResult<Self> {
-        let phys = alloc_phys_page();
+        let phys = alloc_phys_page()?;
 
         // Write revision identifier.
-        unsafe {
+        let loaded = unsafe {
             let rev = (rdmsr(IA32_VMX_BASIC) & 0x7FFF_FFFF) as u32;
-            (phys as *mut u32).write_volatile(rev);
-            vmclear(phys);
-            vmptrld(phys);
+            phys_ptr::<u32>(phys).write_volatile(rev);
+            vmclear(phys) && vmptrld(phys)
+        };
+        if !loaded {
+            free_phys_page(phys);
+            return Err(HvError::VmcsSetupFailed);
         }
 
         Ok(Self { phys })
@@ -742,8 +790,14 @@ fn handle_ept_violation(vcpu: &mut VCpu) -> ExitAction {
     if let Some(frame) = crate::memory::allocate_frame() {
         let hpa = frame.start_address().as_u64();
         // Map with full read/write/execute permissions for the guest
-        vcpu.ept.map_4k_page(gpa, hpa, EPT_READ | EPT_WRITE | EPT_EXEC);
-        ExitAction::Continue
+        match vcpu.ept.map_4k_page(gpa, hpa, EPT_READ | EPT_WRITE | EPT_EXEC) {
+            Ok(()) => ExitAction::Continue,
+            Err(e) => {
+                println!("[HV] Can't map GPA {:#x}: {:?}", gpa, e);
+                crate::memory::deallocate_frame(frame);
+                ExitAction::Halt
+            }
+        }
     } else {
         println!("[HV] Out of memory during demand paging!");
         ExitAction::Halt
@@ -788,7 +842,7 @@ pub struct VCpu {
 impl VCpu {
     pub fn new(id: u32) -> HvResult<Self> {
         let vmcs = Vmcs::new()?;
-        let ept  = EptTable::new(4); // Identity-map 4 GiB
+        let ept  = EptTable::new(4)?; // Identity-map 4 GiB
         Ok(Self { id, vmcs, ept, regs: GuestRegs::default() })
     }
 
@@ -1322,9 +1376,7 @@ lazy_static! {
 /// `entry_rip`   — guest physical address to start executing (usually 0x7C00
 ///                 for a bootable disk image, or 0 for firmware reset vector)
 pub fn launch_windows_vm(disk_path: &str, entry_rip: u64) -> HvResult<()> {
-    if !VMX_STATE.lock().enabled() {
-        enable_vmx()?;
-    }
+    enable_vmx()?;
 
     let id = NEXT_VM_ID.fetch_add(1, Ordering::Relaxed);
     let vm = Vm::new(id, "Windows")?;
@@ -1410,7 +1462,9 @@ lazy_static! {
 pub enum HvError {
     VmxNotSupported,
     VmxLockedDisabled,
+    VmxonFailed,
     AllocFailed,
+    EptHugePageConflict,
     VmcsSetupFailed,
     NotInitialised,
 }
@@ -1421,21 +1475,13 @@ pub type HvResult<T> = Result<T, HvError>;
 // -----| Init |-----
 // =====================================================================
 
+/// Report whether VMX is on offer. Root mode itself is entered by
+/// `enable_vmx` when a VM starts: nothing needs it before then, and an MSR or
+/// VMXON fault at boot would take the whole kernel down for no gain.
 pub fn init() {
-    // CPUID.1:ECX bit 31: already inside a hypervisor, where VMX can't be relied on.
-    if unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 31) != 0 {
-        println!("[HV] Running inside a hypervisor: VMX left off.");
-        return;
-    }
-    match enable_vmx() {
-        Ok(()) => {
-            println!("[HV] VEILOS Hypervisor (VHV) online.");
-            println!("[HV]   Type-1 VMX, EPT (1 GiB huge pages), full virtual device model");
-            println!("[HV]   Windows-in-VEILOS VM mode available.");
-            println!("[HV]   GPU: SR-IOV scaffold ready (passthrough=Perf, intercept=Sec)");
-        }
-        Err(HvError::VmxNotSupported)    => println!("[HV] VMX not supported on this CPU."),
-        Err(HvError::VmxLockedDisabled)  => println!("[HV] VMX locked off by firmware."),
-        Err(e)                           => println!("[HV] VMX init error: {:?}", e),
+    if cpu_has_vmx() {
+        println!("[HV] VEILOS Hypervisor (VHV): VMX offered by CPU; root mode enters when a VM starts.");
+    } else {
+        println!("[HV] VMX not supported on this CPU.");
     }
 }

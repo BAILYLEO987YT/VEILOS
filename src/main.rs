@@ -437,7 +437,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::hal::bind(crate::hal::DeviceClass::Network);
 
     // Phase 15: initialise the hypervisor (VT-x VMX + EPT).
-    // Detects CPU support and gracefully does nothing if unavailable.
+    // Only detects support; VMX root mode is entered when a VM starts.
     crate::hypervisor::init();
 
     // Phase 13 (TLS): load certificate store + initialise TLS layer.
