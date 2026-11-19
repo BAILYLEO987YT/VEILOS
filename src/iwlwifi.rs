@@ -820,6 +820,9 @@ impl Iwl {
         // The command queue: inactive, no aggregation, pointers 0, window 64,
         // active on the command FIFO.
         let q = CMD_QUEUE as u32;
+        // The scheduler off while the command queue is set up, then on for
+        // that queue (Linux: scd_set_active, which the mvm firmware needs).
+        self.write_prph(SCD_EN_CTRL, 0);
         self.write_prph(scd_queue_status_bits(q), 1 << 19);
         self.clear_bits_prph(SCD_AGGR_SEL, 1 << q);
         self.w32(HBUS_TARG_WRPTR, q << 8);
@@ -827,6 +830,7 @@ impl Iwl {
         self.write_mem32(self.scd_base + SCD_CONTEXT_MEM_LOWER_BOUND + q * 8, 0);
         self.write_mem32(self.scd_base + SCD_CONTEXT_MEM_LOWER_BOUND + q * 8 + 4, 64 | 64 << 16);
         self.write_prph(scd_queue_status_bits(q), 1 << 3 | TX_FIFO_CMD | 1 << 4 | 0x017F_0000);
+        self.write_prph(SCD_EN_CTRL, 1 << q);
         self.write_prph(SCD_TXFACT, 0xFF);
         for ch in 0..8 {
             self.w32(fh_tcsr_config(ch), FH_TX_CONFIG_DMA_ENABLE | FH_TX_CONFIG_CREDIT_ENABLE);
@@ -835,7 +839,6 @@ impl Iwl {
         self.w32(FH_TX_CHICKEN_BITS_REG, v | FH_TX_CHICKEN_SCD_AUTO_RETRY_EN);
         self.clear_bits_prph(APMG_PCIDEV_STT_REG, APMG_PCIDEV_STT_VAL_L1_ACT_DIS);
         let _ = SCD_QUEUECHAIN_SEL;
-        let _ = SCD_EN_CTRL;
     }
 
     /// A data queue the firmware will schedule (DQA: the driver sets its
@@ -962,8 +965,8 @@ impl Iwl {
         let (w, r) = self.txq[CMD_QUEUE].as_ref().map_or((0, 0), |t| (t.write, t.read));
         wlog!("cmd seq {:#06x}: INT seen {:#010x} FH seen {:#010x}; queue w {} r {}; SCD rdptr {:#x} status {:#010x}",
             seq, self.int_seen, self.fh_seen, w, r, self.read_prph(scd_queue_rdptr(q)), self.read_prph(scd_queue_status_bits(q)));
-        wlog!("SCD base {:#x} (ALIVE {:#x}) TXFACT {:#x} GP {:#x} ctx {:#x}/{:#x}; FH TX status {:#010x} ch7 cfg {:#010x}",
-            self.scd_base, self.alive_scd, self.read_prph(SCD_TXFACT), self.read_prph(SCD_GP_CTRL),
+        wlog!("SCD base {:#x} (ALIVE {:#x}) EN {:#x} TXFACT {:#x} GP {:#x} ctx {:#x}/{:#x}; FH TX status {:#010x} ch7 cfg {:#010x}",
+            self.scd_base, self.alive_scd, self.read_prph(SCD_EN_CTRL), self.read_prph(SCD_TXFACT), self.read_prph(SCD_GP_CTRL),
             self.read_mem32(self.scd_base + SCD_CONTEXT_MEM_LOWER_BOUND),
             self.read_mem32(self.scd_base + SCD_CONTEXT_MEM_LOWER_BOUND + 4),
             self.r32(FH_TSSR_TX_STATUS_REG), self.r32(fh_tcsr_config(7)));
