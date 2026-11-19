@@ -490,6 +490,8 @@ pub struct Iwl {
     int_seen: u32,
     fh_seen: u32,
     alive_scd: u32,
+    event_log: u32,
+    logs_dumped: bool,
     pub mac: [u8; 6],
     valid_tx_ant: u8,
     valid_rx_ant: u8,
@@ -545,6 +547,8 @@ impl Iwl {
             int_seen: 0,
             fh_seen: 0,
             alive_scd: 0,
+            event_log: 0,
+            logs_dumped: false,
             mac: [0; 6],
             valid_tx_ant: 0,
             valid_rx_ant: 0,
@@ -981,7 +985,9 @@ impl Iwl {
         }
         if alive.data.len() >= 44 {
             self.alive_scd = le32(&alive.data, 40);
+            self.event_log = le32(&alive.data, 24);
         }
+        self.logs_dumped = false;
         wlog!("{} ALIVE: status {:#06x}, {} bytes, seq {:#06x}, error log {:#x}, SCD {:#x}",
             if init { "INIT" } else { "runtime" }, status, alive.data.len(), alive.seq, self.error_table, self.alive_scd);
         if status != 0xCAFE {
@@ -1030,6 +1036,46 @@ impl Iwl {
         wlog!("{}", self.error_log());
     }
 
+    /// The firmware's whole error table (LOG_ERROR_TABLE_API_S_VER_3:
+    /// words 23 hcmd, 24-28 ISRs, 29 last command, 30 wait_event caller,
+    /// 35 PMG clocks, 37 flow handler) and the last event log entries.
+    fn dump_fw_logs(&mut self) {
+        if self.logs_dumped || self.error_table == 0 || self.error_table == 0xFFFF_FFFF {
+            return;
+        }
+        self.logs_dumped = true;
+        let w: Vec<u32> = (0..40).map(|i| self.read_mem32(self.error_table + 4 * i)).collect();
+        for (i, chunk) in w.chunks(8).enumerate() {
+            let t: Vec<String> = chunk.iter().map(|v| format!("{:08x}", v)).collect();
+            wlog!("ERR w{:02}: {}", i * 8, t.join(" "));
+        }
+        if self.event_log == 0 || self.event_log == 0xFFFF_FFFF {
+            return;
+        }
+        // Header: capacity, type (1: with timestamps), wraps, next entry.
+        let cap = self.read_mem32(self.event_log);
+        let ty = self.read_mem32(self.event_log + 4);
+        let wraps = self.read_mem32(self.event_log + 8);
+        let next = self.read_mem32(self.event_log + 12);
+        wlog!("EVT log at {:#x}: capacity {} type {} wraps {} next {}", self.event_log, cap, ty, wraps, next);
+        if cap == 0 || cap > 4096 || next > cap {
+            return;
+        }
+        let words = if ty == 1 { 3 } else { 2 };
+        let n = 24.min(if wraps > 0 { cap } else { next });
+        let mut ev = Vec::new();
+        for k in 0..n {
+            let idx = (next + cap - n + k) % cap;
+            let at = self.event_log + 16 + idx * 4 * words;
+            let id = self.read_mem32(at);
+            let data = self.read_mem32(at + 4 * (words - 1));
+            ev.push(format!("{}:{:x}", id, data));
+        }
+        for chunk in ev.chunks(8) {
+            wlog!("EVT: {}", chunk.join(" "));
+        }
+    }
+
     fn error_log(&self) -> String {
         if self.error_table == 0 || self.error_table == 0xFFFF_FFFF {
             return String::from("; no error log address");
@@ -1053,6 +1099,7 @@ impl Iwl {
             self.fh_seen |= fh;
             if int & (INT_SW_ERR | INT_HW_ERR) != 0 {
                 wlog!("card error: CSR_INT {:#010x}{}", int, self.error_log());
+                self.dump_fw_logs();
                 self.running = false;
                 self.state = String::from("firmware error (see DMESG WIFI)");
             }
