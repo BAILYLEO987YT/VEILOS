@@ -194,6 +194,10 @@ pub trait Nic: Send {
     /// What identifies the device for hot-removal (its BAR0).
     fn key(&self) -> u64;
     fn kind(&self) -> &'static str;
+    /// More about its state, for NET STATUS (chip revision, PHY...).
+    fn detail(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
 }
 
 impl Nic for VirtioNet {
@@ -288,14 +292,20 @@ impl LogicalNic {
 
     /// One line per member, for `NET STATUS`.
     pub fn describe(&self) -> Vec<alloc::string::String> {
-        self.members.iter().enumerate().map(|(i, m)| {
+        let mut out = Vec::new();
+        for (i, m) in self.members.iter().enumerate() {
             let (rx, tx) = m.counts();
-            alloc::format!(
+            out.push(alloc::format!(
                 "  NIC {}: {} {} link {} rx {} tx {}{}",
                 i, m.kind(), m.mac(), if m.link_up() { "up" } else { "DOWN" }, rx, tx,
                 if i == self.active { "  (active)" } else { "" }
-            )
-        }).collect()
+            ));
+            let detail = m.detail();
+            if !detail.is_empty() {
+                out.push(alloc::format!("         {}", detail));
+            }
+        }
+        out
     }
 }
 
