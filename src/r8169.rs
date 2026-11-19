@@ -17,10 +17,16 @@
 //   * the PHY's PLL must be powered up (PMCH, 0x6F, bits 7:6), as Linux's
 //     rtl_pll_power_up does;
 //   * the PHY's link-down power saving (ALDPS) is turned off, as Linux does
-//     for these chips, so the PHY keeps looking for a link partner.
+//     for these chips, so the PHY keeps looking for a link partner;
+//   * the chip's embedded controller may own the port ("out-of-band" mode,
+//     which firmware and Windows use for Wake-on-LAN, keeping the PHY in a
+//     low-power, slow mode): the driver takes the port back as Linux's
+//     rtl_hw_init_8168g does (wait for the FIFOs to drain, RX/TX off,
+//     MCU.NOW_IS_OOB cleared, the MAC OCP 0xE8DE handshake), and ungates
+//     receive (MISC.RXDV_GATED_EN) once the rings are set up.
 // Linux also applies per-revision PHY and "EPHY" tweaks and PHY firmware;
-// none are here. The PHY is powered up (BMCR power-down cleared) and
-// auto-negotiation restarted at every start. The chip revision (XID) and the
+// none are here. The PHY is reset to its defaults, every speed advertised,
+// and auto-negotiation restarted at every start. The chip revision (XID) and the
 // PHY's status are logged and shown by NET STATUS.
 //
 // QEMU emulates none of these chips: this is tested on real hardware.
@@ -51,9 +57,22 @@ const GPHY_OCP: u64 = 0xB8; // PHY registers through OCP (8168G+)
 const OCP_STD_PHY: u32 = 0xA400; // MII register r at OCP_STD_PHY + 2r
 const OCP_ALDPS: u32 = 0xA430; // PHY page 0xA43, register 0x10: bit 2 = ALDPS
 
+const MCU: u64 = 0xD3; // 8168G+: embedded controller state
+const MCU_NOW_IS_OOB: u8 = 1 << 7;
+const MCU_RXTX_EMPTY: u8 = 1 << 5 | 1 << 4;
+const MCU_LINK_LIST_RDY: u8 = 1 << 1;
+const MISC: u64 = 0xF0;
+const MISC_RXDV_GATED_EN: u32 = 1 << 19;
+const TXCFG_EMPTY: u32 = 1 << 11;
+const OCPDR: u64 = 0xB0; // MAC registers through OCP (8168G+)
+
 // MII registers.
 const BMCR: u32 = 0;
 const BMSR: u32 = 1;
+const ANAR: u32 = 4; // what we advertise
+const ANLPAR: u32 = 5; // what the other end advertised (0: nobody there)
+const GBCR: u32 = 9; // gigabit advertisement
+const BMCR_RESET: u16 = 1 << 15;
 const BMCR_ANENABLE: u16 = 1 << 12;
 const BMCR_PDOWN: u16 = 1 << 11;
 const BMCR_ANRESTART: u16 = 1 << 9;
@@ -186,6 +205,7 @@ impl Rtl {
             // The PHY's PLL on (Linux: rtl_pll_power_up for MAC version 40+).
             nic.w8(PMCH, nic.r8(PMCH) | 0xC0);
             crate::time::delay_ms(10);
+            nic.leave_oob();
         }
 
         // Interrupts off; reset.
@@ -233,29 +253,41 @@ impl Rtl {
         }
         nic.w32(TX_CONFIG, (txc & !0x0300_0700) | 3 << 24 | 7 << 8);
         nic.w8(CFG9346, 0x00); // lock
+        if newer {
+            // Frames may reach the rings now (Linux: rtl_disable_rxdvgate).
+            nic.w32(MISC, nic.r32(MISC) & !MISC_RXDV_GATED_EN);
+        }
 
-        // The PHY: who it is (proves the register path works), ALDPS off on
-        // the newer chips, powered up, auto-negotiation restarted.
+        // The PHY: who it is (proves the register path works), as it was
+        // left (what it advertised), then reset to its defaults with ALDPS
+        // off, every speed advertised, powered up, auto-negotiation restarted.
         let id = (nic.phy_read(2), nic.phy_read(3));
-        let bmcr = nic.phy_read(BMCR);
         crate::serial_println!(
-            "[RTL] chip XID {:#x} ({}), PMCH {:#04x}, PHY id {:04x?}/{:04x?}, BMCR {:04x?}",
+            "[RTL] chip XID {:#x} ({}), PMCH {:#04x}, MCU {:#04x}, MISC {:#010x}, PHY id {:04x?}/{:04x?}, \
+             was: BMCR {:04x?} ANAR {:04x?} GBCR {:04x?}",
             nic.xid, if newer { "8168G or later: PHY via OCP" } else { "PHY via PHYAR" },
-            nic.r8(PMCH), id.0, id.1, bmcr
+            nic.r8(PMCH), nic.r8(MCU), nic.r32(MISC), id.0, id.1,
+            nic.phy_read(BMCR), nic.phy_read(ANAR), nic.phy_read(GBCR)
         );
+        nic.phy_write(BMCR, BMCR_RESET);
+        crate::time::spin_until(500_000, || nic.phy_read(BMCR).is_some_and(|v| v & BMCR_RESET == 0));
         if newer {
             if let Some(v) = nic.ocp_read(OCP_ALDPS) {
                 nic.ocp_write(OCP_ALDPS, v & !(1 << 2));
             }
         }
-        let bmcr = bmcr.unwrap_or(BMCR_ANENABLE);
+        // 10/100 half and full, symmetric and asymmetric pause; 1000 half and full.
+        nic.phy_write(ANAR, 0x0DE1);
+        nic.phy_write(GBCR, 0x0300);
+        let bmcr = nic.phy_read(BMCR).unwrap_or(0);
         nic.phy_write(BMCR, (bmcr & !BMCR_PDOWN) | BMCR_ANENABLE | BMCR_ANRESTART);
-        // Auto-negotiation takes up to about 3 s at gigabit.
-        let up = crate::time::spin_until(6_000_000, || nic.r8(PHY_STATUS) & 0x02 != 0);
+        // Auto-negotiation takes up to about 3 s at gigabit; allow more.
+        let up = crate::time::spin_until(8_000_000, || nic.r8(PHY_STATUS) & 0x02 != 0);
         nic.link_was_up = up;
+        let _ = nic.phy_read(BMSR); // link status latches low: read twice
         crate::serial_println!(
-            "[RTL] MAC {}, link {} (PHY status {:#04x}, BMSR {:04x?})",
-            nic.mac, nic.link_text(), nic.r8(PHY_STATUS), nic.phy_read(BMSR)
+            "[RTL] MAC {}, link {} (PHY status {:#04x}, BMSR {:04x?}, ANAR {:04x?}, partner ANLPAR {:04x?})",
+            nic.mac, nic.link_text(), nic.r8(PHY_STATUS), nic.phy_read(BMSR), nic.phy_read(ANAR), nic.phy_read(ANLPAR)
         );
         Ok(nic)
     }
@@ -282,6 +314,41 @@ impl Rtl {
     }
 
     /// A PHY register through OCP (8168G and later).
+    /// A MAC register through OCP (8168G and later; Linux's r8168_mac_ocp_*).
+    fn mac_ocp_read(&self, reg: u32) -> u16 {
+        self.w32(OCPDR, reg << 15);
+        self.r32(OCPDR) as u16
+    }
+
+    fn mac_ocp_write(&self, reg: u32, value: u16) {
+        self.w32(OCPDR, 1 << 31 | reg << 15 | value as u32);
+    }
+
+    /// Take the port back from the chip's embedded controller (Linux's
+    /// rtl_hw_init_8168g): receive gated off, FIFOs drained, RX/TX off,
+    /// out-of-band mode left, and the controller's link-list handshake.
+    fn leave_oob(&self) {
+        self.w32(MISC, self.r32(MISC) | MISC_RXDV_GATED_EN);
+        crate::time::delay_ms(2);
+        let tx_empty = crate::time::spin_until(100_000, || self.r32(TX_CONFIG) & TXCFG_EMPTY != 0);
+        let rx_empty = crate::time::spin_until(100_000, || self.r8(MCU) & MCU_RXTX_EMPTY == MCU_RXTX_EMPTY);
+        self.w8(CHIP_CMD, self.r8(CHIP_CMD) & !0x0C);
+        crate::time::delay_ms(1);
+        let mcu = self.r8(MCU);
+        self.w8(MCU, mcu & !MCU_NOW_IS_OOB);
+        let v = self.mac_ocp_read(0xE8DE);
+        self.mac_ocp_write(0xE8DE, v & !(1 << 14));
+        let ready1 = crate::time::spin_until(100_000, || self.r8(MCU) & MCU_LINK_LIST_RDY != 0);
+        let v = self.mac_ocp_read(0xE8DE);
+        self.mac_ocp_write(0xE8DE, v | 1 << 15);
+        let ready2 = crate::time::spin_until(100_000, || self.r8(MCU) & MCU_LINK_LIST_RDY != 0);
+        crate::serial_println!(
+            "[RTL] out-of-band: MCU was {:#04x} ({}), FIFOs empty tx {} rx {}, link list ready {}/{}, MCU now {:#04x}, E8DE {:#06x}",
+            mcu, if mcu & MCU_NOW_IS_OOB != 0 { "OOB: taking the port back" } else { "not OOB" },
+            tx_empty, rx_empty, ready1, ready2, self.r8(MCU), self.mac_ocp_read(0xE8DE)
+        );
+    }
+
     fn ocp_read(&self, addr: u32) -> Option<u16> {
         self.w32(GPHY_OCP, addr << 15);
         let mut v = 0;
@@ -401,7 +468,8 @@ impl crate::network::Nic for Rtl {
     }
 
     fn detail(&self) -> String {
-        format!("chip XID {:#x}, {}, PHY status {:#04x}, BMSR {:04x?}, rx errors {}",
-            self.xid, self.link_text(), self.r8(PHY_STATUS), self.phy_read(BMSR), self.rx_errors)
+        format!("chip XID {:#x}, {}, PHY status {:#04x}, BMSR {:04x?}, partner {:04x?}, MCU {:#04x}, rx errors {}",
+            self.xid, self.link_text(), self.r8(PHY_STATUS), self.phy_read(BMSR), self.phy_read(ANLPAR),
+            self.r8(MCU), self.rx_errors)
     }
 }
