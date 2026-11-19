@@ -484,6 +484,8 @@ pub struct Iwl {
     pending: VecDeque<Packet>,
     phy_db: Vec<(u16, u16, Vec<u8>)>, // (type, channel group, data)
     error_table: u32,
+    /// grab_nic_access nesting depth.
+    nic_access: core::cell::Cell<u32>,
     /// CSR_INT and FH_INT bits seen since the last command was sent.
     int_seen: u32,
     fh_seen: u32,
@@ -535,6 +537,7 @@ impl Iwl {
             pending: VecDeque::new(),
             phy_db: Vec::new(),
             error_table: 0,
+            nic_access: core::cell::Cell::new(0),
             int_seen: 0,
             fh_seen: 0,
             alive_scd: 0,
@@ -606,12 +609,17 @@ impl Iwl {
         crate::time::spin_until(timeout_us, || self.r32(reg) & mask == bits & mask)
     }
     fn read_prph(&self, reg: u32) -> u32 {
+        self.grab_nic_access();
         self.w32(HBUS_TARG_PRPH_RADDR, (reg & 0x000F_FFFF) | 3 << 24);
-        self.r32(HBUS_TARG_PRPH_RDAT)
+        let v = self.r32(HBUS_TARG_PRPH_RDAT);
+        self.release_nic_access();
+        v
     }
     fn write_prph(&self, reg: u32, v: u32) {
+        self.grab_nic_access();
         self.w32(HBUS_TARG_PRPH_WADDR, (reg & 0x000F_FFFF) | 3 << 24);
         self.w32(HBUS_TARG_PRPH_WDAT, v);
+        self.release_nic_access();
     }
     fn set_bits_prph(&self, reg: u32, mask: u32) {
         self.write_prph(reg, self.read_prph(reg) | mask);
@@ -620,22 +628,48 @@ impl Iwl {
         self.write_prph(reg, self.read_prph(reg) & !mask);
     }
     fn read_mem32(&self, addr: u32) -> u32 {
+        self.grab_nic_access();
         self.w32(HBUS_TARG_MEM_RADDR, addr);
-        self.r32(HBUS_TARG_MEM_RDAT)
+        let v = self.r32(HBUS_TARG_MEM_RDAT);
+        self.release_nic_access();
+        v
     }
     fn write_mem32(&self, addr: u32, v: u32) {
+        self.grab_nic_access();
         self.w32(HBUS_TARG_MEM_WADDR, addr);
         self.w32(HBUS_TARG_MEM_WDAT, v);
+        self.release_nic_access();
     }
 
-    /// Keep the card's MAC awake for register and SRAM access.
+    /// Keep the card's MAC awake for register and SRAM access, a command
+    /// in flight, or (before the firmware runs) the whole bring-up. Nested;
+    /// the last release lets the card sleep again, as Linux does: a MAC
+    /// kept awake for good may stall the firmware's radio work until its
+    /// watchdog fires (seen on the PC: NMI_INTERRUPT_WDG on the first PHY
+    /// context and on the scan).
     fn grab_nic_access(&self) -> bool {
+        let depth = self.nic_access.get();
+        self.nic_access.set(depth + 1);
+        if depth > 0 {
+            return true;
+        }
         self.set_bit(CSR_GP_CNTRL, GP_MAC_ACCESS_REQ);
         let ok = self.poll_bit(CSR_GP_CNTRL, GP_MAC_CLOCK_READY, GP_MAC_CLOCK_READY | GP_GOING_TO_SLEEP, 15_000);
         if !ok {
             wlog!("no NIC access (GP_CNTRL {:#010x})", self.r32(CSR_GP_CNTRL));
         }
         ok
+    }
+
+    fn release_nic_access(&self) {
+        let depth = self.nic_access.get();
+        if depth == 0 {
+            return;
+        }
+        self.nic_access.set(depth - 1);
+        if depth == 1 {
+            self.clear_bit(CSR_GP_CNTRL, GP_MAC_ACCESS_REQ);
+        }
     }
 
     // ---- power-up ---------------------------------------------------------------
@@ -728,6 +762,7 @@ impl Iwl {
         self.write_prph(APMG_CLK_DIS_REG, APMG_CLK_VAL_DMA_CLK_RQT);
         crate::time::delay_us(5);
         self.clear_bit(CSR_GP_CNTRL, GP_MAC_ACCESS_REQ);
+        self.nic_access.set(0);
         // Stop bus mastering, reset, back to uninitialised.
         self.set_bit(CSR_RESET, RESET_STOP_MASTER);
         self.poll_bit(CSR_RESET, RESET_MASTER_DISABLED, RESET_MASTER_DISABLED, 100);
@@ -945,6 +980,10 @@ impl Iwl {
             return Err(format!("firmware not valid (ALIVE status {:#06x})", status));
         }
         self.tx_start();
+        // The bring-up's hold (apm_init) ends: from here on only around
+        // commands and register access (power-up may have taken it twice).
+        self.nic_access.set(0);
+        self.clear_bit(CSR_GP_CNTRL, GP_MAC_ACCESS_REQ);
         self.running = true;
         Ok(())
     }
@@ -1193,7 +1232,14 @@ impl Iwl {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.int_seen = 0;
         self.fh_seen = 0;
+        self.grab_nic_access();
         self.w32(HBUS_TARG_WRPTR, wr | (CMD_QUEUE as u32) << 8);
+        let r = self.wait_reply(seq, group, cmd);
+        self.release_nic_access();
+        r
+    }
+
+    fn wait_reply(&mut self, seq: u16, group: u8, cmd: u8) -> Result<Vec<u8>, String> {
 
         // The reply.
         let deadline = crate::time::Deadline::after_us(2_000_000);
