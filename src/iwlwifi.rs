@@ -508,6 +508,10 @@ pub struct Iwl {
     /// Ethernet frames for the network stack.
     pub eth_rx: VecDeque<Vec<u8>>,
     phy_added: bool,
+    /// WIFI UP <letters>: start-up steps to leave out (diagnosis).
+    pub skip: String,
+    /// Start-up steps done so far, for the error message.
+    steps: String,
     mac_added: bool,
     pub tx_ok: u64,
     pub tx_failed: u64,
@@ -555,6 +559,8 @@ impl Iwl {
             eapol_rx: VecDeque::new(),
             eth_rx: VecDeque::new(),
             phy_added: false,
+            skip: String::new(),
+            steps: String::new(),
             mac_added: false,
             tx_ok: 0,
             tx_failed: 0,
@@ -1305,7 +1311,12 @@ impl Iwl {
     /// From power-up to a runtime firmware ready to scan.
     pub fn up(&mut self) -> Result<(), String> {
         self.state = String::from("starting");
-        let r = self.up_inner();
+        let mut r = self.up_inner();
+        if let Err(e) = &r {
+            if !self.steps.is_empty() {
+                r = Err(format!("{} [steps: {}]", e, self.steps));
+            }
+        }
         match &r {
             Ok(()) => self.state = String::from("ready"),
             Err(e) => self.state = format!("failed: {}", e),
@@ -1333,33 +1344,82 @@ impl Iwl {
             .ok_or_else(|| format!("INIT calibration didn't complete; {}", self.why()))?;
         wlog!("INIT done: {} PHY DB sections", self.phy_db.len());
 
-        // Runtime image.
+        let inv: Vec<String> = self.phy_db.iter().map(|(t, g, d)| format!("{}/{}:{}", t, g, d.len())).collect();
+        for chunk in inv.chunks(8) {
+            wlog!("PHY DB (type/group:bytes): {}", chunk.join(" "));
+        }
+
+        // Runtime image. `skip` (WIFI UP <letters>) leaves steps out, to
+        // find which one the firmware objects to: S smart FIFO, B Bluetooth,
+        // D DQA, A aux station, P PHY contexts, M regulatory, C MAC context;
+        // 1: antenna A only; O: PHY contexts before the aux station.
+        let skip = self.skip.clone();
+        let has = |c: char| skip.contains(c);
+        if has('1') {
+            self.valid_tx_ant = 1;
+            self.valid_rx_ant = 1;
+        }
+        self.steps.clear();
         self.stop_device();
         self.start_hw()?;
         self.start_fw(false)?;
-        self.send_sf_config()?;
+        if !has('S') {
+            self.step("SF");
+            self.send_sf_config()?;
+        }
+        self.step("TXANT");
         self.send_cmd(TX_ANT_CONFIGURATION_CMD, 0, &(self.valid_tx_ant as u32).to_le_bytes())?;
+        self.step("PHYDB");
         self.send_phy_db()?;
         let (flow, event) = self.fw.as_ref().map_or((0, 0), |f| f.calib[0]);
+        self.step("PHYCFG");
         self.send_phy_cfg(flow, event)?;
-        self.send_bt_config()?;
-        if self.fw.as_ref().is_some_and(|f| f.capa(12)) {
+        if !has('B') {
+            self.step("BT");
+            self.send_bt_config()?;
+        }
+        if !has('D') && self.fw.as_ref().is_some_and(|f| f.capa(12)) {
+            self.step("DQA");
             self.send_cmd(DQA_ENABLE_CMD, DATA_PATH_GROUP, &(CMD_QUEUE as u32).to_le_bytes())?;
         }
-        self.add_aux_sta()?;
-        // As Linux's iwl_mvm_up: every PHY context, on the first channel.
-        for id in 0..3 {
-            self.phy_context(id, 1, 1)?;
+        if !has('A') && !has('O') {
+            self.step("AUX");
+            self.add_aux_sta()?;
         }
-        self.phy_added = true;
+        // As Linux's iwl_mvm_up: every PHY context, on the first channel.
+        if !has('P') {
+            for id in 0..3 {
+                self.step("PHYCTX");
+                self.phy_context(id, 1, 1)?;
+            }
+            self.phy_added = true;
+        }
+        if has('O') && !has('A') {
+            self.step("AUX");
+            self.add_aux_sta()?;
+        }
+        self.step("POWER");
         self.send_cmd(POWER_TABLE_CMD, 0, &[0, 0, 0, 0])?; // always awake (CAM)
-        self.update_mcc()?;
+        if !has('M') {
+            self.step("MCC");
+            self.update_mcc()?;
+        }
         // The interface coming up (mac80211's add_interface): MAC context 0.
-        self.add_mac_context()?;
-        self.mac_added = true;
+        if !has('C') {
+            self.step("MAC");
+            self.add_mac_context()?;
+            self.mac_added = true;
+        }
         wlog!("runtime firmware up: MAC {}, NVM {:#x}, antennas TX {:#x} RX {:#x}",
             mac_text(&self.mac), self.nvm_version, self.valid_tx_ant, self.valid_rx_ant);
         Ok(())
+    }
+
+    fn step(&mut self, name: &str) {
+        if !self.steps.is_empty() {
+            self.steps.push(' ');
+        }
+        self.steps.push_str(name);
     }
 
     /// Smart FIFO, state INIT_OFF (no interface associated), with Linux's
@@ -2737,7 +2797,10 @@ pub fn command(args: &[&str]) -> Vec<String> {
     };
     match sub.as_str() {
         "STATUS" => out.extend(iwl.status_lines()),
-        "UP" => match iwl.up() {
+        "UP" => match {
+            iwl.skip = args.get(1).map(|s| s.to_ascii_uppercase()).unwrap_or_default();
+            iwl.up()
+        } {
             Ok(()) => out.push(format!("  Wi-Fi up, MAC {}", mac_text(&iwl.mac))),
             Err(e) => out.push(format!("  Wi-Fi start failed: {}", e)),
         },
