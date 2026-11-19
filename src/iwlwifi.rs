@@ -1386,6 +1386,9 @@ impl Iwl {
             self.send_bt_config()?;
         }
         self.read_nvm()?;
+        if !self.skip.contains('S') {
+            self.send_sf_config()?; // as OpenBSD's iwm, before the calibrations
+        }
         let (flow, event) = self.fw.as_ref().map_or((0, 0), |f| f.calib[1]);
         self.send_cmd(TX_ANT_CONFIGURATION_CMD, 0, &(self.valid_tx_ant as u32).to_le_bytes())?;
         self.send_phy_cfg(flow, event)?;
@@ -1511,12 +1514,20 @@ impl Iwl {
         Ok(())
     }
 
+    /// Bluetooth coexistence. The 7265 shares its antennas with its own
+    /// Bluetooth core, which nothing drives here: BT_COEX_WIFI gives the
+    /// antennas to Wi-Fi for good (OpenBSD's iwm does this). Linux's
+    /// BT_COEX_NW (WIFI UP L) arbitrates with the Bluetooth core; with an
+    /// idle core the firmware hit its watchdog on every radio command.
     fn send_bt_config(&mut self) -> Result<(), String> {
-        // BT_COEX_NW mode; MPLUT (if supported), SYNC2SCO, HIGH_BAND_RET.
-        let mplut = self.fw.as_ref().is_some_and(|f| f.capa(67));
-        let modules: u32 = (if mplut { 1 } else { 0 }) | 1 << 2 | 1 << 4;
+        let (mode, modules): (u32, u32) = if self.skip.contains('L') {
+            let mplut = self.fw.as_ref().is_some_and(|f| f.capa(67));
+            (1, (if mplut { 1 } else { 0 }) | 1 << 2 | 1 << 4)
+        } else {
+            (3, 1 << 4)
+        };
         let mut c = Vec::new();
-        c.extend_from_slice(&1u32.to_le_bytes());
+        c.extend_from_slice(&mode.to_le_bytes());
         c.extend_from_slice(&modules.to_le_bytes());
         self.send_cmd(BT_CONFIG, 0, &c)?;
         Ok(())
