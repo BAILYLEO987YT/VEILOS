@@ -484,6 +484,10 @@ pub struct Iwl {
     pending: VecDeque<Packet>,
     phy_db: Vec<(u16, u16, Vec<u8>)>, // (type, channel group, data)
     error_table: u32,
+    /// CSR_INT and FH_INT bits seen since the last command was sent.
+    int_seen: u32,
+    fh_seen: u32,
+    alive_scd: u32,
     pub mac: [u8; 6],
     valid_tx_ant: u8,
     valid_rx_ant: u8,
@@ -530,6 +534,9 @@ impl Iwl {
             pending: VecDeque::new(),
             phy_db: Vec::new(),
             error_table: 0,
+            int_seen: 0,
+            fh_seen: 0,
+            alive_scd: 0,
             mac: [0; 6],
             valid_tx_ant: 0,
             valid_rx_ant: 0,
@@ -924,8 +931,11 @@ impl Iwl {
         if alive.data.len() >= 24 {
             self.error_table = le32(&alive.data, 20);
         }
-        wlog!("{} ALIVE: status {:#06x}, {} bytes, error log at {:#x}",
-            if init { "INIT" } else { "runtime" }, status, alive.data.len(), self.error_table);
+        if alive.data.len() >= 44 {
+            self.alive_scd = le32(&alive.data, 40);
+        }
+        wlog!("{} ALIVE: status {:#06x}, {} bytes, seq {:#06x}, error log {:#x}, SCD {:#x}",
+            if init { "INIT" } else { "runtime" }, status, alive.data.len(), alive.seq, self.error_table, self.alive_scd);
         if status != 0xCAFE {
             return Err(format!("firmware not valid (ALIVE status {:#06x})", status));
         }
@@ -945,6 +955,29 @@ impl Iwl {
         s
     }
 
+    /// After a command got no reply: did the card fetch it (TX DMA, the
+    /// scheduler's read pointer), and is the receive ring moving?
+    fn dump_queues(&self, seq: u16) {
+        let q = CMD_QUEUE as u32;
+        let (w, r) = self.txq[CMD_QUEUE].as_ref().map_or((0, 0), |t| (t.write, t.read));
+        wlog!("cmd seq {:#06x}: INT seen {:#010x} FH seen {:#010x}; queue w {} r {}; SCD rdptr {:#x} status {:#010x}",
+            seq, self.int_seen, self.fh_seen, w, r, self.read_prph(scd_queue_rdptr(q)), self.read_prph(scd_queue_status_bits(q)));
+        wlog!("SCD base {:#x} (ALIVE {:#x}) TXFACT {:#x} GP {:#x} ctx {:#x}/{:#x}; FH TX status {:#010x} ch7 cfg {:#010x}",
+            self.scd_base, self.alive_scd, self.read_prph(SCD_TXFACT), self.read_prph(SCD_GP_CTRL),
+            self.read_mem32(self.scd_base + SCD_CONTEXT_MEM_LOWER_BOUND),
+            self.read_mem32(self.scd_base + SCD_CONTEXT_MEM_LOWER_BOUND + 4),
+            self.r32(FH_TSSR_TX_STATUS_REG), self.r32(fh_tcsr_config(7)));
+        wlog!("RX: status closed {} finished {}, read {} write {}, RDPTR {:#x}; GP1 {:#x}; FH RX status {:#010x}",
+            self.rx_stts.r16(0) & 0xFFF, self.rx_stts.r16(4) & 0xFFF, self.rx_read, self.rx_write,
+            self.r32(FH_RSCSR_CHNL0_RDPTR), self.r32(0x054), self.r32(FH_MEM_RSSR_RX_STATUS_REG));
+        if let Some(t) = self.txq[CMD_QUEUE].as_ref() {
+            let i = (w + TFD_QUEUE_SIZE - 1) % TFD_QUEUE_SIZE;
+            let d: Vec<u32> = (0..4).map(|k| unsafe { (t.tfds.at(i * TFD_SIZE + 4 * k) as *const u32).read_volatile() }).collect();
+            wlog!("TFD {} at {:#x}: {:08x} {:08x} {:08x} {:08x}", i, t.tfds.phys + (i * TFD_SIZE) as u64, d[0], d[1], d[2], d[3]);
+        }
+        wlog!("{}", self.error_log());
+    }
+
     fn error_log(&self) -> String {
         if self.error_table == 0 || self.error_table == 0xFFFF_FFFF {
             return String::from("; no error log address");
@@ -962,7 +995,10 @@ impl Iwl {
         let int = self.r32(CSR_INT);
         if int != 0 && int != 0xFFFF_FFFF {
             self.w32(CSR_INT, int);
-            self.w32(CSR_FH_INT_STATUS, self.r32(CSR_FH_INT_STATUS));
+            let fh = self.r32(CSR_FH_INT_STATUS);
+            self.w32(CSR_FH_INT_STATUS, fh);
+            self.int_seen |= int;
+            self.fh_seen |= fh;
             if int & (INT_SW_ERR | INT_HW_ERR) != 0 {
                 wlog!("card error: CSR_INT {:#010x}{}", int, self.error_log());
                 self.running = false;
@@ -1136,6 +1172,8 @@ impl Iwl {
         t.write = (idx + 1) % TFD_QUEUE_SIZE;
         let wr = t.write as u32;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.int_seen = 0;
+        self.fh_seen = 0;
         self.w32(HBUS_TARG_WRPTR, wr | (CMD_QUEUE as u32) << 8);
 
         // The reply.
@@ -1153,6 +1191,7 @@ impl Iwl {
                 return Ok(p.data);
             }
             if deadline.expired() {
+                self.dump_queues(seq);
                 return Err(format!("no reply to command {:#x}/{:#x}; {}", group, cmd, self.why()));
             }
             if !self.running && self.r32(CSR_INT) & INT_SW_ERR != 0 {
