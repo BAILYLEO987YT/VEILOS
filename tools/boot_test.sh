@@ -27,7 +27,7 @@ size=$(wc -c < serial.log 2>/dev/null || echo 0)
 echo "[$mode] result=$result after ~$((i * 5))s, serial log $size bytes"
 cat qemu.out
 
-if [ "$result" = booted ] && grep -q '^\[FAT\] FAT32' serial.log; then
+if [ "$result" = booted ] && grep -q 'writable: the VEILOS volume' serial.log; then
     echo "::notice::VEILOS booted to the desktop under $mode in about $((i * 5))s."
     exit 0
 fi

@@ -90,9 +90,12 @@ pub struct Driver {
 /// Every driver the kernel has, in match priority order.
 static DRIVERS: &[Driver] = &[
     crate::ahci::DRIVER,
+    crate::nvme::DRIVER,
     crate::network::VIRTIO_NET_DRIVER,
+    crate::e1000::DRIVER,
     crate::graphics::LFB_DISPLAY_DRIVER,
     crate::audio::DRIVER,
+    crate::usb::XHCI_DRIVER,
 ];
 
 static DEVICES: Mutex<Vec<Device>> = Mutex::new(Vec::new());
@@ -119,6 +122,11 @@ pub fn bind(class: DeviceClass) {
 
     for (id, pci) in candidates {
         bind_one(id, &pci);
+    }
+    // No driver for any display adapter: the framebuffer the firmware set
+    // up still works, at the mode it chose, on any GPU.
+    if class == DeviceClass::Display && crate::graphics::HEADS.lock().is_empty() {
+        crate::graphics::bind_firmware_framebuffer();
     }
 }
 

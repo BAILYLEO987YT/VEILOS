@@ -1,4 +1,3 @@
-use bootloader::bootinfo::MemoryMap;
 use x86_64::{
     structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
     VirtAddr,
@@ -34,9 +33,26 @@ pub unsafe fn get_mapper() -> OffsetPageTable<'static> {
     unsafe { OffsetPageTable::new(level_4_table, offset) }
 }
 
+/// Bootloader 0.11 identity-maps two pages of its own in the kernel's tables
+/// (its GDT and the code that jumps to the kernel). Both are dead once
+/// gdt::init has loaded the kernel's GDT, and they sit in the low 512 GiB,
+/// where they would make 1 GiB slots look like the kernel's to
+/// address_space.rs (one at about 0x7D000000 took KUSER_SHARED_DATA's slot).
+/// Nothing else is mapped there at this point: the kernel image and every
+/// other bootloader mapping are in the upper half (main.rs's config).
+unsafe fn drop_boot_identity_maps(offset: VirtAddr) {
+    let l4 = unsafe { active_level_4_table(offset) };
+    if !l4[0].is_unused() {
+        l4[0].set_unused();
+        x86_64::instructions::tlb::flush_all();
+        crate::serial_println!("[MEM] dropped the bootloader's identity mappings (PML4 slot 0)");
+    }
+}
+
 /// Initialize a new OffsetPageTable.
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     set_phys_mem_offset(physical_memory_offset);
+    unsafe { drop_boot_identity_maps(physical_memory_offset) };
     crate::address_space::init();
     let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
@@ -332,16 +348,16 @@ impl FrameBitmap {
 /// Build the frame bitmap from the bootloader memory map. Call once, after
 /// `init` (the bitmap is reached through the physical-memory mapping) and
 /// before anything allocates a frame.
-pub fn init_frame_allocator(memory_map: &'static MemoryMap) {
-    use bootloader::bootinfo::MemoryRegionType;
+pub fn init_frame_allocator(memory_map: &'static [bootloader_api::info::MemoryRegion]) {
+    use bootloader_api::info::MemoryRegionKind;
     let offset = get_phys_mem_offset();
 
     // Page-aligned usable ranges.
     let mut usable = [(0u64, 0u64); MAX_USABLE_RANGES];
     let mut usable_count = 0;
-    for r in memory_map.iter().filter(|r| r.region_type == MemoryRegionType::Usable) {
-        let start = (r.range.start_addr() + 4095) & !4095;
-        let end = r.range.end_addr() & !4095;
+    for r in memory_map.iter().filter(|r| r.kind == MemoryRegionKind::Usable) {
+        let start = (r.start + 4095) & !4095;
+        let end = r.end & !4095;
         if end <= start { continue; }
         if usable_count == MAX_USABLE_RANGES {
             crate::serial_println!("[MEM] WARN: more than {} usable regions; ignoring {:#X}..{:#X}",

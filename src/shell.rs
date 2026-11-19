@@ -71,6 +71,7 @@ enum OsAction {
     Focus(u32),
     Lock,
     Shutdown,
+    Restart,
 }
 
 /// App names `launch()` understands.
@@ -247,6 +248,10 @@ pub fn host_call(name: &str, args: &[CallArg]) -> Option<Result<VValue, String>>
         }
         "shutdown" => {
             PENDING.lock().push(OsAction::Shutdown);
+            Ok(VValue::None)
+        }
+        "restart" => {
+            PENDING.lock().push(OsAction::Restart);
             Ok(VValue::None)
         }
         _ => return None,
@@ -512,18 +517,27 @@ fn run_action(a: OsAction) {
         }
         OsAction::Lock => crate::desktop::lock_desktop(),
         OsAction::Shutdown => power_off(),
+        OsAction::Restart => crate::power::reboot(crate::power::Method::Any),
     }
 }
 
-/// Emulator power-off. Real hardware needs ACPI (not implemented yet): if the
-/// machine is still running afterwards, the user is told.
-pub fn power_off() {
-    use x86_64::instructions::port::Port;
-    crate::serial_println!("[SHELL] shutdown requested");
+/// What has to reach the disk before the power goes: users, scheduler
+/// profiles, the audit log, and the disk cache last. Also before a restart.
+pub fn save_for_power_off() {
     crate::users::USER_DB.lock().save();
     crate::scheduler::SCHEDULER.lock().flush_profiles();
     crate::security::flush_audit(0);
     crate::block::flush_all();
+}
+
+/// Power-off: ACPI S5 (power.rs), then the emulators' fixed ports. If the
+/// machine is still running afterwards, the user is told.
+pub fn power_off() {
+    use x86_64::instructions::port::Port;
+    crate::serial_println!("[SHELL] shutdown requested");
+    save_for_power_off();
+    // ACPI S5 from the FADT and DSDT (power.rs): any PC.
+    crate::power::acpi_power_off();
     // SAFETY: these ports are the ACPI PM1a control registers of QEMU (newer, older)
     // and VirtualBox; writing the SLP_EN|SLP_TYP value powers the VM off.
     unsafe {

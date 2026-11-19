@@ -2289,14 +2289,14 @@ fn capture_framebuffer(width: u32, height: u32, gpu_mode: bool) -> Vec<u32> {
     
     // The VGA text buffer is 80x25 characters. 
     // We'll roughly map it to the RDP frame buffer using the background colours.
-    let vga_ptr = 0xb8000 as *const u16;
+    let console = crate::vga_buffer::VGA_WRITER.lock();
     for y in 0..height {
         for x in 0..width {
             // Map screen coordinate to VGA character cell (8x16 font assumed)
             let vga_x = (x / 8) % 80;
             let vga_y = (y / 16) % 25;
             let cell_idx = (vga_y * 80 + vga_x) as isize;
-            let cell = unsafe { core::ptr::read_volatile(vga_ptr.offset(cell_idx)) };
+            let cell = console.cell(cell_idx as usize % 80, cell_idx as usize / 80);
             let bg_color = ((cell >> 12) & 0xF) as u32;
             
             // Simple color mapping

@@ -14,7 +14,7 @@
 | Area | State |
 |---|---|
 | Discovery | `pci.rs` is a registry scanned once, with BARs, capabilities, MSI info. No driver binding: each subsystem calls `pci::find_class` itself. |
-| Storage | Already device-count independent: every partition on every disk is mounted (`block.rs`, `/mnt/d<port>p<n>`). |
+| Storage | Already device-count independent: every partition on every disk is mounted (`block.rs`, `/mnt/d<port>p<n>`, read-only unless it is the VEILOS volume). |
 | Network | One virtio-net NIC; the first one found is used. |
 | Display | One framebuffer (BAR0 of the first display device). `1024×768` is hard-coded at 103 sites in 10 files (`ui::SCREEN_W/H`). |
 | GPU | `gpu_driver.rs` is a software model: every `GpuCommand` is executed on the CPU into the framebuffer, and 3D commands are no-ops. All submission goes to `primary()`. No hardware GPU driver exists. |

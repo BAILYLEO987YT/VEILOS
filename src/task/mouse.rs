@@ -101,6 +101,26 @@ pub fn add_byte_and_process(byte: u8) {
     }
 }
 
+/// Movement from another mouse (USB: usb::hid), in the same state the PS/2
+/// mouse fills. `dy` is positive downwards (screen direction), `wheel`
+/// positive towards the user. From an interrupt: never waits for the lock.
+pub fn add_motion(dx: i32, dy: i32, left: bool, right: bool, wheel: i32) {
+    if let Some(mut state) = MOUSE_STATE.try_lock() {
+        let dx = dx + PENDING_DX.swap(0, Ordering::Relaxed);
+        // PENDING_DY holds PS/2 (upwards) units.
+        let dy = dy - PENDING_DY.swap(0, Ordering::Relaxed);
+        state.wheel += wheel + PENDING_WHEEL.swap(0, Ordering::Relaxed);
+        state.x = (state.x + dx).clamp(0, crate::ui::screen_w() as i32 - 1);
+        state.y = (state.y + dy).clamp(0, crate::ui::screen_h() as i32 - 1);
+        state.left_button = left;
+        state.right_button = right;
+    } else {
+        PENDING_DX.fetch_add(dx, Ordering::Relaxed);
+        PENDING_DY.fetch_add(-dy, Ordering::Relaxed);
+        PENDING_WHEEL.fetch_add(wheel, Ordering::Relaxed);
+    }
+}
+
 // -----| PS/2 low-level helpers |-----
 
 /// How long to wait for the PS/2 controller. A mouse reset (0xFF) can take
@@ -173,6 +193,14 @@ async fn hw_init() {
     //    swallows every ACK/self-test byte this sequence is polling for.
     crate::interrupts::mask_irq(12);
 
+    // No 8042 at all (newer boards; QEMU's i8042=off): the port reads as
+    // 0xFF, which looks like a controller that is always busy and always has
+    // data. The mouse is USB then (usb::hid), if there is one.
+    if unsafe { command_port.read() } == 0xFF {
+        crate::serial_println!("[MOUSE] no PS/2 controller (status 0xFF): no PS/2 mouse");
+        return;
+    }
+
     unsafe {
         // 1. Disable both PS/2 ports for a clean slate.
         crate::serial_println!("[MOUSE] Disabling PS/2 ports...");
@@ -181,8 +209,12 @@ async fn hw_init() {
         wait_input();
         command_port.write(0xA7); // Disable mouse port
 
-        // 2. Flush the output buffer (discard any stale bytes).
-        while (command_port.read() & 0x01) != 0 {
+        // 2. Flush the output buffer (discard any stale bytes; bounded,
+        //    in case the controller never stops claiming to have some).
+        for _ in 0..64 {
+            if command_port.read() & 0x01 == 0 {
+                break;
+            }
             data_port.read();
         }
     }

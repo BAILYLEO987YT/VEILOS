@@ -12,21 +12,21 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 
 | | Requirement | Status | Notes |
 |---|---|---|---|
-| **1.0** | UEFI boot | ❌ | `bootloader 0.9` is BIOS-only. Most PCs since about 2020 have CSM (legacy boot) off or removed. |
+| **1.0** | UEFI boot | ⚠️ | Since 2026-11-18 VEILOS boots through `bootloader` 0.11 (`tools/build.sh` makes `veilos-bios.img` and `veilos-uefi.img` from one build). Both reach the desktop in QEMU (UEFI with OVMF under WHPX, BIOS with SeaBIOS). Not tried on a real PC yet. Since 2026-11-18 `tools/build.sh --disk SIZE` also makes one bootable disk (bootloader partition, then the VEILOS volume as a GPT partition of VEILOS's own type, or MBR slot 3), and `--ramdisk SIZE` an image whose volume the firmware loads into memory with the kernel, so a USB stick works before VEILOS drives USB storage (changes are lost at restart). Both boot to the desktop in QEMU, BIOS and UEFI. |
 | **1.0** | Boots and runs on at least one real machine | ⚠️ | Only QEMU (TCG/WHPX) is tested so far. |
 | **1.0** | Installer: partition a disk, copy the system, set up boot | ❌ | Today it runs from a disk image built by `tools/mkdisk.py`. |
-| **1.0** | Graphics from the firmware framebuffer (GOP/VBE) on any GPU | ❌ | Only the Bochs/QEMU display adapter is driven, and the bootloader's framebuffer isn't used. |
+| **1.0** | Graphics from the firmware framebuffer (GOP/VBE) on any GPU | ⚠️ | Since 2026-11-18: boot messages draw on the firmware's framebuffer (no VGA text mode needed), and with no driver for the adapter the desktop runs on it at the firmware's mode (`graphics::bind_firmware_framebuffer`). Only 32-bit BGRX modes carry the desktop; a 24-bit VBE mode keeps the text console. The mode can't be changed. |
 | | Recovery / safe boot when something breaks | ❌ | |
 
 ## 2. Hardware drivers
 
 | | Requirement | Status | Notes |
 |---|---|---|---|
-| **1.0** | USB (xHCI) with HID keyboard and mouse | ❌ | Input is PS/2 only. Laptops and most desktops need USB HID, or I2C HID for touchpads. |
-| **1.0** | USB mass storage (flash drives) | ❌ | Needs xHCI first. |
-| **1.0** | NVMe | ❌ | Most current PCs boot from NVMe. Only AHCI/SATA is supported. |
-| ✅ | SATA (AHCI), several disks, GPT/MBR | ✅ | |
-| **1.0** | A common real Ethernet NIC (Intel e1000e/I219 and/or Realtek r8169) | ❌ | Only virtio-net is supported (and bonded). |
+| **1.0** | USB (xHCI) with HID keyboard and mouse | ⚠️ | Since 2026-11-18 (`src/usb/`): an xHCI driver (firmware handoff, reset, rings, every root port), and boot-protocol keyboards and mice, whose reports become the same scancodes and mouse state as PS/2. Polled from the BSP's timer tick. Checked in QEMU (`qemu-xhci`, `usb-kbd`, `usb-mouse`) with the PS/2 controller removed (`i8042=off`): signing in, the mouse and the terminal all work through USB. Not yet: devices behind hubs, hot-plug, EHCI-only machines, I2C touchpads, a real PC. |
+| **1.0** | USB mass storage (flash drives) | ⚠️ | Since 2026-11-18: bulk-only transport with SCSI commands (`usb/msc.rs`), a block transport like AHCI, so a stick's VEILOS volume can be `/` and other sticks mount read-only. Checked in QEMU (`usb-storage` on xHCI) as the root volume, running Win32 programs from it. Not yet: 4 KiB-sector drives, UAS, a real stick. |
+| **1.0** | NVMe | ⚠️ | Since 2026-11-19 (`nvme.rs`): admin queue, Identify, one I/O queue pair, polled reads, writes and cache flushes (at power-off and FlushFileBuffers), as a block transport. Checked in QEMU (UEFI, booting from an emulated NVMe drive with the one-disk image): `/` on its VEILOS partition, all 20 Win32 regression programs match Windows. Not yet: namespaces other than 1, 4 KiB-sector formats, a real drive. |
+| ✅ | SATA (AHCI), several disks, GPT/MBR | ✅ | Since 2026-11-18 also what real controllers need: AHCI mode enabled, BIOS/OS handoff, staggered spin-up and COMRESET for a link that isn't up, waking a sleeping link, waiting for a busy device, and skipping optical drives and port multipliers. Checked in QEMU only, which needs none of it. |
+| **1.0** | A common real Ethernet NIC (Intel e1000e/I219 and/or Realtek r8169) | ⚠️ | Since 2026-11-19 (`e1000.rs`): Intel e1000 (8254x), e1000e (82571-82574, 82583) and the chipset LAN of Intel PCs since 2010 (82577-82579, I217, I218, I219 through Meteor Lake), polled, joining the logical NIC beside virtio-net. Checked in QEMU with `e1000` and `e1000e` alone and beside virtio-net: DHCP, and git, sockets and TLS (to example.com too) match Windows. The chipset-LAN steps (PHY semaphore, LANPHYPC power-cycle) have no QEMU model and are untried. No Realtek driver yet: QEMU can't emulate an RTL8111. |
 | | Wi-Fi | ❌ | No Wi-Fi driver. Since 2026-11-17 Quick Settings' network panel shows what's really there (the wired connection, its address and adapters) and says there's no Wi-Fi adapter, instead of four made-up networks. |
 | **1.0** | Audio output (Intel HD Audio) | ⚠️ | Done 2026-11-11 in QEMU (`intel-hda` + `hda-output`): `audio.rs` drives the controller and its codec and mixes any number of streams at 48 kHz. The volume slider and the `SOUND` command set the master volume. Real codecs (Realtek etc.) are untested, and there's no input or headphone-jack switching. |
 | | Laptop: battery, brightness, lid, touchpad | ❌ | Since 2026-11-11 the brightness slider dims the picture on its way to the screen (`ui.rs`, never below 10%, on every CPU). There's still no backlight control, and nothing for battery, lid or touchpad. |
@@ -38,20 +38,22 @@ Status is as of 2026-11-10, worked out from the code and the design docs. Nothin
 | | Requirement | Status | Notes |
 |---|---|---|---|
 | ✅ | Preemptive multitasking, SMP, threads | ✅ | |
+| **1.0** | Starts on a modern PC's CPU and timers: x2APIC, no 8254, AMD, many cores | ✅ | Done 2026-11-18 (`smp.rs`, `time.rs`). x2APIC mode when the firmware hands over in it or an APIC ID needs it (MADT type-9 entries, 32-bit IDs); up to 64 CPUs (was 8). With no 8254 the TSC rate comes from CPUID 0x15/0x16 or the HPET and the BSP ticks from its LAPIC timer. Checked in QEMU under TCG with 4 CPUs: `pit=off`, an AMD EPYC model, and x2APIC (forced with `VEILOS_X2APIC=1`, as no QEMU firmware hands over in it). |
 | ✅ | Per-process address spaces, memory protection | ✅ | |
 | ✅ | A crashing program doesn't take the OS down | ✅ | Win32 exceptions end the process. |
-| **1.0** | ACPI: real power-off, reboot, power button | ❌ | Power-off only works through QEMU's and VirtualBox's ports (`shell.rs`, `power_off`). Since 2026-11-11 the Quick Settings power button calls it too (checked in QEMU: the VM powers off), so it now does the same as the menu's Shut down. Real hardware still needs ACPI. |
+| **1.0** | ACPI: real power-off, reboot, power button | ✅ | In QEMU. Since 2026-11-19 (`power.rs`): power-off is ACPI S5, its sleep type read from the DSDT's `\_S5` package and written with SLP_EN to the FADT's PM1a/PM1b control registers (the firmware put in ACPI mode first if needed); the emulator ports stay as a fallback. The power button's status bit is polled and shuts down after saving, as Windows does. Restart since 2026-11-18: the FADT's reset register, then port 0xCF9, the 8042's reset line, and a triple fault; `REBOOT` in the terminal (`REBOOT ACPI|CF9|KBD|TRIPLE` tries one), Restart in the Start menu, and any key on the crash screen or the no-system-volume screen. All checked in QEMU, BIOS and UEFI (restarts under TCG: WHPX stops QEMU on any guest reset). No sleep (S3), which needs an AML interpreter; untried on a real PC. |
 | | Sleep / resume (S3) | ❌ | Needs an AML interpreter. |
 | | Swap / pagefile, demand-zero memory | ⚠️ | Images page in from disk. Nothing pages out. |
 | **1.0** | Runs for days without leaking or hanging (soak test) | ⚠️ | Never measured. |
 | **1.0** | Fast enough to use on one CPU / a normal PC | ⚠️ | The S6 notes say building in the VM is too slow, and a small `hello.rs` takes about 36 s. Measure this on real hardware. |
-| | Kernel panic screen + saved crash log | ✅ | Since 2026-11-17 (`crash.rs`): a panic stops the other CPUs (NMI), paints a crash screen with the report straight onto the display, and writes the report to `/var/log/crash.log` through sectors set aside at start-up (past the filesystem and the cache, as Windows writes its dump). The next start keeps it as `/var/log/crash-N.log` and says so in a notification. `CRASH TEST` in the terminal (administrators) checks it; checked in QEMU, report kept across the restart. No memory dump, and the machine waits for a restart rather than restarting itself. |
+| | Kernel panic screen + saved crash log | ✅ | Since 2026-11-17 (`crash.rs`): a panic stops the other CPUs (NMI), paints a crash screen with the report straight onto the display, and writes the report to `/var/log/crash.log` through sectors set aside at start-up (past the filesystem and the cache, as Windows writes its dump). The next start keeps it as `/var/log/crash-N.log` and says so in a notification. `CRASH TEST` in the terminal (administrators) checks it; checked in QEMU, report kept across the restart. No memory dump. Since 2026-11-18 any key restarts (PS/2, or USB with the firmware's PS/2 emulation). |
 
 ## 4. Files and data safety
 
 | | Requirement | Status | Notes |
 |---|---|---|---|
 | ✅ | Read/write FAT32 with long names, rename, handles, seek | ✅ | |
+| **1.0** | Never writes to a volume that isn't VEILOS's (an ESP, Windows, a USB stick) | ✅ | Done 2026-11-18 (`block.rs`). Only a volume with `VEILOS.VOL` at its root becomes `/` and is writable; every other filesystem mounts read-only at `/mnt/d<port>p<n>`, and each disk refuses writes outside the root volume's partition. With no VEILOS volume, boot stops on a screen listing what it found and writes nothing. `tools/mkdisk.py` and `storage/` carry the marker. Checked in QEMU with `tools/mkwindisk.py` (a GPT disk with an ESP, MSR and NTFS, attached before the VEILOS disk): signed in as admin, `MKDIR`/`RM` on both Windows volumes fail in Security and Performance Mode, reads work, and the image's SHA-256 is unchanged. Older disk images need `VEILOS.VOL` copied to their root. |
 | **1.0** | Survives a power cut without corrupting the disk | ❌ | FAT has no journal. Needs a journaled or copy-on-write native FS, or at least fsck-on-boot. |
 | | Write NTFS / exFAT (read Windows disks *and* USB sticks) | ⚠️ | Both are read-only. |
 | **1.0** | File ownership and permissions between users | ❌ | FAT stores none ("everything is the user's"). |

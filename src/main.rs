@@ -10,6 +10,10 @@ extern crate alloc;
 #[macro_use]
 pub mod encryption;
 pub mod vga_buffer;
+pub mod power;
+pub mod usb;
+pub mod e1000;
+pub mod nvme;
 pub mod interrupts;
 pub mod gdt;
 pub mod allocator;
@@ -112,7 +116,7 @@ use core::fmt::{self, Write};
 use spin::Mutex;
 use uart_16550::SerialPort;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
-use bootloader::{BootInfo, entry_point};
+use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 
 /// Persistent keyboard decoder state — shared across all frames of the
 /// gui_refresh_task so that modifier keys (Shift, Caps-Lock) are remembered.
@@ -180,7 +184,20 @@ pub fn _serial_print(args: fmt::Arguments) {
 
 // -----| kernel entry point |-----
 
-entry_point!(kernel_main);
+/// What the bootloader (0.11) sets up before kernel_main. The physical-memory
+/// map and the bootloader's other mappings (stack, boot info, framebuffer)
+/// go in the upper half: the low 512 GiB holds the kernel image and every
+/// process's user space (address_space.rs).
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    use bootloader_api::config::Mapping;
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.mappings.dynamic_range_start = Some(0xFFFF_8000_0000_0000);
+    config.kernel_stack_size = 1024 * 1024;
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Halt with a fatal message on critical boot failures.
 /// Unlike panic!, this is intentionally minimal — it runs before the heap
@@ -202,9 +219,94 @@ macro_rules! boot_assert {
     };
 }
 
-fn kernel_main(boot_info: &'static BootInfo) -> ! {
+/// Keep what the bootloader found that the rest of boot needs: the
+/// framebuffer (the boot console draws on it from here on) and the ACPI RSDP
+/// (UEFI machines have none where smp.rs used to look).
+fn take_boot_info(boot_info: &mut BootInfo) {
+    use bootloader_api::info::PixelFormat;
+    if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
+        crate::smp::set_rsdp(rsdp);
+    }
+    if let Some(addr) = boot_info.ramdisk_addr.into_option() {
+        crate::block::set_ram_disk(addr, boot_info.ramdisk_len as usize);
+    }
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let info = fb.info();
+        let virt = fb.buffer_mut().as_mut_ptr() as u64;
+        let pixels = match info.pixel_format {
+            PixelFormat::Rgb => Some(vga_buffer::Pixels::Rgb),
+            PixelFormat::Bgr => Some(vga_buffer::Pixels::Bgr),
+            PixelFormat::U8 => Some(vga_buffer::Pixels::Grey),
+            _ => None,
+        };
+        serial_println!(
+            "[BOOT] framebuffer {}x{}, {} bytes/pixel, {:?}, stride {}",
+            info.width, info.height, info.bytes_per_pixel, info.pixel_format, info.stride
+        );
+        if let Some(pixels) = pixels {
+            // The bootloader maps the framebuffer at `virt`; its physical
+            // address is found again once paging is known (graphics.rs).
+            vga_buffer::init_framebuffer(vga_buffer::FirmwareFb {
+                virt,
+                byte_len: info.byte_len,
+                width: info.width,
+                height: info.height,
+                stride: info.stride,
+                bytes_per_pixel: info.bytes_per_pixel,
+                pixels,
+            });
+        }
+    } else {
+        serial_println!("[BOOT] no framebuffer from the firmware");
+    }
+}
+
+/// No disk holds a VEILOS volume (block.rs: the `VEILOS.VOL` marker). Stop
+/// here, before anything is written: every other volume stays untouched.
+fn no_system_volume() -> ! {
+    vga_buffer::VGA_WRITER.lock().set_colour(vga_buffer::VgaColour::White, vga_buffer::VgaColour::Red);
+    println!();
+    println!(" VEILOS could not find its system volume.                                       ");
+    vga_buffer::VGA_WRITER.lock().set_colour(vga_buffer::VgaColour::LightGray, vga_buffer::VgaColour::Black);
+    println!();
+    println!(" No disk has a filesystem with {} at its root, so VEILOS has", crate::block::VOLUME_MARKER);
+    println!(" stopped here. It has written nothing to any disk. The volumes it found");
+    println!(" are listed above; they were only read.");
+    println!();
+    println!(" Make a VEILOS disk with tools/mkdisk.py, or copy storage/VEILOS.VOL to the");
+    println!(" root of the FAT32 volume VEILOS should use. Press any key to restart.");
+    serial_println!("[BOOT] no VEILOS system volume ({} not found on any disk): stopped, nothing written", crate::block::VOLUME_MARKER);
+    // The same on a framebuffer, for machines with no VGA text mode (UEFI,
+    // a display with no VGA core). Binding the display writes to no disk.
+    crate::hal::bind(crate::hal::DeviceClass::Display);
+    let volumes = crate::block::found_volumes();
+    let mut body = alloc::string::String::from("Volumes found (each was only read):\n");
+    if volumes.is_empty() {
+        body.push_str("  none\n");
+    }
+    for v in &volumes {
+        body.push_str("  ");
+        body.push_str(v);
+        body.push('\n');
+    }
+    crate::crash::paint_stop(
+        b"VEILOS COULD NOT FIND ITS SYSTEM VOLUME.",
+        &[
+            b"NO DISK HAS A FILESYSTEM WITH VEILOS.VOL AT ITS ROOT, SO VEILOS STOPPED HERE.",
+            b"IT HAS WRITTEN NOTHING TO ANY DISK.",
+            b"MAKE A VEILOS DISK WITH TOOLS/MKDISK.PY, OR COPY STORAGE/VEILOS.VOL TO THE ROOT",
+            b"OF THE FAT32 VOLUME VEILOS SHOULD USE. PRESS ANY KEY TO RESTART.",
+        ],
+        body.as_bytes(),
+    );
+    crate::power::wait_key_then_reset()
+}
+
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // -----| initialization |-----
     SERIAL_WRITER.lock().init();
+    take_boot_info(boot_info);
+    let boot_info: &'static BootInfo = boot_info;
     
     // Welcome message to Serial Terminal
     serial_println!("\n\n\n");
@@ -249,14 +351,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Set up IDT and Hardware Interrupts (PIC)
     interrupts::init_idt();
     unsafe { interrupts::PICS.lock().initialize() };
+    // Which lines start enabled: the timer, the keyboard and the cascade (the
+    // mouse enables IRQ 12 itself). `initialize` keeps the firmware's masks,
+    // and the I/O APIC set-up copies them: a BIOS leaves these open, but UEFI
+    // firmware masks every line, and then no timer tick or key ever arrived.
+    unsafe { interrupts::PICS.lock().write_masks(0xF8, 0xFF) };
     x86_64::instructions::interrupts::enable();
     
     // Set up Advanced Memory Management (Paging and Frame Allocation)
     use x86_64::VirtAddr;
     
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let phys_mem_offset = VirtAddr::new(
+        boot_info.physical_memory_offset.into_option().expect("the bootloader didn't map physical memory"),
+    );
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    memory::init_frame_allocator(&boot_info.memory_map);
+    memory::init_frame_allocator(&boot_info.memory_regions);
     let mut frame_allocator = memory::GlobalFrameAllocator;
     
     println!("Memory Map loaded.");
@@ -270,6 +379,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Heap is now live — safe to initialise the adaptive scheduler.
     crate::scheduler::init();
     println!("Heap Initialized with Physical RAM Paging.");
+    // Without PIT channel 2 or a CPUID rate: the TSC against the HPET.
+    crate::time::calibrate_late();
 
     // Register kernel process (PID 0) with full capabilities for system services.
     crate::process::PROCESSOR.lock().register_kernel();
@@ -282,6 +393,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Move device IRQs from the 8259 to the I/O APIC (needs the LAPIC from smp::init).
     crate::ioapic::init(&mut mapper, &mut frame_allocator);
+    // ACPI power management: FADT, \_S5, ACPI mode, the power button.
+    crate::power::init();
 
     // -----| Hardware Enumeration |-----
     vga_buffer::VGA_WRITER.lock().set_colour(
@@ -302,10 +415,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     crate::hotplug::init();
 
     // Storage first: the filesystems are needed by most of the rest of boot.
+    crate::block::mount_ram_disk();
     crate::hal::bind(crate::hal::DeviceClass::Storage);
+    // USB too before the root volume is settled: it may be on a USB stick.
+    crate::hal::bind(crate::hal::DeviceClass::SerialBus);
+    if !crate::block::root_mounted() {
+        no_system_volume();
+    }
     crate::vfs::ensure_standard_dirs();
     crate::scheduler::load_profiles();
     crate::crash::prepare();
+    if crate::block::root_on_ram_disk() {
+        crate::desktop::notify(
+            crate::desktop::NotifCategory::Warning,
+            "VEILOS",
+            "Running from memory (RAM disk): nothing you change is kept after a restart",
+        );
+    }
 
     // Phase 13: the network stack (VirtIO-net + smoltcp) starts when its NIC binds.
     crate::hal::bind(crate::hal::DeviceClass::Network);
@@ -393,6 +519,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Register Windows in WM
     crate::interrupts::init_pit();
+    crate::interrupts::check_tick_source();
     crate::ui::init_back_buffer();
 
     // Initialize Input Subsystems
@@ -499,6 +626,11 @@ async fn gui_refresh_task() {
 
     loop {
         let ms = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        // The power button: shut down, saving what power-off saves.
+        if crate::power::take_button_press() {
+            crate::serial_println!("[POWER] power button pressed");
+            crate::shell::power_off();
+        }
         diag_iters += 1;
         let mut ui_dirty = false;
         // Separate flag: only the panel clock needs repainting, not the whole scene.
@@ -920,14 +1052,6 @@ fn panic(info: &PanicInfo) -> ! {
     // Stop the other CPUs, show the crash screen, save the report (crash.rs).
     crate::crash::on_panic(info);
 
-    // Re-enable interrupts before parking. A panic can be reached with IF=0
-    // (SFMASK cleared it for a syscall, or an exception gate cleared it) —
-    // without this, the timer/mouse ISRs never fire again and the machine
-    // looks totally dead instead of "kernel panicked, but still breathing"
-    // (cursor still moves, clock still ticks), which is far easier to debug
-    // from the screen alone when serial isn't being watched live.
-    unsafe { core::arch::asm!("sti"); }
-
     // Tell the user on the screen! (best-effort: if VGA_WRITER is itself the
     // thing that was locked when we panicked, this could still hang here —
     // but the serial_println! above already got the diagnostic out.)
@@ -938,19 +1062,9 @@ fn panic(info: &PanicInfo) -> ! {
         );
     }
     println!("\n[KERNEL PANIC]\n{}", info);
+    println!("Press any key to restart.");
 
-    loop {
-        x86_64_hlt();
-    }
-}
-
-// -----| architecture utilities |-----
-
-/// Issues an x86_64 HLT instruction to halt the CPU until the next interrupt.
-/// This is preferable to a busy-loop as it reduces power consumption.
-#[inline(always)]
-fn x86_64_hlt() {
-    unsafe {
-        core::arch::asm!("hlt");
-    }
+    // The crash screen says any key restarts: poll the keyboard with
+    // interrupts off (power.rs), then reset without saving anything.
+    crate::power::wait_key_then_reset()
 }

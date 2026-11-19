@@ -259,6 +259,8 @@ fn probe_display(dev: &pci::PciDevice) -> Result<(), alloc::string::String> {
     }
 
     let fb = Framebuffer { base_addr: phys_addr as u64, width, height, stride };
+    // The boot console drew on this memory; the mode is ours now.
+    crate::vga_buffer::stop_drawing();
     fb.clear(Color { r: 20, g: 20, b: 35 });
     let mut heads = HEADS.lock();
     let x = heads.iter().map(|h| h.fb.width).sum();
@@ -272,6 +274,47 @@ fn probe_display(dev: &pci::PciDevice) -> Result<(), alloc::string::String> {
     crate::ui::set_screen_size(x + width, height);
     println!("[GRAPHICS] Manually mapped framebuffer at {:#X}", phys_addr);
     Ok(())
+}
+
+// -----| the firmware's framebuffer |-----
+
+/// Make the framebuffer the firmware (UEFI GOP, or VBE on BIOS) set up the
+/// display head, when no driver knows the adapter. The mode can't change: it
+/// is whatever the firmware chose. Only 32-bit BGRX is drawn by the desktop;
+/// anything else stays the boot console's.
+pub fn bind_firmware_framebuffer() {
+    use x86_64::structures::paging::Translate;
+    let Some(fw) = crate::vga_buffer::firmware_framebuffer() else {
+        crate::serial_println!("[GRAPHICS] no display driver and no firmware framebuffer");
+        return;
+    };
+    if fw.bytes_per_pixel != 4 || fw.pixels != crate::vga_buffer::Pixels::Bgr {
+        crate::serial_println!("[GRAPHICS] firmware framebuffer is {:?} at {} bytes/pixel: the desktop can't draw it",
+            fw.pixels, fw.bytes_per_pixel);
+        return;
+    }
+    let mapper = unsafe { crate::memory::get_mapper() };
+    let Some(phys) = mapper.translate_addr(VirtAddr::new(fw.virt)).map(|p| p.as_u64()) else {
+        crate::serial_println!("[GRAPHICS] firmware framebuffer at {:#x} isn't mapped", fw.virt);
+        return;
+    };
+    // Identity-mapped like every other head (the desktop and the crash
+    // screen draw at `base_addr`), write-combining.
+    let mut mapper = unsafe { crate::memory::get_mapper() };
+    let mut frames = crate::memory::GlobalFrameAllocator;
+    let size = (fw.byte_len as u64 + 4095) & !4095;
+    if let Err(e) = map_direct_hw(phys, size, phys, &mut mapper, &mut frames) {
+        crate::serial_println!("[GRAPHICS] firmware framebuffer at {:#x}: {}", phys, e);
+        return;
+    }
+    crate::vga_buffer::stop_drawing();
+    let fb = Framebuffer { base_addr: phys, width: fw.width, height: fw.height, stride: fw.stride };
+    fb.clear(Color { r: 20, g: 20, b: 35 });
+    let mut heads = HEADS.lock();
+    *FRAMEBUFFER.lock() = Some(fb);
+    heads.push(Head { fb, x: 0, vram_base: phys, vram_size: size as usize, location: alloc::string::String::from("firmware") });
+    crate::ui::set_screen_size(fw.width, fw.height);
+    crate::serial_println!("[GRAPHICS] firmware framebuffer {}x{} stride {} at {:#x} (fixed mode)", fw.width, fw.height, fw.stride, phys);
 }
 
 // -----| hardware security (DirectHW) |-----

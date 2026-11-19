@@ -8,10 +8,14 @@ build-std-features = ["compiler-builtins-mem"]
 
 # -----| target runner (QEMU) |-----
 [target.'cfg(target_os = "none")']
-runner = "bootimage runner"
+# Disk images: tools/build.sh (bootloader 0.11, tools/mkimage).
 rustflags = [
     "-C", "relocation-model=static",
     "-C", "link-arg=--omagic",
+    # The top 2 GiB (the target's "kernel" code model): bootloader 0.11 identity-maps
+    # pages of low physical memory (its GDT) in the kernel's tables, which collided
+    # with the image at lld's default base of 2 MiB on UEFI machines.
+    "-C", "link-arg=--image-base=0xffffffff80000000",
     # Disable CPU features that cause SIMD intrinsics the bare-metal target can't lower.
     "-C", "target-feature=-sse4.1,-sse4.2,-avx,-avx2,-aes,-pclmulqdq,-sha",
     "-C", "no-redzone",

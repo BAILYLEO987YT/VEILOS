@@ -65,8 +65,80 @@ Initializing AHCI controller at {}:{}:{}...", dev.bus, dev.device, dev.function)
     println!("  -> ABAR mapped at {:#010X}", virt_addr.as_u64());
 
     let hba_mem = unsafe { &mut *(virt_addr.as_mut_ptr::<HbaMemory>()) };
+    take_ownership(hba_mem);
     reinit_ports(hba_mem, crate::memory::get_phys_mem_offset());
     Ok(())
+}
+
+// Capability bits (CAP, CAP2, GHC, BOHC) and port registers used below.
+const CAP_S64A: u32 = 1 << 31; // 64-bit DMA addresses
+const CAP_SSS: u32 = 1 << 27;  // staggered spin-up: ports start powered down
+const CAP2_BOH: u32 = 1 << 0;  // BIOS/OS handoff
+const GHC_AE: u32 = 1 << 31;   // AHCI enable
+const BOHC_BOS: u32 = 1 << 0;  // BIOS owns the controller
+const BOHC_OOS: u32 = 1 << 1;  // OS wants it
+const BOHC_BB: u32 = 1 << 4;   // BIOS busy
+const PXCMD_SUD: u32 = 1 << 1; // spin up device
+const PXCMD_ICC_ACTIVE: u32 = 1 << 28;
+const SIG_ATA: u32 = 0x0000_0101;
+
+/// Before touching the ports, as on a real PC: AHCI mode on (the controller
+/// may also speak legacy IDE), and the controller taken from the firmware
+/// (BIOS/OS handoff: firmware with SMM SATA code keeps using it until
+/// asked). QEMU needs neither; real chipsets can. All DMA memory comes from
+/// below 4 GiB (memory::DMA_LIMIT), so controllers without 64-bit
+/// addressing are fine.
+fn take_ownership(hba: &mut HbaMemory) {
+    let cap = hba.capability.read();
+    let ghc = hba.global_host_control.read();
+    if ghc & GHC_AE == 0 {
+        hba.global_host_control.write(ghc | GHC_AE);
+    }
+    if hba.capability2.read() & CAP2_BOH != 0 {
+        let bohc = hba.bohc.read();
+        if bohc & BOHC_BOS != 0 {
+            hba.bohc.write(bohc | BOHC_OOS);
+            // The firmware gets 25 ms to let go, 2 s more if it says it's busy.
+            let mut released = crate::time::spin_until(25_000, || hba.bohc.read() & BOHC_BOS == 0);
+            if !released && hba.bohc.read() & BOHC_BB != 0 {
+                released = crate::time::spin_until(2_000_000, || hba.bohc.read() & BOHC_BOS == 0);
+            }
+            crate::serial_println!("[AHCI] BIOS/OS handoff: {}", if released { "the firmware let go" } else { "WARN: the firmware kept it" });
+        }
+    }
+    crate::serial_println!(
+        "[AHCI] CAP {:#010x}: {} command slots, {} ports, 64-bit DMA {}, staggered spin-up {}",
+        cap, ((cap >> 8) & 0x1F) + 1, (cap & 0x1F) + 1,
+        cap & CAP_S64A != 0, cap & CAP_SSS != 0
+    );
+}
+
+/// Bring a port's link up if it isn't: spin the device up (staggered
+/// spin-up), then a COMRESET if a device is there but the link isn't
+/// established. Returns DET (3: device present and link up).
+fn bring_up_link(port: &mut HbaPort, sss: bool) -> u32 {
+    let det = |p: &HbaPort| p.sata_status.read() & 0x0F;
+    if det(port) == 3 {
+        return 3;
+    }
+    if sss && port.command_and_status.read() & PXCMD_SUD == 0 {
+        let cmd = port.command_and_status.read();
+        port.command_and_status.write(cmd | PXCMD_SUD);
+        crate::time::spin_until(10_000, || det(port) == 3);
+    }
+    if det(port) == 1 || (sss && det(port) != 3) {
+        // COMRESET: DET=1 in SControl for at least 1 ms, then back to 0.
+        let sctl = port.sata_control.read() & !0x0F;
+        port.sata_control.write(sctl | 1);
+        crate::time::delay_ms(2);
+        port.sata_control.write(sctl);
+        // A device shows up within a few ms; then the link takes up to 1 s.
+        if crate::time::spin_until(50_000, || det(port) != 0) {
+            crate::time::spin_until(1_000_000, || det(port) == 3);
+        }
+        port.sata_error.write(0xFFFF_FFFF);
+    }
+    det(port)
 }
 
 fn reinit_ports(
@@ -74,16 +146,27 @@ fn reinit_ports(
     physical_memory_offset: VirtAddr,
 ) {
     let ports_implemented = hba_mem.ports_implemented.read();
+    let sss = hba_mem.capability.read() & CAP_SSS != 0;
     for i in 0..32 {
         if (ports_implemented & (1 << i)) != 0 {
             let port = &mut hba_mem.ports[i];
-            let status = port.sata_status.read();
-            let det = status & 0x0F;
-            let ipm = (status >> 8) & 0x0F;
-
-            if det == 0x03 && ipm == 0x01 {
-                setup_port(port, i, physical_memory_offset);
+            if bring_up_link(port, sss) != 3 {
+                continue;
             }
+            // Asleep (partial or slumber) after the firmware: wake the link.
+            if (port.sata_status.read() >> 8) & 0x0F != 1 {
+                let cmd = port.command_and_status.read() & !(0xF << 28);
+                port.command_and_status.write(cmd | PXCMD_ICC_ACTIVE);
+                crate::time::spin_until(10_000, || (port.sata_status.read() >> 8) & 0x0F == 1);
+            }
+            // Only disks: an optical drive (ATAPI), port multiplier or
+            // enclosure answers IDENTIFY DEVICE with an error.
+            let sig = port.signature.read();
+            if sig != SIG_ATA && sig != 0xFFFF_FFFF {
+                crate::serial_println!("[AHCI] Port {}: signature {:#010x} is not a disk; skipped", i, sig);
+                continue;
+            }
+            setup_port(port, i, physical_memory_offset);
         }
     }
 }
@@ -129,6 +212,11 @@ fn setup_port(
 
     port.interrupt_status.write(0xFFFF_FFFF);
     port.sata_error.write(0xFFFF_FFFF);
+    // The device may still be busy from power-on or the COMRESET (BSY, DRQ
+    // in the task file): a command issued now would be lost.
+    if !crate::time::spin_until(2_000_000, || port.task_file_data.read() & 0x88 == 0) {
+        crate::serial_println!("[AHCI] Port {}: device still busy (TFD {:#x}); trying anyway", port_num, port.task_file_data.read());
+    }
     if !port.start() {
         crate::serial_println!("[AHCI] Port {}: start() failed — skipping port setup.", port_num);
         return;
@@ -162,8 +250,12 @@ fn setup_port(
         // and stop probing once anything was mounted, so a second partition
         // or disk was never seen.
         let port_static: &'static mut HbaPort = unsafe { &mut *(port as *mut HbaPort) };
-        match crate::block::Disk::new(port_static, port_num, sectors) {
-            Some(disk) => crate::block::mount_disk(disk),
+        match crate::block::AhciTransport::new(port_static) {
+            Some(t) => crate::block::mount_disk(crate::block::Disk::new(
+                alloc::boxed::Box::new(t),
+                alloc::format!("d{}", port_num),
+                sectors,
+            )),
             None => crate::serial_println!("[AHCI] Port {}: no DMA memory for the disk buffer.", port_num),
         }
     }

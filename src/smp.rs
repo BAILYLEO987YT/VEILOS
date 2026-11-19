@@ -60,7 +60,55 @@ pub static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 pub static LAPIC_BASE: AtomicU32 = AtomicU32::new(0);
 
 /// Bitmask: bit N is set when CPU N has completed its AP startup sequence.
-pub static CPU_ONLINE: AtomicU32 = AtomicU32::new(1); // BSP (core 0) always online
+pub static CPU_ONLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1); // BSP (core 0) always online
+
+/// The local APICs run in x2APIC mode: registers are MSRs (0x800 + offset/16)
+/// rather than MMIO, IDs are 32-bit, and the ICR is one 64-bit MSR. Set when
+/// the firmware handed over in that mode (it must be kept: going back to
+/// xAPIC means disabling the APIC), or when an APIC ID doesn't fit in 8 bits.
+static X2APIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+const IA32_APIC_BASE: u32 = 0x1B;
+const APIC_BASE_EXTD: u64 = 1 << 10; // x2APIC mode
+const APIC_BASE_EN: u64 = 1 << 11;   // APIC global enable
+const X2APIC_MSR_BASE: u32 = 0x800;
+const X2APIC_ICR: u32 = 0x830;
+
+pub fn x2apic() -> bool {
+    X2APIC.load(Ordering::Relaxed)
+}
+
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe { core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nostack, preserves_flags)) };
+    (hi as u64) << 32 | lo as u64
+}
+
+unsafe fn wrmsr(msr: u32, value: u64) {
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags))
+    };
+}
+
+/// CPUID.1:ECX[21]: the CPU has x2APIC mode.
+fn x2apic_supported() -> bool {
+    unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 21) != 0
+}
+
+/// Put this CPU's APIC in x2APIC mode if the system runs in it (APs the
+/// firmware left in xAPIC mode, when VEILOS switched the BSP itself).
+fn enter_x2apic_if_needed() {
+    if !x2apic() {
+        return;
+    }
+    unsafe {
+        let base = rdmsr(IA32_APIC_BASE);
+        if base & APIC_BASE_EXTD == 0 {
+            wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+        }
+    }
+}
 
 // ── Per-CPU data ───────────────────────────────────────────────────────
 //
@@ -78,7 +126,10 @@ pub static CPU_ONLINE: AtomicU32 = AtomicU32::new(1); // BSP (core 0) always onl
 // overwrite the frames `return_from_usermode()` later jumps back into.
 
 pub const SYSCALL_STACK_SIZE: usize = 4096 * 16;   // 64 KiB per CPU
-pub const MAX_CPUS:           usize = 8;            // supports up to 8-way SMP
+/// CPUs VEILOS starts. Each has static per-CPU state (syscall, IST and RSP0
+/// stacks: about 144 KiB), so this is the kernel image's bss as much as a
+/// limit. More than this are left halted, with a log line.
+pub const MAX_CPUS:           usize = 64;
 
 /// Size of each AP's boot/idle stack (heap-allocated in `init`).
 const AP_BOOT_STACK_SIZE: usize = 4096 * 16;
@@ -117,9 +168,9 @@ static SYSCALL_STACKS: StackTable = StackTable(core::cell::UnsafeCell::new(
     [const { SyscallStack([0u8; SYSCALL_STACK_SIZE]) }; MAX_CPUS]
 ));
 
-/// APIC ID → CPU index. 0xFF = unknown. APIC IDs are not dense on real
-/// hardware (e.g. 0, 2, 4, ... or > MAX_CPUS), so they can't index tables
-/// directly.
+/// APIC ID → CPU index for IDs below 256. 0xFF = unknown. APIC IDs are not
+/// dense on real hardware (e.g. 0, 2, 4, ... or > MAX_CPUS), so they can't
+/// index tables directly. Larger (x2APIC) IDs are looked up in `PERCPU`.
 static APIC_TO_CPU: [core::sync::atomic::AtomicU8; 256] =
     [const { core::sync::atomic::AtomicU8::new(0xFF) }; 256];
 
@@ -169,7 +220,9 @@ pub fn init_percpu(cpu_index: usize) {
         (*p).cpu_index  = cpu_index as u64;
         (*p).apic_id    = apic_id as u64;
     }
-    APIC_TO_CPU[(apic_id & 0xFF) as usize].store(cpu_index as u8, Ordering::Release);
+    if apic_id < 256 {
+        APIC_TO_CPU[apic_id as usize].store(cpu_index as u8, Ordering::Release);
+    }
     write_kernel_gs_base(p as u64);
     crate::serial_println!(
         "[SMP] CPU {} (APIC ID {}) per-CPU block at {:#x}, syscall stack top {:#x}",
@@ -359,8 +412,15 @@ pub fn reset_kernel_gs_base() {
 /// including interrupt handlers that interrupted ring 3.
 #[inline]
 pub fn cpu_index() -> usize {
-    let idx = APIC_TO_CPU[(current_apic_id() & 0xFF) as usize].load(Ordering::Relaxed);
-    if idx == 0xFF { 0 } else { idx as usize }
+    let id = current_apic_id();
+    if id < 256 {
+        let idx = APIC_TO_CPU[id as usize].load(Ordering::Relaxed);
+        return if idx == 0xFF { 0 } else { idx as usize };
+    }
+    let online = CPU_ONLINE.load(Ordering::Acquire);
+    (0..MAX_CPUS)
+        .find(|&c| online & (1 << c) != 0 && unsafe { (*percpu_ptr(c)).apic_id } == id as u64)
+        .unwrap_or(0)
 }
 
 /// User RSP of the syscall currently executing on this CPU.
@@ -370,18 +430,49 @@ pub fn current_syscall_user_rsp() -> u64 {
 
 // ── LAPIC access ──────────────────────────────────────────────────────
 
-/// Read a 32-bit LAPIC register at `offset` bytes from the LAPIC base.
+/// Read a 32-bit LAPIC register at `offset` bytes from the LAPIC base (in
+/// x2APIC mode, its MSR).
 #[inline(always)]
 unsafe fn lapic_read(offset: usize) -> u32 {
+    if x2apic() {
+        return unsafe { rdmsr(X2APIC_MSR_BASE + (offset >> 4) as u32) } as u32;
+    }
     let base = LAPIC_BASE.load(Ordering::Relaxed) as usize;
     unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
 }
 
-/// Write a 32-bit value to a LAPIC register.
+/// Write a 32-bit value to a LAPIC register. Not for the ICR: `send_icr`.
 #[inline(always)]
 unsafe fn lapic_write(offset: usize, val: u32) {
+    if x2apic() {
+        unsafe { wrmsr(X2APIC_MSR_BASE + (offset >> 4) as u32, val as u64) };
+        return;
+    }
     let base = LAPIC_BASE.load(Ordering::Relaxed) as usize;
     unsafe { core::ptr::write_volatile((base + offset) as *mut u32, val); }
+}
+
+/// Send an IPI: `low` is the ICR's low word (vector, delivery mode,
+/// shorthand), `dest` the target APIC ID. xAPIC: two MMIO writes, then wait
+/// (bounded) for Delivery Status to clear. x2APIC: one MSR write, no status.
+unsafe fn send_icr(dest: u32, low: u32) -> bool {
+    if x2apic() {
+        unsafe { wrmsr(X2APIC_ICR, (dest as u64) << 32 | low as u64) };
+        return true;
+    }
+    unsafe {
+        lapic_write(LAPIC_ICR_HIGH, (dest & 0xFF) << 24);
+        lapic_write(LAPIC_ICR_LOW, low);
+    }
+    let mut spins = 0u32;
+    while unsafe { lapic_read(LAPIC_ICR_LOW) } & (1 << 12) != 0 {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins >= 1_000_000 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Read the APIC ID from CPUID leaf 1, EBX[31:24].
@@ -405,10 +496,13 @@ fn cpuid_apic_id() -> u32 {
     (result >> 24) & 0xFF
 }
 
-/// Read the current CPU's APIC ID from LAPIC register 0x20.
+/// Read the current CPU's APIC ID from LAPIC register 0x20 (all 32 bits in
+/// x2APIC mode, the top 8 in xAPIC mode).
 #[inline(always)]
 pub fn current_apic_id() -> u32 {
-    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+    if x2apic() {
+        unsafe { lapic_read(LAPIC_ID) }
+    } else if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
         cpuid_apic_id()
     } else {
         unsafe { lapic_read(LAPIC_ID) >> 24 }
@@ -464,20 +558,9 @@ fn calibrate_lapic_timer() {
 
 /// Send a write to LAPIC ICR.  Waits for the Delivery Status bit to clear
 /// (i.e. the IPI has been accepted by the bus) before returning.
-unsafe fn lapic_send_ipi(apic_id: u8, delivery: u32) {
-    unsafe {
-        lapic_write(LAPIC_ICR_HIGH, (apic_id as u32) << 24);
-        lapic_write(LAPIC_ICR_LOW,  delivery);
-        // Spin until Delivery Status (bit 12) clears.
-        let mut timeout = 1_000_000u32;
-        while (lapic_read(LAPIC_ICR_LOW) & (1 << 12)) != 0 {
-            core::hint::spin_loop();
-            timeout -= 1;
-            if timeout == 0 {
-                crate::serial_println!("[SMP] IPI delivery timeout for APIC ID {}", apic_id);
-                break;
-            }
-        }
+unsafe fn lapic_send_ipi(apic_id: u32, delivery: u32) {
+    if !unsafe { send_icr(apic_id, delivery) } {
+        crate::serial_println!("[SMP] IPI delivery timeout for APIC ID {}", apic_id);
     }
 }
 
@@ -580,18 +663,15 @@ const AP_TRAMPOLINE_PHYS: u64 = 0x8000;
 const AP_TR_PARAMS_OFF: u64 = 0x0C0;
 
 /// Copy the trampoline blob to its fixed physical address and identity-map the page.
+/// The copy goes through the physical-memory map: low memory isn't
+/// identity-mapped until the page is mapped below (bootloader 0.11 maps
+/// nothing there; 0.9 did). The bootloader leaves the first MiB alone for
+/// exactly this (SIPI), and memory.rs never hands it out.
 fn install_ap_trampoline(mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+    let copy = (crate::memory::get_phys_mem_offset().as_u64() + AP_TRAMPOLINE_PHYS) as *mut u8;
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            AP_TRAMPOLINE_BYTES.as_ptr(),
-            AP_TRAMPOLINE_PHYS as *mut u8,
-            AP_TRAMPOLINE_BYTES.len(),
-        );
-        core::ptr::write_bytes(
-            (AP_TRAMPOLINE_PHYS as *mut u8).add(AP_TRAMPOLINE_BYTES.len()),
-            0u8,
-            AP_TRAMPOLINE_SIZE - AP_TRAMPOLINE_BYTES.len(),
-        );
+        core::ptr::copy_nonoverlapping(AP_TRAMPOLINE_BYTES.as_ptr(), copy, AP_TRAMPOLINE_BYTES.len());
+        core::ptr::write_bytes(copy.add(AP_TRAMPOLINE_BYTES.len()), 0u8, AP_TRAMPOLINE_SIZE - AP_TRAMPOLINE_BYTES.len());
     }
 
     let page  = Page::<Size4KiB>::containing_address(VirtAddr::new(AP_TRAMPOLINE_PHYS));
@@ -637,6 +717,12 @@ fn write_ap_params(cpu_index: u32, stack_top: u64) {
 /// When this is detected, the 16-bit AP real-mode trampoline cannot be used
 /// because WHPX does not support executing 16-bit guest code.
 fn running_under_hyper_v() -> bool {
+    // Leaf 0x40000000 means something only when CPUID.1:ECX[31] says a
+    // hypervisor is present; on bare metal it returns whatever the CPU
+    // returns for leaves past its last one.
+    if unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 31) == 0 {
+        return false;
+    }
     let ebx: u32;
     let ecx: u32;
     let edx: u32;
@@ -713,8 +799,8 @@ pub struct MadtOverride {
 
 /// What the kernel uses from the MADT.
 pub struct Madt {
-    /// APIC ID of every enabled processor.
-    pub apic_ids:  alloc::vec::Vec<u8>,
+    /// APIC ID of every enabled processor (MADT types 0 and 9).
+    pub apic_ids:  alloc::vec::Vec<u32>,
     pub ioapics:   alloc::vec::Vec<MadtIoApic>,
     pub overrides: alloc::vec::Vec<MadtOverride>,
 }
@@ -732,12 +818,25 @@ unsafe fn read_phys_bytes(phys_addr: u64, len: usize) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(virt as *const u8, len) }
 }
 
+static RSDP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The RSDP the bootloader found (main.rs, from BootInfo).
+pub fn set_rsdp(phys: u64) {
+    RSDP.store(phys, core::sync::atomic::Ordering::Release);
+}
+
 /// Locate the RSDP by scanning the two regions the ACPI spec guarantees it
 /// lives in on a BIOS boot: the first 1 KiB of the Extended BIOS Data Area,
 /// and the BIOS read-only memory space 0xE0000–0xFFFFF. Both are scanned on
 /// 16-byte boundaries for the 8-byte signature "RSD PTR ".
 fn find_rsdp() -> Option<u64> {
     const SIG: &[u8; 8] = b"RSD PTR ";
+    // The bootloader's, when it has one: on UEFI the RSDP is found through
+    // the firmware's configuration table, and there is no EBDA to scan.
+    match RSDP.load(core::sync::atomic::Ordering::Acquire) {
+        0 => {}
+        addr => return Some(addr),
+    }
 
     let checksum_ok = |addr: u64, len: usize| -> bool {
         let bytes = unsafe { read_phys_bytes(addr, len) };
@@ -765,10 +864,9 @@ fn find_rsdp() -> Option<u64> {
     scan(0xE0000, 0x100000)
 }
 
-/// Parse the MADT (signature "APIC") reachable from the RSDP: the APIC ID of
-/// every enabled processor, plus the I/O APICs and ISA interrupt overrides.
-/// Returns `None` if there is no MADT or it lists no enabled processor.
-pub fn parse_madt() -> Option<Madt> {
+/// The physical address of the ACPI table with signature `sig` ("APIC",
+/// "FACP", ...), found through the RSDP's XSDT or RSDT.
+pub fn acpi_table(sig: &[u8; 4]) -> Option<u64> {
     let rsdp_addr = find_rsdp()?;
 
     let revision: u8 = unsafe { read_phys(rsdp_addr + 15) };
@@ -793,7 +891,7 @@ pub fn parse_madt() -> Option<Madt> {
     if (sdt_len as usize) < 36 { return None; }
     let entry_count = (sdt_len as usize - 36) / entry_size;
 
-    let mut madt_addr: Option<u64> = None;
+    let mut found: Option<u64> = None;
     for i in 0..entry_count {
         let ptr_addr = sdt_addr + 36 + (i * entry_size) as u64;
         let table_addr: u64 = if is_xsdt {
@@ -802,13 +900,19 @@ pub fn parse_madt() -> Option<Madt> {
             unsafe { read_phys::<u32>(ptr_addr) as u64 }
         };
         if table_addr == 0 { continue; }
-        let sig = unsafe { read_phys_bytes(table_addr, 4) };
-        if sig == b"APIC" {
-            madt_addr = Some(table_addr);
+        if unsafe { read_phys_bytes(table_addr, 4) } == sig {
+            found = Some(table_addr);
             break;
         }
     }
-    let madt_addr = madt_addr?;
+    found
+}
+
+/// Parse the MADT (signature "APIC") reachable from the RSDP: the APIC ID of
+/// every enabled processor, plus the I/O APICs and ISA interrupt overrides.
+/// Returns `None` if there is no MADT or it lists no enabled processor.
+pub fn parse_madt() -> Option<Madt> {
+    let madt_addr = acpi_table(b"APIC")?;
 
     let madt_len: u32 = unsafe { read_phys(madt_addr + 4) };
     if (madt_len as usize) < 44 { return None; }
@@ -829,7 +933,16 @@ pub fn parse_madt() -> Option<Madt> {
             let apic_id: u8 = unsafe { read_phys(offset + 3) };
             let flags: u32  = unsafe { read_phys(offset + 4) };
             const ENABLED: u32 = 1 << 0;
-            if flags & ENABLED != 0 {
+            if flags & ENABLED != 0 && !apic_ids.contains(&(apic_id as u32)) {
+                apic_ids.push(apic_id as u32);
+            }
+        } else if entry_type == 9 && entry_len as u64 >= 16 {
+            // Processor Local x2APIC: reserved[2] x2apic_id[4] flags[4]
+            // acpi_uid[4]. Firmware lists CPUs whose IDs don't fit in 8 bits
+            // here (and, on some machines, every CPU).
+            let apic_id: u32 = unsafe { read_phys(offset + 4) };
+            let flags: u32   = unsafe { read_phys(offset + 8) };
+            if flags & 1 != 0 && !apic_ids.contains(&apic_id) {
                 apic_ids.push(apic_id);
             }
         } else if entry_type == 1 && entry_len as u64 >= 12 {
@@ -848,8 +961,8 @@ pub fn parse_madt() -> Option<Madt> {
                 flags:  unsafe { read_phys(offset + 8) },
             });
         }
-        // Type 9 (Local x2APIC) exists for >255 CPUs; out of scope for the
-        // MAX_CPUS=8 cap this kernel currently supports.
+        // Types 4 and 10 (LINT NMI wiring, xAPIC and x2APIC) aren't used:
+        // the LINT pins keep the firmware's setup.
 
         offset += entry_len as u64;
     }
@@ -880,7 +993,7 @@ fn least_loaded_ap(cpu: usize) -> bool {
     let online = CPU_ONLINE.load(Ordering::Acquire);
     let mine = USER_THREADS[cpu].load(Ordering::Acquire);
     (1..MAX_CPUS)
-        .filter(|&c| online & (1 << c) != 0)
+        .filter(|&c| online & (1u64 << c) != 0)
         .all(|c| USER_THREADS[c].load(Ordering::Acquire) >= mine)
 }
 
@@ -935,13 +1048,7 @@ pub fn wake_aps() {
     // level assert, fixed delivery.
     let icr = 0x000C_4000 | crate::interrupts::AP_TIMER_VECTOR as u32;
     x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        lapic_write(LAPIC_ICR_HIGH, 0);
-        lapic_write(LAPIC_ICR_LOW, icr);
-        let mut spins = 0u32;
-        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 && spins < 100_000 {
-            core::hint::spin_loop();
-            spins += 1;
-        }
+        send_icr(0, icr);
     });
 }
 
@@ -953,13 +1060,7 @@ pub fn stop_others() {
     }
     // ICR: "all excluding self", level assert, NMI delivery (100b).
     unsafe {
-        lapic_write(LAPIC_ICR_HIGH, 0);
-        lapic_write(LAPIC_ICR_LOW, 0x000C_4400);
-        let mut spins = 0u32;
-        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 && spins < 100_000 {
-            core::hint::spin_loop();
-            spins += 1;
-        }
+        send_icr(0, 0x000C_4400);
     }
     // Let them reach the handler before anything they hold is taken.
     for _ in 0..2_000_000 {
@@ -980,6 +1081,9 @@ pub fn stop_others() {
 /// predictable calling convention when invoked from inline asm.
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry(cpu_index: u32) -> ! {
+    // 0. The same APIC mode as the BSP, before anything reads the APIC ID.
+    enter_x2apic_if_needed();
+
     // 1. Load this AP's own GDT + TSS (unique stacks per CPU).
     //    init_ap() also calls init_percpu(cpu_index) internally.
     crate::gdt::init_ap(cpu_index as usize);
@@ -1009,7 +1113,7 @@ pub extern "C" fn ap_entry(cpu_index: u32) -> ! {
     crate::interrupts::init_syscall_ap();
 
     // 5. Mark this CPU as online.
-    CPU_ONLINE.fetch_or(1 << cpu_index, Ordering::Release);
+    CPU_ONLINE.fetch_or(1u64 << cpu_index, Ordering::Release);
     crate::serial_println!("[SMP] CPU {} online (APIC ID {})", cpu_index, current_apic_id());
 
     // 6. Enable interrupts and park — the scheduler will give this core work.
@@ -1041,19 +1145,40 @@ pub fn init(
     // which is why this previously reported "1 CPU" even when more were
     // requested on the command line.
     let madt = parse_madt();
-    let (cpu_count, apic_ids): (u32, alloc::vec::Vec<u8>) = match &madt {
+    let (cpu_count, apic_ids): (u32, alloc::vec::Vec<u32>) = match &madt {
         Some(m) => {
             let n = (m.apic_ids.len() as u32).min(MAX_CPUS as u32);
             crate::serial_println!("[SMP] MADT reports {} enabled processor(s): {:?}", m.apic_ids.len(), m.apic_ids);
+            if m.apic_ids.len() > MAX_CPUS {
+                crate::serial_println!("[SMP] only the first {} are started (MAX_CPUS)", MAX_CPUS);
+            }
             (n, m.apic_ids.clone())
         }
         None => {
             let n = cpuid_logical_cpu_count();
             crate::serial_println!("[SMP] MADT not found/parseable — falling back to CPUID leaf 1 ({})", n);
             // Fallback assumes the common QEMU layout: sequential APIC IDs 0..N-1.
-            (n, (0..n as u8).collect())
+            (n, (0..n).collect())
         }
     };
+
+    // x2APIC: keep it if the firmware handed over in it (leaving it means
+    // disabling the APIC); switch to it if an APIC ID doesn't fit in 8 bits.
+    // VEILOS_X2APIC=1 at build time switches anyway, for testing on machines
+    // whose firmware stays in xAPIC mode.
+    let apic_base = unsafe { rdmsr(IA32_APIC_BASE) };
+    let wide_ids = apic_ids.iter().any(|&id| id >= 255);
+    let forced = option_env!("VEILOS_X2APIC") == Some("1");
+    if apic_base & APIC_BASE_EXTD != 0 {
+        X2APIC.store(true, Ordering::Release);
+        crate::serial_println!("[SMP] the firmware left the APICs in x2APIC mode: using it");
+    } else if (wide_ids || forced) && x2apic_supported() {
+        X2APIC.store(true, Ordering::Release);
+        enter_x2apic_if_needed();
+        crate::serial_println!("[SMP] x2APIC mode on ({})", if wide_ids { "APIC IDs above 254" } else { "VEILOS_X2APIC" });
+    } else if wide_ids {
+        crate::serial_println!("[SMP] WARN: APIC IDs above 254 but no x2APIC: those CPUs can't be reached");
+    }
 
     crate::serial_println!("[SMP] LAPIC phys base: {:#012x}", lapic_phys);
     crate::serial_println!("[SMP] Logical CPU count: {}", cpu_count);
@@ -1062,7 +1187,8 @@ pub fn init(
     CPU_COUNT.store(cpu_count, Ordering::Release);
 
     // ── 2. Map the LAPIC page ─────────────────────────────────────────────
-    // The LAPIC is MMIO — it must be mapped as uncacheable (NO_CACHE).
+    // The LAPIC is MMIO — it must be mapped as uncacheable (NO_CACHE). In
+    // x2APIC mode it isn't used, but LAPIC_BASE still says "set up".
     let lapic_virt = lapic_phys; // identity map for simplicity
     let flags = PageTableFlags::PRESENT
               | PageTableFlags::WRITABLE
@@ -1140,7 +1266,8 @@ pub fn init(
 
     let mut cpu_index: u32 = 0;
     for &ap_apic_id in apic_ids.iter() {
-        if ap_apic_id == bsp_apic_id as u8 { continue; }
+        if ap_apic_id == bsp_apic_id { continue; }
+        if !x2apic() && ap_apic_id > 255 { continue; }
         cpu_index += 1;
         if cpu_index >= cpu_count { break; }
 
@@ -1180,7 +1307,7 @@ pub fn init(
 
         // ── 6. Wait for AP to come online (200 ms timeout) ────────────────
         let online = crate::time::spin_until(200_000, || {
-            CPU_ONLINE.load(Ordering::Acquire) & (1 << cpu_index) != 0
+            CPU_ONLINE.load(Ordering::Acquire) & (1u64 << cpu_index) != 0
         });
         if !online {
             crate::serial_println!(
@@ -1195,7 +1322,22 @@ pub fn init(
 
     let online = CPU_ONLINE.load(Ordering::Acquire).count_ones();
     crate::println!("[SMP] {}/{} CPUs online.", online, cpu_count);
-    crate::serial_println!("[SMP] init complete. Online mask: {:#010b}", CPU_ONLINE.load(Ordering::Acquire));
+    crate::serial_println!("[SMP] init complete. Online mask: {:#010b}{}", CPU_ONLINE.load(Ordering::Acquire),
+        if x2apic() { " (x2APIC)" } else { "" });
+}
+
+/// The BSP's 1 ms tick from its LAPIC timer, on the PIT's vector 32
+/// (interrupts::check_tick_source). False if the LAPIC isn't set up.
+pub fn start_bsp_tick() -> bool {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    unsafe {
+        lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_DIVIDE_16);
+        lapic_write(LAPIC_TIMER_LVT, 0x20000 | crate::interrupts::InterruptIndex::Timer as u32); // periodic
+        lapic_write(LAPIC_TIMER_INITIAL, lapic_timer_ticks_per_ms());
+    }
+    true
 }
 
 /// Send an EOI to the LAPIC on the current CPU.

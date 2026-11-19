@@ -2,7 +2,7 @@
 #
 # The disk is in %LOCALAPPDATA%\VEILOS: those programs and the sign-in stay
 # out of the repository (and out of OneDrive). What changes on it persists.
-# The kernel is this repository's latest `cargo bootimage`.
+# The kernel is this repository's latest `sh tools/build.sh` (the BIOS image).
 #
 #   powershell -ExecutionPolicy Bypass -File tools\run_claude.ps1
 #
@@ -12,7 +12,7 @@ param([int]$Cpus = 4, [string]$Ram = '4G')
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
-$boot = Join-Path $repo 'target\x86_64-unknown-none\debug\bootimage-VEIL-OS.bin'
+$boot = Join-Path $repo 'target\x86_64-unknown-none\debug\veilos-bios.img'
 $dir  = Join-Path $env:LOCALAPPDATA 'VEILOS'
 # The development disk (also the Rust toolchain, the crate registry and a
 # clone of this repository at C:\src\veilos), else the older one without them.
@@ -21,8 +21,11 @@ if (-not (Test-Path $disk)) { $disk = Join-Path $dir 'claude-disk.img' }
 $log  = Join-Path $dir 'serial.log'
 $qemu = 'C:\Program Files\qemu\qemu-system-x86_64.exe'
 
-if (-not (Test-Path $boot)) { throw "No kernel at $boot. Run: cargo bootimage" }
+if (-not (Test-Path $boot)) { throw "No kernel at $boot. Run: sh tools/build.sh" }
 if (-not (Test-Path $disk)) { throw "No disk at $disk." }
+# Disks made before VEILOS needed its volume marker (src/block.rs) get it now.
+& python (Join-Path $PSScriptRoot 'addmarker.py') $disk
+if ($LASTEXITCODE -ne 0) { throw "Couldn't add VEILOS.VOL to $disk." }
 if (-not (Test-Path $qemu)) { throw "QEMU isn't at $qemu." }
 
 $qargs = @(
@@ -31,7 +34,7 @@ $qargs = @(
     '-serial', "file:`"$log`"",
     '-display', 'sdl',
     '-monitor', 'tcp:127.0.0.1:4566,server,nowait',
-    '-vga', 'none', '-device', 'bochs-display',
+    '-vga', 'std',
     '-drive', "id=disk,file=`"$disk`",if=none,format=raw",
     '-device', 'ide-hd,drive=disk,bus=ide.1',
     '-netdev', 'user,id=net0', '-device', 'virtio-net-pci,netdev=net0',

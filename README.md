@@ -42,7 +42,7 @@ VEILOS can currently do the following, in QEMU:
 | **Hardware** | SATA (AHCI) with GPT/MBR, FAT32 read/write, NTFS and exFAT read-only, virtio-net (with NIC bonding), Intel HD Audio, PCIe hot-plug |
 | **Networking** | DHCP, TCP/UDP, DNS and TLS |
 
-It cannot yet run on real hardware. The main gaps are UEFI boot, USB, NVMe, a real network card driver, ACPI power control, an installer, a crash-safe filesystem and a web browser. [V1_CHECKLIST.md](V1_CHECKLIST.md) tracks every item with its status.
+It hasn't run on real hardware yet. It now boots on BIOS and UEFI, from one disk or a USB stick, with USB keyboards and mice; the main gaps are NVMe, a real network card driver, ACPI power-off, an installer, a crash-safe filesystem and a web browser. [V1_CHECKLIST.md](V1_CHECKLIST.md) tracks every item with its status.
 
 Some modules are scaffolds, not finished features. These include the native app format, parts of Cluster Mode and the hypervisor and anti-cheat support. The audit notes ([AUDIT_2026-10.md](AUDIT_2026-10.md)) say honestly which pieces are real and which are not.
 
@@ -51,22 +51,29 @@ Some modules are scaffolds, not finished features. These include the native app 
 You'll need:
 
 - **Rust nightly** with `rust-src` and `llvm-tools-preview`. [`rust-toolchain.toml`](rust-toolchain.toml) installs it automatically through `rustup`. CI pins `nightly-2026-05-11`; see [`release.yml`](.github/workflows/release.yml).
-- **[`bootimage`](https://github.com/rust-osdev/bootimage):** `cargo install bootimage --locked`
+- **A second, newer nightly for the boot image builder** (`tools/mkimage`, bootloader 0.11): `rustup toolchain install nightly-2026-11-01 --component rust-src,llvm-tools-preview`. The bootloader's own stages need nightly-2026-07-10 or later; `MKIMAGE_TOOLCHAIN` picks another.
 - **QEMU** (`qemu-system-x86_64`)
 - **Python 3**, used by the disk-image tools
 
 ```bash
 # Build the kernel and boot it in QEMU (reads the disk from ./storage)
-cargo run
+sh tools/run.sh            # BIOS (SeaBIOS)
+sh tools/run.sh --uefi     # UEFI (QEMU's OVMF)
 
-# Build the bootable image only
-cargo bootimage
+# Build the boot images only: target/x86_64-unknown-none/debug/veilos-{bios,uefi}.img
+sh tools/build.sh
+
+# One bootable disk (bootloader, kernel and a 1 GB VEILOS volume from storage/):
+# veilos-{bios,uefi}-disk.img. Or the volume loaded into memory with the kernel,
+# for a USB stick until VEILOS drives USB storage: veilos-{bios,uefi}-ram.img.
+sh tools/build.sh --disk 1G
+sh tools/build.sh --ramdisk 64M
 
 # Build the release zip (dist/VEILOS.zip), as CI does
 bash tools/package_release.sh
 ```
 
-The kernel targets `x86_64-unknown-none` with `build-std`; see [`.cargo/config.toml`](.cargo/config.toml). The QEMU options for `cargo run` are in [`Cargo.toml`](Cargo.toml) under `[package.metadata.bootimage]`.
+The kernel targets `x86_64-unknown-none` with `build-std`, linked in the top 2 GiB; see [`.cargo/config.toml`](.cargo/config.toml). It boots through [`bootloader` 0.11](https://github.com/rust-osdev/bootloader), on BIOS and UEFI alike, and draws on the framebuffer the firmware sets up until a display driver takes over. The QEMU options are in [`tools/run.sh`](tools/run.sh). VEILOS mounts as `/` only a volume with `VEILOS.VOL` at its root (other volumes are read-only); `tools/mkdisk.py` adds it, and `tools/addmarker.py IMAGE` adds it to an older disk image.
 
 To test the mesh/cluster networking, [`run_dual.ps1`](run_dual.ps1) starts two VEILOS VMs connected by a socket network (Windows PowerShell).
 

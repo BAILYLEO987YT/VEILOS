@@ -181,8 +181,48 @@ use crate::virtio_net::*;
 // next member that is up. The interface keeps the first member's MAC
 // throughout, so peers see one address.
 
+/// One physical NIC, as the logical NIC drives it: virtio-net, or Intel
+/// e1000/e1000e (e1000.rs).
+pub trait Nic: Send {
+    fn mac(&self) -> smoltcp::wire::EthernetAddress;
+    fn link_up(&self) -> bool;
+    /// Move the frames received since the last call into `out`.
+    fn poll_rx(&mut self, out: &mut Vec<PacketBuf>);
+    fn transmit(&mut self, frame: &[u8]);
+    /// Frames received and sent so far.
+    fn counts(&self) -> (u64, u64);
+    /// What identifies the device for hot-removal (its BAR0).
+    fn key(&self) -> u64;
+    fn kind(&self) -> &'static str;
+}
+
+impl Nic for VirtioNet {
+    fn mac(&self) -> smoltcp::wire::EthernetAddress {
+        self.mac
+    }
+    fn link_up(&self) -> bool {
+        VirtioNet::link_up(self)
+    }
+    fn poll_rx(&mut self, out: &mut Vec<PacketBuf>) {
+        VirtioNet::poll_rx(self);
+        out.append(&mut self.rx_queue);
+    }
+    fn transmit(&mut self, frame: &[u8]) {
+        self.hw_transmit(frame);
+    }
+    fn counts(&self) -> (u64, u64) {
+        (self.rx_count, self.tx_count)
+    }
+    fn key(&self) -> u64 {
+        self.io_base as u64
+    }
+    fn kind(&self) -> &'static str {
+        "virtio-net"
+    }
+}
+
 pub struct LogicalNic {
-    members: Vec<VirtioNet>,
+    members: Vec<alloc::boxed::Box<dyn Nic>>,
     active: usize,
     /// The interface's MAC (the first member's).
     pub mac: smoltcp::wire::EthernetAddress,
@@ -192,21 +232,22 @@ pub struct LogicalNic {
 }
 
 impl LogicalNic {
-    fn new(first: VirtioNet) -> Self {
-        let mac = first.mac;
+    fn new(first: alloc::boxed::Box<dyn Nic>) -> Self {
+        let mac = first.mac();
         Self { members: alloc::vec![first], active: 0, mac, rx_queue: Vec::new(), rx_count: 0 }
     }
 
     /// Add another NIC. It takes over if the active member fails.
-    pub fn add_member(&mut self, nic: VirtioNet) {
-        crate::serial_println!("[NET] logical NIC: member {} added (MAC {})", self.members.len(), nic.mac);
+    pub fn add_member(&mut self, nic: alloc::boxed::Box<dyn Nic>) {
+        crate::serial_println!("[NET] logical NIC: member {} added ({}, MAC {})", self.members.len(), nic.kind(), nic.mac());
         self.members.push(nic);
     }
 
-    /// Drop the member at `io_base` (hot-removal). Traffic moves to another
-    /// member; with none left the interface is down until a NIC is added.
-    pub fn remove_member(&mut self, io_base: u16) -> bool {
-        let Some(i) = self.members.iter().position(|m| m.io_base == io_base) else { return false };
+    /// Drop the member whose BAR0 is `key` (hot-removal). Traffic moves to
+    /// another member; with none left the interface is down until a NIC is
+    /// added.
+    pub fn remove_member(&mut self, key: u64) -> bool {
+        let Some(i) = self.members.iter().position(|m| m.key() == key) else { return false };
         self.members.remove(i);
         if i < self.active {
             self.active -= 1;
@@ -234,25 +275,27 @@ impl LogicalNic {
     pub fn poll_rx(&mut self) {
         self.check_links();
         for m in self.members.iter_mut() {
-            m.poll_rx();
-            self.rx_queue.append(&mut m.rx_queue);
+            m.poll_rx(&mut self.rx_queue);
         }
     }
 
     fn transmit(&mut self, frame: &[u8]) {
         // No member: the frame is dropped, as on a cable pulled out.
         if let Some(m) = self.members.get_mut(self.active) {
-            m.hw_transmit(frame);
+            m.transmit(frame);
         }
     }
 
     /// One line per member, for `NET STATUS`.
     pub fn describe(&self) -> Vec<alloc::string::String> {
-        self.members.iter().enumerate().map(|(i, m)| alloc::format!(
-            "  NIC {}: {} link {} rx {} tx {}{}",
-            i, m.mac, if m.link_up() { "up" } else { "DOWN" }, m.rx_count, m.tx_count,
-            if i == self.active { "  (active)" } else { "" }
-        )).collect()
+        self.members.iter().enumerate().map(|(i, m)| {
+            let (rx, tx) = m.counts();
+            alloc::format!(
+                "  NIC {}: {} {} link {} rx {} tx {}{}",
+                i, m.kind(), m.mac(), if m.link_up() { "up" } else { "DOWN" }, rx, tx,
+                if i == self.active { "  (active)" } else { "" }
+            )
+        }).collect()
     }
 }
 
@@ -1067,7 +1110,7 @@ pub const VIRTIO_NET_DRIVER: crate::hal::Driver = crate::hal::Driver {
 /// device and frees its DMA memory).
 fn remove_virtio_net(dev: &crate::pci::PciDevice) -> Result<(), alloc::string::String> {
     let io_base = dev.bar(0).io_port().ok_or_else(|| alloc::string::String::from("BAR0 is not an I/O BAR"))?;
-    let removed = NETWORK.lock().as_mut().is_some_and(|stack| stack.device.remove_member(io_base));
+    let removed = NETWORK.lock().as_mut().is_some_and(|stack| stack.device.remove_member(io_base as u64));
     if removed { Ok(()) } else { Err(alloc::format!("no member at I/O {:#x}", io_base)) }
 }
 
@@ -1085,11 +1128,17 @@ fn probe_virtio_net(dev: &crate::pci::PciDevice) -> Result<(), alloc::string::St
     println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
     crate::serial_println!("[NET] VirtIO-net found at PCI {:02x}:{:02x} BAR0=0x{:04x}", dev.bus, dev.device, io_base);
     let nic = VirtioNet::new(io_base).map_err(String::from)?;
+    attach_nic(alloc::boxed::Box::new(nic));
+    Ok(())
+}
 
+/// A NIC driver has a working device: it joins the logical NIC, or, the
+/// first time, the network stack is built on it and DHCP starts.
+pub fn attach_nic(nic: alloc::boxed::Box<dyn Nic>) {
     // Every NIC after the first joins the one logical NIC the stack uses.
     if let Some(stack) = NETWORK.lock().as_mut() {
         stack.device.add_member(nic);
-        return Ok(());
+        return;
     }
 
     let mut stack = NetworkStack::new(LogicalNic::new(nic));
@@ -1112,7 +1161,6 @@ fn probe_virtio_net(dev: &crate::pci::PciDevice) -> Result<(), alloc::string::St
     crate::serial_println!("[NET] Network stack online. Awaiting DHCP...");
     println!("[NET]   IPv4 + IPv6, TCP, UDP, ICMP via smoltcp 0.13");
     println!("[NET]   DHCP client, DNS resolver, NTP client, Firewall");
-    Ok(())
 }
 
 /// Drive the network stack forward. Call this from a background async task

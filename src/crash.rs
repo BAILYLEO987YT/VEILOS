@@ -17,7 +17,8 @@
 // At the next start `prepare` finds a report in crash.log, keeps it as
 // /var/log/crash-N.log, says so in a notification, and clears crash.log
 // for next time. CRASH TEST in the terminal (administrators) panics on
-// purpose.
+// purpose. Any key on the crash screen restarts (power.rs; main.rs's panic
+// handler waits for it).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -137,7 +138,11 @@ pub fn on_panic(info: &core::panic::PanicInfo) {
     // "panicked at FILE:LINE:COL:" and the message.
     let _ = write!(r, "\n{}\n", info);
 
-    paint(r.bytes());
+    paint(
+        b"VEILOS RAN INTO A PROBLEM AND STOPPED.",
+        &[b"THE REPORT BELOW WAS SAVED TO /VAR/LOG/CRASH.LOG AND IS KEPT AT THE NEXT START.", b"PRESS ANY KEY TO RESTART."],
+        r.bytes(),
+    );
 
     // Pad to whole sectors; write the runs of consecutive sectors.
     if let Some(guard) = TARGET.try_lock() {
@@ -163,8 +168,17 @@ pub fn on_panic(info: &core::panic::PanicInfo) {
     }
 }
 
-/// The crash screen, straight onto every display.
-fn paint(report: &[u8]) {
+/// A screen VEILOS stops at (main.rs: no system volume), on every display.
+/// `body`'s lines are shown below `notes`.
+pub fn paint_stop(headline: &[u8], notes: &[&[u8]], body: &[u8]) {
+    let mut report: Vec<u8> = Vec::from(&b"\n"[..]);
+    report.extend_from_slice(body);
+    paint(headline, notes, &report);
+}
+
+/// The crash screen, straight onto every display. The report's first line
+/// (its magic) is not shown.
+fn paint(headline: &[u8], notes: &[&[u8]], report: &[u8]) {
     const BG: u32 = 0x0010_2A43;
     const FG: u32 = 0x00FF_FFFF;
     const DIM: u32 = 0x00A8_C0D8;
@@ -211,12 +225,15 @@ fn paint(report: &[u8]) {
         };
         let left = 48;
         text(b":(", left, 48, 6, FG);
-        text(b"VEILOS RAN INTO A PROBLEM AND STOPPED.", left, 120, 2, FG);
-        text(b"THE REPORT BELOW WAS SAVED TO /VAR/LOG/CRASH.LOG AND IS KEPT AT THE NEXT START.", left, 150, 1, DIM);
-        text(b"RESTART THE COMPUTER TO CONTINUE.", left, 164, 1, DIM);
+        text(headline, left, 120, 2, FG);
+        let mut y = 150;
+        for note in notes {
+            text(note, left, y, 1, DIM);
+            y += 14;
+        }
         // The report, wrapped to the screen.
         let cols = ((fb.width.saturating_sub(2 * left)) / 9).max(20);
-        let mut y = 196;
+        y += 18;
         for line in report.split(|&b| b == b'\n').skip(1) {
             let mut rest = line;
             loop {

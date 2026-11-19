@@ -2,10 +2,12 @@
 // VEILOS: block layer
 // =============================================================================
 //
-// One `Disk` per AHCI port, shared by everything that uses that disk, with a
-// lock around the port so two CPUs can never drive it at once. Each disk has
-// a 64 KiB DMA bounce buffer (128 sectors per command; it was 8) and a
-// sector cache, which is also the FAT cache: FAT and directory sectors are
+// One `Disk` per device, shared by everything that uses that disk, with a
+// lock around it so two CPUs can never drive it at once. What moves the
+// sectors is the disk's `Transport`: an AHCI port (`AhciTransport`, with a
+// 64 KiB DMA bounce buffer, 128 sectors per command) or memory (`RamDisk`,
+// the image the bootloader loaded); NVMe and USB storage will be more. Each
+// disk has a sector cache, which is also the FAT cache: FAT and directory sectors are
 // re-read constantly and come from memory. In Security Mode the cache is
 // write-through and holds 1 MiB; in Performance Mode it is write-back (dirty
 // sectors go to the disk within a second, sorted and merged into large
@@ -15,17 +17,134 @@
 // On top of a disk sit `Partition`s (MBR primary entries, GPT entries, or
 // the whole disk for a superfloppy). Each is a `vfs::BlockDevice` with
 // partition-relative LBAs and bounds checking. `mount_disk` probes every
-// partition for a filesystem and mounts what it finds: the first one at `/`,
-// the rest at `/mnt/d<port>p<n>`.
+// partition for a filesystem and mounts what it finds. Only a volume that
+// names itself VEILOS's (`VOLUME_MARKER` at its root) becomes `/`; every other
+// filesystem goes to `/mnt/<disk>p<n>` read-only (`d<port>` for AHCI,
+// `ram` for the RAM disk).
+//
+// Root-volume safety. On a real PC the first filesystem is usually the EFI
+// System Partition (FAT32), and before this the kernel made it `/` and wrote
+// its registry, users, logs and caches there. Now a volume must say it is
+// VEILOS's: a marker file is the test because it works the same on every
+// layout VEILOS meets (a superfloppy, MBR, GPT, QEMU's vvfat folder, a USB
+// stick), nothing else puts that file there by accident, and it needs no
+// filesystem driver beyond reading. A volume label is too easy to collide
+// with and a GPT type GUID exists only on GPT. Writes are refused twice: the
+// mount is read-only (callers get an error) and each `Disk` accepts writes
+// only inside the ranges `allow_writes` opened, which is only ever the root
+// volume's partition, so no driver, cache or crash path can write elsewhere.
+// With no VEILOS volume the kernel stops at boot (main.rs) and writes nothing.
 //
 // Buffers passed to `BlockDevice` are kernel virtual addresses (heap,
 // stack); the bounce buffer handles the DMA side.
 
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
 use spin::Mutex;
-use x86_64::VirtAddr;
 
 use crate::ahci::HbaPort;
+
+/// What moves sectors for a `Disk`: a controller port, or memory. Called
+/// with the disk's lock held, so one request at a time.
+pub trait Transport: Send {
+    /// Read `buf.len() / 512` sectors starting at `lba`.
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
+    /// Write `buf.len() / 512` sectors starting at `lba`.
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool;
+    /// Make what was written durable (the device's own write cache).
+    fn flush(&mut self) -> bool {
+        true
+    }
+}
+
+/// An AHCI port. Commands go through a DMA bounce buffer: callers' buffers
+/// are kernel virtual memory (heap, stack) that may not be contiguous.
+pub struct AhciTransport {
+    port: *mut HbaPort,
+    bounce_phys: u64,
+    bounce_virt: *mut u8,
+}
+
+// The port pointer is only used under the owning disk's lock.
+unsafe impl Send for AhciTransport {}
+
+impl AhciTransport {
+    pub fn new(port: &'static mut HbaPort) -> Option<Self> {
+        let (bounce_phys, bounce_virt) = crate::memory::DmaRegion::new(BOUNCE_BYTES)?.leak();
+        Some(Self { port, bounce_phys, bounce_virt })
+    }
+}
+
+impl Transport for AhciTransport {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        let count = (buf.len() / SECTOR) as u32;
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(BOUNCE_SECTORS);
+            let bytes = chunk as usize * SECTOR;
+            if !unsafe { &mut *self.port }.read_sectors(lba + done as u64, chunk, self.bounce_phys, crate::memory::get_phys_mem_offset()) {
+                return false;
+            }
+            let dst = &mut buf[done as usize * SECTOR..done as usize * SECTOR + bytes];
+            unsafe { core::ptr::copy_nonoverlapping(self.bounce_virt, dst.as_mut_ptr(), bytes) };
+            done += chunk;
+        }
+        true
+    }
+
+    fn write(&mut self, lba: u64, src: &[u8]) -> bool {
+        let count = (src.len() / SECTOR) as u32;
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(BOUNCE_SECTORS);
+            let bytes = chunk as usize * SECTOR;
+            let part = &src[done as usize * SECTOR..done as usize * SECTOR + bytes];
+            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), self.bounce_virt, bytes) };
+            if !unsafe { &mut *self.port }.write_sectors(lba + done as u64, chunk, self.bounce_phys, crate::memory::get_phys_mem_offset()) {
+                return false;
+            }
+            done += chunk;
+        }
+        true
+    }
+}
+
+/// A disk image in memory: the RAM disk the bootloader loaded beside the
+/// kernel (main.rs). What's written to it is gone at the next start.
+pub struct RamDisk {
+    base: *mut u8,
+    sectors: u64,
+}
+
+// The memory is the bootloader's mapping, reserved for this, used under the
+// owning disk's lock.
+unsafe impl Send for RamDisk {}
+
+impl RamDisk {
+    /// # Safety
+    /// `base..base + len` must be mapped, writable and used by nothing else.
+    pub unsafe fn new(base: *mut u8, len: usize) -> Self {
+        Self { base, sectors: (len / SECTOR) as u64 }
+    }
+
+    fn range(&self, lba: u64, len: usize) -> Option<usize> {
+        let end = lba.checked_add((len / SECTOR) as u64)?;
+        (end <= self.sectors).then_some(lba as usize * SECTOR)
+    }
+}
+
+impl Transport for RamDisk {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        let Some(at) = self.range(lba, buf.len()) else { return false };
+        unsafe { core::ptr::copy_nonoverlapping(self.base.add(at), buf.as_mut_ptr(), buf.len()) };
+        true
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool {
+        let Some(at) = self.range(lba, buf.len()) else { return false };
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), self.base.add(at), buf.len()) };
+        true
+    }
+}
 use crate::vfs::BlockDevice;
 
 pub const SECTOR: usize = 512;
@@ -116,27 +235,21 @@ impl SectorCache {
 }
 
 struct DiskInner {
-    port: *mut HbaPort,
-    bounce_phys: u64,
-    bounce_virt: *mut u8,
+    transport: alloc::boxed::Box<dyn Transport>,
     cache: SectorCache,
+    /// Absolute sector ranges [start, end) writes may touch: the root
+    /// volume's partition, or nothing.
+    writable: Vec<(u64, u64)>,
 }
 
 impl DiskInner {
+    fn may_write(&self, lba: u64, count: u64) -> bool {
+        let Some(end) = lba.checked_add(count) else { return false };
+        self.writable.iter().any(|&(s, e)| lba >= s && end <= e)
+    }
+
     fn write_disk(&mut self, lba: u64, src: &[u8]) -> bool {
-        let count = (src.len() / SECTOR) as u32;
-        let mut done = 0u32;
-        while done < count {
-            let chunk = (count - done).min(BOUNCE_SECTORS);
-            let bytes = chunk as usize * SECTOR;
-            let part = &src[done as usize * SECTOR..done as usize * SECTOR + bytes];
-            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), self.bounce_virt, bytes) };
-            if !unsafe { &mut *self.port }.write_sectors(lba + done as u64, chunk, self.bounce_phys, Disk::phys_offset()) {
-                return false;
-            }
-            done += chunk;
-        }
-        true
+        self.transport.write(lba, src)
     }
 
     /// Write the dirty sectors among `lbas` (sorted), contiguous ones in one
@@ -205,16 +318,23 @@ impl DiskInner {
     }
 }
 
-/// An AHCI disk. Clone the `Arc` to share it.
+/// A disk. Clone the `Arc` to share it.
 pub struct Disk {
-    pub port_num: usize,
+    /// Its name in logs and mount points: `d<port>` (AHCI), `ram`.
+    pub name: String,
     pub sectors: u64,
     inner: Mutex<DiskInner>,
 }
 
-// The raw port pointer is only used under `inner`'s lock.
-unsafe impl Send for Disk {}
-unsafe impl Sync for Disk {}
+/// A write outside the root volume, refused. Logged a limited number of
+/// times so a driver retrying in a loop can't flood the serial port.
+fn refused(disk: &str, lba: u64, count: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+        crate::serial_println!("[BLOCK] refused write: disk {} lba {} +{} is not the VEILOS volume", disk, lba, count);
+    }
+}
 
 /// Every disk, for write-back.
 static DISKS: Mutex<Vec<Arc<Disk>>> = Mutex::new(Vec::new());
@@ -225,7 +345,9 @@ static LAST_FLUSH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 pub fn flush_all() {
     let disks: Vec<Arc<Disk>> = DISKS.lock().clone();
     for d in disks {
-        d.inner.lock().flush();
+        let mut inner = d.inner.lock();
+        inner.flush();
+        inner.transport.flush();
     }
 }
 
@@ -249,24 +371,14 @@ pub fn tick(now_ms: u64) {
 }
 
 impl Disk {
-    pub fn new(port: &'static mut HbaPort, port_num: usize, sectors: u64) -> Option<Arc<Self>> {
-        let (bounce_phys, bounce_virt) = crate::memory::DmaRegion::new(BOUNCE_BYTES)?.leak();
+    pub fn new(transport: alloc::boxed::Box<dyn Transport>, name: String, sectors: u64) -> Arc<Self> {
         let disk = Arc::new(Self {
-            port_num,
+            name,
             sectors,
-            inner: Mutex::new(DiskInner {
-                port,
-                bounce_phys,
-                bounce_virt,
-                cache: SectorCache::new(),
-            }),
+            inner: Mutex::new(DiskInner { transport, cache: SectorCache::new(), writable: Vec::new() }),
         });
         DISKS.lock().push(disk.clone());
-        Some(disk)
-    }
-
-    fn phys_offset() -> VirtAddr {
-        crate::memory::get_phys_mem_offset()
+        disk
     }
 
     /// Read `buf.len() / 512` sectors from absolute `lba`. Cached sectors
@@ -288,17 +400,8 @@ impl Disk {
         }
         d.cache.misses += 1;
 
-        let mut done = 0u32;
-        while done < count {
-            let chunk = (count - done).min(BOUNCE_SECTORS);
-            let bytes = chunk as usize * SECTOR;
-            let (port, phys, virt) = (d.port, d.bounce_phys, d.bounce_virt);
-            if !unsafe { &mut *port }.read_sectors(lba + done as u64, chunk, phys, Self::phys_offset()) {
-                return false;
-            }
-            let dst = &mut buf[done as usize * SECTOR..done as usize * SECTOR + bytes];
-            unsafe { core::ptr::copy_nonoverlapping(virt, dst.as_mut_ptr(), bytes) };
-            done += chunk;
+        if !d.transport.read(lba, &mut buf[..count as usize * SECTOR]) {
+            return false;
         }
         // What the cache holds is at least as new as the disk.
         let end = lba + count as u64;
@@ -324,6 +427,11 @@ impl Disk {
         let count = (buf.len() / SECTOR) as u32;
         let perf = performance();
         let mut d = self.inner.lock();
+        if !d.may_write(lba, count as u64) {
+            drop(d);
+            refused(&self.name, lba, count);
+            return false;
+        }
         if perf {
             for i in 0..count as usize {
                 d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], true, false);
@@ -353,9 +461,14 @@ impl Disk {
             unsafe { self.inner.force_unlock() };
         }
         match self.inner.try_lock() {
-            Some(mut d) => d.write_disk(lba, data),
-            None => false,
+            Some(mut d) if d.may_write(lba, (data.len() / SECTOR) as u64) => d.write_disk(lba, data),
+            _ => false,
         }
+    }
+
+    /// Let writes reach sectors [start, start + sectors): the root volume.
+    fn allow_writes(&self, start: u64, sectors: u64) {
+        self.inner.lock().writable.push((start, start + sectors));
     }
 
     /// (hits, misses) of the sector cache, for diagnostics.
@@ -442,7 +555,7 @@ pub fn read_partitions(disk: &Disk) -> Vec<PartitionInfo> {
         match kind {
             0xEE => return read_gpt(disk).unwrap_or_else(whole),
             0x05 | 0x0F | 0x85 => {
-                crate::serial_println!("[BLOCK] disk {}: extended partition {} not read yet", disk.port_num, i + 1);
+                crate::serial_println!("[BLOCK] disk {}: extended partition {} not read yet", disk.name, i + 1);
             }
             _ => parts.push(PartitionInfo { start, sectors, kind: format!("MBR #{} type {:#04x}", i + 1, kind) }),
         }
@@ -453,7 +566,7 @@ pub fn read_partitions(disk: &Disk) -> Vec<PartitionInfo> {
 fn read_gpt(disk: &Disk) -> Option<Vec<PartitionInfo>> {
     let mut hdr = [0u8; SECTOR];
     if !disk.read(1, &mut hdr) || &hdr[0..8] != b"EFI PART" {
-        crate::serial_println!("[BLOCK] disk {}: protective MBR but no GPT header", disk.port_num);
+        crate::serial_println!("[BLOCK] disk {}: protective MBR but no GPT header", disk.name);
         return None;
     }
     let u32_at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
@@ -494,28 +607,90 @@ fn read_gpt(disk: &Disk) -> Option<Vec<PartitionInfo>> {
 
 // -----| mounting |-----
 
-/// Probe every partition of `disk` and mount each filesystem found.
+/// The file at the root of a VEILOS system volume, and how it starts.
+/// tools/mkdisk.py writes it; storage/ carries it for QEMU's vvfat disk.
+pub const VOLUME_MARKER: &str = "/VEILOS.VOL";
+const MARKER_MAGIC: &[u8] = b"VEILOS SYSTEM VOLUME";
+
+static ROOT_FOUND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Every filesystem seen, for the no-system-volume screen (main.rs).
+static FOUND: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// What was found on each disk: "NTFS, disk 1 partition 2 (64 MiB) at ...".
+pub fn found_volumes() -> Vec<String> {
+    FOUND.lock().clone()
+}
+
+/// Whether a VEILOS volume is mounted at `/`.
+pub fn root_mounted() -> bool {
+    ROOT_FOUND.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Does this filesystem carry the VEILOS marker? Reads only.
+fn is_veilos_volume(fs: &dyn crate::vfs::FileSystem, device: &Partition) -> bool {
+    match fs.read_file(device, VOLUME_MARKER) {
+        Ok(data) => data.starts_with(MARKER_MAGIC),
+        Err(_) => false,
+    }
+}
+
+/// Probe every partition of `disk` and mount each filesystem found: the
+/// first VEILOS volume writable at `/`, everything else read-only.
 pub fn mount_disk(disk: Arc<Disk>) {
+    use core::sync::atomic::Ordering;
     let parts = read_partitions(&disk);
     crate::println!("     - {} partition(s)", parts.len());
     for (n, p) in parts.iter().enumerate() {
         crate::serial_println!(
             "[BLOCK] disk {} part {}: {} start {} ({} MiB)",
-            disk.port_num, n, p.kind, p.start, p.sectors / 2048
+            disk.name, n, p.kind, p.start, p.sectors / 2048
         );
         let device = Partition { disk: disk.clone(), start: p.start, sectors: p.sectors };
         let Some((fs, name)) = detect_filesystem(&device) else {
             crate::serial_println!("[BLOCK]   no filesystem recognised");
             continue;
         };
-        let path = if crate::vfs::VFS.mount_count() == 0 {
-            String::from("/")
+        let veilos = is_veilos_volume(&*fs, &device);
+        let root = veilos && !ROOT_FOUND.swap(true, Ordering::AcqRel);
+        let (path, how) = if root {
+            disk.allow_writes(p.start, p.sectors);
+            (String::from("/"), "writable: the VEILOS volume")
+        } else if veilos {
+            (format!("/mnt/{}p{}", disk.name, n), "read-only: another VEILOS volume")
         } else {
-            format!("/mnt/d{}p{}", disk.port_num, n)
+            (format!("/mnt/{}p{}", disk.name, n), "read-only: not VEILOS's")
         };
-        crate::println!("  -> Mounted {} (disk {} partition {}) at {}", name, disk.port_num, n, path);
-        crate::vfs::VFS.mount(path, fs, Box::new(device));
+        let line = format!("{} on disk {} partition {} ({} MiB) at {}, {}", name, disk.name, n, p.sectors / 2048, path, how);
+        crate::println!("  -> Mounted {}", line);
+        crate::serial_println!("[BLOCK]   mounted {}", line);
+        FOUND.lock().push(line);
+        crate::vfs::VFS.mount(path, fs, Box::new(device), !root);
     }
+}
+
+/// The RAM disk the bootloader loaded (main.rs), if there is one: probed
+/// before any other disk, so a VEILOS volume on it becomes `/`. Booting from
+/// a RAM-disk image is how VEILOS runs from a USB stick before it has a USB
+/// storage driver: everything works, and nothing written survives a restart.
+static RAM_DISK: Mutex<Option<(u64, usize)>> = Mutex::new(None);
+
+pub fn set_ram_disk(virt: u64, len: usize) {
+    *RAM_DISK.lock() = Some((virt, len));
+}
+
+pub fn mount_ram_disk() {
+    let Some((virt, len)) = *RAM_DISK.lock() else { return };
+    crate::println!("RAM disk: {} MiB (changes are not kept)", len >> 20);
+    crate::serial_println!("[BLOCK] RAM disk at {:#x}, {} MiB", virt, len >> 20);
+    // SAFETY: the bootloader mapped the image here for the kernel alone and
+    // reports its frames as in use (memory.rs never hands them out).
+    let ram = unsafe { RamDisk::new(virt as *mut u8, len) };
+    mount_disk(Disk::new(Box::new(ram), String::from("ram"), (len / SECTOR) as u64));
+}
+
+/// Is `/` on the RAM disk? (Nothing written there is kept.)
+pub fn root_on_ram_disk() -> bool {
+    FOUND.lock().iter().any(|l| l.contains("disk ram ") && l.contains("writable"))
 }
 
 /// Try each filesystem driver on `device`.

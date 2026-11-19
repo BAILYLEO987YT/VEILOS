@@ -458,6 +458,12 @@ var MenuLock: element.button = {
     on_click: { lock_session(); },
 };
 
+var MenuRestart: element.button = {
+    ...MenuItem,
+    label:    "Restart",
+    on_click: { restart(); },
+};
+
 var MenuShutdown: element.button = {
     ...MenuItem,
     label:    "Shut down",
@@ -675,6 +681,7 @@ on_event start {
     add element.button(MenuSettings,   parent: menu_ref);
     add element.divider(MenuDivider,   parent: menu_ref);
     add element.button(MenuLock,       parent: menu_ref);
+    add element.button(MenuRestart,    parent: menu_ref);
     add element.button(MenuShutdown,   parent: menu_ref);
 
     // 7. Optionally open one window on first boot so the user
