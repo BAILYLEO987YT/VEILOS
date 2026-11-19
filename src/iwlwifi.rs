@@ -1298,9 +1298,16 @@ impl Iwl {
             self.send_cmd(DQA_ENABLE_CMD, DATA_PATH_GROUP, &(CMD_QUEUE as u32).to_le_bytes())?;
         }
         self.add_aux_sta()?;
+        // As Linux's iwl_mvm_up: every PHY context, on the first channel.
+        for id in 0..3 {
+            self.phy_context(id, 1, 1)?;
+        }
+        self.phy_added = true;
         self.send_cmd(POWER_TABLE_CMD, 0, &[0, 0, 0, 0])?; // always awake (CAM)
         self.update_mcc()?;
-        self.mac_added = false;
+        // The interface coming up (mac80211's add_interface): MAC context 0.
+        self.add_mac_context()?;
+        self.mac_added = true;
         wlog!("runtime firmware up: MAC {}, NVM {:#x}, antennas TX {:#x} RX {:#x}",
             mac_text(&self.mac), self.nvm_version, self.valid_tx_ant, self.valid_rx_ant);
         Ok(())
@@ -1433,6 +1440,22 @@ impl Iwl {
             Ok(_) => {}
             Err(e) => wlog!("regulatory update failed: {}", e),
         }
+        Ok(())
+    }
+
+    /// PHY context `id` (a radio channel configuration) on `channel`, 20 MHz.
+    fn phy_context(&mut self, id: u32, action: u32, channel: u8) -> Result<(), String> {
+        let mut c = [0u8; 32];
+        c[0..4].copy_from_slice(&id.to_le_bytes());
+        c[4..8].copy_from_slice(&action.to_le_bytes());
+        c[16] = if channel <= 14 { 1 } else { 0 }; // band: 2.4 / 5 GHz
+        c[17] = channel;
+        c[18] = 0; // 20 MHz
+        c[19] = 0;
+        c[20..24].copy_from_slice(&(self.valid_tx_ant as u32).to_le_bytes());
+        let rx = self.valid_rx_ant as u32;
+        c[24..28].copy_from_slice(&(rx << 1 | 2 << 10 | 2 << 12).to_le_bytes());
+        self.send_cmd(PHY_CONTEXT_CMD, 0, &c)?;
         Ok(())
     }
 
@@ -1995,18 +2018,7 @@ impl Iwl {
             self.add_mac_context()?;
             self.mac_added = true;
         }
-        let band = if bss.channel <= 14 { 1u8 } else { 0 };
-        let mut c = [0u8; 32];
-        c[0..4].copy_from_slice(&PHY_ID.to_le_bytes());
-        c[4..8].copy_from_slice(&(if self.phy_added { 2u32 } else { 1 }).to_le_bytes());
-        c[16] = band;
-        c[17] = bss.channel;
-        c[18] = 0; // 20 MHz
-        c[19] = 0;
-        c[20..24].copy_from_slice(&(self.valid_tx_ant as u32).to_le_bytes());
-        let rx = self.valid_rx_ant as u32;
-        c[24..28].copy_from_slice(&(rx << 1 | 2 << 10 | 2 << 12).to_le_bytes());
-        self.send_cmd(PHY_CONTEXT_CMD, 0, &c)?;
+        self.phy_context(PHY_ID, if self.phy_added { 2 } else { 1 }, bss.channel)?;
         self.phy_added = true;
 
         let mut b = [0u8; 24];
