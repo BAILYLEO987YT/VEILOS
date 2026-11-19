@@ -10,6 +10,8 @@ cd "$dir" || exit 2
 rm -f serial.log qemu.out
 
 export VEILOS_ACCEL="$mode"
+# No sound server on a CI runner: QEMU's PulseAudio backend would exit.
+export VEILOS_AUDIO=none
 sh run.sh -display none > qemu.out 2>&1 &
 qemu=$!
 

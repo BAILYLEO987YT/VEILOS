@@ -22,6 +22,12 @@ fi
 # For none:  VEILOS_AUDIO=none sh run.sh
 AUDIO=${VEILOS_AUDIO:-pa}
 [ "$(uname -s)" = Darwin ] && AUDIO=${VEILOS_AUDIO:-coreaudio}
+# With no PulseAudio server to talk to (a server, a container, a CI runner),
+# QEMU's "pa" backend makes QEMU exit before VEILOS starts: run silent.
+if [ "$AUDIO" = pa ] && [ -z "${VEILOS_AUDIO:-}" ] && [ -z "${PULSE_SERVER:-}" ]     && [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native" ]; then
+    echo "No PulseAudio server found: starting without sound (VEILOS_AUDIO=pa to force it)."
+    AUDIO=none
+fi
 
 echo "Starting VEILOS. The first boot can take a minute or two."
 echo 'Log in as "admin" with password "veilos" (or "root" with no password).'
