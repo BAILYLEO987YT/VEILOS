@@ -24,6 +24,8 @@ const CSW_SIG: u32 = 0x5342_5355; // "USBS"
 pub struct UsbMsc {
     ctrl: Arc<Mutex<Controller>>,
     slot: u8,
+    /// The slot's generation when found: the device is gone once it moves on.
+    generation: u32,
     bulk_in: Endpoint,
     bulk_out: Endpoint,
     tag: u32,
@@ -55,7 +57,7 @@ impl UsbMsc {
     fn new(ctrl: Arc<Mutex<Controller>>, f: MscFound) -> Result<(Self, u64), String> {
         let (cmd_phys, cmd) = crate::memory::DmaRegion::new(1024).ok_or("no DMA memory")?.leak();
         let (buf_phys, buf) = crate::memory::DmaRegion::new(CHUNK).ok_or("no DMA memory")?.leak();
-        let mut dev = Self { ctrl, slot: f.slot, bulk_in: f.bulk_in, bulk_out: f.bulk_out, tag: 1, cmd_phys, cmd, buf_phys, buf };
+        let mut dev = Self { ctrl, slot: f.slot, generation: f.generation, bulk_in: f.bulk_in, bulk_out: f.bulk_out, tag: 1, cmd_phys, cmd, buf_phys, buf };
 
         let inq = dev.scsi_in(&[0x12, 0, 0, 0, 36, 0], 36)?;
         let text = |r: core::ops::Range<usize>| String::from_utf8_lossy(&inq[r.start.min(inq.len())..r.end.min(inq.len())]).trim().into();
@@ -119,6 +121,9 @@ impl UsbMsc {
 
         let ctrl = self.ctrl.clone();
         let mut c = ctrl.lock();
+        if !c.slot_alive(self.slot, self.generation) {
+            return Err(String::from("the device was unplugged"));
+        }
         let (slot, bin, bout) = (self.slot, self.bulk_in, self.bulk_out);
         c.bulk(slot, bout.dci(), self.cmd_phys, 31, 1_000_000).map_err(|cc| format!("CBW failed: code {}", cc))?;
         let mut moved = 0;

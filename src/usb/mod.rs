@@ -16,10 +16,17 @@
 // plugged into them enumerated, with route strings and, for low/full-speed
 // devices behind a high-speed hub, its transaction translator.
 //
+// Hot-plug: root port changes (port status events) and hub port changes
+// (each hub's status-change endpoint) are noted as events arrive, and
+// `hotplug_task` sets up what was plugged in and forgets what was pulled
+// out. A keyboard, mouse or hub endpoint that fails (a transaction error,
+// say, when a power surge on a bus-powered hub upsets it) is reset there
+// too. A USB disk plugged in later mounts read-only under /mnt; one pulled
+// out stops answering (its mount stays, with errors).
+//
 // Everything is polled. Commands and bulk transfers wait for their own
 // completion; the BSP's timer tick (`poll`) collects keyboard and mouse
-// reports. Not yet: hot-plug after boot (root ports or hub ports),
-// isochronous transfers, USB 2 EHCI controllers.
+// reports. Not yet: isochronous transfers, USB 2 EHCI controllers.
 
 pub mod hid;
 pub mod msc;
@@ -40,6 +47,16 @@ pub const XHCI_DRIVER: crate::hal::Driver = crate::hal::Driver {
 /// Skips a controller that a transfer is using (it collects them itself).
 pub fn poll() {
     xhci::poll_all();
+}
+
+/// Set up devices plugged in after start-up and forget those pulled out,
+/// every 100 ms. On the executor: setting a device up takes a few hundred
+/// milliseconds, which only happens when something was plugged in.
+pub async fn hotplug_task() {
+    loop {
+        crate::interrupts::SleepFuture::new(100).await;
+        xhci::service_hotplug();
+    }
 }
 
 // -----| standard requests and descriptors |-----
