@@ -192,6 +192,40 @@ pub struct MscFound {
     pub bulk_out: Endpoint,
 }
 
+/// Where a device hangs: which root port, through which hubs, at what speed.
+#[derive(Clone, Copy)]
+struct Attach {
+    root_port: u8,
+    /// xHCI route string: the hub port at each tier below the root, 4 bits each.
+    route: u32,
+    /// Hubs between the root port and this device.
+    tier: u8,
+    /// xHCI speed: 1 full, 2 low, 3 high, 4+ SuperSpeed.
+    speed: u8,
+    /// A low/full-speed device behind a high-speed hub: that hub's slot and
+    /// port (its transaction translator).
+    tt: Option<(u8, u8)>,
+}
+
+impl Attach {
+    /// "3" for root port 3, "3.2.1" behind hubs.
+    fn path(&self) -> String {
+        let mut s = format!("{}", self.root_port);
+        for t in 0..self.tier {
+            s += &format!(".{}", (self.route >> (4 * t)) & 0xF);
+        }
+        s
+    }
+}
+
+// Hub class requests (USB 2.0 11.24, USB 3.2 10.14).
+const HUB_PORT_RESET: u16 = 4;
+const HUB_PORT_POWER: u16 = 8;
+const HUB_C_PORT_CONNECTION: u16 = 16;
+const HUB_C_PORT_RESET: u16 = 20;
+const HUB_C_PORT_LINK_STATE: u16 = 25;
+const HUB_C_BH_PORT_RESET: u16 = 29;
+
 pub struct Controller {
     pub name: String,
     op: u64,
@@ -501,16 +535,18 @@ impl Controller {
                 continue;
             }
             let speed = ((sc >> 10) & 0xF) as u8;
-            match self.enumerate(port, speed) {
-                Ok(Some(m)) => found.push(m),
-                Ok(None) => {}
-                Err(e) => crate::serial_println!("[XHCI] {} port {}: {}", self.name, port, e),
+            let at = Attach { root_port: port, route: 0, tier: 0, speed, tt: None };
+            if let Err(e) = self.enumerate(at, &mut found) {
+                crate::serial_println!("[XHCI] {} port {}: {}", self.name, port, e);
             }
         }
         found
     }
 
-    fn enumerate(&mut self, port: u8, speed: u8) -> Result<Option<MscFound>, String> {
+    /// Set up the device at `at`: a hub's own devices too. Mass-storage
+    /// devices found go to `found`.
+    fn enumerate(&mut self, at: Attach, found: &mut Vec<MscFound>) -> Result<(), String> {
+        let (port, speed) = (at.root_port, at.speed);
         let slot = self.command(0, TRB_ENABLE_SLOT << 10)?;
         if slot == 0 || slot > self.max_slots {
             return Err(format!("bad slot id {}", slot));
@@ -533,8 +569,11 @@ impl Controller {
             let ctrl = self.in_ctx(slot, 0);
             ctrl.add(1).write_volatile(0b11); // add slot + EP0
             let sc = self.in_ctx(slot, 1);
-            sc.write_volatile((speed as u32) << 20 | 1 << 27);
+            sc.write_volatile(at.route | (speed as u32) << 20 | 1 << 27);
             sc.add(1).write_volatile((port as u32) << 16);
+            if let Some((hub_slot, hub_port)) = at.tt {
+                sc.add(2).write_volatile(hub_slot as u32 | (hub_port as u32) << 8);
+            }
         }
         self.set_ep(slot, 1, 4, mps0, 0, ep0_phys);
         self.command(in_phys, TRB_ADDRESS_DEVICE << 10 | (slot as u32) << 24)?;
@@ -567,11 +606,10 @@ impl Controller {
         let interfaces = super::parse_config(&cfg);
         crate::serial_println!(
             "[XHCI] {} port {} slot {}: {:04x}:{:04x}, speed {}, class {:02x}, {} interface(s)",
-            self.name, port, slot, vid, pid, speed, dev[4], interfaces.len()
+            self.name, at.path(), slot, vid, pid, speed, dev[4], interfaces.len()
         );
-        if dev[4] == 9 || interfaces.iter().any(|i| i.class == 9) {
-            crate::serial_println!("[XHCI]   a hub: devices behind hubs aren't supported yet");
-            return Ok(None);
+        if let Some(hub) = interfaces.iter().find(|i| i.class == 9).cloned() {
+            return self.setup_hub(slot, at, config_value, &hub, found);
         }
 
         // What VEILOS can drive: boot keyboards and mice, bulk-only SCSI storage.
@@ -580,7 +618,7 @@ impl Controller {
         let storage = interfaces.iter().find(|i| i.class == 8 && i.subclass == 6 && i.protocol == 0x50).cloned();
         if keyboard.is_none() && mouse.is_none() && storage.is_none() {
             crate::serial_println!("[XHCI]   nothing VEILOS drives on it");
-            return Ok(None);
+            return Ok(());
         }
         self.control_out(slot, Setup::set_configuration(config_value))?;
 
@@ -604,7 +642,7 @@ impl Controller {
                 msc = Some(MscFound { slot, interface: i.number, bulk_in: *bin, bulk_out: *bout });
             }
         }
-        self.configure_endpoints(slot, speed, &eps)?;
+        self.configure_endpoints(slot, speed, &eps, None)?;
 
         for (iface, kind, e) in hid {
             // Boot protocol (fixed report formats), and reports only on change.
@@ -620,13 +658,130 @@ impl Controller {
             w32(self.db + 4 * slot as u64, e.dci() as u32);
             crate::serial_println!("[XHCI]   {:?} on interface {}", kind, iface.number);
         }
-        if msc.is_some() {
+        if let Some(m) = msc {
             crate::serial_println!("[XHCI]   mass storage (bulk-only SCSI)");
+            found.push(m);
         }
-        Ok(msc)
+        Ok(())
     }
 
-    fn configure_endpoints(&mut self, slot: u8, speed: u8, eps: &[Endpoint]) -> Result<(), String> {
+    // -----| hubs |-----
+
+    /// A hub: tell the controller it is one, power its ports, and set up
+    /// what is plugged into them. Done once, at start-up, like the root
+    /// ports (no hot-plug).
+    fn setup_hub(&mut self, slot: u8, at: Attach, config_value: u8, hub: &Interface, found: &mut Vec<MscFound>) -> Result<(), String> {
+        if at.tier >= 5 {
+            return Err(String::from("hubs nested more than 5 deep"));
+        }
+        let usb3 = at.speed >= 4;
+        self.control_out(slot, Setup::set_configuration(config_value))?;
+        if usb3 {
+            // SET_HUB_DEPTH: where its ports' route-string nibble goes.
+            self.control_out(slot, Setup { request_type: 0x20, request: 12, value: at.tier as u16, index: 0, length: 0 })?;
+        }
+        let kind: u16 = if usb3 { 0x2A } else { 0x29 };
+        let desc = self.control_in(slot, Setup { request_type: 0xA0, request: 6, value: kind << 8, index: 0, length: 16 })?;
+        if desc.len() < 7 {
+            return Err(String::from("short hub descriptor"));
+        }
+        let ports = desc[2].min(15);
+        let chars = u16::from_le_bytes([desc[3], desc[4]]);
+        let power_good_ms = (desc[5] as u64 * 2).max(20);
+        // Think time of the transaction translator (high-speed hubs only).
+        let ttt = if at.speed == 3 { ((chars >> 5) & 3) as u32 } else { 0 };
+        crate::serial_println!("[XHCI]   a {} hub, {} ports", if usb3 { "USB 3" } else { "USB 2" }, ports);
+
+        // The controller must know it is a hub (and its ports) before it
+        // routes anything through it. Its status-change endpoint is set up
+        // too, though not used yet.
+        let eps: Vec<Endpoint> = hub.endpoints.iter().filter(|e| e.kind == 3 && e.is_in()).copied().collect();
+        self.configure_endpoints(slot, at.speed, &eps, Some((ports, ttt)))?;
+
+        for p in 1..=ports {
+            let _ = self.hub_feature(slot, true, HUB_PORT_POWER, p);
+        }
+        crate::time::delay_ms(power_good_ms + 100); // power good, then connect debounce
+
+        for p in 1..=ports {
+            let mut st = self.hub_port_status(slot, p).unwrap_or((0, 0));
+            if usb3 {
+                // Link training: wait while the link state is Polling (7).
+                crate::time::spin_until(500_000, || {
+                    st = self.hub_port_status(slot, p).unwrap_or((0, 0));
+                    (st.0 >> 5) & 0xF != 7
+                });
+            }
+            if st.0 & 1 == 0 {
+                continue; // nothing connected
+            }
+            let _ = self.hub_feature(slot, true, HUB_PORT_RESET, p);
+            let reset = crate::time::spin_until(500_000, || {
+                st = self.hub_port_status(slot, p).unwrap_or((0, 0));
+                st.1 & (1 << 4) != 0 && st.0 & (1 << 4) == 0
+            });
+            for f in [HUB_C_PORT_RESET, HUB_C_PORT_CONNECTION] {
+                let _ = self.hub_feature(slot, false, f, p);
+            }
+            if usb3 {
+                for f in [HUB_C_BH_PORT_RESET, HUB_C_PORT_LINK_STATE] {
+                    let _ = self.hub_feature(slot, false, f, p);
+                }
+            }
+            crate::time::delay_ms(10); // recovery after reset
+            let st = self.hub_port_status(slot, p).unwrap_or((0, 0));
+            let child = Attach {
+                root_port: at.root_port,
+                route: at.route | (p as u32) << (4 * at.tier),
+                tier: at.tier + 1,
+                speed: if usb3 {
+                    4
+                } else if st.0 & (1 << 9) != 0 {
+                    2
+                } else if st.0 & (1 << 10) != 0 {
+                    3
+                } else {
+                    1
+                },
+                tt: None,
+            };
+            let child = Attach {
+                tt: match (child.speed, at.speed) {
+                    (1 | 2, 3) => Some((slot, p)), // this hub translates
+                    (1 | 2, _) => at.tt,           // a translator further up, if any
+                    _ => None,
+                },
+                ..child
+            };
+            if !reset || st.0 & 2 == 0 {
+                crate::serial_println!("[XHCI] {} port {}: device didn't enable (hub port status {:#06x})", self.name, child.path(), st.0);
+                continue;
+            }
+            if let Err(e) = self.enumerate(child, found) {
+                crate::serial_println!("[XHCI] {} port {}: {}", self.name, child.path(), e);
+            }
+        }
+        Ok(())
+    }
+
+    /// SET_FEATURE / CLEAR_FEATURE on a hub port.
+    fn hub_feature(&mut self, slot: u8, set: bool, feature: u16, port: u8) -> Result<(), String> {
+        let request = if set { 3 } else { 1 };
+        self.control_out(slot, Setup { request_type: 0x23, request, value: feature, index: port as u16, length: 0 })
+    }
+
+    /// GET_STATUS on a hub port: (wPortStatus, wPortChange).
+    fn hub_port_status(&mut self, slot: u8, port: u8) -> Result<(u16, u16), String> {
+        let s = self.control_in(slot, Setup { request_type: 0xA3, request: 0, value: 0, index: port as u16, length: 4 })?;
+        if s.len() < 4 {
+            return Err(String::from("short port status"));
+        }
+        Ok((u16::from_le_bytes([s[0], s[1]]), u16::from_le_bytes([s[2], s[3]])))
+    }
+
+    /// Add endpoints `eps` to the slot. `hub`: the device is a hub with
+    /// this many ports and this TT think time.
+    fn configure_endpoints(&mut self, slot: u8, speed: u8, eps: &[Endpoint], hub: Option<(u8, u32)>) -> Result<(), String> {
         self.clear_input(slot);
         let max_dci = eps.iter().map(|e| e.dci()).max().unwrap_or(1);
         let mut add = 1u32; // the slot context
@@ -661,6 +816,15 @@ impl Controller {
             core::ptr::copy_nonoverlapping(s.dev_ctx, self.in_ctx(slot, 1) as *mut u8, self.ctx_size);
             let sc = self.in_ctx(slot, 1);
             sc.write_volatile((sc.read_volatile() & !(0x1F << 27)) | (max_dci as u32) << 27);
+            if let Some((ports, ttt)) = hub {
+                sc.write_volatile(sc.read_volatile() | 1 << 26); // Hub
+                let d1 = sc.add(1);
+                d1.write_volatile((d1.read_volatile() & 0x00FF_FFFF) | (ports as u32) << 24);
+                let d2 = sc.add(2);
+                d2.write_volatile((d2.read_volatile() & !(3 << 16)) | ttt << 16);
+            }
+            // The output context's dword 3 (state, address) means nothing here.
+            sc.add(3).write_volatile(0);
         }
         let in_phys = self.slots[slot as usize].as_ref().unwrap().in_phys;
         self.command(in_phys, TRB_CONFIGURE_EP << 10 | (slot as u32) << 24)?;

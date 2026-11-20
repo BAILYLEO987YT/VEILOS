@@ -11,10 +11,15 @@
 //   * mass storage, bulk-only transport with SCSI commands (`msc.rs`): a
 //     `block::Transport`, so a USB stick's VEILOS volume can be `/`.
 //
+// Hubs (USB 2 and USB 3, up to the 5 tiers USB allows) are set up at
+// start-up like the root ports: their ports powered and reset, and what is
+// plugged into them enumerated, with route strings and, for low/full-speed
+// devices behind a high-speed hub, its transaction translator.
+//
 // Everything is polled. Commands and bulk transfers wait for their own
 // completion; the BSP's timer tick (`poll`) collects keyboard and mouse
-// reports. Not yet: hubs (devices behind one are skipped, with a log line),
-// hot-plug after boot, isochronous transfers, USB 2 EHCI controllers.
+// reports. Not yet: hot-plug after boot (root ports or hub ports),
+// isochronous transfers, USB 2 EHCI controllers.
 
 pub mod hid;
 pub mod msc;
