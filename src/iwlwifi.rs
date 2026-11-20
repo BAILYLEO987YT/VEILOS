@@ -2261,7 +2261,11 @@ impl Iwl {
     }
 
     fn best_bss(&self, ssid: &[u8]) -> Option<Bss> {
-        self.scan_results.iter().filter(|b| b.ssid == ssid).max_by_key(|b| b.signal).cloned()
+        // The exact name first; else one that differs only in case (the
+        // terminal shows everything in capitals).
+        self.scan_results.iter().filter(|b| b.ssid == ssid).max_by_key(|b| b.signal)
+            .or_else(|| self.scan_results.iter().filter(|b| b.ssid.eq_ignore_ascii_case(ssid)).max_by_key(|b| b.signal))
+            .cloned()
     }
 
     fn join(&mut self, bss: &Bss) -> Result<(), String> {
