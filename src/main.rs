@@ -15,6 +15,8 @@ pub mod usb;
 pub mod e1000;
 pub mod nvme;
 pub mod r8169;
+pub mod iwlwifi;
+pub mod wpa;
 pub mod klog;
 pub mod interrupts;
 pub mod gdt;

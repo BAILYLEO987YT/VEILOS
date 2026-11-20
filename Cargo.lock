@@ -6,6 +6,7 @@ version = 4
 name = "VEIL-OS"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "blake3",
  "bootloader_api",
@@ -24,6 +25,7 @@ dependencies = [
  "pc-keyboard",
  "pic8259",
  "rand_core",
+ "sha1",
  "sha2",
  "smoltcp",
  "spin",
@@ -960,6 +962,17 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
+]
 
 [[package]]
 name = "sha2"
