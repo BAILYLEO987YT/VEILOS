@@ -14,6 +14,8 @@ pub mod power;
 pub mod usb;
 pub mod e1000;
 pub mod nvme;
+pub mod r8169;
+pub mod klog;
 pub mod interrupts;
 pub mod gdt;
 pub mod allocator;
@@ -180,6 +182,8 @@ pub fn _serial_print(args: fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         SERIAL_WRITER.lock().write_fmt(args).expect("Printing to serial failed");
     });
+    // Kept in memory too, for DMESG on machines with no serial port.
+    crate::klog::record(args);
 }
 
 // -----| kernel entry point |-----

@@ -109,6 +109,10 @@ static NET_CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
 
 /// True once the NIC has been found and the stack is live.
 static NETWORK_READY: AtomicBool = AtomicBool::new(false);
+/// No DHCP answer: the address is the fallback one (DHCP keeps trying).
+static DHCP_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+pub fn on_fallback_address() -> bool { DHCP_FALLBACK.load(Ordering::Acquire) }
 
 pub fn is_ready() -> bool { NETWORK_READY.load(Ordering::Acquire) }
 
@@ -194,6 +198,10 @@ pub trait Nic: Send {
     /// What identifies the device for hot-removal (its BAR0).
     fn key(&self) -> u64;
     fn kind(&self) -> &'static str;
+    /// More about its state, for NET STATUS (chip revision, PHY...).
+    fn detail(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
 }
 
 impl Nic for VirtioNet {
@@ -288,14 +296,20 @@ impl LogicalNic {
 
     /// One line per member, for `NET STATUS`.
     pub fn describe(&self) -> Vec<alloc::string::String> {
-        self.members.iter().enumerate().map(|(i, m)| {
+        let mut out = Vec::new();
+        for (i, m) in self.members.iter().enumerate() {
             let (rx, tx) = m.counts();
-            alloc::format!(
+            out.push(alloc::format!(
                 "  NIC {}: {} {} link {} rx {} tx {}{}",
                 i, m.kind(), m.mac(), if m.link_up() { "up" } else { "DOWN" }, rx, tx,
                 if i == self.active { "  (active)" } else { "" }
-            )
-        }).collect()
+            ));
+            let detail = m.detail();
+            if !detail.is_empty() {
+                out.push(alloc::format!("         {}", detail));
+            }
+        }
+        out
     }
 }
 
@@ -505,7 +519,7 @@ impl NetworkStack {
             None => {
                 if let Some(start_tick) = self.dhcp_start_tick {
                     let now = crate::interrupts::TICKS.load(Ordering::Relaxed);
-                    if now.saturating_sub(start_tick) > 5000 && !self.dhcp_done {
+                    if now.saturating_sub(start_tick) > 5000 && !self.dhcp_done && !DHCP_FALLBACK.load(Ordering::Acquire) {
                         let mac = self.device.mac.0;
                         // Derive the fallback IP last octet directly from the
                         // last two MAC bytes to guarantee uniqueness per NIC.
@@ -542,13 +556,20 @@ impl NetworkStack {
                             dns: None,
                             lease_ms: 3600 * 1000,
                         };
-                        self.dhcp_done = true;
+                        // DHCP keeps trying: a lease that comes later (a link
+                        // that came up late, a slow server) replaces this.
+                        DHCP_FALLBACK.store(true, Ordering::Release);
                         NETWORK_READY.store(true, Ordering::Release);
                         println!("[NET] Network ready (fallback). Route via {}", fallback_ip);
                     }
                 }
             }
             Some(dhcpv4::Event::Configured(cfg)) => {
+                if DHCP_FALLBACK.swap(false, Ordering::AcqRel) {
+                    // Replace the fallback route with the lease's.
+                    self.iface.routes_mut().remove_default_ipv4_route();
+                }
+                crate::serial_println!("[NET] DHCP configured: {}/{}", cfg.address.address(), cfg.address.prefix_len());
                 println!("[NET] DHCP configured: {}/{}", cfg.address.address(), cfg.address.prefix_len());
                 if let Some(gw) = cfg.router {
                     println!("[NET]   Gateway: {}", gw);

@@ -52,7 +52,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from(" STAB:    FUZZ [KERNEL|SYSCALL]  AUDIT  STRESS DRIVERS"));
             history.push(String::from(" DIST:    UPDATE [CHECK|APPLY|STATUS]  INSTALL  DOCS [LIST|READ path]"));
             history.push(String::from(" USERS:   WHOAMI  USERS  USERADD  USERDEL  PASSWD  UNLOCK  LOGOUT"));
-            history.push(String::from(" UTIL:    ECHO  DATE  UPTIME  FREE  NET STATUS  PEERS"));
+            history.push(String::from(" UTIL:    ECHO  DATE  UPTIME  FREE  NET STATUS  PEERS  DMESG [TEXT]"));
             history.push(String::from(" POWER:   REBOOT  REBOOT [ACPI|CF9|KBD|TRIPLE]  (one reset method, to check a machine)"));
             history.push(String::from(" MESH:    PING [IP]  EXEC [ID/ALIAS] [CMD] [ARGS]  DFSGET [ID/ALIAS] [PATH] [LOCAL]  DFSPUT [LOCAL] [ID/ALIAS] [PATH]  (see PEERS for aliases like peer1)"));
             history.push(String::from(" OFFLOAD: THREADS  BROKER STATUS  CHECKPOINT LIST"));
@@ -718,7 +718,11 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             match sub {
                 "STATUS" => {
                     if crate::network::is_ready() {
-                        history.push(String::from("  Network: ONLINE"));
+                        history.push(String::from(if crate::network::on_fallback_address() {
+                            "  Network: NO DHCP ANSWER (fallback address; still asking)"
+                        } else {
+                            "  Network: ONLINE"
+                        }));
                         let cfg = crate::network::NETWORK_CONFIG.lock();
                         history.push(alloc::format!("  IP:      {}/{}", cfg.ip.address(), cfg.ip.prefix_len()));
                         if let Some(gw) = cfg.gateway { history.push(alloc::format!("  Gateway: {}", gw)); }
@@ -728,6 +732,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                         history.extend(crate::network::nic_status());
                     } else {
                         history.push(String::from("  Network: OFFLINE (no NIC or DHCP pending)"));
+                        // Still show the NICs: "no link" and "no DHCP answer" differ.
+                        history.extend(crate::network::nic_status());
                     }
                 }
                 _ => history.push(String::from("USAGE: NET STATUS")),
@@ -921,6 +927,18 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     history.push(alloc::format!("  Current mode: {:?}", mode));
                     history.push(String::from("  Usage: MODE [SECURITY|PERFORMANCE]"));
                 }
+            }
+        }
+        "DMESG" => {
+            // The kernel log, for machines with no serial port (klog.rs):
+            // the last 30 lines, or those containing the text given.
+            let filter = parts[1..].join(" ");
+            let lines = crate::klog::lines(&filter, 30);
+            if lines.is_empty() {
+                history.push(alloc::format!("DMESG: nothing containing '{}'", filter));
+            }
+            for l in lines {
+                history.push(l.chars().take(110).collect());
             }
         }
         "REBOOT" | "RESTART" => {
