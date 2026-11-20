@@ -1,0 +1,10 @@
+[package]
+name = "avx1"
+version = "0.1.0"
+edition = "2021"
+
+# Not part of the win32/ workspace: a plain Windows program.
+[workspace]
+
+[profile.release]
+opt-level = 2

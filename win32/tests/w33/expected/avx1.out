@@ -1,0 +1,3 @@
+avx1: CPUID AVX true AVX2 true OSXSAVE true; XCR0 0x7
+avx1: 4 threads x 40 rounds in 226.4692ms: 0 bad registers
+exit 0

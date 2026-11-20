@@ -253,7 +253,7 @@ pub fn enable_sse() {
         );
         core::arch::asm!("fninit", options(nostack, nomem));
     }
-    enable_xsave_query();
+    enable_xsave();
     enable_smep();
     enable_smap();
 }
@@ -351,28 +351,76 @@ fn enable_smep() {
     crate::serial_println!("[SMP] SMEP on; SMAP {}", if ebx & (1 << 20) != 0 { "available" } else { "not available" });
 }
 
-/// CR4.OSXSAVE (bit 18), where the CPU has XSAVE, with XCR0 = x87 + SSE:
-/// the state the kernel already saves with FXSAVE. Programs may then ask
-/// with XGETBV which state the OS manages (Cygwin's signal code does, and
-/// XGETBV is #UD without OSXSAVE); AVX stays off, so they don't use it.
-fn enable_xsave_query() {
-    let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
+/// The state components (XCR0) the kernel saves with XSAVE on a thread
+/// switch, 0 when the CPU has no XSAVE (FXSAVE saves x87 + SSE instead).
+/// The same on every CPU: the BSP sets it, and each AP loads it into XCR0.
+pub static XSAVE_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Room in a thread's saved state for its XSAVE area: x87, SSE, AVX and
+/// AVX-512 in the standard layout (2688 bytes). A CPU whose CPUID says it
+/// needs more for those runs without AVX-512.
+pub const XSAVE_AREA: usize = 2688;
+
+/// CR4.OSXSAVE (bit 18), where the CPU has XSAVE, with XCR0 = x87 + SSE,
+/// plus AVX (YMM upper halves) where the CPU has it, plus AVX-512 (opmask,
+/// ZMM upper halves, ZMM16-31) where it has that. `kthread` saves exactly
+/// these on a thread switch, so programs that check CPUID and XGETBV (as
+/// they must) use AVX and AVX-512. MPX, PKRU and AMX stay off.
+fn enable_xsave() {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    use core::sync::atomic::Ordering;
+    let ecx = __cpuid(1).ecx;
     if ecx & (1 << 26) == 0 {
         return; // no XSAVE
     }
+    let set_xcr0 = |mask: u64| unsafe {
+        core::arch::asm!(
+            "xsetbv",
+            in("ecx") 0u32, in("eax") mask as u32, in("edx") (mask >> 32) as u32,
+            options(nostack),
+        );
+    };
     unsafe {
         core::arch::asm!(
             "mov rax, cr4",
             "or  rax, {bit}",
             "mov cr4, rax",
-            "xor ecx, ecx",
-            "mov eax, 3",
-            "xor edx, edx",
-            "xsetbv",
             bit = const 1u64 << 18,
-            out("rax") _, out("rcx") _, out("rdx") _,
+            out("rax") _,
             options(nostack),
         );
+    }
+    let mut mask = XSAVE_MASK.load(Ordering::Relaxed);
+    if mask == 0 {
+        // The BSP: choose. CPUID.D.0 EAX lists the components XCR0 may hold.
+        let supported = __cpuid_count(0xD, 0).eax as u64;
+        mask = 3;
+        if ecx & (1 << 28) != 0 && supported & 4 != 0 {
+            mask |= 4; // AVX
+            let avx512 = __cpuid_count(7, 0).ebx & (1 << 16) != 0;
+            if avx512 && supported & 0xE0 == 0xE0 {
+                mask |= 0xE0; // opmask, ZMM_Hi256, Hi16_ZMM
+            }
+        }
+        set_xcr0(mask);
+        // CPUID.D.0 EBX: the area XSAVE needs for what XCR0 now holds.
+        if __cpuid_count(0xD, 0).ebx as usize > XSAVE_AREA && mask & 0xE0 != 0 {
+            mask &= !0xE0;
+            set_xcr0(mask);
+        }
+        if __cpuid_count(0xD, 0).ebx as usize > XSAVE_AREA {
+            mask = 3;
+            set_xcr0(mask);
+        }
+        XSAVE_MASK.store(mask, Ordering::Relaxed);
+        crate::serial_println!(
+            "[SMP] XSAVE on: x87 SSE{}{} ({} bytes per thread)",
+            if mask & 4 != 0 { " AVX" } else { "" },
+            if mask & 0xE0 != 0 { " AVX-512" } else { "" },
+            __cpuid_count(0xD, 0).ebx,
+        );
+    } else {
+        set_xcr0(mask);
     }
 }
 
