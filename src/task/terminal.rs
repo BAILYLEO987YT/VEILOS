@@ -53,6 +53,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from(" DIST:    UPDATE [CHECK|APPLY|STATUS]  INSTALL  DOCS [LIST|READ path]"));
             history.push(String::from(" USERS:   WHOAMI  USERS  USERADD  USERDEL  PASSWD  UNLOCK  LOGOUT"));
             history.push(String::from(" UTIL:    ECHO  DATE  UPTIME  FREE  NET STATUS  PEERS  DMESG [TEXT]"));
+            history.push(String::from(" WI-FI:   WIFI [STATUS|UP|SCAN]"));
             history.push(String::from(" POWER:   REBOOT  REBOOT [ACPI|CF9|KBD|TRIPLE]  (one reset method, to check a machine)"));
             history.push(String::from(" MESH:    PING [IP]  EXEC [ID/ALIAS] [CMD] [ARGS]  DFSGET [ID/ALIAS] [PATH] [LOCAL]  DFSPUT [LOCAL] [ID/ALIAS] [PATH]  (see PEERS for aliases like peer1)"));
             history.push(String::from(" OFFLOAD: THREADS  BROKER STATUS  CHECKPOINT LIST"));
@@ -928,6 +929,10 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     history.push(String::from("  Usage: MODE [SECURITY|PERFORMANCE]"));
                 }
             }
+        }
+        "WIFI" => {
+            // The Intel 7265 Wi-Fi card (iwlwifi.rs).
+            history.extend(crate::iwlwifi::command(&parts[1..]));
         }
         "DMESG" => {
             // The kernel log, for machines with no serial port (klog.rs):

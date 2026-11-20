@@ -232,8 +232,14 @@ impl Nic for VirtioNet {
 pub struct LogicalNic {
     members: Vec<alloc::boxed::Box<dyn Nic>>,
     active: usize,
-    /// The interface's MAC (the first member's).
+    /// The interface's MAC: the active member's. A Wi-Fi card can't send
+    /// with another NIC's address, so it follows failover.
     pub mac: smoltcp::wire::EthernetAddress,
+    /// The active member's link as last seen.
+    active_link_was: bool,
+    /// The active member changed, or its link came back: the stack takes the
+    /// new MAC and asks DHCP again (a different network may be behind it).
+    pub relink: bool,
     /// Frames received on any member, oldest first, for smoltcp.
     pub rx_queue: Vec<PacketBuf>,
     pub rx_count: u64,
@@ -242,7 +248,8 @@ pub struct LogicalNic {
 impl LogicalNic {
     fn new(first: alloc::boxed::Box<dyn Nic>) -> Self {
         let mac = first.mac();
-        Self { members: alloc::vec![first], active: 0, mac, rx_queue: Vec::new(), rx_count: 0 }
+        let up = first.link_up();
+        Self { members: alloc::vec![first], active: 0, mac, active_link_was: up, relink: false, rx_queue: Vec::new(), rx_count: 0 }
     }
 
     /// Add another NIC. It takes over if the active member fails.
@@ -269,13 +276,27 @@ impl LogicalNic {
 
     /// Switch away from the active member if its link is down.
     fn check_links(&mut self) {
-        if self.members.is_empty() || self.members[self.active].link_up() {
+        if self.members.is_empty() {
             return;
         }
+        let up = self.members[self.active].link_up();
+        if up {
+            if !self.active_link_was {
+                crate::serial_println!("[NET] logical NIC: member {} ({}) link up", self.active, self.members[self.active].kind());
+                self.relink = true;
+            }
+            self.active_link_was = true;
+            return;
+        }
+        self.active_link_was = false;
         let n = self.members.len();
         if let Some(next) = (1..n).map(|k| (self.active + k) % n).find(|&i| self.members[i].link_up()) {
-            crate::serial_println!("[NET] logical NIC: member {} link down, failing over to member {}", self.active, next);
+            crate::serial_println!("[NET] logical NIC: member {} link down, failing over to member {} ({})",
+                self.active, next, self.members[next].kind());
             self.active = next;
+            self.mac = self.members[next].mac();
+            self.active_link_was = true;
+            self.relink = true;
         }
     }
 
@@ -455,6 +476,10 @@ impl NetworkStack {
             crate::interrupts::TICKS.load(Ordering::Relaxed) as i64
         );
         self.device.poll_rx();
+        if self.device.relink {
+            self.device.relink = false;
+            self.relink();
+        }
         let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.process_dhcp();
         self.process_dns();
@@ -501,6 +526,23 @@ impl NetworkStack {
     // ---- DHCP -------------------------------------------------------
 
     /// Start the DHCP discovery process.
+    /// The active NIC changed or its link came back: its MAC, and a fresh
+    /// DHCP exchange (the old address may belong to another network).
+    fn relink(&mut self) {
+        let mac = self.device.mac;
+        crate::serial_println!("[NET] interface MAC {}; asking DHCP again", mac);
+        self.iface.set_hardware_addr(smoltcp::wire::HardwareAddress::Ethernet(mac));
+        self.iface.update_ip_addrs(|addrs| addrs.clear());
+        self.iface.routes_mut().remove_default_ipv4_route();
+        if let Some(h) = self.dhcp_handle.take() {
+            self.sockets.remove(h);
+        }
+        self.dhcp_done = false;
+        DHCP_FALLBACK.store(false, Ordering::Release);
+        NETWORK_READY.store(false, Ordering::Release);
+        self.start_dhcp();
+    }
+
     pub fn start_dhcp(&mut self) {
         if self.dhcp_handle.is_some() { return; }
         let dhcp_socket = dhcpv4::Socket::new();

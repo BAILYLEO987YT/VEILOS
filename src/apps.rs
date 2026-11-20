@@ -1318,7 +1318,16 @@ impl TerminalEmulator {
                 if cmd.starts_with("PASSWD ") {
                     cmd = alloc::format!("PASSWD {}", self.input_buf.trim()[7..].trim());
                 }
-                self.history.push(alloc::format!("> {}", self.input_buf));
+                // WIFI CONNECT: the network name and password as typed, and
+                // the password hidden in the echoed line.
+                let mut echo = self.input_buf.clone();
+                if cmd.starts_with("WIFI ") {
+                    cmd = alloc::format!("WIFI {}", self.input_buf.trim()[5..].trim());
+                    if cmd[5..].trim_start().to_ascii_uppercase().starts_with("CONNECT ") {
+                        echo = mask_wifi_password(&self.input_buf);
+                    }
+                }
+                self.history.push(alloc::format!("> {}", echo));
                 if cmd.starts_with("RUN ") {
                     // As typed: arguments keep their case.
                     let rest = String::from(self.input_buf.trim()[4..].trim());
@@ -2308,4 +2317,28 @@ fn console_colours(attr: u16) -> (Color, Color) {
     let c = |i: u16| { let (r, g, b) = P[(i & 0xF) as usize]; Color { r, g, b } };
     let (fg, bg) = (c(attr), c(attr >> 4));
     if attr & 0x4000 != 0 { (bg, fg) } else { (fg, bg) }
+}
+
+/// "WIFI CONNECT <ssid> <password>" with the password as asterisks (the
+/// SSID may be "quoted" and contain spaces).
+fn mask_wifi_password(line: &str) -> String {
+    let t = line.trim_start();
+    let mut i = 0;
+    // Skip "WIFI" and "CONNECT".
+    for _ in 0..2 {
+        i += t[i..].find(|c: char| !c.is_whitespace()).unwrap_or(t.len() - i);
+        i += t[i..].find(char::is_whitespace).unwrap_or(t.len() - i);
+    }
+    i += t[i..].find(|c: char| !c.is_whitespace()).unwrap_or(t.len() - i);
+    // The SSID: quoted or one word.
+    if t[i..].starts_with('"') {
+        i += 1 + t[i + 1..].find('"').map_or(t.len() - i - 1, |q| q + 1);
+    } else {
+        i += t[i..].find(char::is_whitespace).unwrap_or(t.len() - i);
+    }
+    let rest = t[i..].trim();
+    if rest.is_empty() {
+        return String::from(t);
+    }
+    alloc::format!("{} {}", t[..i].trim_end(), "*".repeat(rest.chars().count()))
 }
