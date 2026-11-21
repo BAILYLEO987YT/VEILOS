@@ -81,6 +81,9 @@ impl InterruptIndex {
 /// `hlt` so it re-checks `smp::AP_WORK_QUEUE`.
 pub const AP_TIMER_VECTOR: u8 = 0x40;
 
+/// xHCI controllers' MSI/MSI-X interrupt, on the BSP (usb::xhci).
+pub const USB_VECTOR: u8 = 0x50;
+
 /// Vector the LAPIC raises for spurious interrupts (low byte of the SVR, see smp.rs).
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
@@ -146,6 +149,8 @@ lazy_static! {
             .set_handler_fn(ap_timer_interrupt_handler);
         idt[SPURIOUS_VECTOR as usize]
             .set_handler_fn(spurious_interrupt_handler);
+        idt[USB_VECTOR as usize]
+            .set_handler_fn(usb_interrupt_handler);
         // 8259 spurious IRQs (7 and 15). They can still arrive just after the
         // PIC is masked for the I/O APIC switch.
         idt[(PIC_1_OFFSET + 7) as usize]
@@ -976,6 +981,13 @@ extern "x86-interrupt" fn ap_timer_interrupt_handler(stack_frame: InterruptStack
 /// must NOT be acknowledged with an EOI.
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {}
 
+/// xHCI events (MSI/MSI-X). Edge-triggered: EOI first, so an interrupt
+/// raised while the events are read is taken again afterwards.
+extern "x86-interrupt" fn usb_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::smp::lapic_eoi();
+    crate::usb::xhci::interrupt();
+}
+
 /// Nothing uses IRQ 7 or 15, so anything on these vectors is an 8259
 /// spurious interrupt. A spurious IRQ 7 needs no EOI.
 extern "x86-interrupt" fn pic_spurious_irq7_handler(_stack_frame: InterruptStackFrame) {}
@@ -1025,7 +1037,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     crate::kusd::tick(tick);
     crate::debugger::profiler_tick(tick);
     crate::audio::tick(tick);
-    crate::usb::poll();
+    crate::usb::tick(tick);
     crate::power::poll_button();
     crate::entropy::stir(stack_frame.instruction_pointer.as_u64());
 

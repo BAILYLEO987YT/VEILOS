@@ -448,6 +448,48 @@ impl PciDevice {
         })
     }
 
+    /// Send the device's interrupt as MSI: one vector, `vector`, fixed
+    /// delivery to the CPU with (xAPIC) id `apic_id`, edge-triggered. INTx is
+    /// turned off. False if the device has no MSI capability.
+    pub fn enable_msi(&self, vector: u8, apic_id: u8) -> bool {
+        let Some(m) = self.msi() else { return false };
+        let a = self.address();
+        let o = m.offset;
+        a.write_u32(o + 4, 0xFEE0_0000 | (apic_id as u32) << 12);
+        if m.is_64bit {
+            a.write_u32(o + 8, 0);
+            a.write_u16(o + 0xC, vector as u16);
+        } else {
+            a.write_u16(o + 8, vector as u16);
+        }
+        // Multiple Message Enable (bits 6:4) = 0: one vector; then MSI Enable.
+        let control = a.read_u16(o + 2);
+        a.write_u16(o + 2, (control & !(0x7 << 4)) | 1);
+        self.set_command_bits(CMD_INTX_DISABLE);
+        true
+    }
+
+    /// Send the device's interrupt as MSI-X entry 0, as `enable_msi` does;
+    /// the other entries stay masked. `table` is where the vector table is
+    /// mapped (the BAR `msix().table_bar` plus `table_offset`).
+    pub fn enable_msix(&self, table: u64, vector: u8, apic_id: u8) -> bool {
+        let Some(m) = self.msix() else { return false };
+        let a = self.address();
+        let control = a.read_u16(m.offset + 2);
+        // Enable with the function masked while the entry is written.
+        a.write_u16(m.offset + 2, control | 1 << 15 | 1 << 14);
+        unsafe {
+            let e = table as *mut u32;
+            e.add(0).write_volatile(0xFEE0_0000 | (apic_id as u32) << 12);
+            e.add(1).write_volatile(0);
+            e.add(2).write_volatile(vector as u32);
+            e.add(3).write_volatile(0); // unmasked
+        }
+        a.write_u16(m.offset + 2, (control | 1 << 15) & !(1 << 14));
+        self.set_command_bits(CMD_INTX_DISABLE);
+        true
+    }
+
     pub fn command(&self) -> u16 {
         self.address().read_u16(REG_COMMAND)
     }

@@ -24,9 +24,10 @@
 // too. A USB disk plugged in later mounts read-only under /mnt; one pulled
 // out stops answering (its mount stays, with errors).
 //
-// Everything is polled. Commands and bulk transfers wait for their own
-// completion; the BSP's timer tick (`poll`) collects keyboard and mouse
-// reports. Not yet: isochronous transfers, USB 2 EHCI controllers.
+// Commands and bulk transfers spin until their own completion. Keyboard and
+// mouse reports and hot-plug changes come with the controller's interrupt
+// (MSI or MSI-X to the BSP), or from the BSP's timer tick on a controller
+// without one. Not yet: isochronous transfers, USB 2 EHCI controllers.
 
 pub mod hid;
 pub mod msc;
@@ -43,10 +44,17 @@ pub const XHCI_DRIVER: crate::hal::Driver = crate::hal::Driver {
     remove: None,
 };
 
-/// From the BSP's timer interrupt: collect keyboard and mouse reports.
-/// Skips a controller that a transfer is using (it collects them itself).
+/// Collect keyboard and mouse reports now (the power code's key wait, with
+/// interrupts off). Skips a controller that a transfer is using (it
+/// collects them itself).
 pub fn poll() {
     xhci::poll_all();
+}
+
+/// From the BSP's timer interrupt (tick `n`): poll controllers that have no
+/// interrupt of their own, and the rest every 10 ms in case one was missed.
+pub fn tick(n: u64) {
+    xhci::tick(n);
 }
 
 /// Set up devices plugged in after start-up and forget those pulled out,
