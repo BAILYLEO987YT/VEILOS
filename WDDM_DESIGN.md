@@ -263,8 +263,59 @@ The 97 left, by area:
   `netio.sys` (4).
 - **`SeExports`.**
 
+### W1: Zw, BCrypt, HAL, SeExports (2026-11-21)
+
+445 exported functions. Every import of the NVIDIA and Arc kernel drivers
+now resolves except 41, all W2's: the device stack and PnP (attach,
+detach, remove locks, device interfaces and properties, device registry
+keys, PnP notifications), `IoConnectInterruptEx`, the error log,
+`IoCancelIrp`, `PoRequestPowerIrp`, `ObOpenObjectByPointer` and
+`FsRtlRegisterFileSystemFilterCallbacks`.
+
+- `zw.rs`:
+  - files on the VFS (`\??\C:\`, `\DosDevices\`, `\SystemRoot\`), and
+    devices by name with kernel-side IOCTLs;
+  - named events, symbolic links, handle duplication, LUIDs;
+  - registry enumeration (`ZwEnumerateValueKey`, `ZwEnumerateKey`,
+    `ZwQueryKey`);
+  - `ZwQuerySystemInformation` (basic, and the module list with the
+    kernel and loaded drivers);
+  - `ZwLoadDriver`/`ZwUnloadDriver` through a Services key's `ImagePath`.
+
+  Process virtual memory, sections, process and token queries and power
+  information return `STATUS_NOT_SUPPORTED` and log it the first time.
+- `bcrypt.rs` (ksecdd.sys) uses the kernel's crypto crates:
+  - random numbers;
+  - SHA-1/256/384/512, plain or HMAC;
+  - AES-128/192/256 decryption in ECB, CBC (PKCS#7) and GCM.
+
+  Asymmetric keys and key derivation return `STATUS_NOT_SUPPORTED` (no RSA
+  or ECC crate in the kernel yet).
+- `misc.rs`: `SeExports` (privilege LUIDs and the well-known SIDs), the
+  netio.sys network module registrar (accepted; nothing attaches), and
+  `HalGet/SetBusDataByOffset` on PCI configuration space.
+
+The first run caught a data-export rule. A `dllimport` declaration
+(`extern NTKERNELAPI PSE_EXPORTS SeExports`) reads the exported variable's
+value, so `SeExports` must hold a pointer to the structure. Plainly
+declared ones (`extern POBJECT_TYPE *ExEventObjectType`) bind to the
+exported address itself. The driver had read a privilege LUID as the
+pointer.
+
+K1 now has 29 self-test parts, `1fffffff`. The new ones:
+- `ZwCreateFile`/`Write`/`Read`/`QueryInformationFile` round trip;
+- a named event opened twice;
+- the device's symbolic link;
+- registry enumeration;
+- the driver finding itself in the module list;
+- SHA-256 and HMAC-SHA256 test vectors and the FIPS-197 AES vector;
+- PCI 00:00.0's vendor ID;
+- `SeExports`' LocalSystem SID.
+
+layout.c checks SE_EXPORTS and the information structures. In QEMU:
+`1fffffff of 1fffffff`, `k1test: 0 failed`.
+
 Still to do in W1:
-- the `Zw*` group, BCrypt, Nmr and `SeExports`;
 - per-section protection;
 - freeing an unloaded image;
 - mapping an MDL into a program (`UserMode`);

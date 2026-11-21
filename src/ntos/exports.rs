@@ -1,6 +1,6 @@
 // What VEILOS's ntoskrnl.exe and hal.dll export to drivers: name -> address.
 
-use super::{cm, crt, dpc, ex, io, ke, misc, mm, ob, pool, ps, rtl, rtlx, seh};
+use super::{bcrypt, cm, crt, dpc, ex, io, ke, misc, mm, ob, pool, ps, rtl, rtlx, seh, zw};
 
 // -----| pool |-----
 
@@ -175,7 +175,19 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
                 misc::MmCopyMemory, misc::MmAllocateMappingAddress, misc::MmFreeMappingAddress,
                 misc::MmMapLockedPagesWithReservedMapping, misc::MmUnmapReservedMapping,
             );
-            if let Some(a) = ex::data_export(name) {
+            table!(name;
+                // Zw*: files, devices, events, links, registry, system
+                zw::ZwCreateFile, zw::ZwOpenFile, zw::ZwReadFile, zw::ZwWriteFile, zw::ZwQueryInformationFile,
+                zw::ZwDeviceIoControlFile, zw::ZwCreateEvent, zw::ZwOpenEvent, zw::ZwSetEvent, zw::ZwResetEvent,
+                zw::ZwClearEvent, zw::ZwWaitForSingleObject, zw::ZwOpenSymbolicLinkObject, zw::ZwQuerySymbolicLinkObject,
+                zw::ZwDuplicateObject, zw::ZwAllocateLocallyUniqueId, zw::ZwEnumerateValueKey, zw::ZwEnumerateKey,
+                zw::ZwQueryKey, zw::ZwQuerySystemInformation, zw::ZwLoadDriver, zw::ZwUnloadDriver,
+                zw::ZwAllocateVirtualMemory, zw::ZwFreeVirtualMemory, zw::ZwQueryVirtualMemory, zw::ZwCreateSection,
+                zw::ZwOpenSection, zw::ZwMapViewOfSection, zw::ZwUnmapViewOfSection, zw::ZwOpenProcess,
+                zw::ZwQueryInformationProcess, zw::ZwOpenProcessTokenEx, zw::ZwQueryInformationToken,
+                zw::ZwSetSecurityObject, zw::ZwQueryInformationThread, zw::ZwPowerInformation, zw::ZwSetInformationThread,
+            );
+            if let Some(a) = ex::data_export(name).or_else(|| misc::data_export(name)) {
                 return Some(a);
             }
             // Data exports.
@@ -188,7 +200,21 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
             None
         }
         "hal.dll" => {
-            table!(name; ke::KeQueryPerformanceCounter, ke::KeStallExecutionProcessor);
+            table!(name; ke::KeQueryPerformanceCounter, ke::KeStallExecutionProcessor,
+                misc::HalGetBusDataByOffset, misc::HalSetBusDataByOffset);
+            None
+        }
+        "ksecdd.sys" => {
+            table!(name; bcrypt::BCryptOpenAlgorithmProvider, bcrypt::BCryptCloseAlgorithmProvider,
+                bcrypt::BCryptGetProperty, bcrypt::BCryptSetProperty, bcrypt::BCryptCreateHash, bcrypt::BCryptHashData,
+                bcrypt::BCryptFinishHash, bcrypt::BCryptDestroyHash, bcrypt::BCryptGenerateSymmetricKey,
+                bcrypt::BCryptDestroyKey, bcrypt::BCryptDecrypt, bcrypt::BCryptGenRandom, bcrypt::BCryptImportKeyPair,
+                bcrypt::BCryptVerifySignature, bcrypt::BCryptKeyDerivation);
+            None
+        }
+        "netio.sys" => {
+            table!(name; misc::NmrRegisterProvider, misc::NmrDeregisterProvider,
+                misc::NmrWaitForProviderDeregisterComplete, misc::NmrProviderDetachClientComplete);
             None
         }
         _ => None,

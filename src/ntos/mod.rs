@@ -26,7 +26,10 @@
 //   * `crt`, `rtlx`: the C runtime and run-time library beyond the basics.
 //   * `ex`: resources, fast mutexes, SLists, lookaside lists, callbacks,
 //     Ex timers; `misc`: queues, Ps, Po, Cm, Etw and Mm odds and ends.
-//   * `exports`: the name -> address tables of ntoskrnl.exe and hal.dll.
+//   * `zw`: files on the VFS, devices, events, links, registry enumeration,
+//     system information, ZwLoadDriver.
+//   * `exports`: the name -> address tables of ntoskrnl.exe, hal.dll and
+//     the other modules drivers import from (netio.sys).
 //
 // The structures drivers read directly (DRIVER_OBJECT, DEVICE_OBJECT, IRP,
 // IO_STACK_LOCATION, KEVENT, UNICODE_STRING) have Windows' x64 layout, byte
@@ -42,6 +45,7 @@
 // Exported functions keep the names drivers link against.
 #![allow(non_snake_case)]
 
+pub mod bcrypt;
 pub mod cm;
 pub mod crt;
 pub mod dpc;
@@ -58,6 +62,7 @@ pub mod ps;
 pub mod rtl;
 pub mod rtlx;
 pub mod seh;
+pub mod zw;
 
 pub type NtStatus = i32;
 pub const STATUS_SUCCESS: NtStatus = 0;
@@ -79,6 +84,7 @@ pub const STATUS_INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009Au32 as i32;
 pub fn init() {
     pool::init();
     ex::init();
+    misc::init();
 }
 
 /// Run `f` (driver code) with GS on this CPU's per-CPU block, where

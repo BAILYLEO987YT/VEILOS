@@ -365,3 +365,137 @@ pub extern "win64" fn MmMapLockedPagesWithReservedMapping(va: u64, _tag: u32, md
 pub extern "win64" fn MmUnmapReservedMapping(va: u64, _tag: u32, mdl: *mut u8) {
     mm::MmUnmapLockedPages(va, mdl)
 }
+
+// -----| SeExports |-----
+//
+// SE_EXPORTS: 23 privilege LUIDs (SeCreateTokenPrivilege = 2 ...
+// SeRemoteShutdownPrivilege = 24), then PSIDs from 0xB8: SeNullSid,
+// SeWorldSid, SeLocalSid, SeCreatorOwnerSid, SeCreatorGroupSid,
+// SeNtAuthoritySid, SeDialupSid, SeNetworkSid, SeBatchSid,
+// SeInteractiveSid, SeLocalSystemSid (0x108), SeAliasAdminsSid,
+// SeAliasUsersSid, SeAliasGuestsSid, SeAliasPowerUsersSid,
+// SeAliasAccountOpsSid, SeAliasSystemOpsSid, SeAliasPrintOpsSid,
+// SeAliasBackupOpsSid, SeAuthenticatedUsersSid (0x150), ... (layout.c
+// checks these offsets). Later fields stay zero.
+
+static mut SE_EXPORTS: [u64; 0x80] = [0; 0x80];
+/// The exported variable: drivers declare it `extern NTKERNELAPI
+/// PSE_EXPORTS SeExports` (dllimport), so its value is the structure's
+/// address. (Plainly declared data exports, `extern POBJECT_TYPE
+/// *ExEventObjectType`, bind to the exported address itself; ex.rs.)
+static mut SE_EXPORTS_PTR: u64 = 0;
+
+/// Well-known SIDs: revision 1, count, authority (6 bytes), sub-authorities.
+static SIDS: [[u8; 16]; 20] = {
+    const fn sid(auth: u8, subs: &[u32]) -> [u8; 16] {
+        let mut s = [0u8; 16];
+        s[0] = 1;
+        s[1] = subs.len() as u8;
+        s[7] = auth;
+        let mut i = 0;
+        while i < subs.len() {
+            let b = subs[i].to_le_bytes();
+            s[8 + 4 * i] = b[0];
+            s[9 + 4 * i] = b[1];
+            s[10 + 4 * i] = b[2];
+            s[11 + 4 * i] = b[3];
+            i += 1;
+        }
+        s
+    }
+    [
+        sid(0, &[0]),         // Null S-1-0-0
+        sid(1, &[0]),         // World S-1-1-0
+        sid(2, &[0]),         // Local S-1-2-0
+        sid(3, &[0]),         // Creator owner S-1-3-0
+        sid(3, &[1]),         // Creator group S-1-3-1
+        sid(5, &[]),          // NT authority S-1-5
+        sid(5, &[1]),         // Dialup
+        sid(5, &[2]),         // Network
+        sid(5, &[3]),         // Batch
+        sid(5, &[4]),         // Interactive
+        sid(5, &[18]),        // Local system
+        sid(5, &[32, 544]),   // Administrators
+        sid(5, &[32, 545]),   // Users
+        sid(5, &[32, 546]),   // Guests
+        sid(5, &[32, 547]),   // Power users
+        sid(5, &[32, 548]),   // Account operators
+        sid(5, &[32, 549]),   // System operators
+        sid(5, &[32, 550]),   // Print operators
+        sid(5, &[32, 551]),   // Backup operators
+        sid(5, &[11]),        // Authenticated users
+    ]
+};
+
+pub fn init() {
+    unsafe {
+        let e = &mut *(&raw mut SE_EXPORTS);
+        for (i, slot) in e.iter_mut().take(23).enumerate() {
+            *slot = i as u64 + 2;
+        }
+        for (k, s) in SIDS.iter().enumerate() {
+            e[23 + k] = s.as_ptr() as u64;
+        }
+        SE_EXPORTS_PTR = e.as_ptr() as u64;
+    }
+}
+
+pub fn data_export(name: &str) -> Option<u64> {
+    (name == "SeExports").then(|| &raw const SE_EXPORTS_PTR as u64)
+}
+
+// -----| netio.sys: the network module registrar |-----
+//
+// Drivers that offer a network module (NVIDIA's for its network features)
+// register a provider; no client attaches in VEILOS, so it never gets
+// called.
+
+pub extern "win64" fn NmrRegisterProvider(_chars: *const u8, _ctx: u64, handle: *mut u64) -> NtStatus {
+    if !handle.is_null() {
+        unsafe { handle.write(new_cookie()) };
+    }
+    STATUS_SUCCESS
+}
+pub extern "win64" fn NmrDeregisterProvider(_handle: u64) -> NtStatus {
+    0x103 // STATUS_PENDING: done when NmrWaitForProviderDeregisterComplete returns
+}
+pub extern "win64" fn NmrWaitForProviderDeregisterComplete(_handle: u64) -> NtStatus {
+    STATUS_SUCCESS
+}
+pub extern "win64" fn NmrProviderDetachClientComplete(_binding: u64) -> NtStatus {
+    STATUS_SUCCESS
+}
+
+// -----| hal.dll: PCI configuration space |-----
+
+/// HalGetBusDataByOffset(BusDataType, BusNumber, SlotNumber, Buffer,
+/// Offset, Length): PCIConfiguration (4) only. SlotNumber is a
+/// PCI_SLOT_NUMBER: device in bits 0-4, function in 5-7. Bytes read.
+pub extern "win64" fn HalGetBusDataByOffset(kind: u32, bus: u32, slot: u32, buf: *mut u8, offset: u32, len: u32) -> u32 {
+    if kind != 4 || bus > 255 {
+        return 0;
+    }
+    let a = crate::pci::PciAddress::new(bus as u8, (slot & 0x1F) as u8, ((slot >> 5) & 7) as u8);
+    if offset == 0 && len >= 2 && a.read_u16(0) == 0xFFFF {
+        // No device there: Windows writes PCI_INVALID_VENDORID and reports 2.
+        unsafe { (buf as *mut u16).write_unaligned(0xFFFF) };
+        return 2;
+    }
+    let n = len.min(256u32.saturating_sub(offset));
+    for i in 0..n {
+        unsafe { buf.add(i as usize).write(a.read_u8((offset + i) as u8)) };
+    }
+    n
+}
+
+pub extern "win64" fn HalSetBusDataByOffset(kind: u32, bus: u32, slot: u32, buf: *const u8, offset: u32, len: u32) -> u32 {
+    if kind != 4 || bus > 255 {
+        return 0;
+    }
+    let a = crate::pci::PciAddress::new(bus as u8, (slot & 0x1F) as u8, ((slot >> 5) & 7) as u8);
+    let n = len.min(256u32.saturating_sub(offset));
+    for i in 0..n {
+        a.write_u8((offset + i) as u8, unsafe { buf.add(i as usize).read() });
+    }
+    n
+}

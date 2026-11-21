@@ -7,7 +7,7 @@
 // on. Reference counts aren't kept: objects live until the handle closes or
 // the thread they stand for ends.
 
-use alloc::{collections::BTreeMap, string::String};
+use alloc::{collections::BTreeMap, string::String, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
@@ -19,8 +19,16 @@ const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008u32 as i32;
 pub enum Object {
     /// A registry key: its hive-rooted path ("HKLM\SYSTEM\...").
     Key(String),
-    /// A dispatcher object in pool (a system thread's).
+    /// A dispatcher object in pool (a system thread's, an event's).
     Dispatcher(usize),
+    /// A file on the VFS (zw.rs).
+    File(Arc<super::zw::KFile>),
+    /// A directory on the VFS, by path.
+    Directory(String),
+    /// A driver's device, opened by name.
+    Device(Arc<super::io::DeviceHandle>),
+    /// A symbolic link: its target.
+    Link(String),
 }
 
 static HANDLES: Mutex<BTreeMap<u64, Object>> = Mutex::new(BTreeMap::new());

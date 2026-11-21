@@ -76,6 +76,12 @@ int main(void) {
         check("driver Rtl: time fields, RtlQueryRegistryValues", ok && (mask & 0x100000));
         check("driver Ex: timer, callback object", ok && (mask & 0x200000));
         check("driver KPCR: current thread, CPU, PCR via GS", ok && (mask & 0x400000));
+        check("driver Zw: file create/write/read/query", ok && (mask & 0x800000));
+        check("driver Zw: named event, symbolic link", ok && (mask & 0x1000000));
+        check("driver Zw: registry enumeration", ok && (mask & 0x2000000));
+        check("driver Zw: system and module information", ok && (mask & 0x4000000));
+        check("driver BCrypt: SHA-256, HMAC, AES, RNG", ok && (mask & 0x8000000));
+        check("driver HAL PCI config, SeExports", ok && (mask & 0x10000000));
     }
     {
         // METHOD_OUT_DIRECT: the driver writes straight into this buffer

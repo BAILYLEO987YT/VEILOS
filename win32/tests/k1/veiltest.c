@@ -7,10 +7,12 @@
 //   IOCTL_VEIL_ADD   (METHOD_BUFFERED): two ULONGs in, their sum out
 //   IOCTL_VEIL_STATS (METHOD_BUFFERED): counters: creates, closes, ioctls
 // DriverUnload removes the link and the device and frees the pool.
-#include <ntddk.h>
+#include <ntifs.h> // ntddk.h plus SeExports
+#include <bcrypt.h>
 
 // Exported by ntoskrnl, but only declared in the user-mode headers.
 NTSYSAPI VOID NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
+NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(ULONG Class, PVOID Info, ULONG Length, PULONG ReturnLength);
 int __cdecl sprintf_s(char *buffer, size_t size, const char *format, ...);
 int __cdecl swprintf_s(wchar_t *buffer, size_t size, const wchar_t *format, ...);
 
@@ -49,7 +51,13 @@ int __cdecl swprintf_s(wchar_t *buffer, size_t size, const wchar_t *format, ...)
 #define T_TIME_REG     0x100000
 #define T_EXTIMER_CB   0x200000
 #define T_KPCR         0x400000
-#define T_ALL      0x7FFFFF
+#define T_ZW_FILE      0x800000
+#define T_ZW_EVENT     0x1000000
+#define T_ZW_REGISTRY  0x2000000
+#define T_ZW_SYSINFO   0x4000000
+#define T_BCRYPT       0x8000000
+#define T_HAL_SE       0x10000000
+#define T_ALL      0x1FFFFFFF
 
 typedef struct _VEIL_EXT {
     KSPIN_LOCK Lock;
@@ -471,6 +479,177 @@ static ULONG RuntimeTest(void) {
     return mask;
 }
 
+// -----| Zw*, BCrypt, HAL, SeExports |-----
+
+static int Same(const UCHAR *a, const UCHAR *b, ULONG n) {
+    return RtlCompareMemory(a, b, n) == n;
+}
+
+static ULONG ZwTest(PUNICODE_STRING reg) {
+    ULONG mask = 0;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING name;
+    IO_STATUS_BLOCK io;
+    NTSTATUS st;
+
+    // A file: created, written, read back, its size queried.
+    {
+        HANDLE f;
+        static const char text[] = "VEILOS ZwWriteFile";
+        char back[32] = { 0 };
+        FILE_STANDARD_INFORMATION si;
+        LARGE_INTEGER zero = { 0 };
+        BOOLEAN ok = FALSE;
+        RtlInitUnicodeString(&name, L"\\??\\C:\\k1zw.txt");
+        InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        st = ZwCreateFile(&f, GENERIC_READ | GENERIC_WRITE, &oa, &io, NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OVERWRITE_IF,
+                          FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+        if (NT_SUCCESS(st)) {
+            ok = NT_SUCCESS(ZwWriteFile(f, NULL, NULL, NULL, &io, (PVOID)text, sizeof text - 1, &zero, NULL)) &&
+                 io.Information == sizeof text - 1;
+            ok = ok && NT_SUCCESS(ZwReadFile(f, NULL, NULL, NULL, &io, back, sizeof back, &zero, NULL)) &&
+                 io.Information == sizeof text - 1 && Same((const UCHAR *)back, (const UCHAR *)text, sizeof text - 1);
+            ok = ok && NT_SUCCESS(ZwQueryInformationFile(f, &io, &si, sizeof si, FileStandardInformation)) &&
+                 si.EndOfFile.QuadPart == sizeof text - 1;
+            ZwClose(f);
+        }
+        if (ok) mask |= T_ZW_FILE;
+        DbgPrint("veiltest: Zw file %08lx, read back \"%s\"\n", st, back);
+    }
+    // A named event, opened again by name and waited on; the device's link.
+    {
+        HANDLE e1, e2, l;
+        LARGE_INTEGER zero = { 0 };
+        WCHAR buf[64];
+        UNICODE_STRING target = { 0, sizeof buf, buf }, expect;
+        BOOLEAN ok;
+        RtlInitUnicodeString(&name, L"\\KernelObjects\\VeilTestEvent");
+        InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        ok = NT_SUCCESS(ZwCreateEvent(&e1, EVENT_ALL_ACCESS, &oa, NotificationEvent, FALSE)) &&
+             NT_SUCCESS(ZwOpenEvent(&e2, EVENT_ALL_ACCESS, &oa));
+        if (ok) {
+            ok = ZwWaitForSingleObject(e2, FALSE, &zero) == STATUS_TIMEOUT;
+            ZwSetEvent(e1, NULL);
+            ok = ok && ZwWaitForSingleObject(e2, FALSE, &zero) == STATUS_SUCCESS;
+            ZwClose(e1);
+            ZwClose(e2);
+        }
+        RtlInitUnicodeString(&name, L"\\DosDevices\\VeilTest");
+        InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        RtlInitUnicodeString(&expect, L"\\Device\\VeilTest");
+        if (NT_SUCCESS(ZwOpenSymbolicLinkObject(&l, GENERIC_READ, &oa))) {
+            ok = ok && NT_SUCCESS(ZwQuerySymbolicLinkObject(l, &target, NULL)) && RtlEqualUnicodeString(&target, &expect, TRUE);
+            ZwClose(l);
+        } else {
+            ok = FALSE;
+        }
+        if (ok) mask |= T_ZW_EVENT;
+    }
+    // The registry: our Parameters key's values, enumerated, and its counts.
+    {
+        HANDLE k;
+        UCHAR info[256];
+        ULONG got;
+        UNICODE_STRING sub;
+        WCHAR path[200];
+        UNICODE_STRING full = { 0, sizeof path, path };
+        BOOLEAN ok = FALSE;
+        RtlCopyUnicodeString(&full, reg);
+        RtlInitUnicodeString(&sub, L"\\Parameters");
+        RtlAppendUnicodeStringToString(&full, &sub);
+        InitializeObjectAttributes(&oa, &full, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(ZwOpenKey(&k, KEY_READ, &oa))) {
+            PKEY_FULL_INFORMATION fi = (PKEY_FULL_INFORMATION)info;
+            PKEY_VALUE_BASIC_INFORMATION vb = (PKEY_VALUE_BASIC_INFORMATION)info;
+            ULONG values = 0, seen = 0;
+            if (NT_SUCCESS(ZwQueryKey(k, KeyFullInformation, info, sizeof info, &got))) values = fi->Values;
+            for (ULONG i = 0; ZwEnumerateValueKey(k, i, KeyValueBasicInformation, info, sizeof info, &got) == STATUS_SUCCESS; i++)
+                if (vb->NameLength > 0) seen++;
+            ok = values == 2 && seen == 2; // Answer and Greeting
+            DbgPrint("veiltest: Parameters has %lu values, %lu enumerated\n", values, seen);
+            ZwClose(k);
+        }
+        if (ok) mask |= T_ZW_REGISTRY;
+    }
+    // System information: the basic block, and this driver in the module list.
+    {
+        UCHAR basic[0x40];
+        ULONG need = 0;
+        BOOLEAN ok = NT_SUCCESS(ZwQuerySystemInformation(0, basic, sizeof basic, &need)) && *(ULONG *)(basic + 8) == PAGE_SIZE;
+        ZwQuerySystemInformation(11, NULL, 0, &need);
+        if (ok && need) {
+            PUCHAR mods = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, need, 'liev');
+            ok = FALSE;
+            if (mods && NT_SUCCESS(ZwQuerySystemInformation(11, mods, need, &need))) {
+                ULONG n = *(ULONG *)mods;
+                ULONG_PTR me = (ULONG_PTR)ZwTest;
+                for (ULONG i = 0; i < n; i++) {
+                    PUCHAR m = mods + 8 + i * 0x128;
+                    ULONG_PTR base = *(ULONG_PTR *)(m + 0x10);
+                    ULONG size = *(ULONG *)(m + 0x18);
+                    if (me >= base && me < base + size && strstr((char *)m + 0x28, "veiltest")) ok = TRUE;
+                }
+            }
+            if (mods) ExFreePoolWithTag(mods, 'liev');
+        }
+        if (ok) mask |= T_ZW_SYSINFO;
+    }
+    // BCrypt: SHA-256 and HMAC-SHA256 test vectors, AES (FIPS-197) decrypt, random.
+    {
+        static const UCHAR sha_abc[32] = { 0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+                                           0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad };
+        static const UCHAR hmac_fox[32] = { 0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24, 0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f, 0xb1, 0x43,
+                                            0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x17, 0x59, 0x97, 0x47, 0x9d, 0xbc, 0x2d, 0x1a, 0x3c, 0xd8 };
+        static const UCHAR aes_key[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        static const UCHAR aes_ct[16] = { 0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a };
+        static const UCHAR aes_pt[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+        static const char fox[] = "The quick brown fox jumps over the lazy dog";
+        BCRYPT_ALG_HANDLE sha = NULL, hm = NULL, aes = NULL;
+        BCRYPT_HASH_HANDLE h;
+        BCRYPT_KEY_HANDLE key;
+        UCHAR out[32], pt[16], rnd[16] = { 0 };
+        ULONG got = 0, len = 0, nonzero = 0;
+        BOOLEAN ok = TRUE;
+        ok &= NT_SUCCESS(BCryptOpenAlgorithmProvider(&sha, BCRYPT_SHA256_ALGORITHM, NULL, 0));
+        ok &= ok && NT_SUCCESS(BCryptGetProperty(sha, BCRYPT_HASH_LENGTH, (PUCHAR)&len, sizeof len, &got, 0)) && len == 32;
+        if (ok && NT_SUCCESS(BCryptCreateHash(sha, &h, NULL, 0, NULL, 0, 0))) {
+            BCryptHashData(h, (PUCHAR)"abc", 3, 0);
+            ok &= NT_SUCCESS(BCryptFinishHash(h, out, 32, 0)) && Same(out, sha_abc, 32);
+            BCryptDestroyHash(h);
+        } else ok = FALSE;
+        ok &= NT_SUCCESS(BCryptOpenAlgorithmProvider(&hm, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG));
+        if (ok && NT_SUCCESS(BCryptCreateHash(hm, &h, NULL, 0, (PUCHAR)"key", 3, 0))) {
+            BCryptHashData(h, (PUCHAR)fox, sizeof fox - 1, 0);
+            ok &= NT_SUCCESS(BCryptFinishHash(h, out, 32, 0)) && Same(out, hmac_fox, 32);
+            BCryptDestroyHash(h);
+        } else ok = FALSE;
+        ok &= NT_SUCCESS(BCryptOpenAlgorithmProvider(&aes, BCRYPT_AES_ALGORITHM, NULL, 0));
+        ok &= ok && NT_SUCCESS(BCryptSetProperty(aes, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
+                                                 sizeof BCRYPT_CHAIN_MODE_ECB, 0));
+        if (ok && NT_SUCCESS(BCryptGenerateSymmetricKey(aes, &key, NULL, 0, (PUCHAR)aes_key, 16, 0))) {
+            ok &= NT_SUCCESS(BCryptDecrypt(key, (PUCHAR)aes_ct, 16, NULL, NULL, 0, pt, 16, &got, 0)) && got == 16 && Same(pt, aes_pt, 16);
+            BCryptDestroyKey(key);
+        } else ok = FALSE;
+        ok &= NT_SUCCESS(BCryptGenRandom(NULL, rnd, sizeof rnd, BCRYPT_USE_SYSTEM_PREFERRED_RNG));
+        for (int i = 0; i < 16; i++) nonzero |= rnd[i];
+        ok &= nonzero != 0;
+        if (sha) BCryptCloseAlgorithmProvider(sha, 0);
+        if (hm) BCryptCloseAlgorithmProvider(hm, 0);
+        if (aes) BCryptCloseAlgorithmProvider(aes, 0);
+        if (ok) mask |= T_BCRYPT;
+    }
+    // HAL PCI config space (bus 0, device 0: the host bridge), SeExports.
+    {
+        USHORT vendor = 0;
+        ULONG n = HalGetBusDataByOffset(PCIConfiguration, 0, 0, &vendor, 0, sizeof vendor);
+        PSID sys = SeExports ? SeExports->SeLocalSystemSid : NULL;
+        if (n == 2 && vendor != 0 && vendor != 0xFFFF && sys && RtlValidSid(sys) && RtlLengthSid(sys) == 12)
+            mask |= T_HAL_SE;
+        DbgPrint("veiltest: PCI 00:00.0 vendor %04x; LocalSystem SID length %lu\n", vendor, sys ? RtlLengthSid(sys) : 0);
+    }
+    return mask;
+}
+
 static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
     LARGE_INTEGER second, due;
     NTSTATUS st;
@@ -621,6 +800,8 @@ static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
              !!(g_passed & T_IOSPACE), !!(g_passed & T_MDL_POOL), !!(g_passed & T_MDL_PAGES));
 
     g_passed |= RuntimeTest();
+    g_passed |= ZwTest(reg);
+    DbgPrint("veiltest: Zw, BCrypt, HAL, SeExports: %lx of %x\n", g_passed & 0x1F800000, 0x1F800000);
 
     // The KPCR fields the WDK reads through GS without calling in.
     {

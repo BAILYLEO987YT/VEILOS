@@ -27,7 +27,7 @@ echo "layout: every offset matches the WDK"
 VC="C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231"
 "$VC/bin/Hostx64/x64/cl.exe" /nologo /kernel /GS- /O2 /W3 /Zl /D_AMD64_ /D_WIN64 /DAMD64 /DNTDDI_VERSION=0x0A000010 /D_WIN32_WINNT=0x0A00 /c veiltest.c /Fobuild/veiltest.obj
 "$LLVM/lld-link.exe" /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /NODEFAULTLIB /MACHINE:X64 \
-    build/veiltest.obj "/LIBPATH:$KITS/Lib/$VER/km/x64" ntoskrnl.lib hal.lib /OUT:build/veiltest.sys
+    build/veiltest.obj "/LIBPATH:$KITS/Lib/$VER/km/x64" ntoskrnl.lib hal.lib ksecdd.lib /OUT:build/veiltest.sys
 cp build/veiltest.sys "$OUT/"
 echo "built: veiltest.sys"
 

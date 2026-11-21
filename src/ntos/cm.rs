@@ -89,6 +89,15 @@ pub extern "win64" fn ZwQueryValueKey(h: u64, name: *const u8, class: u32, info:
     };
     let vname = rtl::unicode_to_string(name);
     let Some((kind, data)) = crate::nt_registry::kernel_get(&path, &vname) else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    value_info(&vname, kind, &data, class, info, len, result)
+}
+
+/// A KEY_VALUE_*_INFORMATION for one value into the caller's buffer:
+/// classes 0 basic {TitleIndex, Type, NameLength, Name}, 1 full
+/// {TitleIndex, Type, DataOffset, DataLength, NameLength, Name, data}, 2
+/// partial {TitleIndex, Type, DataLength, Data}. The fixed part must fit;
+/// then as much as fits, and STATUS_BUFFER_OVERFLOW.
+pub fn value_info(vname: &str, kind: u32, data: &[u8], class: u32, info: *mut u8, len: u32, result: *mut u32) -> NtStatus {
     let name_bytes: Vec<u8> = vname.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
     let mut out: Vec<u8> = Vec::new();
     let push = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
@@ -108,27 +117,35 @@ pub extern "win64" fn ZwQueryValueKey(h: u64, name: *const u8, class: u32, info:
             push(&mut out, name_bytes.len() as u32);
             out.extend_from_slice(&name_bytes);
             out.resize(data_off as usize, 0);
-            out.extend_from_slice(&data);
+            out.extend_from_slice(data);
         }
         2 => {
             push(&mut out, 0);
             push(&mut out, kind);
             push(&mut out, data.len() as u32);
-            out.extend_from_slice(&data);
+            out.extend_from_slice(data);
         }
         _ => return STATUS_INVALID_PARAMETER,
     }
+    put_info(&out, if class == 1 { 20 } else { 12 }, info, len, result)
+}
+
+/// Copy a built information block out: the fixed part must fit, then as
+/// much as fits (BUFFER_OVERFLOW if not all of it).
+pub fn put_info(out: &[u8], fixed: usize, info: *mut u8, len: u32, result: *mut u32) -> NtStatus {
     if !result.is_null() {
         unsafe { result.write(out.len() as u32) };
     }
-    // The fixed part must fit; then as much as fits, and BUFFER_OVERFLOW.
-    let fixed = if class == 1 { 20 } else { 12 };
     if (len as usize) < fixed {
         return STATUS_BUFFER_TOO_SMALL;
     }
     let n = out.len().min(len as usize);
     unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), info, n) };
     if n < out.len() { STATUS_BUFFER_OVERFLOW } else { STATUS_SUCCESS }
+}
+
+pub fn key_path(h: u64) -> Result<String, NtStatus> {
+    key_of(h)
 }
 
 /// ZwSetValueKey(KeyHandle, ValueName*, TitleIndex, Type, Data, DataSize).

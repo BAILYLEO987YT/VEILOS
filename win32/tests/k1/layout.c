@@ -186,6 +186,29 @@ AT(IO_RESOURCE_DESCRIPTOR, u.Memory.MaximumAddress, 0x18);
 AT(KPCR, Self, 0x18);
 AT(KPCR, CurrentPrcb, 0x20);
 
+// misc.rs: SE_EXPORTS (privileges, then the well-known SIDs)
+AT(SE_EXPORTS, SeCreateTokenPrivilege, 0x00);
+AT(SE_EXPORTS, SeRemoteShutdownPrivilege, 0xB0);
+AT(SE_EXPORTS, SeNullSid, 0xB8);
+AT(SE_EXPORTS, SeWorldSid, 0xC0);
+AT(SE_EXPORTS, SeLocalSystemSid, 0x108);
+AT(SE_EXPORTS, SeAliasAdminsSid, 0x110);
+AT(SE_EXPORTS, SeAliasBackupOpsSid, 0x148);
+AT(SE_EXPORTS, SeAuthenticatedUsersSid, 0x150);
+static_assert(sizeof(SE_EXPORTS) <= 0x80 * 8, "SE_EXPORTS fits VEILOS's block");
+
+// zw.rs: the information classes and structures it builds
+static_assert(FileBasicInformation == 4 && FileStandardInformation == 5 && FilePositionInformation == 14, "FILE_INFORMATION_CLASS");
+SIZE(FILE_STANDARD_INFORMATION, 24);
+SIZE(FILE_BASIC_INFORMATION, 40);
+static_assert(KeyBasicInformation == 0 && KeyFullInformation == 2, "KEY_INFORMATION_CLASS");
+AT(KEY_FULL_INFORMATION, SubKeys, 0x14);
+AT(KEY_FULL_INFORMATION, Values, 0x20);
+AT(KEY_FULL_INFORMATION, Class, 0x2C);
+AT(KEY_BASIC_INFORMATION, Name, 0x10);
+static_assert(FILE_OPEN == 1 && FILE_CREATE == 2 && FILE_OPEN_IF == 3 && FILE_OVERWRITE == 4 && FILE_OVERWRITE_IF == 5, "dispositions");
+static_assert(PCIConfiguration == 4, "BUS_DATA_TYPE");
+
 // ke.rs: dispatcher objects, queued spinlock handle
 SIZE(DISPATCHER_HEADER, 0x18);
 AT(DISPATCHER_HEADER, SignalState, 0x04);

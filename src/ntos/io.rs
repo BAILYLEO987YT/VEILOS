@@ -100,6 +100,17 @@ fn key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// Where a symbolic link (\??\X, \DosDevices\X, \GLOBAL??\X) points.
+pub fn link_target(name: &str) -> Option<String> {
+    let mut n = key(name);
+    for p in [r"\??\", r"\global??\"] {
+        if let Some(rest) = n.strip_prefix(p) {
+            n = alloc::format!(r"\dosdevices\{}", rest);
+        }
+    }
+    LINKS.lock().get(&n).cloned()
+}
+
 /// The device a name (or a link to it) refers to.
 pub fn device_by_name(name: &str) -> Option<*mut u8> {
     // A bare name: the device of that name, or the link.
@@ -425,6 +436,69 @@ pub fn open_device(nt_name: &str) -> Option<Result<DeviceHandle, NtStatus>> {
         return Some(Err(status));
     }
     Some(Ok(DeviceHandle { dev: dev as usize, file: file as usize }))
+}
+
+/// ZwDeviceIoControlFile from a driver: its buffers are kernel memory.
+/// Buffered through pool; direct with an MDL over the output buffer;
+/// METHOD_NEITHER with the pointers as they are.
+pub fn kernel_device_control(h: &DeviceHandle, code: u32, input: u64, in_len: usize, output: u64, out_len: usize) -> (NtStatus, u64) {
+    let (dev, file) = (h.dev as *mut u8, h.file as *mut u8);
+    match code & 3 {
+        METHOD_NEITHER => send(
+            dev,
+            file,
+            IRP_MJ_DEVICE_CONTROL,
+            |irp, sl| unsafe {
+                wr::<u64>(irp, IRP_USER_BUFFER, output);
+                wr::<u32>(sl, SL_OUTPUT_LENGTH, out_len as u32);
+                wr::<u32>(sl, SL_INPUT_LENGTH, in_len as u32);
+                wr::<u32>(sl, SL_IOCTL_CODE, code);
+                wr::<u64>(sl, SL_TYPE3_INPUT, input);
+            },
+            |_| {},
+        ),
+        method => {
+            let direct = method != METHOD_BUFFERED;
+            let size = if direct { in_len } else { in_len.max(out_len) };
+            let buf = pool::alloc_tracked(size.max(1));
+            if buf.is_null() {
+                return (STATUS_NO_MEMORY, 0);
+            }
+            unsafe { core::ptr::copy_nonoverlapping(input as *const u8, buf, in_len) };
+            let mdl = if direct && out_len > 0 {
+                let m = super::mm::IoAllocateMdl(output, out_len as u32, 0, 0, core::ptr::null_mut());
+                if !m.is_null() {
+                    super::mm::MmBuildMdlForNonPagedPool(m);
+                }
+                m
+            } else {
+                core::ptr::null_mut()
+            };
+            let r = send(
+                dev,
+                file,
+                IRP_MJ_DEVICE_CONTROL,
+                |irp, sl| unsafe {
+                    wr(irp, IRP_SYSTEM_BUFFER, buf);
+                    wr(irp, IRP_MDL_ADDRESS, mdl);
+                    wr::<u32>(sl, SL_OUTPUT_LENGTH, out_len as u32);
+                    wr::<u32>(sl, SL_INPUT_LENGTH, in_len as u32);
+                    wr::<u32>(sl, SL_IOCTL_CODE, code);
+                },
+                |irp| unsafe {
+                    if !direct {
+                        let n = (rd::<u64>(irp, IRP_INFORMATION) as usize).min(out_len);
+                        core::ptr::copy_nonoverlapping(buf, output as *mut u8, n);
+                    }
+                },
+            );
+            if !mdl.is_null() {
+                super::mm::IoFreeMdl(mdl);
+            }
+            pool::free_tracked(buf);
+            r
+        }
+    }
 }
 
 /// NtDeviceIoControlFile for a program. METHOD_BUFFERED copies through a

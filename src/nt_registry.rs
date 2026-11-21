@@ -7,6 +7,7 @@
 //! like the rest of VEILOS's Windows layer, this runs as one standard user.
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use nt_abi::reg::{self, RegCall};
@@ -644,4 +645,22 @@ pub fn kernel_delete(path: &str, name: Option<&str>) -> bool {
         changed();
     }
     ok
+}
+
+/// A key's values, in order: (name, type, data).
+pub fn kernel_values(path: &str) -> Option<Vec<(String, u32, Vec<u8>)>> {
+    let pieces = split(&w(path));
+    kernel_tree(|root| {
+        let k = root.walk(&pieces)?;
+        Some(k.values.iter().map(|v| (String::from_utf16_lossy(&v.name), v.kind, v.data.clone())).collect())
+    })
+}
+
+/// A key's subkeys' names, in order.
+pub fn kernel_subkeys(path: &str) -> Option<Vec<String>> {
+    let pieces = split(&w(path));
+    kernel_tree(|root| {
+        let k = root.walk(&pieces)?;
+        Some(k.subkeys.iter().map(|s| String::from_utf16_lossy(&s.name)).collect())
+    })
 }
