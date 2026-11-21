@@ -1,7 +1,7 @@
 # VEILOS: GPU drivers through WDDM
 
-**Status:** planned (2026-11-21). Stage W0 is done and W1's import census
-has been run (below); no driver-host code exists yet.
+**Status:** in progress (2026-11-21). W0 done. W1: import census run, and
+the first slice of the kernel driver host works (below).
 
 ## Goal
 
@@ -120,6 +120,35 @@ Maxwell/Pascal; lists the GTX 745, `DEV_1382`) and Intel Arc 32.0.101.9175
   mostly in kernel32, user32 and advapi32. The UMDs' real dependency is the
   D3DKMT calls and the runtimes' DDI, which an import list doesn't show
   either (they go through gdi32's `D3DKMT*`, a handful of exports).
+
+### W1 kernel driver host, first slice (2026-11-21)
+
+`src/ntos/`: VEILOS's own implementation of the kernel interface, 89
+exports so far (pool, IRQL as CR8, spinlocks including queued ones, events,
+semaphores, mutexes and waits, time, DriverObject/DeviceObject/IRPs with
+IoCallDriver and IoCompleteRequest and its completion routines, device
+names and links, strings, version, the CRT, DbgPrint with printf). Pool and
+driver images live in the upper half (PML4 slot 448), as drivers expect.
+The loader maps a `.sys`, relocates it, binds every import by name
+(refusing the load with a list when one is missing), sets the /GS cookie
+and calls `DriverEntry`.
+
+K1 (`win32/tests/k1`): a WDM driver built with clang-cl against the WDK.
+`layout.c` asserts every structure offset `src/ntos` uses against the WDK
+headers at compile time (all matched). In QEMU, `DRIVER LOAD
+/tests/veiltest.sys` runs its DriverEntry (pool zeroed, IRQL 2 under its
+spinlock, event waits time out and succeed as they should, device and link
+created); `DRIVER OPEN` sends create and close; `DRIVER IOCTL` gets its
+echo reversed, its counters, and `STATUS_INVALID_DEVICE_REQUEST` for an
+unknown code; `DRIVER UNLOAD` runs its unload routine.
+
+Still to do in W1: the rest of the census list; Win32 programs reaching
+devices (`CreateFile("\.\VeilTest")`, `DeviceIoControl` → IRPs with file
+objects); SEH in drivers (`__C_specific_handler` with the image's `.pdata`);
+per-section protection; freeing an unloaded image; system threads, DPCs,
+timers and work items; the registry for drivers (`ZwOpenKey` & co. on
+VEILOS's registry). The system time drivers see is VEILOS's wall clock,
+which is 1970 until NTP has answered.
 
 W1 to W3 need no GPU and run in QEMU. From W4 on, testing is on real
 hardware only: QEMU on a Windows host can't pass a GPU through. Logs go to

@@ -1,0 +1,89 @@
+// What VEILOS's ntoskrnl.exe and hal.dll export to drivers: name -> address.
+
+use super::{io, ke, pool, rtl};
+
+// -----| pool |-----
+
+pub extern "win64" fn ExAllocatePoolWithTag(_pool_type: u32, size: usize, _tag: u32) -> *mut u8 {
+    pool::alloc_tracked(size)
+}
+
+pub extern "win64" fn ExAllocatePool(pool_type: u32, size: usize) -> *mut u8 {
+    ExAllocatePoolWithTag(pool_type, size, 0)
+}
+
+/// ExAllocatePool2(Flags, Size, Tag): always zeroed (pool memory is).
+pub extern "win64" fn ExAllocatePool2(_flags: u64, size: usize, _tag: u32) -> *mut u8 {
+    pool::alloc_tracked(size)
+}
+
+pub extern "win64" fn ExFreePoolWithTag(p: *mut u8, _tag: u32) {
+    pool::free_tracked(p)
+}
+
+pub extern "win64" fn ExFreePool(p: *mut u8) {
+    pool::free_tracked(p)
+}
+
+/// MmGetSystemRoutineAddress(UNICODE_STRING name): drivers look up optional
+/// functions this way; null when VEILOS doesn't have one.
+pub extern "win64" fn MmGetSystemRoutineAddress(name: *const u8) -> u64 {
+    let n = rtl::unicode_to_string(name);
+    lookup("ntoskrnl.exe", &n).or_else(|| lookup("hal.dll", &n)).unwrap_or(0)
+}
+
+macro_rules! table {
+    ($name:expr; $($f:path),* $(,)?) => {{
+        let n: &str = $name;
+        $(
+            if n == stringify!($f).rsplit("::").next().unwrap() {
+                return Some($f as *const () as usize as u64);
+            }
+        )*
+    }};
+}
+
+/// The address `module` exports as `name`, if VEILOS has it.
+pub fn lookup(module: &str, name: &str) -> Option<u64> {
+    match module.to_ascii_lowercase().as_str() {
+        "ntoskrnl.exe" => {
+            table!(name;
+                // pool
+                ExAllocatePoolWithTag, ExAllocatePool, ExAllocatePool2, ExFreePoolWithTag, ExFreePool,
+                MmGetSystemRoutineAddress,
+                // IRQL, locks, dispatcher objects, waits
+                ke::KeGetCurrentIrql, ke::KfRaiseIrql, ke::KeLowerIrql,
+                ke::KeInitializeSpinLock, ke::KeAcquireSpinLockRaiseToDpc, ke::KeReleaseSpinLock,
+                ke::KeAcquireSpinLockAtDpcLevel, ke::KeReleaseSpinLockFromDpcLevel, ke::KeTryToAcquireSpinLockAtDpcLevel,
+                ke::KeAcquireInStackQueuedSpinLock, ke::KeReleaseInStackQueuedSpinLock,
+                ke::KeAcquireInStackQueuedSpinLockAtDpcLevel, ke::KeReleaseInStackQueuedSpinLockFromDpcLevel,
+                ke::KeInitializeEvent, ke::KeSetEvent, ke::KeResetEvent, ke::KeClearEvent, ke::KeReadStateEvent,
+                ke::KeInitializeSemaphore, ke::KeReleaseSemaphore, ke::KeInitializeMutex, ke::KeReleaseMutex,
+                ke::KeWaitForSingleObject, ke::KeWaitForMultipleObjects, ke::KeDelayExecutionThread,
+                ke::KeEnterCriticalRegion, ke::KeLeaveCriticalRegion,
+                // time, processors, bug checks
+                ke::KeQuerySystemTimePrecise, ke::KeQuerySystemTime, ke::ExSystemTimeToLocalTime,
+                ke::KeQueryTimeIncrement, ke::KeQueryInterruptTime,
+                ke::KeQueryActiveProcessorCount, ke::KeGetCurrentProcessorNumberEx,
+                ke::KeBugCheckEx, ke::KeBugCheck,
+                // I/O manager
+                io::IoCreateDevice, io::IoDeleteDevice, io::IoCreateSymbolicLink, io::IoDeleteSymbolicLink,
+                io::IoAllocateIrp, io::IoFreeIrp, io::IofCallDriver, io::IofCompleteRequest,
+                io::IoGetCurrentProcess, io::PsGetCurrentProcessId, io::PsGetCurrentThreadId,
+                io::IoIsWdmVersionAvailable,
+                // run-time library and C runtime
+                rtl::RtlInitUnicodeString, rtl::RtlInitAnsiString, rtl::RtlInitString, rtl::RtlCopyUnicodeString,
+                rtl::RtlCompareUnicodeString, rtl::RtlEqualUnicodeString, rtl::RtlGetVersion, rtl::RtlCompareMemory,
+                rtl::memcpy, rtl::memmove, rtl::memset, rtl::memcmp, rtl::strlen, rtl::wcslen,
+                rtl::strcmp, rtl::strncmp, rtl::_stricmp, rtl::wcscmp, rtl::__chkstk,
+                rtl::DbgPrint, rtl::DbgPrintEx, rtl::vDbgPrintEx,
+            );
+            None
+        }
+        "hal.dll" => {
+            table!(name; ke::KeQueryPerformanceCounter, ke::KeStallExecutionProcessor);
+            None
+        }
+        _ => None,
+    }
+}

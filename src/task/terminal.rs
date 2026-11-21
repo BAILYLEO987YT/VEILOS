@@ -724,6 +724,68 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 }
             }
         }
+        "DRIVER" => {
+            // Windows kernel drivers (ntos, WDDM_DESIGN.md W1).
+            let admin = {
+                let user = crate::users::SESSION.lock().username.clone();
+                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+            };
+            match parts.get(1).copied() {
+                Some("LOAD") | Some("UNLOAD") | Some("IOCTL") | Some("OPEN") if !admin => {
+                    history.push(String::from("DRIVER: administrators only"));
+                }
+                Some("LOAD") => match parts.get(2) {
+                    Some(p) => match crate::ntos::image::load(&p.to_ascii_lowercase()) {
+                        Ok((name, st)) => history.push(alloc::format!("  {}: DriverEntry returned {:#010X}", name, st as u32)),
+                        Err(e) => history.push(alloc::format!("  DRIVER LOAD: {}", e)),
+                    },
+                    None => history.push(String::from("USAGE: DRIVER LOAD <path.sys>")),
+                },
+                Some("UNLOAD") => match parts.get(2) {
+                    Some(n) => match crate::ntos::image::unload(&n.to_ascii_lowercase()) {
+                        Ok(()) => history.push(alloc::format!("  {} unloaded", n)),
+                        Err(e) => history.push(alloc::format!("  DRIVER UNLOAD: {}", e)),
+                    },
+                    None => history.push(String::from("USAGE: DRIVER UNLOAD <name>")),
+                },
+                Some("OPEN") => {
+                    // DRIVER OPEN <\Device\X or \??\X>: IRP_MJ_CREATE, then CLOSE.
+                    match parts.get(2).and_then(|n| crate::ntos::io::device_by_name(n)) {
+                        Some(dev) => {
+                            let c = crate::ntos::io::create_close(dev, crate::ntos::io::IRP_MJ_CREATE);
+                            let d = crate::ntos::io::create_close(dev, crate::ntos::io::IRP_MJ_CLOSE);
+                            history.push(alloc::format!("  create {:#010X}, close {:#010X}", c as u32, d as u32));
+                        }
+                        None => history.push(String::from("  DRIVER OPEN: no such device")),
+                    }
+                }
+                Some("IOCTL") => {
+                    // DRIVER IOCTL <device> <code hex> [text]: METHOD_BUFFERED, shows the reply.
+                    let dev = parts.get(2).and_then(|n| crate::ntos::io::device_by_name(n));
+                    let code = parts.get(3).and_then(|c| u32::from_str_radix(c.trim_start_matches("0X").trim_start_matches("0x"), 16).ok());
+                    match (dev, code) {
+                        (Some(dev), Some(code)) => {
+                            let text = parts.get(4..).map(|p| p.join(" ")).unwrap_or_default();
+                            let (st, out) = crate::ntos::io::device_control(dev, code, text.as_bytes(), 256);
+                            let shown: String = out.iter().map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
+                            let hex: String = out.iter().take(16).map(|b| alloc::format!("{:02X} ", b)).collect();
+                            history.push(alloc::format!("  status {:#010X}, {} byte(s): \"{}\"  {}", st as u32, out.len(), shown, hex));
+                        }
+                        _ => history.push(String::from("USAGE: DRIVER IOCTL <DEVICE NAME> <CODE HEX> [TEXT]")),
+                    }
+                }
+                _ => {
+                    let list = crate::ntos::image::DRIVERS.lock();
+                    if list.is_empty() {
+                        history.push(String::from("  No Windows drivers loaded."));
+                    }
+                    for d in list.iter() {
+                        history.push(alloc::format!("  {}  {} at {:#X} ({} KiB)", d.name, d.path, d.base, d.size / 1024));
+                    }
+                    history.push(String::from("  USAGE: DRIVER LOAD <path.sys> | UNLOAD <name> | OPEN <dev> | IOCTL <dev> <code> [text]"));
+                }
+            }
+        }
         "USB" => {
             // xHCI controllers, how their events arrive, and their devices.
             history.extend(crate::usb::xhci::status());
