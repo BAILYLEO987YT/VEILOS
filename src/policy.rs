@@ -42,7 +42,7 @@ impl PolicyManager {
                 }
             }
             PolicyMode::Performance => {
-                println!("  -> Bypassing Ring transitions. Elevating GPU/kernel capabilities.");
+                println!("  -> Performance Mode: elevating the active process's capabilities.");
                 // Elevate capabilities for the active process.
                 if let Some(proc) = crate::process::PROCESSOR.lock().get_active() {
                     crate::sandbox::POLICY_ENGINE.lock().on_performance_mode(proc.pid);

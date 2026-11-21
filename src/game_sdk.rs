@@ -463,7 +463,7 @@ pub type SdkResult<T> = Result<T, SdkError>;
 
 pub fn init() {
     println!("[SDK] VEILOS Game SDK online.");
-    println!("[SDK]   GPU handle: policy-transparent (Security=scheduled, Perf=direct)");
+    println!("[SDK]   Graphics: drawn on the CPU (no GPU driver yet)");
     println!("[SDK]   Game arena: pre-allocated slab, O(1) reset");
     println!("[SDK]   Input: low-latency snapshot API, 1ms PIT-stamped");
     println!("[SDK]   Telemetry: per-frame timing + adaptive scheduler integration");

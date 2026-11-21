@@ -1,11 +1,14 @@
-// -----| VEILOS GPU Driver Model |-----
+// -----| VEILOS GPU command model (software) |-----
 //
-// Phase 6 roadmap items implemented here:
+// STATUS: no GPU hardware is driven. Every GpuCommand is executed on the
+// CPU (lgpu.rs, banded over every core) into the framebuffer the firmware
+// set up; 3D commands are no-ops here. "VRAM" below is the display
+// adapter's PCI memory window, used only as the framebuffer. Driving real
+// GPUs, by loading the vendors' Windows display drivers, is WDDM_DESIGN.md.
 //
-//   [x] Implement a user-mode GPU driver interface
-//   [x] Add kernel-mode GPU scheduler (or bypass in Performance Mode)
-//   [x] Map GPU VRAM into user or kernel space depending on mode
-//   [x] Implement command submission queues
+// What this file does provide: per-process submission queues, a scheduler
+// that drains them (Security Mode) or direct submission (Performance Mode),
+// and an allocator over the framebuffer aperture.
 //
 // Architecture
 // ------------
@@ -639,8 +642,8 @@ pub fn init() {
             gpu.vram.lock().alloc(scanout_bytes, "scanout");
         }
 
-        println!("[GPU] Registered {:?} device {:#06x} regs={:#X} VRAM_base={:#X} ({} MiB)",
-            vendor, dev.device_id, regs_bar.base, vram_bar.base, vram_size / (1024 * 1024));
+        println!("[GPU] {:?} display adapter {:#06x}: no driver, used as a framebuffer only ({} MiB window at {:#X})",
+            vendor, dev.device_id, vram_size / (1024 * 1024), vram_bar.base);
         gpus.push(gpu);
     }
 
@@ -659,7 +662,7 @@ pub fn init() {
         gpus.push(sw_gpu);
     }
 
-    println!("[GPU] Scheduler ready. {} GPU(s) available.", gpus.len());
+    println!("[GPU] Software command queue ready ({} display adapter(s)); drawing runs on the CPU.", gpus.len());
 }
 
 /// Convenience: get the primary GPU (index 0).

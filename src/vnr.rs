@@ -457,6 +457,5 @@ pub fn init() {
     println!("[VNR] VEILOS Native Runtime online.");
     println!("[VNR]   Zero-copy IPC: {} byte rings per direction", RING_CAPACITY);
     println!("[VNR]   Async waker integration: AtomicWaker-based IpcRecvFuture");
-    println!("[VNR]   GPU context: policy-transparent routing");
     println!("[VNR]   Fiber support: async task spawn via PENDING_SPAWNS queue");
 }
