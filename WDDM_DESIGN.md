@@ -1,6 +1,7 @@
 # VEILOS: GPU drivers through WDDM
 
-**Status:** planned (2026-11-21). Nothing below exists yet except stage W0.
+**Status:** in progress (2026-11-21). W0 done. W1: import census run, and
+the first slice of the kernel driver host works (below).
 
 ## Goal
 
@@ -86,6 +87,285 @@ Each stage ends in something that works and can be tested on its own.
 | **W5** | **VidMm and VidSch.** Allocations, segments / GPU virtual memory, paging buffers, residency, monitored fences, contexts and submission, `DxgkDdiSubmitCommand`, interrupts → DPC → fence completion, TDR | A `D3DKMT`-level test program allocates, submits a vendor-built command buffer through the UMD and waits on its fence | Real hardware |
 | **W6** | **User mode.** `NtGdiDdDDI*` system calls; VEILOS's `d3d11`/`dxgi` drive the vendor UMD through the D3D11 DDI; present through dxgkrnl | A D3D11 triangle and the D3D test programs (`storage/tests/d3d*`, `dx*`) render on the GPU, matching their `.ref` images | Real hardware |
 | **W7** | D3D12 DDI; OpenGL ICD in `opengl32`; Vulkan loader and ICD; video decode; installing from the vendor's package; several GPUs | Games run on the GPU | Real hardware |
+
+### W1 import census (2026-11-21)
+
+`tools/import_census.py` on two current driver packages (read only, kept
+out of the repository): NVIDIA 581.80 (R580, the last branch for
+Maxwell/Pascal; lists the GTX 745, `DEV_1382`) and Intel Arc 32.0.101.9175
+(the A770 in the main PC, from its driver store).
+
+| Driver part | NVIDIA 581.80 | Intel Arc 32.0.101.9175 | VEILOS has today |
+|---|---|---|---|
+| Kernel driver | `nvlddmkm.sys`: 336 imports (327 ntoskrnl, 4 hal, 4 netio, 1 ksecdd) | `igdkmdnd64.sys`: 259 (240 ntoskrnl, 15 ksecdd BCrypt, 4 hal) | none |
+| D3D11/D3D12 UMD | `nvwgf2umx.dll` 342, `nvd3dumx.dll` 288 | `igd10umt64xe.dll` 215, `igd12um64xe2.dll` 222 | 89–96 % |
+| OpenGL ICD | `nvoglv64.dll` 385 | `igxe2hpgicd64.dll` 213 | 89–95 % |
+| Vulkan | (in `nvoglv64.dll`) | `igvk64.dll` 196 | 94 % |
+| Loader / shader compiler | `nvldumdx.dll` 135, `nvgpucomp64.dll` 187 | `igc-default64.dll` 184 | 97–99 % |
+
+- **Kernel:** the two drivers together use 399 distinct ntoskrnl functions,
+  168 of them shared. By area: Rtl 68 (strings, bitmaps, generic tables,
+  security descriptors), Ke 68 (IRQL, spinlocks, DPCs, timers, events,
+  waits), Io 57 (devices, IRPs, work items, interrupts, PnP and interface
+  registration), Ex 46 (pool, resources, fast mutexes, SLists, callbacks),
+  Zw 41 (registry, files, sections), C runtime 38, Mm 32 (contiguous and I/O
+  memory, MDLs), Ps 21, a few Etw/Ob/Se/Po/Cm/Kd. hal: 4 (PCI config,
+  performance counter, stall). That is W1's list; most entries are small.
+- **Neither kernel driver imports dxgkrnl.** Both reach it at run time
+  (`IoGetDeviceObjectPointer` on `\Device\DxgKrnl`, from `displib`), so the
+  DxgkDdi/DxgkCb interface, VidPN, VidMm and VidSch don't show in an import
+  list: they are W3–W5's work and the largest part.
+- **User mode is mostly there already:** VEILOS's own DLLs provide 89–99 % of
+  what the vendors' UMDs and ICDs import; each lacks a few dozen functions,
+  mostly in kernel32, user32 and advapi32. The UMDs' real dependency is the
+  D3DKMT calls and the runtimes' DDI, which an import list doesn't show
+  either (they go through gdi32's `D3DKMT*`, a handful of exports).
+
+### W1 kernel driver host, first slice (2026-11-21)
+
+`src/ntos/`: VEILOS's own implementation of the kernel interface, 89
+exports so far (pool, IRQL as CR8, spinlocks including queued ones, events,
+semaphores, mutexes and waits, time, DriverObject/DeviceObject/IRPs with
+IoCallDriver and IoCompleteRequest and its completion routines, device
+names and links, strings, version, the CRT, DbgPrint with printf). Pool and
+driver images live in the upper half (PML4 slot 448), as drivers expect.
+The loader maps a `.sys`, relocates it, binds every import by name
+(refusing the load with a list when one is missing), sets the /GS cookie
+and calls `DriverEntry`.
+
+K1 (`win32/tests/k1`): a WDM driver built with clang-cl against the WDK.
+`layout.c` asserts every structure offset `src/ntos` uses against the WDK
+headers at compile time (all matched). In QEMU, `DRIVER LOAD
+/tests/veiltest.sys` runs its DriverEntry (pool zeroed, IRQL 2 under its
+spinlock, event waits time out and succeed as they should, device and link
+created); `DRIVER OPEN` sends create and close; `DRIVER IOCTL` gets its
+echo reversed, its counters, and `STATUS_INVALID_DEVICE_REQUEST` for an
+unknown code; `DRIVER UNLOAD` runs its unload routine.
+
+### W1 second slice (2026-11-21)
+
+124 exports now. Added:
+- **Windows programs reach drivers.** `CreateFile("\\.\Name")` opens a
+  device: `NtCreateFile` sees a device name, sends IRP_MJ_CREATE with a
+  real `FILE_OBJECT`, and the handle sends IRP_MJ_CLEANUP and IRP_MJ_CLOSE
+  when it closes. `DeviceIoControl` is a new system call,
+  `NtDeviceIoControlFile`: METHOD_BUFFERED goes through a pool buffer;
+  METHOD_NEITHER hands the driver the program's own pointers, with SMAP
+  lifted.
+- **System threads** (`PsCreateSystemThread`, waitable, and
+  `PsTerminateSystemThread`).
+- **DPCs**: run at once, at DISPATCH_LEVEL, when queued below it; at the
+  next 1 ms tick otherwise.
+- **Timers**: one-shot and periodic, checked every tick, signalling
+  waiters and queueing their DPC.
+- **Work items**: `IoQueueWorkItem(Ex)` and `ExQueueWorkItem`, each on a
+  thread of its own.
+- **Registry**: `Zw*Key` and `RtlWriteRegistryValue` on VEILOS's registry
+  through kernel handles. A driver's Services key exists before its
+  `DriverEntry` runs.
+
+K1 grew to match. Its driver self-tests all of the above in `DriverEntry`,
+and `k1test.exe`, an ordinary Windows program, opens `\\.\VeilTest` and
+checks the following through `DeviceIoControl`: buffered and
+METHOD_NEITHER IOCTLs, the create on its handle, the self-test results,
+and an unknown code failing with `ERROR_INVALID_FUNCTION`. In QEMU: all
+passed (self-test `1f of 1f`, `k1test: 0 failed`).
+
+### W1 third slice: SEH in drivers (2026-11-21)
+
+`src/ntos/seh.rs` brings `__try`/`__except`/`__finally` to drivers. It is
+adapted from VEILOS's user-mode SEH (ntdll's unwinder and dispatcher, and
+ucrtbase's `__C_specific_handler`).
+
+- **CPU faults** in ring 0 whose RIP lies in the driver image region:
+  nt_exception's entry stubs send them to `kernel_entry`. That builds a
+  `CONTEXT` and `EXCEPTION_RECORD`, moves off the IST stack onto the
+  driver's own, and dispatches through the driver's `.pdata` with the
+  interrupt flag as it was.
+- **Software exceptions**: `RtlRaiseException`, `ExRaiseStatus`,
+  `ProbeForRead/Write` and `RtlUnwind(Ex)` are assembly stubs that capture
+  their caller's registers first. VEILOS's own frames have no Windows
+  unwind tables, so every walk starts in driver code.
+- An unwind made during a dispatch starts from the context that exception
+  was raised in (kept per thread).
+- **Unhandled**: an exception no driver frame takes is bug check 0x1E, as
+  on Windows.
+- Data exports `MmUserProbeAddress`, `MmHighestUserAddress` and
+  `MmSystemRangeStart`.
+
+K1's driver is now built with MSVC, as vendors build theirs. clang-cl's
+`__try` only catches exceptions raised by calls; MSVC also catches a fault
+in the `__try` body itself. In QEMU every part passed, and `k1test` checks
+each:
+- a page fault caught by `__except` (`STATUS_ACCESS_VIOLATION`);
+- `ExRaiseStatus` caught two calls up, with both `__finally` blocks run;
+- `ProbeForRead` refusing a kernel address and passing a user one;
+- `EXCEPTION_CONTINUE_EXECUTION` resuming after `RtlRaiseException`.
+
+### W1 memory for drivers (2026-11-21)
+
+`src/ntos/mm.rs`:
+- **MDLs**: `IoAllocateMdl`, `MmBuildMdlForNonPagedPool`,
+  `MmProbeAndLockPages` (raising into the driver's `__try` for a bad
+  page; a program's not-yet-made pages are touched first),
+  `MmMapLockedPagesSpecifyCache`, `IoBuildPartialMdl`, and
+  `MmAllocatePagesForMdl(Ex)` / `MmFreePagesFromMdl`.
+- **Contiguous memory** below a limit and within a boundary
+  (`MmAllocateContiguousMemory(SpecifyCache)`, `MmAllocateNonCachedMemory`).
+- **Device memory**: `MmMapIoSpace(Ex)` and `MmUnmapIoSpace`, cached,
+  write-combining or uncached (VEILOS's PAT).
+- `MmGetPhysicalAddress` and `MmIsAddressValid`.
+- Mappings go in a system-PTE range of the ntos region. Programs' requests
+  with `METHOD_IN_DIRECT`/`METHOD_OUT_DIRECT` get their output buffer as an
+  MDL (`Irp->MdlAddress`).
+
+K1 tests each of these: contiguous memory below 4 GiB with consecutive
+physical pages, the same pages through `MmMapIoSpace`, an MDL over pool
+whose PFNs match `MmGetPhysicalAddress`, pages for an MDL mapped and
+written, and a `METHOD_OUT_DIRECT` request writing 9000 bytes across three
+of the program's pages (and nothing either side). All passed in QEMU
+(`3fff of 3fff`, `k1test: 0 failed`). 163 exports now.
+
+### W1 census, most of the way (2026-11-21)
+
+386 functions and 12 data exports now. The NVIDIA and Arc kernel drivers
+together lack 97 imports, down from 399:
+
+- `crt.rs`: the sprintf family, narrow and wide, with one printf engine for
+  all of ntos (MSVC sizes: `l` is 32-bit); bounded and `_s` string
+  functions; `sqrt`.
+- `rtlx.rs`: counted-string conversions and numbers, bitmaps, generic
+  tables, SIDs, ACLs and security descriptors, `RtlTimeToTimeFields`,
+  resource-descriptor encoding, `RtlCheckRegistryKey`,
+  `RtlCreateRegistryKey`, and `RtlQueryRegistryValues` (direct values,
+  query routines, subkeys, defaults).
+- `ex.rs`: ERESOURCE (recursive exclusive, shared), fast and guarded
+  mutexes, SLists in Windows' header layout, lookaside lists, interlocked
+  lists, callback objects, Ex timers, UUIDs, and the object-type and
+  debugger data exports.
+- `misc.rs`: kernel queues, processor queries, and accepted-but-unused
+  registrations (process and image notifications, power settings, ETW,
+  registry callbacks, bug-check callbacks). Also tokens, pageable-section
+  calls, reserved mappings and `MmCopyMemory`.
+
+K1 checks each group in its self-test (now 22 parts, `3fffff`), and
+layout.c checks the new structures against the WDK (with ntifs.h for
+SECURITY_DESCRIPTOR). In QEMU: `3fffff of 3fffff`, `k1test: 0 failed`.
+
+The 97 left, by area:
+- **Device stacks and PnP** (attach and detach, remove locks, device
+  interfaces and properties, device registry keys, PnP notifications, error
+  log, `IoConnectInterruptEx`, PCI config through `HalGet/SetBusDataByOffset`,
+  `PoRequestPowerIrp`): that's W2.
+- **`Zw*` files, sections, events, processes, tokens and system
+  information**: on VEILOS's VFS and objects.
+- **BCrypt from `ksecdd.sys`** (15) and the network module registrar from
+  `netio.sys` (4).
+- **`SeExports`.**
+
+### W1: Zw, BCrypt, HAL, SeExports (2026-11-21)
+
+445 exported functions. Every import of the NVIDIA and Arc kernel drivers
+now resolves except 41, all W2's: the device stack and PnP (attach,
+detach, remove locks, device interfaces and properties, device registry
+keys, PnP notifications), `IoConnectInterruptEx`, the error log,
+`IoCancelIrp`, `PoRequestPowerIrp`, `ObOpenObjectByPointer` and
+`FsRtlRegisterFileSystemFilterCallbacks`.
+
+- `zw.rs`:
+  - files on the VFS (`\??\C:\`, `\DosDevices\`, `\SystemRoot\`), and
+    devices by name with kernel-side IOCTLs;
+  - named events, symbolic links, handle duplication, LUIDs;
+  - registry enumeration (`ZwEnumerateValueKey`, `ZwEnumerateKey`,
+    `ZwQueryKey`);
+  - `ZwQuerySystemInformation` (basic, and the module list with the
+    kernel and loaded drivers);
+  - `ZwLoadDriver`/`ZwUnloadDriver` through a Services key's `ImagePath`.
+
+  Process virtual memory, sections, process and token queries and power
+  information return `STATUS_NOT_SUPPORTED` and log it the first time.
+- `bcrypt.rs` (ksecdd.sys) uses the kernel's crypto crates:
+  - random numbers;
+  - SHA-1/256/384/512, plain or HMAC;
+  - AES-128/192/256 decryption in ECB, CBC (PKCS#7) and GCM.
+
+  Asymmetric keys and key derivation return `STATUS_NOT_SUPPORTED` (no RSA
+  or ECC crate in the kernel yet).
+- `misc.rs`: `SeExports` (privilege LUIDs and the well-known SIDs), the
+  netio.sys network module registrar (accepted; nothing attaches), and
+  `HalGet/SetBusDataByOffset` on PCI configuration space.
+
+The first run caught a data-export rule. A `dllimport` declaration
+(`extern NTKERNELAPI PSE_EXPORTS SeExports`) reads the exported variable's
+value, so `SeExports` must hold a pointer to the structure. Plainly
+declared ones (`extern POBJECT_TYPE *ExEventObjectType`) bind to the
+exported address itself. The driver had read a privilege LUID as the
+pointer.
+
+K1 now has 29 self-test parts, `1fffffff`. The new ones:
+- `ZwCreateFile`/`Write`/`Read`/`QueryInformationFile` round trip;
+- a named event opened twice;
+- the device's symbolic link;
+- registry enumeration;
+- the driver finding itself in the module list;
+- SHA-256 and HMAC-SHA256 test vectors and the FIPS-197 AES vector;
+- PCI 00:00.0's vendor ID;
+- `SeExports`' LocalSystem SID.
+
+layout.c checks SE_EXPORTS and the information structures. In QEMU:
+`1fffffff of 1fffffff`, `k1test: 0 failed`.
+
+W1 is finished. The last items:
+- ~~per-section protection~~: done. After relocation each page of a driver
+  image gets its sections' rights: no-execute unless the section is
+  executable, writable only if the section is writable. K1 calls a `ret`
+  stored in `.data` inside `__try` and gets an access violation (passed).
+  CR0.WP is on, so ring 0 can't write read-only sections either.
+- ~~freeing an unloaded image~~: done. DRIVER UNLOAD calls DriverUnload,
+  then frees the image's pages, the DRIVER_OBJECT and its extension. K1
+  unloads, loads again (self-test passes again) and unloads. The reload
+  found that named events outlived their handles; as in Windows, the name
+  now goes with the last handle.
+- ~~mapping an MDL into a program (`UserMode`)~~: done.
+  MmMapLockedPagesSpecifyCache with UserMode reserves a view in the calling
+  program and maps the MDL's pages there; MmUnmapLockedPages takes it back.
+  K1's program reads the driver's pattern through it and writes a byte the
+  driver then sees (passed).
+- ~~`KeGetCurrentThread` and the other GS inlines~~: done. VEILOS's
+  per-CPU block now carries the KPCR/KPRCB fields drivers read through GS:
+  Self 0x18, CurrentPrcb 0x20, Number 0x184, CurrentThread 0x188 (each
+  kernel thread's own record, set on every switch) and ProcessorIndex
+  0x1A4. Kernel threads run with GS there, and DPCs run from an interrupt
+  that came from user mode switch it there too. K1 checks it in
+  DriverEntry, in a system thread and inside a program's request (all
+  passed). The thread records are in the kernel heap, which by Windows'
+  rules is a user-range address; no driver seen so far checks that.
+
+### Waits inside a program's request (2026-11-21)
+
+A driver's IOCTL runs inside the program's system call, with interrupts
+off. The concern was that its waits would never see the 1 ms tick that
+fires timers and DPCs. A negative control with the old loop (yield, then
+spin) passed every wait too: yielding hands the CPU to another thread (on
+the boot CPU, the desktop's), which runs with interrupts on, so ticks
+still came. Waits below DISPATCH_LEVEL now pause the way VEILOS's own
+system calls do (`ke::pause`): another ready thread on this CPU, else HLT
+with interrupts on until the next interrupt, and off again after. That's
+the same result without spinning when nothing else is ready.
+
+The bug the test did find was in the clock: `KeQuerySystemTime(Precise)`
+came from the 1 ms tick count, which lags whenever ticks arrive late
+(WHPX delivers them in bursts), so a 30 ms delay could measure under
+20 ms. It now comes from the TSC (plus the NTP offset): 29.5–29.8 ms in
+four runs.
+
+K1's `IOCTL_VEIL_WAITTEST`, sent by `k1test`, waits inside the request on
+a system thread, a timer object, `KeDelayExecutionThread`, a work item and
+a timer's DPC. All five passed in QEMU on 1 CPU (twice) and on 2 CPUs.
+
+Opening a device after its driver unloads fails with `ERROR_INVALID_NAME`
+where Windows says `ERROR_FILE_NOT_FOUND`. The system time drivers see is
+VEILOS's wall clock, which is 1970 until NTP has answered.
 
 W1 to W3 need no GPU and run in QEMU. From W4 on, testing is on real
 hardware only: QEMU on a Windows host can't pass a GPU through. Logs go to

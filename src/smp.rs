@@ -120,6 +120,13 @@ fn enter_x2apic_if_needed() {
 // arrives in ring 3 does not `swapgs`, so GS still holds the user's TEB
 // there. Use `cpu_index()` (LAPIC-ID lookup) instead.
 //
+// The block also has the Windows KPCR/KPRCB fields that Windows drivers
+// read through GS without calling in (the WDK inlines them; ntos/): Self at
+// 0x18, CurrentPrcb 0x20, Prcb.MxCsr 0x180, Prcb.Number 0x184,
+// Prcb.CurrentThread 0x188, Prcb.ProcessorIndex 0x1A4. So kernel threads
+// run with GS_BASE pointing here too (not only KERNEL_GS_BASE), and
+// kthread keeps CurrentThread up to date on every switch.
+//
 // Each CPU also gets a dedicated 64 KiB syscall stack. It is used ONLY for
 // syscalls — never as a boot or idle stack (APs get separate boot stacks
 // in `init`). Sharing the two used to let the first syscall on an AP
@@ -146,7 +153,57 @@ pub struct PerCpu {
     /// Offset 8 (`PERCPU_USER_RSP`).
     pub user_rsp: u64,
     pub cpu_index: u64,
+    /// KPCR.Self (0x18): this block's address.
+    pub kpcr_self: u64,
+    /// KPCR.CurrentPrcb (0x20): the address of `prcb_mxcsr`.
+    pub current_prcb: u64,
     pub apic_id: u64,
+    _pad0: [u8; 0x180 - 0x30],
+    /// KPRCB.MxCsr (0x180).
+    pub prcb_mxcsr: u32,
+    /// KPRCB.LegacyNumber (0x184): KeGetCurrentProcessorNumber.
+    pub prcb_number: u8,
+    _pad1: [u8; 3],
+    /// KPRCB.CurrentThread (0x188): KeGetCurrentThread / PsGetCurrentThread.
+    pub current_thread: u64,
+    pub next_thread: u64,
+    pub idle_thread: u64,
+    _pad2: [u8; 4],
+    /// KPRCB.ProcessorIndex (0x1A4): KeGetCurrentProcessorIndex.
+    pub processor_index: u32,
+    _pad3: [u8; 0x200 - 0x1A8],
+}
+
+const _: () = assert!(core::mem::offset_of!(PerCpu, kpcr_self) == 0x18);
+const _: () = assert!(core::mem::offset_of!(PerCpu, current_prcb) == 0x20);
+const _: () = assert!(core::mem::offset_of!(PerCpu, prcb_number) == 0x184);
+const _: () = assert!(core::mem::offset_of!(PerCpu, current_thread) == 0x188);
+const _: () = assert!(core::mem::offset_of!(PerCpu, processor_index) == 0x1A4);
+const _: () = assert!(core::mem::size_of::<PerCpu>() == 0x200);
+
+const PERCPU_ZERO: PerCpu = PerCpu {
+    kernel_rsp: 0,
+    user_rsp: 0,
+    cpu_index: 0,
+    kpcr_self: 0,
+    current_prcb: 0,
+    apic_id: 0,
+    _pad0: [0; 0x180 - 0x30],
+    prcb_mxcsr: 0,
+    prcb_number: 0,
+    _pad1: [0; 3],
+    current_thread: 0,
+    next_thread: 0,
+    idle_thread: 0,
+    _pad2: [0; 4],
+    processor_index: 0,
+    _pad3: [0; 0x200 - 0x1A8],
+};
+
+/// KPRCB.CurrentThread for `cpu`: what Windows drivers get as the current
+/// thread (kthread sets it to the running thread's identity).
+pub fn set_current_thread(cpu: usize, thread: u64) {
+    unsafe { (*percpu_ptr(cpu)).current_thread = thread };
 }
 
 #[repr(C, align(16))]
@@ -162,7 +219,7 @@ struct StackTable(core::cell::UnsafeCell<[SyscallStack; MAX_CPUS]>);
 unsafe impl Sync for StackTable {}
 
 static PERCPU: PerCpuTable = PerCpuTable(core::cell::UnsafeCell::new(
-    [const { PerCpu { kernel_rsp: 0, user_rsp: 0, cpu_index: 0, apic_id: 0 } }; MAX_CPUS]
+    [const { PERCPU_ZERO }; MAX_CPUS]
 ));
 static SYSCALL_STACKS: StackTable = StackTable(core::cell::UnsafeCell::new(
     [const { SyscallStack([0u8; SYSCALL_STACK_SIZE]) }; MAX_CPUS]
@@ -219,11 +276,30 @@ pub fn init_percpu(cpu_index: usize) {
         (*p).user_rsp   = 0;
         (*p).cpu_index  = cpu_index as u64;
         (*p).apic_id    = apic_id as u64;
+        (*p).kpcr_self = p as u64;
+        (*p).current_prcb = core::ptr::addr_of!((*p).prcb_mxcsr) as u64;
+        (*p).prcb_mxcsr = 0x1F80;
+        (*p).prcb_number = cpu_index as u8;
+        (*p).processor_index = cpu_index as u32;
+        // Until kthread records a thread: this CPU's boot thread, as an
+        // identity of its own.
+        (*p).current_thread = core::ptr::addr_of!((*p).idle_thread) as u64;
+        (*p).idle_thread = (*p).current_thread;
     }
     if apic_id < 256 {
         APIC_TO_CPU[apic_id as usize].store(cpu_index as u8, Ordering::Release);
     }
     write_kernel_gs_base(p as u64);
+    // Kernel code runs with GS here too (Windows drivers read it).
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC0000101u32, // MSR_GS_BASE
+            in("eax") (p as u64 & 0xFFFF_FFFF) as u32,
+            in("edx") (p as u64 >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
     crate::serial_println!(
         "[SMP] CPU {} (APIC ID {}) per-CPU block at {:#x}, syscall stack top {:#x}",
         cpu_index, apic_id, p as u64, syscall_stack_top(cpu_index)

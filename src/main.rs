@@ -66,6 +66,7 @@ pub mod kthread;
 pub mod address_space;
 pub mod block;
 pub mod install;
+pub mod ntos;
 pub mod hal;
 pub mod hotplug;
 pub mod modules;
@@ -385,6 +386,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Heap is now live — safe to initialise the adaptive scheduler.
     crate::scheduler::init();
+    // Windows drivers' pool and image region: before any process exists, so
+    // every address space shares its tables (ntos/pool.rs).
+    crate::ntos::init();
     println!("Heap Initialized with Physical RAM Paging.");
     // Without PIT channel 2 or a CPUID rate: the TSC against the HPET.
     crate::time::calibrate_late();

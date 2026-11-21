@@ -237,7 +237,11 @@ pub mod sys {
     /// delete (CredKey*), 5 list (CredOut*). STATUS_NO_SUCH_LOGON_SESSION
     /// with nobody signed in.
     pub const VEIL_CRED: u32 = BASE + 89;
-    pub const END: u32 = BASE + 90;
+    /// NtDeviceIoControlFile(file, event, apc, apc_context, iosb*, code,
+    /// in*, in_length, out*, out_length): an IRP_MJ_DEVICE_CONTROL to the
+    /// Windows driver behind a device handle (src/ntos/io.rs).
+    pub const NT_DEVICE_IO_CONTROL_FILE: u32 = BASE + 90;
+    pub const END: u32 = BASE + 91;
 }
 
 /// The pseudo-handle for "this process" (NtCurrentProcess()).

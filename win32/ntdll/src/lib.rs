@@ -48,6 +48,7 @@ syscall_stubs! {
     NtQueryAttributesFile, ZwQueryAttributesFile => sys::NT_QUERY_ATTRIBUTES_FILE;
     NtDeleteFile, ZwDeleteFile => sys::NT_DELETE_FILE;
     NtFlushBuffersFile, ZwFlushBuffersFile => sys::NT_FLUSH_BUFFERS_FILE;
+    NtDeviceIoControlFile, ZwDeviceIoControlFile => sys::NT_DEVICE_IO_CONTROL_FILE;
     NtCreateEvent, ZwCreateEvent => sys::NT_CREATE_EVENT;
     NtSetEvent, ZwSetEvent => sys::NT_SET_EVENT;
     NtResetEvent, ZwResetEvent => sys::NT_RESET_EVENT;
@@ -197,6 +198,8 @@ pub extern "system" fn RtlNtStatusToDosError(s: NtStatus) -> u32 {
         status::NO_MORE_FILES => 18,            // ERROR_NO_MORE_FILES
         status::PARTIAL_COPY => 299,            // ERROR_PARTIAL_COPY
         status::NOT_IMPLEMENTED => 1,           // ERROR_INVALID_FUNCTION
+        s if s == 0xC000_0010u32 as NtStatus => 1,   // STATUS_INVALID_DEVICE_REQUEST (a driver refused the IOCTL)
+        s if s == 0x8000_0005u32 as NtStatus => 234, // STATUS_BUFFER_OVERFLOW: ERROR_MORE_DATA
         status::INVALID_INFO_CLASS => 87,       // ERROR_INVALID_PARAMETER
         status::INVALID_HANDLE => 6,            // ERROR_INVALID_HANDLE
         status::OBJECT_TYPE_MISMATCH => 6,      // ERROR_INVALID_HANDLE

@@ -390,6 +390,8 @@ pub enum KernelObjectRef {
     Gpu3d(Arc<crate::nt_gpu3d::Gpu3d>),
     /// A sound stream (nt_sound.rs).
     Sound(Arc<crate::nt_sound::SoundHandle>),
+    /// A device a Windows driver made, opened by name (ntos/io.rs).
+    Device(Arc<crate::ntos::io::DeviceHandle>),
 }
 
 impl KernelObjectRef {
@@ -413,6 +415,7 @@ impl KernelObjectRef {
             Self::Link(_)      => ObjectType::Directory,
             Self::Gpu3d(_)     => ObjectType::File,
             Self::Sound(_)     => ObjectType::File,
+            Self::Device(_)    => ObjectType::File,
         }
     }
 }

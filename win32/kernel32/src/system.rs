@@ -452,10 +452,17 @@ pub unsafe extern "system" fn GetFileInformationByHandleEx(h: Handle, class: u32
     check(unsafe { crate::NtQueryInformationFile(h, &mut iosb, out, size, nt_class) })
 }
 
+/// To the Windows driver behind a device handle (CreateFile of "\\.\Name").
+/// Synchronous: an OVERLAPPED is accepted, and the request has completed
+/// when this returns.
 #[no_mangle]
-pub extern "system" fn DeviceIoControl(_h: Handle, _code: u32, _in: usize, _in_len: u32, _out: usize, _out_len: u32, _ret: *mut u32, _ov: usize) -> Bool {
-    crate::SetLastError(1); // ERROR_INVALID_FUNCTION
-    0
+pub unsafe extern "system" fn DeviceIoControl(h: Handle, code: u32, input: usize, in_len: u32, output: usize, out_len: u32, ret: *mut u32, _ov: usize) -> Bool {
+    let mut iosb = nt_abi::IoStatusBlock::default();
+    let s = unsafe { crate::NtDeviceIoControlFile(h, 0, 0, 0, &mut iosb, code, input, in_len, output, out_len) };
+    if !ret.is_null() {
+        unsafe { *ret = iosb.information as u32 };
+    }
+    check(s)
 }
 
 /// Look for `file` (with `ext` if it has none) in `path`, else the

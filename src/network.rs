@@ -1014,6 +1014,13 @@ pub fn parse_ntp_response(pkt: &[u8]) -> Option<i64> {
     Some(offset_ms)
 }
 
+/// Wall-clock time in microseconds since the Unix epoch, from the TSC
+/// rather than the 1 ms tick count (which lags when ticks arrive late), for
+/// callers that measure short intervals with it.
+pub fn wall_clock_us() -> i64 {
+    NET_CLOCK_OFFSET.load(Ordering::Acquire) * 1000 + crate::time::now_us() as i64
+}
+
 /// Current wall-clock time in milliseconds since Unix epoch (best estimate).
 pub fn wall_clock_ms() -> i64 {
     let ticks = crate::interrupts::TICKS.load(Ordering::Relaxed) as i64;

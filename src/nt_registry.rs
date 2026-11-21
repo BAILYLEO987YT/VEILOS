@@ -7,6 +7,7 @@
 //! like the rest of VEILOS's Windows layer, this runs as one standard user.
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use nt_abi::reg::{self, RegCall};
@@ -545,4 +546,121 @@ fn run(pid: u32, c: &mut RegCall) -> i32 {
         }
         _ => ERROR_INVALID_PARAMETER,
     }
+}
+
+// -----| for the kernel itself (Windows drivers' Zw*Key calls, ntos) |-----
+//
+// Paths are hive-rooted, as the tree stores them: "HKLM\SYSTEM\...".
+
+fn kernel_tree<R>(f: impl FnOnce(&mut Key) -> R) -> R {
+    let mut guard = REGISTRY.lock();
+    if guard.is_none() {
+        *guard = Some(Registry { root: load(), handles: BTreeMap::new() });
+    }
+    f(&mut guard.as_mut().unwrap().root)
+}
+
+/// Whether `path` names a key; with `create`, make it (and every missing
+/// key above it) first. Some(true) when it was just made.
+pub fn kernel_key(path: &str, create: bool) -> Option<bool> {
+    let pieces = split(&w(path));
+    kernel_tree(|root| {
+        if !create {
+            return root.walk(&pieces).map(|_| false);
+        }
+        let mut k = root;
+        let mut made = false;
+        for p in &pieces {
+            if k.child(p).is_none() {
+                k.add_child(p);
+                made = true;
+            }
+            k = k.child_mut(p).unwrap();
+        }
+        if made {
+            changed();
+        }
+        Some(made)
+    })
+}
+
+/// A value: (type, data).
+pub fn kernel_get(path: &str, name: &str) -> Option<(u32, Vec<u8>)> {
+    let (pieces, name) = (split(&w(path)), w(name));
+    kernel_tree(|root| {
+        let k = root.walk(&pieces)?;
+        k.values.iter().find(|v| same(&v.name, &name)).map(|v| (v.kind, v.data.clone()))
+    })
+}
+
+/// Set a value; false if the key doesn't exist.
+pub fn kernel_set(path: &str, name: &str, kind: u32, data: Vec<u8>) -> bool {
+    let (pieces, name) = (split(&w(path)), w(name));
+    let ok = kernel_tree(|root| match root.walk_mut(&pieces) {
+        Some(k) => {
+            k.set(&name, kind, data);
+            true
+        }
+        None => false,
+    });
+    if ok {
+        changed();
+    }
+    ok
+}
+
+/// Delete a value (`name` Some) or a key with no subkeys (None).
+pub fn kernel_delete(path: &str, name: Option<&str>) -> bool {
+    let mut pieces = split(&w(path));
+    let ok = kernel_tree(|root| match name {
+        Some(n) => {
+            let n = w(n);
+            match root.walk_mut(&pieces) {
+                Some(k) => {
+                    let before = k.values.len();
+                    k.values.retain(|v| !same(&v.name, &n));
+                    k.values.len() != before
+                }
+                None => false,
+            }
+        }
+        None => {
+            let Some(last) = pieces.pop() else { return false };
+            if pieces.is_empty() {
+                return false;
+            }
+            match root.walk_mut(&pieces) {
+                Some(parent) => match parent.subkeys.iter().position(|k| same(&k.name, &last)) {
+                    Some(i) if parent.subkeys[i].subkeys.is_empty() => {
+                        parent.subkeys.remove(i);
+                        true
+                    }
+                    _ => false,
+                },
+                None => false,
+            }
+        }
+    });
+    if ok {
+        changed();
+    }
+    ok
+}
+
+/// A key's values, in order: (name, type, data).
+pub fn kernel_values(path: &str) -> Option<Vec<(String, u32, Vec<u8>)>> {
+    let pieces = split(&w(path));
+    kernel_tree(|root| {
+        let k = root.walk(&pieces)?;
+        Some(k.values.iter().map(|v| (String::from_utf16_lossy(&v.name), v.kind, v.data.clone())).collect())
+    })
+}
+
+/// A key's subkeys' names, in order.
+pub fn kernel_subkeys(path: &str) -> Option<Vec<String>> {
+    let pieces = split(&w(path));
+    kernel_tree(|root| {
+        let k = root.walk(&pieces)?;
+        Some(k.subkeys.iter().map(|s| String::from_utf16_lossy(&s.name)).collect())
+    })
 }
