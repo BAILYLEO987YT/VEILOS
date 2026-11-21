@@ -513,9 +513,13 @@ impl HbaPort {
         let cl_virt = physical_memory_offset.as_u64() + clb;
         let cmd_header = unsafe { &mut *(cl_virt as *mut CommandHeader).add(slot) };
 
-        // Bit 6 of flags = Write direction (host→device).
-        cmd_header.command_fis_length = 5;
-        cmd_header.flags       = 1 << 6; // Write bit
+        // DW0: CFL (bits 4:0) = 5 dwords, W (bit 6) = host to device. W
+        // is in the first byte with CFL; the second byte holds R, B, C and
+        // the port multiplier port (bits 15:12), which must stay 0 with no
+        // port multiplier. (W used to be set there, as PMP 4: QEMU ignores
+        // both fields, real controllers sent the write nowhere.)
+        cmd_header.command_fis_length = 5 | 1 << 6;
+        cmd_header.flags       = 0;
         cmd_header.prdt_length = 1;
         cmd_header.prdb_count  = 0;
 
