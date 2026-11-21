@@ -44,7 +44,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from("VEILOS SHELL - AVAILABLE COMMANDS:"));
             history.push(String::from(" FS:      LS [PATH]  CAT [FILE]  HEAD [FILE]  MKDIR [DIR]  RM [FILE]  PWD"));
             history.push(String::from(" PROC:    PS  KILL [PID]  CAPS [PID]"));
-            history.push(String::from(" HW:      DEVICES  USB  INSTALL  DISPLAYS  SLOTS  WORKERS  GPUTEST  SOUND [VOLUME]  RUN"));
+            history.push(String::from(" HW:      DEVICES  USB  INSTALL  UPDATE  DISPLAYS  SLOTS  WORKERS  GPUTEST  SOUND [VOLUME]  RUN"));
             history.push(String::from(" PKG:     PKG LIST  PKG INSTALL [NAME]  PKG REMOVE [NAME]"));
             history.push(String::from(" DEBUG:   TRACE [N]  PROFILE [START|STOP|REPORT]  DBG [ATTACH|BP] [PID/ADDR]"));
             history.push(String::from(" POLICY:  POLICY  POLICY SET [PROFILE] [PID]  MODE [SECURITY|PERFORMANCE]"));
@@ -394,13 +394,45 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
 
         // -----| distribution / update |-----
         "UPDATE" => {
-            let sub = parts.get(1).copied().unwrap_or("CHECK");
-            match sub {
-                "CHECK"      => { crate::distribution::UPDATE_SYSTEM.lock().check(); history.push(String::from("UPDATE CHECK COMPLETE")); }
-                "APPLY"      => { crate::distribution::UPDATE_SYSTEM.lock().apply(); history.push(String::from("UPDATE APPLIED")); }
-                "ENROLL-LTS" => { crate::distribution::LTS_CHANNEL.lock().enroll(); history.push(String::from("ENROLLED IN LTS")); }
-                "STATUS"     => { crate::distribution::LTS_CHANNEL.lock().status(); history.push(String::from("")); }
-                _            => history.push(String::from("USAGE: UPDATE [CHECK|APPLY|ENROLL-LTS|STATUS]")),
+            // UPDATE <DISK>: upgrade the VEILOS installed on another disk
+            // from this one, keeping its users and data (install.rs).
+            // UPDATE STATUS: how far that is (the installer's status), and
+            // the update channel's. UPDATE alone: the disks it could update.
+            // CHECK, APPLY and ENROLL-LTS: the update channel (distribution.rs).
+            let admin = {
+                let user = crate::users::SESSION.lock().username.clone();
+                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+            };
+            match parts.get(1).copied() {
+                Some("CHECK")      => { crate::distribution::UPDATE_SYSTEM.lock().check(); history.push(String::from("UPDATE CHECK COMPLETE")); }
+                Some("APPLY")      => { crate::distribution::UPDATE_SYSTEM.lock().apply(); history.push(String::from("UPDATE APPLIED")); }
+                Some("ENROLL-LTS") => { crate::distribution::LTS_CHANNEL.lock().enroll(); history.push(String::from("ENROLLED IN LTS")); }
+                Some("STATUS") => {
+                    let s = crate::install::state();
+                    if s.is_empty() { history.push(String::from("  No install or update has run.")) } else { history.extend(wrap_lines(&s)) }
+                    crate::distribution::LTS_CHANNEL.lock().status();
+                }
+                Some(_) if !admin => history.push(String::from("UPDATE: administrators only")),
+                Some(disk) => match crate::install::start_update(disk) {
+                    Ok(()) => {
+                        history.extend(wrap_lines(&alloc::format!(
+                            "Updating VEILOS on {}: its boot partitions and system files are being replaced.                              Users, home folders and settings stay. UPDATE STATUS shows progress.",
+                            disk
+                        )));
+                    }
+                    Err(e) => history.extend(wrap_lines(&alloc::format!("UPDATE: {}", e))),
+                },
+                None => {
+                    history.push(String::from("  Upgrade the VEILOS installed on another disk to this build."));
+                    history.push(String::from("  Keeps its users, home folders, Wi-Fi networks and settings. Disks:"));
+                    let t = crate::install::update_targets();
+                    if t.is_empty() {
+                        history.push(String::from("    (no other disk has a VEILOS volume)"));
+                    }
+                    history.extend(t);
+                    history.push(String::from("  USAGE: UPDATE <DISK>   (e.g. UPDATE D0)"));
+                    history.push(String::from("         UPDATE STATUS    UPDATE [CHECK|APPLY|ENROLL-LTS]"));
+                }
             }
         }
 
@@ -701,7 +733,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             match (parts.get(1).copied(), parts.get(2).copied()) {
                 (Some("STATUS"), _) => {
                     let s = crate::install::state();
-                    history.push(if s.is_empty() { String::from("  No install has run.") } else { alloc::format!("  {}", s) });
+                    if s.is_empty() { history.push(String::from("  No install has run.")) } else { history.extend(wrap_lines(&s)) }
                 }
                 (Some(_), Some("ERASE")) if !admin => history.push(String::from("INSTALL: administrators only")),
                 (Some(disk), Some("ERASE")) => match crate::install::start(disk) {
@@ -709,7 +741,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                         history.push(alloc::format!("  Installing onto {}: EVERYTHING ON IT IS BEING ERASED.", disk));
                         history.push(String::from("  This takes a few minutes. INSTALL STATUS shows progress."));
                     }
-                    Err(e) => history.push(alloc::format!("  INSTALL: {}", e)),
+                    Err(e) => history.extend(wrap_lines(&alloc::format!("INSTALL: {}", e))),
                 },
                 _ => {
                     history.push(String::from("  Put VEILOS on another disk, to start without the stick."));
@@ -1359,4 +1391,23 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         _ => { history.push(String::from("UNKNOWN COMMAND: ") + parts[0] + "  (TYPE HELP)"); }
     }
     
+}
+
+/// A long message (the installer's) as indented lines that fit the
+/// terminal window, broken between words.
+fn wrap_lines(text: &str) -> Vec<String> {
+    const WIDTH: usize = 56;
+    let mut out = Vec::new();
+    let mut line = String::from(" ");
+    for word in text.split_whitespace() {
+        if line.len() > 1 && line.len() + 1 + word.len() > WIDTH {
+            out.push(core::mem::replace(&mut line, String::from(" ")));
+        }
+        line.push(' ');
+        line.push_str(word);
+    }
+    if line.len() > 1 {
+        out.push(line);
+    }
+    out
 }

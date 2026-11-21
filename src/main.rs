@@ -238,6 +238,9 @@ fn take_boot_info(boot_info: &mut BootInfo) {
     if let Some(addr) = boot_info.ramdisk_addr.into_option() {
         crate::block::set_ram_disk(addr, boot_info.ramdisk_len as usize);
     }
+    // Where the kernel's ELF file is: block::choose_root finds the disk it
+    // came from by looking for it on each boot partition.
+    crate::block::set_kernel_image(boot_info.kernel_addr, boot_info.kernel_len);
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
         let virt = fb.buffer_mut().as_mut_ptr() as u64;
@@ -430,6 +433,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::hal::bind(crate::hal::DeviceClass::Storage);
     // USB too before the root volume is settled: it may be on a USB stick.
     crate::hal::bind(crate::hal::DeviceClass::SerialBus);
+    // Every disk is mounted read-only so far: make the VEILOS volume on the
+    // disk the kernel booted from `/` (not just the first one found).
+    crate::block::choose_root();
     if !crate::block::root_mounted() {
         no_system_volume();
     }
