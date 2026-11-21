@@ -11,9 +11,15 @@
 //
 // All DMA memory comes from memory::DmaRegion (below 4 GiB, contiguous,
 // zeroed). Rings are one page: 255 TRBs and a link TRB back to the start.
-// Nothing uses interrupts: `process_events` reads the event ring when a
-// command or transfer waits for its completion, and from the BSP's timer
-// tick (`poll_all`) for keyboard and mouse reports.
+//
+// Events: `process_events` reads the event ring when a command or transfer
+// waits for its completion (it spins), and from the controller's interrupt
+// (MSI, else MSI-X, to the BSP: `interrupt`) for keyboard and mouse reports
+// and hot-plug. A controller without either, or a machine without a LAPIC,
+// is polled from the BSP's timer tick instead (`poll_all`, every 1 ms). With
+// the interrupt, the tick still looks every 10 ms, in case an interrupt came
+// while the controller was busy and its events were read without the
+// interrupter being re-armed.
 
 use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
 use spin::Mutex;
@@ -263,6 +269,8 @@ pub struct Controller {
     hotplug: bool,
     /// Per slot id: bumped each time a device using it goes away.
     gens: Vec<u32>,
+    /// How its events arrive: "MSI", "MSI-X" or "polled".
+    irq: &'static str,
 }
 
 // Its raw pointers are DMA memory and MMIO owned by this controller, used
@@ -270,6 +278,11 @@ pub struct Controller {
 unsafe impl Send for Controller {}
 
 static CONTROLLERS: Mutex<Vec<Arc<Mutex<Controller>>>> = Mutex::new(Vec::new());
+
+/// Every controller delivers its events by interrupt (none is polled).
+static ALL_IRQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Interrupts taken, for DMESG/diagnostics.
+pub static IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Root ports and hub ports that changed (a device plugged in, pulled out,
 /// or dropped and reconnected by its hub): set up or forget what is there
@@ -326,6 +339,18 @@ pub fn probe(dev: &crate::pci::PciDevice) -> Result<(), String> {
     map_mmio(base, (bar.size as u64).max(0x10000));
     let name = format!("{:02x}:{:02x}.{}", dev.bus, dev.device, dev.function);
     let mut c = Controller::start(base, name)?;
+    let how = route_interrupt(dev, bar.size as u64);
+    match how {
+        Some(how) => {
+            c.irq = how;
+            c.enable_interrupter();
+            crate::serial_println!("[XHCI] {}: interrupts by {} (vector {:#x})", c.name, how, crate::interrupts::USB_VECTOR);
+        }
+        None => {
+            ALL_IRQ.store(false, core::sync::atomic::Ordering::Relaxed);
+            crate::serial_println!("[XHCI] {}: no MSI/MSI-X, polled", c.name);
+        }
+    }
     let found = c.scan_ports();
     let c = Arc::new(Mutex::new(c));
     CONTROLLERS.lock().push(c.clone());
@@ -335,13 +360,94 @@ pub fn probe(dev: &crate::pci::PciDevice) -> Result<(), String> {
     Ok(())
 }
 
-/// From the BSP's timer tick: keyboard and mouse reports, on every
-/// controller not busy with a transfer.
+/// Point the controller's MSI (or, without it, MSI-X entry 0) at
+/// `interrupts::USB_VECTOR` on this CPU (the BSP, which binds devices).
+/// None if it has neither, or there is no LAPIC to receive it.
+fn route_interrupt(dev: &crate::pci::PciDevice, bar_size: u64) -> Option<&'static str> {
+    if crate::smp::LAPIC_BASE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let apic = u8::try_from(crate::smp::current_apic_id()).ok()?;
+    let vector = crate::interrupts::USB_VECTOR;
+    if dev.enable_msi(vector, apic) {
+        return Some("MSI");
+    }
+    let m = dev.msix()?;
+    let table_base = dev.bar(m.table_bar as usize).mem_base()?;
+    let table = table_base + m.table_offset as u64;
+    // BAR0 is mapped already (`probe`); another BAR, or past the part of
+    // BAR0 mapped, needs its page.
+    if m.table_bar != 0 || m.table_offset as u64 + 16 > bar_size.max(0x10000) {
+        map_mmio(table & !0xFFF, 0x1000);
+    }
+    dev.enable_msix(table, vector, apic).then_some("MSI-X")
+}
+
+/// The xHCI interrupt (`interrupts::USB_VECTOR`, every controller): read
+/// each one's events. A controller locked by a transfer or command waiting
+/// for its completion is skipped: that waiter reads the events.
+pub fn interrupt() {
+    IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    poll_all();
+}
+
+/// The terminal's USB command: each controller, how its events arrive, and
+/// the devices on it.
+pub fn status() -> Vec<String> {
+    let mut out = vec![format!(
+        "  xHCI interrupts taken: {}",
+        IRQS.load(core::sync::atomic::Ordering::Relaxed)
+    )];
+    let list: Vec<Arc<Mutex<Controller>>> = CONTROLLERS.lock().clone();
+    if list.is_empty() {
+        out.push(String::from("  No xHCI controller"));
+    }
+    for c in list {
+        let c = c.lock();
+        out.push(format!("  Controller {}: events by {}", c.name, c.irq));
+        for (id, s) in c.slots.iter().enumerate() {
+            let Some(s) = s else { continue };
+            let speed = match s.at.speed {
+                1 => "full",
+                2 => "low",
+                3 => "high",
+                _ => "super",
+            };
+            let what = if let Some((ports, usb3)) = s.hub {
+                format!("{} hub, {} ports", if usb3 { "USB 3" } else { "USB 2" }, ports)
+            } else if !s.hid.is_empty() {
+                let kinds: Vec<&str> = s.hid.iter().map(|h| match h.kind {
+                    HidKind::Keyboard => "keyboard",
+                    HidKind::Mouse => "mouse",
+                    HidKind::Hub => "hub",
+                }).collect();
+                kinds.join(" + ")
+            } else {
+                String::from("other")
+            };
+            out.push(format!("    slot {:>2}  port {:<7} {:<5}  {}", id, s.at.path(), speed, what));
+        }
+    }
+    out
+}
+
+/// From the BSP's timer tick (`tick`, every 1 ms): poll when some
+/// controller has no interrupt, else every 10th tick as a safety net.
+pub fn tick(n: u64) {
+    if !ALL_IRQ.load(core::sync::atomic::Ordering::Relaxed) || n % 10 == 0 {
+        poll_all();
+    }
+}
+
+/// Keyboard and mouse reports, on every controller not busy with a
+/// transfer, and re-arm its interrupter. From the interrupt, the timer tick,
+/// and the power code's key wait (interrupts off).
 pub fn poll_all() {
     let Some(list) = CONTROLLERS.try_lock() else { return };
     for c in list.iter() {
         if let Some(mut c) = c.try_lock() {
             c.process_events();
+            c.rearm();
         }
     }
 }
@@ -394,7 +500,8 @@ impl Controller {
         let cmd = Ring::new().ok_or_else(|| String::from("no DMA memory"))?;
         w64(op + 0x18, cmd.phys | 1); // CRCR, ring cycle state 1
 
-        // One event ring segment for interrupter 0 (polled: IMAN.IE stays off).
+        // One event ring segment for interrupter 0 (its interrupt is turned
+        // on by `probe`, once MSI is set up).
         let (ev_phys, ev) = dma(EVENT_TRBS * 16).ok_or_else(|| String::from("no DMA memory"))?;
         let (erst_phys, erst) = dma(64).ok_or_else(|| String::from("no DMA memory"))?;
         unsafe {
@@ -433,10 +540,32 @@ impl Controller {
             root_changes: Vec::new(),
             hotplug: false,
             gens: vec![0; max_slots as usize + 1],
+            irq: "polled",
         })
     }
 
     // -----| events |-----
+
+    /// Interrupter 0 on: an interrupt per batch of events, at most one every
+    /// 250 us (IMOD), and USBCMD.INTE. Before `scan_ports`, which waits for
+    /// its commands' completions itself.
+    fn enable_interrupter(&mut self) {
+        let ir = self.rt + 0x20;
+        w32(ir + 4, 1000); // IMODI, in 250 ns units
+        w32(ir, 0b11); // IMAN: IE, and clear IP
+        w32(self.op, r32(self.op) | 1 << 2); // USBCMD.INTE
+    }
+
+    /// Clear the Event Handler Busy bit if it is set. The controller sets it
+    /// with each interrupt and sends no more until it is cleared, which
+    /// `process_events` does only when it read some events: if a waiter read
+    /// them before the controller set EHB, it would stay set.
+    fn rearm(&mut self) {
+        let ir = self.rt + 0x20;
+        if r32(ir + 0x18) & 1 << 3 != 0 {
+            w64(ir + 0x18, self.events.phys + (self.events.dequeue * 16) as u64 | 1 << 3);
+        }
+    }
 
     /// Read every event the controller has posted: command completions and
     /// transfer completions are recorded for whoever waits on them;
