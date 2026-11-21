@@ -252,6 +252,20 @@ impl VfsManager {
         self.mounts.lock().push(Arc::new(MountedFileSystem { path, fs, device, read_only }));
     }
 
+    /// The filesystem mounted at `/`.
+    pub fn root_mount(&self) -> Option<Arc<MountedFileSystem>> {
+        self.mounts.lock().iter().find(|m| m.path == "/").cloned()
+    }
+
+    /// Forget every mount on disk `name` (the installer, before it erases
+    /// it). Returns how many there were.
+    pub fn unmount_disk(&self, name: &str) -> usize {
+        let mut mounts = self.mounts.lock();
+        let before = mounts.len();
+        mounts.retain(|m| !m.device.on_disk().is_some_and(|(d, _)| d.name == name));
+        before - mounts.len()
+    }
+
     pub fn mount_count(&self) -> usize {
         self.mounts.lock().len()
     }

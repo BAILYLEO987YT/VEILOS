@@ -44,13 +44,13 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from("VEILOS SHELL - AVAILABLE COMMANDS:"));
             history.push(String::from(" FS:      LS [PATH]  CAT [FILE]  HEAD [FILE]  MKDIR [DIR]  RM [FILE]  PWD"));
             history.push(String::from(" PROC:    PS  KILL [PID]  CAPS [PID]"));
-            history.push(String::from(" HW:      DEVICES  USB  DISPLAYS  SLOTS  WORKERS  GPUTEST  SOUND [VOLUME]  RUN"));
+            history.push(String::from(" HW:      DEVICES  USB  INSTALL  DISPLAYS  SLOTS  WORKERS  GPUTEST  SOUND [VOLUME]  RUN"));
             history.push(String::from(" PKG:     PKG LIST  PKG INSTALL [NAME]  PKG REMOVE [NAME]"));
             history.push(String::from(" DEBUG:   TRACE [N]  PROFILE [START|STOP|REPORT]  DBG [ATTACH|BP] [PID/ADDR]"));
             history.push(String::from(" POLICY:  POLICY  POLICY SET [PROFILE] [PID]  MODE [SECURITY|PERFORMANCE]"));
             history.push(String::from(" SDK:     SDK INFO  SDK HEADERS"));
             history.push(String::from(" STAB:    FUZZ [KERNEL|SYSCALL]  AUDIT  STRESS DRIVERS"));
-            history.push(String::from(" DIST:    UPDATE [CHECK|APPLY|STATUS]  INSTALL  DOCS [LIST|READ path]"));
+            history.push(String::from(" DIST:    UPDATE [CHECK|APPLY|STATUS]  DOCS [LIST|READ path]"));
             history.push(String::from(" USERS:   WHOAMI  USERS  USERADD  USERDEL  PASSWD  UNLOCK  LOGOUT"));
             history.push(String::from(" UTIL:    ECHO  DATE  UPTIME  FREE  NET STATUS  PEERS  DMESG [TEXT]"));
             history.push(String::from(" WI-FI:   WIFI [STATUS|UP|SCAN]"));
@@ -403,13 +403,6 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 _            => history.push(String::from("USAGE: UPDATE [CHECK|APPLY|ENROLL-LTS|STATUS]")),
             }
         }
-        "INSTALL" => {
-            history.push(String::from("RUNNING VEILOS INSTALLER (DRY RUN)..."));
-            let cfg = crate::distribution::InstallerConfig::default();
-            let mut inst = crate::distribution::Installer::new(cfg);
-            let ok = inst.run();
-            history.push(if ok { String::from("INSTALL COMPLETE") } else { String::from("INSTALL FAILED") });
-        }
 
         // -----| documentation |-----
         "DOCS" => {
@@ -696,6 +689,39 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             for line in crate::gpu_driver::self_test() {
                 crate::serial_println!("[GPU] {}", line);
                 history.push(line);
+            }
+        }
+        "INSTALL" => {
+            // INSTALL: disks VEILOS could go on. INSTALL <DISK> ERASE: put
+            // this system on it (install.rs). INSTALL STATUS: how far it is.
+            let admin = {
+                let user = crate::users::SESSION.lock().username.clone();
+                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+            };
+            match (parts.get(1).copied(), parts.get(2).copied()) {
+                (Some("STATUS"), _) => {
+                    let s = crate::install::state();
+                    history.push(if s.is_empty() { String::from("  No install has run.") } else { alloc::format!("  {}", s) });
+                }
+                (Some(_), Some("ERASE")) if !admin => history.push(String::from("INSTALL: administrators only")),
+                (Some(disk), Some("ERASE")) => match crate::install::start(disk) {
+                    Ok(()) => {
+                        history.push(alloc::format!("  Installing onto {}: EVERYTHING ON IT IS BEING ERASED.", disk));
+                        history.push(String::from("  This takes a few minutes. INSTALL STATUS shows progress."));
+                    }
+                    Err(e) => history.push(alloc::format!("  INSTALL: {}", e)),
+                },
+                _ => {
+                    history.push(String::from("  Put VEILOS on another disk, to start without the stick."));
+                    history.push(String::from("  ERASES EVERYTHING on that disk. Disks:"));
+                    let t = crate::install::targets();
+                    if t.is_empty() {
+                        history.push(String::from("    (none besides the one VEILOS runs from)"));
+                    }
+                    history.extend(t);
+                    history.push(String::from("  USAGE: INSTALL <DISK> ERASE   (e.g. INSTALL D2 ERASE)"));
+                    history.push(String::from("         INSTALL STATUS"));
+                }
             }
         }
         "USB" => {

@@ -65,6 +65,7 @@ pub mod ioapic;
 pub mod kthread;
 pub mod address_space;
 pub mod block;
+pub mod install;
 pub mod hal;
 pub mod hotplug;
 pub mod modules;

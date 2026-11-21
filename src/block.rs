@@ -33,6 +33,8 @@
 // mount is read-only (callers get an error) and each `Disk` accepts writes
 // only inside the ranges `allow_writes` opened, which is only ever the root
 // volume's partition, so no driver, cache or crash path can write elsewhere.
+// The one exception is the installer (install.rs): while INSTALL <disk>
+// ERASE runs, typed by an administrator, it opens that whole disk.
 // With no VEILOS volume the kernel stops at boot (main.rs) and writes nothing.
 //
 // Buffers passed to `BlockDevice` are kernel virtual addresses (heap,
@@ -471,6 +473,35 @@ impl Disk {
         self.inner.lock().writable.push((start, start + sectors));
     }
 
+    /// The installer (install.rs) only: let writes reach the whole disk
+    /// while it puts VEILOS on it (`open`), and close that again after. The
+    /// one other way a disk becomes writable, besides holding the root volume.
+    pub fn set_install_window(&self, open: bool) {
+        let whole = (0, self.sectors);
+        let mut d = self.inner.lock();
+        d.writable.retain(|&r| r != whole);
+        if open {
+            d.writable.push(whole);
+        }
+    }
+
+    /// Write straight to the disk, past the cache (and dropping what the
+    /// cache held for those sectors): for the installer's large writes,
+    /// which would only push everything else out of the cache.
+    pub fn write_through(&self, lba: u64, buf: &[u8]) -> bool {
+        let count = (buf.len() / SECTOR) as u64;
+        let mut d = self.inner.lock();
+        if !d.may_write(lba, count) {
+            drop(d);
+            refused(&self.name, lba, count as u32);
+            return false;
+        }
+        for i in 0..count {
+            d.cache.forget(lba + i);
+        }
+        d.write_disk(lba, buf)
+    }
+
     /// (hits, misses) of the sector cache, for diagnostics.
     pub fn cache_stats(&self) -> (u64, u64) {
         let d = self.inner.lock();
@@ -613,6 +644,18 @@ pub const VOLUME_MARKER: &str = "/VEILOS.VOL";
 const MARKER_MAGIC: &[u8] = b"VEILOS SYSTEM VOLUME";
 
 static ROOT_FOUND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The disk and partition (start, sectors) mounted at `/`.
+static ROOT_AT: Mutex<Option<(Arc<Disk>, u64, u64)>> = Mutex::new(None);
+
+/// Where `/` is: its disk, and the partition's start and length in sectors.
+pub fn root_location() -> Option<(Arc<Disk>, u64, u64)> {
+    ROOT_AT.lock().clone()
+}
+
+/// Every disk found, in the order found.
+pub fn disks() -> Vec<Arc<Disk>> {
+    DISKS.lock().clone()
+}
 /// Every filesystem seen, for the no-system-volume screen (main.rs).
 static FOUND: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -654,6 +697,7 @@ pub fn mount_disk(disk: Arc<Disk>) {
         let root = veilos && !ROOT_FOUND.swap(true, Ordering::AcqRel);
         let (path, how) = if root {
             disk.allow_writes(p.start, p.sectors);
+            *ROOT_AT.lock() = Some((disk.clone(), p.start, p.sectors));
             (String::from("/"), "writable: the VEILOS volume")
         } else if veilos {
             (format!("/mnt/{}p{}", disk.name, n), "read-only: another VEILOS volume")
