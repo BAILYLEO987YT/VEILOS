@@ -75,6 +75,7 @@ int main(void) {
         check("driver Ex: lookaside lists, SLists", ok && (mask & 0x80000));
         check("driver Rtl: time fields, RtlQueryRegistryValues", ok && (mask & 0x100000));
         check("driver Ex: timer, callback object", ok && (mask & 0x200000));
+        check("driver KPCR: current thread, CPU, PCR via GS", ok && (mask & 0x400000));
     }
     {
         // METHOD_OUT_DIRECT: the driver writes straight into this buffer
@@ -98,6 +99,7 @@ int main(void) {
         check("in a request: KeDelayExecutionThread", ok && (mask & 0x04));
         check("in a request: wait for a work item", ok && (mask & 0x08));
         check("in a request: wait for a timer's DPC", ok && (mask & 0x10));
+        check("in a request: KPCR through GS", ok && (mask & 0x20));
     }
     {
         BOOL ok = DeviceIoControl(h, CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8FF, METHOD_BUFFERED, FILE_ANY_ACCESS), NULL, 0, NULL, 0, &got, NULL);

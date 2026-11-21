@@ -99,6 +99,10 @@ pub extern "win64" fn KeFlushQueuedDpcs() {
 
 /// Run queued DPCs at DISPATCH_LEVEL until the queue is empty.
 fn drain() {
+    super::with_kernel_gs(drain_inner)
+}
+
+fn drain_inner() {
     let old = ke::KfRaiseIrql(ke::DISPATCH_LEVEL);
     loop {
         let next = locked(|| {

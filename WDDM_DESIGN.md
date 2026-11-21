@@ -268,9 +268,15 @@ Still to do in W1:
 - per-section protection;
 - freeing an unloaded image;
 - mapping an MDL into a program (`UserMode`);
-- `KeGetCurrentThread` and the other gs-based inlines: the WDK reads the
-  current thread from `gs:[0x188]` (KPCR.Prcb), which VEILOS's per-CPU
-  block doesn't yet hold.
+- ~~`KeGetCurrentThread` and the other GS inlines~~: done. VEILOS's
+  per-CPU block now carries the KPCR/KPRCB fields drivers read through GS:
+  Self 0x18, CurrentPrcb 0x20, Number 0x184, CurrentThread 0x188 (each
+  kernel thread's own record, set on every switch) and ProcessorIndex
+  0x1A4. Kernel threads run with GS there, and DPCs run from an interrupt
+  that came from user mode switch it there too. K1 checks it in
+  DriverEntry, in a system thread and inside a program's request (all
+  passed). The thread records are in the kernel heap, which by Windows'
+  rules is a user-range address; no driver seen so far checks that.
 
 ### Waits inside a program's request (2026-11-21)
 

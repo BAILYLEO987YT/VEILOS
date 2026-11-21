@@ -182,6 +182,10 @@ AT(IO_RESOURCE_DESCRIPTOR, u.Memory.Alignment, 0xC);
 AT(IO_RESOURCE_DESCRIPTOR, u.Memory.MinimumAddress, 0x10);
 AT(IO_RESOURCE_DESCRIPTOR, u.Memory.MaximumAddress, 0x18);
 
+// smp.rs: the KPCR fields drivers read through GS (PerCpu asserts the same)
+AT(KPCR, Self, 0x18);
+AT(KPCR, CurrentPrcb, 0x20);
+
 // ke.rs: dispatcher objects, queued spinlock handle
 SIZE(DISPATCHER_HEADER, 0x18);
 AT(DISPATCHER_HEADER, SignalState, 0x04);

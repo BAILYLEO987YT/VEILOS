@@ -81,6 +81,24 @@ pub fn init() {
     ex::init();
 }
 
+/// Run `f` (driver code) with GS on this CPU's per-CPU block, where
+/// drivers find their KPCR fields: an interrupt that came from user mode
+/// still has the program's TEB there.
+pub fn with_kernel_gs<R>(f: impl FnOnce() -> R) -> R {
+    use x86_64::registers::model_specific::Msr;
+    let mut gs = Msr::new(0xC000_0101);
+    let want = crate::smp::percpu_base(crate::smp::cpu_index());
+    let was = unsafe { gs.read() };
+    if was != want {
+        unsafe { gs.write(want) };
+    }
+    let r = f();
+    if was != want {
+        unsafe { gs.write(was) };
+    }
+    r
+}
+
 /// From the BSP's 1 ms timer interrupt: due timers and queued DPCs.
 pub fn tick(now_ms: u64) {
     dpc::tick(now_ms);

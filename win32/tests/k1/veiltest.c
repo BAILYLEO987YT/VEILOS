@@ -48,7 +48,8 @@ int __cdecl swprintf_s(wchar_t *buffer, size_t size, const wchar_t *format, ...)
 #define T_LOOKASIDE    0x80000
 #define T_TIME_REG     0x100000
 #define T_EXTIMER_CB   0x200000
-#define T_ALL      0x3FFFFF
+#define T_KPCR         0x400000
+#define T_ALL      0x7FFFFF
 
 typedef struct _VEIL_EXT {
     KSPIN_LOCK Lock;
@@ -164,8 +165,11 @@ NTSTATUS VeilIoctl(PDEVICE_OBJECT dev, PIRP irp) {
     return st;
 }
 
+static PKTHREAD g_sys_kthread;
+
 static VOID VeilThread(PVOID ctx) {
     UNREFERENCED_PARAMETER(ctx);
+    g_sys_kthread = KeGetCurrentThread(); // gs:[0x188], inline
     KeWaitForSingleObject(&g_go, Executive, KernelMode, FALSE, NULL);
     g_thread_value = 7;
     PsTerminateSystemThread(STATUS_SUCCESS);
@@ -617,6 +621,19 @@ static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
              !!(g_passed & T_IOSPACE), !!(g_passed & T_MDL_POOL), !!(g_passed & T_MDL_PAGES));
 
     g_passed |= RuntimeTest();
+
+    // The KPCR fields the WDK reads through GS without calling in.
+    {
+        PKTHREAD me = KeGetCurrentThread();
+        PROCESSOR_NUMBER pn;
+        ULONG n = KeGetCurrentProcessorNumberEx(&pn);
+        PKPCR pcr = KeGetPcr();
+        if (me && me == (PKTHREAD)PsGetCurrentThread() && g_sys_kthread && g_sys_kthread != me &&
+            KeGetCurrentProcessorIndex() == n && pn.Number == n && pcr && pcr->Self == pcr)
+            g_passed |= T_KPCR;
+        DbgPrint("veiltest: thread %p (system thread %p), CPU %lu / %lu, PCR %p\n", me, g_sys_kthread, n,
+                 KeGetCurrentProcessorIndex(), pcr);
+    }
     DbgPrint("veiltest: run-time library and executive: %lx of %x\n", g_passed & 0x3FC000, 0x3FC000);
 
     // Structured exception handling.
@@ -716,7 +733,9 @@ static ULONG WaitTest(PDEVICE_OBJECT dev) {
     if (KeWaitForSingleObject(&g_wt_event, Executive, KernelMode, FALSE, &two_s) == STATUS_SUCCESS && g_wt_dpc_runs == 1)
         mask |= 0x10;
 
-    DbgPrint("veiltest: waits inside a request: %lx of 1f\n", mask);
+    // GS inside a program's request (after the system call's swapgs).
+    if (KeGetCurrentThread() && KeGetCurrentThread() != g_sys_kthread && KeGetPcr()->Self == KeGetPcr()) mask |= 0x20;
+    DbgPrint("veiltest: waits inside a request: %lx of 3f\n", mask);
     return mask;
 }
 

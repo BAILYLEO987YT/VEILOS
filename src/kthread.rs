@@ -246,6 +246,8 @@ unsafe fn reschedule(cpu: usize, becomes: State) -> bool {
             gs.write(ct.threads[next].gs_base);
             kgs.write(ct.threads[next].kernel_gs_base);
         }
+        // Windows drivers' KeGetCurrentThread: this thread's own record.
+        crate::smp::set_current_thread(cpu, &*ct.threads[next] as *const Thread as u64);
         let krsp = ct.threads[next].user.kernel_rsp;
         if krsp != 0 {
             crate::gdt::set_rsp0(cpu, krsp);
@@ -297,7 +299,10 @@ fn spawn_with(name: &'static str, cr3: u64, pid: u32, stack_size: usize, f: impl
         name,
         state: State::Ready,
         user: UserCtx::new(pid),
-        gs_base: 0,
+        // A kernel thread runs with GS on the per-CPU block (smp.rs: Windows
+        // drivers read their KPCR fields through it); a program's thread
+        // gets its TEB there when it enters user mode.
+        gs_base: if pid == 0 { crate::smp::percpu_base(cpu) } else { 0 },
         kernel_gs_base: crate::smp::percpu_base(cpu),
         saved: SavedState::new(rsp),
         stack: Some(stack),
