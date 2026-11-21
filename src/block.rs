@@ -912,6 +912,7 @@ pub fn choose_root() {
         c.fs_name, c.disk.name, c.n, c.part.sectors / 2048
     );
     crate::println!("  -> Mounted {}", line);
+    crate::serial_println!("[BLOCK]   mounted {}", line);
     crate::println!("     / is disk {} partition {}: {}", c.disk.name, c.n, reason);
     crate::serial_println!("[BLOCK] / is disk {} partition {} (VEILOS volumes: {}): {}", c.disk.name, c.n, all, reason);
     FOUND.lock().push(line);
