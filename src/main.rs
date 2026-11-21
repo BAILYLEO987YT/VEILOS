@@ -546,6 +546,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     executor.spawn(task::Task::new(task::mouse::mouse_tick()));
     executor.spawn(task::Task::new(gui_refresh_task()));
     executor.spawn(task::Task::new(crate::scheduler::reaper_task()));
+    executor.spawn(task::Task::new(crate::usb::hotplug_task()));
     
     // (All non-blocking system apps are initialized in apps::init())
     
