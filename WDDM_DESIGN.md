@@ -202,11 +202,35 @@ each:
 - `ProbeForRead` refusing a kernel address and passing a user one;
 - `EXCEPTION_CONTINUE_EXECUTION` resuming after `RtlRaiseException`.
 
+### W1 memory for drivers (2026-11-21)
+
+`src/ntos/mm.rs`:
+- **MDLs**: `IoAllocateMdl`, `MmBuildMdlForNonPagedPool`,
+  `MmProbeAndLockPages` (raising into the driver's `__try` for a bad
+  page; a program's not-yet-made pages are touched first),
+  `MmMapLockedPagesSpecifyCache`, `IoBuildPartialMdl`, and
+  `MmAllocatePagesForMdl(Ex)` / `MmFreePagesFromMdl`.
+- **Contiguous memory** below a limit and within a boundary
+  (`MmAllocateContiguousMemory(SpecifyCache)`, `MmAllocateNonCachedMemory`).
+- **Device memory**: `MmMapIoSpace(Ex)` and `MmUnmapIoSpace`, cached,
+  write-combining or uncached (VEILOS's PAT).
+- `MmGetPhysicalAddress` and `MmIsAddressValid`.
+- Mappings go in a system-PTE range of the ntos region. Programs' requests
+  with `METHOD_IN_DIRECT`/`METHOD_OUT_DIRECT` get their output buffer as an
+  MDL (`Irp->MdlAddress`).
+
+K1 tests each of these: contiguous memory below 4 GiB with consecutive
+physical pages, the same pages through `MmMapIoSpace`, an MDL over pool
+whose PFNs match `MmGetPhysicalAddress`, pages for an MDL mapped and
+written, and a `METHOD_OUT_DIRECT` request writing 9000 bytes across three
+of the program's pages (and nothing either side). All passed in QEMU
+(`3fff of 3fff`, `k1test: 0 failed`). 163 exports now.
+
 Still to do in W1:
 - the rest of the census list;
 - per-section protection;
 - freeing an unloaded image;
-- METHOD_IN/OUT_DIRECT (MDLs);
+- mapping an MDL into a program (`UserMode`);
 - `RtlQueryRegistryValues`.
 
 ### Waits inside a program's request (2026-11-21)

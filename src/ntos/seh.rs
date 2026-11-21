@@ -525,12 +525,14 @@ macro_rules! capture {
                 "call {imp}",
                 "add rsp, 0x4F8",
                 "ret",
-                capture = sym RtlCaptureContext,
+                capture = sym $crate::ntos::seh::RtlCaptureContext,
                 imp = sym $imp,
             )
         }
     };
 }
+
+pub(crate) use capture;
 
 capture!(RtlRaiseException, raise_exception_impl);
 capture!(ExRaiseStatus, raise_status_impl);
@@ -580,6 +582,15 @@ fn probe(args: *const u64, c: *mut Context, write: bool) {
         rec.count = 2;
         rec.info = [write as u64, MM_USER_PROBE_ADDRESS, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     }
+    unsafe { raise_from(&mut rec, c) }
+}
+
+/// Raise STATUS_ACCESS_VIOLATION about `addr` from `c` (a driver's
+/// context captured by `capture!`).
+pub fn raise_access_violation(addr: u64, c: *mut Context) -> ! {
+    let mut rec = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0);
+    rec.count = 2;
+    rec.info[1] = addr;
     unsafe { raise_from(&mut rec, c) }
 }
 

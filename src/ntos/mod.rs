@@ -21,6 +21,7 @@
 //   * `dpc`: DPCs and timers; `ps`: system threads and work items.
 //   * `seh`: __try/__except/__finally in drivers: their CPU faults and
 //     raised exceptions dispatched through their unwind tables.
+//   * `mm`: MDLs, contiguous memory, device memory, physical addresses.
 //   * `ob`: kernel handles; `cm`: the registry (Zw*Key on nt_registry).
 //   * `exports`: the name -> address tables of ntoskrnl.exe and hal.dll.
 //
@@ -44,6 +45,7 @@ pub mod exports;
 pub mod image;
 pub mod io;
 pub mod ke;
+pub mod mm;
 pub mod ob;
 pub mod pool;
 pub mod ps;

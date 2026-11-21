@@ -101,6 +101,22 @@ AT(KEY_VALUE_FULL_INFORMATION, Name, 20);
 AT(KEY_VALUE_BASIC_INFORMATION, NameLength, 8);
 AT(KEY_VALUE_BASIC_INFORMATION, Name, 12);
 
+// mm.rs: MDL
+SIZE(MDL, 0x30);
+AT(MDL, Size, 0x08);
+AT(MDL, MdlFlags, 0x0A);
+AT(MDL, Process, 0x10);
+AT(MDL, MappedSystemVa, 0x18);
+AT(MDL, StartVa, 0x20);
+AT(MDL, ByteCount, 0x28);
+AT(MDL, ByteOffset, 0x2C);
+AT(IRP, MdlAddress, 0x08);
+static_assert(MDL_MAPPED_TO_SYSTEM_VA == 0x1 && MDL_PAGES_LOCKED == 0x2 && MDL_SOURCE_IS_NONPAGED_POOL == 0x4 &&
+              MDL_PARTIAL == 0x10, "MDL_ flags");
+static_assert(METHOD_IN_DIRECT == 1 && METHOD_OUT_DIRECT == 2, "METHOD_ direct");
+static_assert(MmNonCached == 0 && MmCached == 1 && MmWriteCombined == 2, "MEMORY_CACHING_TYPE");
+static_assert(PAGE_NOCACHE == 0x200 && PAGE_WRITECOMBINE == 0x400, "PAGE_ cache flags");
+
 // ke.rs: dispatcher objects, queued spinlock handle
 SIZE(DISPATCHER_HEADER, 0x18);
 AT(DISPATCHER_HEADER, SignalState, 0x04);

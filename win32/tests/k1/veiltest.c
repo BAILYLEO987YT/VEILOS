@@ -19,6 +19,9 @@ NTSYSAPI VOID NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
 #define IOCTL_VEIL_NEITHER  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_NEITHER, FILE_ANY_ACCESS)
 // Waits inside the request itself (a program's system call): see WaitTest.
 #define IOCTL_VEIL_WAITTEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// The output buffer as an MDL of the program's pages: filled with a pattern
+// seeded by the first input byte.
+#define IOCTL_VEIL_DIRECT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 
 // Self-test results (bits), run in DriverEntry and reported by SELFTEST.
 #define T_REGISTRY 0x01
@@ -31,7 +34,11 @@ NTSYSAPI VOID NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
 #define T_SEH_FINALLY  0x80
 #define T_SEH_PROBE    0x100
 #define T_SEH_CONTINUE 0x200
-#define T_ALL      0x3FF
+#define T_CONTIGUOUS   0x400
+#define T_IOSPACE      0x800
+#define T_MDL_POOL     0x1000
+#define T_MDL_PAGES    0x2000
+#define T_ALL      0x3FFF
 
 typedef struct _VEIL_EXT {
     KSPIN_LOCK Lock;
@@ -112,6 +119,14 @@ NTSTATUS VeilIoctl(PDEVICE_OBJECT dev, PIRP irp) {
         mask = WaitTest(dev);
         RtlCopyMemory(buf, &mask, sizeof mask);
         info = sizeof mask;
+        break;
+    }
+    case IOCTL_VEIL_DIRECT: {
+        UCHAR *dst = irp->MdlAddress ? (UCHAR *)MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority) : NULL;
+        UCHAR seed = in ? buf[0] : 0;
+        if (!dst) { st = STATUS_INSUFFICIENT_RESOURCES; break; }
+        for (ULONG i = 0; i < out; i++) dst[i] = (UCHAR)(seed + i * 7);
+        info = out;
         break;
     }
     case IOCTL_VEIL_NEITHER: {
@@ -319,6 +334,76 @@ static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
             IoFreeWorkItem(w);
         }
     }
+    // Memory: contiguous, device (I/O space) mappings, MDLs.
+    {
+        PHYSICAL_ADDRESS low = { 0 }, high, boundary = { 0 }, pa0, pa1;
+        UCHAR *c;
+        high.QuadPart = 0xFFFFFFFFLL; // below 4 GiB, as DMA engines often need
+        c = (UCHAR *)MmAllocateContiguousMemorySpecifyCache(3 * PAGE_SIZE, low, high, boundary, MmCached);
+        if (c) {
+            pa0 = MmGetPhysicalAddress(c);
+            pa1 = MmGetPhysicalAddress(c + 2 * PAGE_SIZE + 5);
+            if (pa0.QuadPart != 0 && pa0.QuadPart + 3 * PAGE_SIZE <= 0x100000000LL && pa1.QuadPart == pa0.QuadPart + 2 * PAGE_SIZE + 5 &&
+                c[100] == 0)
+                g_passed |= T_CONTIGUOUS;
+            DbgPrint("veiltest: contiguous memory %p at physical %I64x\n", c, pa0.QuadPart);
+
+            // The same memory again through MmMapIoSpace (cached, like the
+            // first mapping: mixing cache types on one page isn't coherent on
+            // real CPUs): writes through one are seen through the other.
+            {
+                UCHAR *io = (UCHAR *)MmMapIoSpace(pa0, 2 * PAGE_SIZE, MmCached);
+                if (io && io != c) {
+                    io[PAGE_SIZE + 3] = 0x5A;
+                    c[17] = 0xA5;
+                    if (c[PAGE_SIZE + 3] == 0x5A && io[17] == 0xA5) g_passed |= T_IOSPACE;
+                    MmUnmapIoSpace(io, 2 * PAGE_SIZE);
+                }
+            }
+            MmFreeContiguousMemory(c);
+        }
+    }
+    {
+        // An MDL over a pool buffer spanning pages: its PFNs agree with
+        // MmGetPhysicalAddress.
+        UCHAR *p = (UCHAR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 3 * PAGE_SIZE, 'liev');
+        if (p) {
+            PMDL m = IoAllocateMdl(p + 100, 2 * PAGE_SIZE, FALSE, FALSE, NULL);
+            if (m) {
+                PPFN_NUMBER pfn;
+                MmBuildMdlForNonPagedPool(m);
+                pfn = MmGetMdlPfnArray(m);
+                if (pfn[0] == (PFN_NUMBER)(MmGetPhysicalAddress(p + 100).QuadPart >> PAGE_SHIFT) &&
+                    pfn[2] == (PFN_NUMBER)(MmGetPhysicalAddress(p + 100 + 2 * PAGE_SIZE).QuadPart >> PAGE_SHIFT) &&
+                    MmGetSystemAddressForMdlSafe(m, NormalPagePriority) == p + 100)
+                    g_passed |= T_MDL_POOL;
+                IoFreeMdl(m);
+            }
+            ExFreePoolWithTag(p, 'liev');
+        }
+    }
+    {
+        // Pages for an MDL, mapped into system space, written and read back.
+        PHYSICAL_ADDRESS low = { 0 }, high, skip = { 0 };
+        PMDL m;
+        high.QuadPart = -1LL;
+        m = MmAllocatePagesForMdlEx(low, high, skip, 3 * PAGE_SIZE, MmCached, 0);
+        if (m) {
+            ULONG *v = (ULONG *)MmMapLockedPagesSpecifyCache(m, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+            if (v && MmGetMdlByteCount(m) == 3 * PAGE_SIZE) {
+                ULONG ok = 1;
+                for (ULONG i = 0; i < 3 * PAGE_SIZE / 4; i += 997) v[i] = i ^ 0xC0FFEE;
+                for (ULONG i = 0; i < 3 * PAGE_SIZE / 4; i += 997) ok &= v[i] == (i ^ 0xC0FFEE);
+                if (ok) g_passed |= T_MDL_PAGES;
+                MmUnmapLockedPages(v, m);
+            }
+            MmFreePagesFromMdl(m);
+            ExFreePool(m);
+        }
+    }
+    DbgPrint("veiltest: memory: contiguous %d, I/O space %d, pool MDL %d, MDL pages %d\n", !!(g_passed & T_CONTIGUOUS),
+             !!(g_passed & T_IOSPACE), !!(g_passed & T_MDL_POOL), !!(g_passed & T_MDL_PAGES));
+
     // Structured exception handling.
     {
         ULONG fault = SehFault();

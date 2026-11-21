@@ -63,6 +63,24 @@ int main(void) {
         check("driver SEH: both __finally blocks ran", ok && (mask & 0x80));
         check("driver SEH: ProbeForRead", ok && (mask & 0x100));
         check("driver SEH: EXCEPTION_CONTINUE_EXECUTION", ok && (mask & 0x200));
+        check("driver memory: contiguous below 4 GiB", ok && (mask & 0x400));
+        check("driver memory: MmMapIoSpace of it", ok && (mask & 0x800));
+        check("driver memory: MDL over pool", ok && (mask & 0x1000));
+        check("driver memory: pages for an MDL, mapped", ok && (mask & 0x2000));
+    }
+    {
+        // METHOD_OUT_DIRECT: the driver writes straight into this buffer
+        // (three pages, starting partway into the first) through an MDL.
+        UCHAR *mem = (UCHAR *)VirtualAlloc(NULL, 4 * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        UCHAR seed = 0x21;
+        int good = mem != NULL;
+        BOOL ok = FALSE;
+        if (mem) {
+            ok = DeviceIoControl(h, CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_OUT_DIRECT, FILE_ANY_ACCESS), &seed, 1, mem + 100, 9000, &got, NULL);
+            for (ULONG i = 0; i < 9000 && good; i++) good = mem[100 + i] == (UCHAR)(seed + i * 7);
+            good = good && mem[99] == 0 && mem[9100] == 0;
+        }
+        check("METHOD_OUT_DIRECT across 3 pages", ok && got == 9000 && good);
     }
     {
         ULONG mask = 0;

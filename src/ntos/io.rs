@@ -34,6 +34,7 @@ const DO_DEVICE_INITIALIZING: u32 = 0x80;
 
 // IRP (0xD0 bytes, then its stack locations)
 pub const IRP_SIZE: usize = 0xD0;
+pub const IRP_MDL_ADDRESS: usize = 0x08;
 pub const IRP_SYSTEM_BUFFER: usize = 0x18;
 pub const IRP_STATUS: usize = 0x30;
 pub const IRP_INFORMATION: usize = 0x38;
@@ -67,6 +68,8 @@ pub const FO_DEVICE_OBJECT: usize = 0x08;
 pub const FO_FILE_NAME: usize = 0x58;
 
 const METHOD_BUFFERED: u32 = 0;
+const METHOD_IN_DIRECT: u32 = 1;
+const METHOD_OUT_DIRECT: u32 = 2;
 const METHOD_NEITHER: u32 = 3;
 const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005u32 as i32;
 
@@ -425,9 +428,9 @@ pub fn open_device(nt_name: &str) -> Option<Result<DeviceHandle, NtStatus>> {
 }
 
 /// NtDeviceIoControlFile for a program. METHOD_BUFFERED copies through a
-/// pool buffer; METHOD_NEITHER hands the driver the program's own
-/// pointers, which it reads with SMAP lifted, as Windows drivers expect;
-/// the direct methods need MDLs (not yet).
+/// pool buffer; the direct methods give the output buffer as an MDL of the
+/// program's pages; METHOD_NEITHER hands the driver the program's own
+/// pointers, which it reads with SMAP lifted, as Windows drivers expect.
 pub fn program_device_control(h: &DeviceHandle, iosb: u64, code: u32, input: u64, in_len: usize, output: u64, out_len: usize) -> NtStatus {
     use crate::nt_file::ptr_ok;
     let (dev, file) = (h.dev as *mut u8, h.file as *mut u8);
@@ -474,6 +477,42 @@ pub fn program_device_control(h: &DeviceHandle, iosb: u64, code: u32, input: u64
                 |_| {},
             )
         }),
+        METHOD_IN_DIRECT | METHOD_OUT_DIRECT => {
+            // Input through a pool buffer, the output buffer through an MDL
+            // of the program's own pages (mapped by the driver with
+            // MmGetSystemAddressForMdlSafe).
+            let buf = pool::alloc_tracked(in_len.max(1));
+            if buf.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            crate::smp::user_access(|| unsafe { core::ptr::copy_nonoverlapping(input as *const u8, buf, in_len) });
+            let mdl = if out_len > 0 { super::mm::lock_user_buffer(output, out_len) } else { Ok(core::ptr::null_mut()) };
+            let r = match mdl {
+                Err(s) => (s, 0),
+                Ok(mdl) => {
+                    let r = send(
+                        dev,
+                        file,
+                        IRP_MJ_DEVICE_CONTROL,
+                        |irp, sl| unsafe {
+                            wr(irp, IRP_SYSTEM_BUFFER, buf);
+                            wr(irp, IRP_MDL_ADDRESS, mdl);
+                            wr::<u32>(sl, SL_OUTPUT_LENGTH, out_len as u32);
+                            wr::<u32>(sl, SL_INPUT_LENGTH, in_len as u32);
+                            wr::<u32>(sl, SL_IOCTL_CODE, code);
+                        },
+                        |_| {},
+                    );
+                    if !mdl.is_null() {
+                        super::mm::MmUnlockPages(mdl);
+                        super::mm::IoFreeMdl(mdl);
+                    }
+                    r
+                }
+            };
+            pool::free_tracked(buf);
+            r
+        }
         _ => (super::STATUS_NOT_IMPLEMENTED, 0),
     };
     if ptr_ok(iosb, 16) {

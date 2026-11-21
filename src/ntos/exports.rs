@@ -1,6 +1,6 @@
 // What VEILOS's ntoskrnl.exe and hal.dll export to drivers: name -> address.
 
-use super::{cm, dpc, io, ke, ob, pool, ps, rtl, seh};
+use super::{cm, dpc, io, ke, mm, ob, pool, ps, rtl, seh};
 
 // -----| pool |-----
 
@@ -94,6 +94,14 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
                 seh::__C_specific_handler, seh::RtlRaiseException, seh::ExRaiseStatus, seh::RtlUnwindEx, seh::RtlUnwind,
                 seh::ProbeForRead, seh::ProbeForWrite, seh::RtlCaptureContext, seh::RtlRestoreContext,
                 seh::RtlLookupFunctionEntry, seh::RtlVirtualUnwind, seh::RtlPcToFileHeader,
+                // memory: MDLs, contiguous, device, physical
+                mm::MmGetPhysicalAddress, mm::MmIsAddressValid, mm::IoAllocateMdl, mm::IoFreeMdl,
+                mm::MmBuildMdlForNonPagedPool, mm::MmProbeAndLockPages, mm::MmUnlockPages,
+                mm::MmMapLockedPagesSpecifyCache, mm::MmMapLockedPages, mm::MmUnmapLockedPages, mm::IoBuildPartialMdl,
+                mm::MmAllocatePagesForMdlEx, mm::MmAllocatePagesForMdl, mm::MmFreePagesFromMdl,
+                mm::MmAllocateContiguousMemorySpecifyCache, mm::MmAllocateContiguousMemory, mm::MmAllocateNonCachedMemory,
+                mm::MmFreeContiguousMemory, mm::MmFreeContiguousMemorySpecifyCache, mm::MmFreeNonCachedMemory,
+                mm::MmMapIoSpace, mm::MmMapIoSpaceEx, mm::MmUnmapIoSpace,
             );
             // Data exports.
             match name {

@@ -4,6 +4,7 @@
 //                           more pages as it runs out
 //   IMAGE_BASE  .. +64 GiB  driver images, one after another (each mapped
 //                           when loaded)
+//   SYSTEM_PTE_BASE .. +128 GiB  what drivers map (mm.rs)
 //
 // Both are mapped present + writable + executable, like the kernel heap:
 // driver sections get their own protection in a later stage.
@@ -22,9 +23,21 @@ const POOL_START_SIZE: u64 = 4 << 20;
 /// Grow by at least this much at a time.
 const POOL_GROW: u64 = 4 << 20;
 pub const IMAGE_BASE: u64 = REGION + (1 << 39) / 2;
+/// Mappings drivers ask for (MDLs, MmMapIoSpace, contiguous memory): VA
+/// only here; mm.rs maps the frames.
+pub const SYSTEM_PTE_BASE: u64 = REGION + (1 << 39) / 4 * 3;
 
 static POOL: Mutex<Option<(Heap, u64)>> = Mutex::new(None);
 static NEXT_IMAGE: AtomicU64 = AtomicU64::new(IMAGE_BASE);
+static NEXT_SYSTEM: AtomicU64 = AtomicU64::new(SYSTEM_PTE_BASE);
+
+/// `bytes` (rounded to pages) of system-PTE address space, unmapped, with a
+/// guard page after it. Never reused (VEILOS has 128 GiB of it).
+pub fn system_va(bytes: u64) -> Option<u64> {
+    let bytes = bytes.next_multiple_of(4096);
+    let va = NEXT_SYSTEM.fetch_add(bytes + 4096, Ordering::Relaxed);
+    (va + bytes <= SYSTEM_PTE_BASE + (128 << 30)).then_some(va)
+}
 
 /// Map `bytes` of fresh, zeroed pages at `va`. False if memory ran out.
 pub fn map_fresh(va: u64, bytes: u64) -> bool {
