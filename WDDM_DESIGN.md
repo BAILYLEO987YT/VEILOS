@@ -315,10 +315,22 @@ K1 now has 29 self-test parts, `1fffffff`. The new ones:
 layout.c checks SE_EXPORTS and the information structures. In QEMU:
 `1fffffff of 1fffffff`, `k1test: 0 failed`.
 
-Still to do in W1:
-- per-section protection;
-- freeing an unloaded image;
-- mapping an MDL into a program (`UserMode`);
+W1 is finished. The last items:
+- ~~per-section protection~~: done. After relocation each page of a driver
+  image gets its sections' rights: no-execute unless the section is
+  executable, writable only if the section is writable. K1 calls a `ret`
+  stored in `.data` inside `__try` and gets an access violation (passed).
+  CR0.WP is on, so ring 0 can't write read-only sections either.
+- ~~freeing an unloaded image~~: done. DRIVER UNLOAD calls DriverUnload,
+  then frees the image's pages, the DRIVER_OBJECT and its extension. K1
+  unloads, loads again (self-test passes again) and unloads. The reload
+  found that named events outlived their handles; as in Windows, the name
+  now goes with the last handle.
+- ~~mapping an MDL into a program (`UserMode`)~~: done.
+  MmMapLockedPagesSpecifyCache with UserMode reserves a view in the calling
+  program and maps the MDL's pages there; MmUnmapLockedPages takes it back.
+  K1's program reads the driver's pattern through it and writes a byte the
+  driver then sees (passed).
 - ~~`KeGetCurrentThread` and the other GS inlines~~: done. VEILOS's
   per-CPU block now carries the KPCR/KPRCB fields drivers read through GS:
   Self 0x18, CurrentPrcb 0x20, Number 0x184, CurrentThread 0x188 (each

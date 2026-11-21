@@ -187,6 +187,42 @@ pub fn map(file: &[u8]) -> Result<Mapped, String> {
             }
         }
     }
+    // Each section's protection, now that relocations, imports and the
+    // cookie are written: code executable and read-only, data writable and
+    // not executable, read-only data neither, headers read-only. A page two
+    // sections share gets both's rights. (Ring 0 only honours read-only with
+    // CR0.WP, which VEILOS doesn't set yet; no-execute always holds.)
+    {
+        use x86_64::structures::paging::PageTableFlags as F;
+        let pages = (image_size as usize).div_ceil(4096);
+        let mut flags: Vec<F> = alloc::vec![F::NO_EXECUTE; pages];
+        let mut set = |va: usize, len: usize, f: F| {
+            let (first, last) = (va / 4096, (va + len.max(1)).div_ceil(4096).min(pages));
+            for p in first..last {
+                if f.contains(F::WRITABLE) {
+                    flags[p] |= F::WRITABLE;
+                }
+                if !f.contains(F::NO_EXECUTE) {
+                    flags[p].remove(F::NO_EXECUTE);
+                }
+            }
+        };
+        for i in 0..nsec {
+            let s = sec + 40 * i;
+            let va = u32_at(file, s + 12) as usize;
+            let vsize = (u32_at(file, s + 8) as usize).max(u32_at(file, s + 16) as usize);
+            let ch = u32_at(file, s + 36);
+            let mut f = F::NO_EXECUTE;
+            if ch & 0x2000_0000 != 0 {
+                f.remove(F::NO_EXECUTE); // IMAGE_SCN_MEM_EXECUTE
+            }
+            if ch & 0x8000_0000 != 0 {
+                f |= F::WRITABLE; // IMAGE_SCN_MEM_WRITE
+            }
+            set(va, vsize, f);
+        }
+        pool::protect_pages(base, &flags);
+    }
     Ok(Mapped { base, size: image_size, entry: base + entry_rva })
 }
 
@@ -271,7 +307,17 @@ pub fn unload(name: &str) -> Result<(), String> {
     let f: extern "win64" fn(*mut u8) = unsafe { core::mem::transmute(unload) };
     f(drv);
     super::ke::set_irql(0);
-    DRIVERS.lock().retain(|d| d.name != name);
-    crate::serial_println!("[NTOS] {} unloaded", name);
+    let (base, size) = {
+        let mut list = DRIVERS.lock();
+        let at = list.iter().position(|d| d.name == name).unwrap();
+        let d = list.remove(at);
+        (d.base, d.size)
+    };
+    // Its image goes; whatever the driver left behind (a queued DPC, a
+    // timer) would now point at nothing, as on Windows.
+    let pages = pool::free_image(base, size);
+    pool::free_tracked(unsafe { (drv.add(io::DRV_EXTENSION) as *const *mut u8).read() });
+    pool::free_tracked(drv);
+    crate::serial_println!("[NTOS] {} unloaded, {} image pages freed", name, pages);
     Ok(())
 }

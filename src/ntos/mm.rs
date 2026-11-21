@@ -230,12 +230,54 @@ pub extern "win64" fn MmUnlockPages(mdl: *mut u8) {
     }
 }
 
+/// Pages a driver mapped into a program: user VA -> (address space, pages).
+static USER_MAPS: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// UserMode: the MDL's pages in the current program's address space (the
+/// program whose request the driver is serving), writable, not executable.
+/// The pages stay the driver's: the program's memory teardown frees neither
+/// leaf pages of its tables nor regions recorded as images, so a program
+/// that exits without the driver unmapping them doesn't free them.
+fn map_into_program(mdl: *mut u8, cache: u32) -> u64 {
+    let Some(proc) = crate::process::PROCESSOR.lock().get_active() else { return 0 };
+    let n = mdl_pages(mdl);
+    let Some(base) = proc.vad.lock().reserve_view((n * 4096) as usize) else { return 0 };
+    let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE | cache_flags(cache);
+    let ok = crate::address_space::with(proc.cr3, || {
+        let mut mapper = unsafe { crate::memory::get_mapper() };
+        let mut frames = crate::memory::GlobalFrameAllocator;
+        (0..n).all(|i| {
+            let pfn = unsafe { pfn_array(mdl).add(i as usize).read() };
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + i * 4096));
+            let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(pfn * 4096));
+            crate::memory::map_page_checked(page, frame, flags, &mut mapper, &mut frames).is_ok()
+        })
+    });
+    if !ok {
+        proc.vad.lock().forget(base);
+        return 0;
+    }
+    locked(|| USER_MAPS.lock().insert(base, (proc.cr3, n)));
+    base + unsafe { rd::<u32>(mdl, MDL_BYTE_OFFSET) } as u64
+}
+
+/// Undo `map_into_program`; false if `va` isn't one of its mappings.
+fn unmap_from_program(va: u64) -> bool {
+    let base = va & !0xFFF;
+    let Some((cr3, n)) = locked(|| USER_MAPS.lock().remove(&base)) else { return false };
+    crate::address_space::with(cr3, || unmap(base, n));
+    if let Some(proc) = crate::process::PROCESSOR.lock().get_active().filter(|p| p.cr3 == cr3) {
+        proc.vad.lock().forget(base);
+    }
+    true
+}
+
 /// MmMapLockedPagesSpecifyCache(Mdl, AccessMode, CacheType, RequestedAddress,
-/// BugCheckOnFailure, Priority): the pages in system space. Mapping into a
-/// program (UserMode) isn't supported yet: null.
+/// BugCheckOnFailure, Priority): KernelMode in system space, UserMode in
+/// the program whose request this is.
 pub extern "win64" fn MmMapLockedPagesSpecifyCache(mdl: *mut u8, mode: u8, cache: u32, _req: u64, _bugcheck: u32, _priority: u32) -> u64 {
     if mode != 0 {
-        return 0;
+        return map_into_program(mdl, cache);
     }
     unsafe {
         let flags: u16 = rd(mdl, MDL_FLAGS);
@@ -278,6 +320,9 @@ pub extern "win64" fn MmMapLockedPages(mdl: *mut u8, mode: u8) -> u64 {
 }
 
 pub extern "win64" fn MmUnmapLockedPages(va: u64, mdl: *mut u8) {
+    if va < seh::MM_USER_PROBE_ADDRESS && unmap_from_program(va) {
+        return;
+    }
     unsafe {
         unmap(va & !0xFFF, mdl_pages(mdl));
         wr::<u16>(mdl, MDL_FLAGS, rd::<u16>(mdl, MDL_FLAGS) & !MDL_MAPPED_TO_SYSTEM_VA);

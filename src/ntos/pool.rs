@@ -143,6 +143,33 @@ pub fn free_tracked(p: *mut u8) {
     }
 }
 
+/// Set each page of an image to its section's protection: `flags[i]` for
+/// page i (PRESENT and GLOBAL are added).
+pub fn protect_pages(base: u64, flags: &[PageTableFlags]) {
+    use x86_64::structures::paging::Mapper;
+    let mut mapper = unsafe { crate::memory::get_mapper() };
+    for (i, f) in flags.iter().enumerate() {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + i as u64 * 4096));
+        if let Ok(flush) = unsafe { mapper.update_flags(page, *f | PageTableFlags::PRESENT | PageTableFlags::GLOBAL) } {
+            flush.flush();
+        }
+    }
+}
+
+/// Unmap an image's pages and give their frames back (its address range
+/// isn't reused). The number of pages freed.
+pub fn free_image(base: u64, bytes: u64) -> u64 {
+    let mut mapper = unsafe { crate::memory::get_mapper() };
+    let mut n = 0;
+    for p in (0..bytes.next_multiple_of(4096)).step_by(4096) {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(base + p));
+        if crate::memory::unmap_and_free_page(page, &mut mapper).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Room for a driver image: `bytes` (page multiple) of mapped, zeroed
 /// memory in the image region. None if memory ran out.
 pub fn image_space(bytes: u64) -> Option<u64> {

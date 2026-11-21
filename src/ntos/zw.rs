@@ -290,15 +290,43 @@ pub extern "win64" fn ZwDeviceIoControlFile(
 
 // -----| events |-----
 
-/// Named kernel events (\BaseNamedObjects\X, \KernelObjects\X, ...).
-static NAMED: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+/// Named kernel events (\BaseNamedObjects\X, \KernelObjects\X, ...): the
+/// event and how many handles are open to it. As in Windows the name goes
+/// away with the last handle, so the next ZwCreateEvent makes a new event.
+/// The event itself stays allocated: ObfDereferenceObject doesn't count
+/// references yet, so a driver may still hold the pointer.
+static NAMED: Mutex<BTreeMap<String, (usize, u32)>> = Mutex::new(BTreeMap::new());
+
+/// Takes a reference for a new handle to the event called `name`, if it exists.
+fn open_named(name: &str) -> Option<usize> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        NAMED.lock().get_mut(name).map(|(e, n)| {
+            *n += 1;
+            *e
+        })
+    })
+}
+
+/// A handle to a dispatcher object was closed (ZwClose).
+pub fn dispatcher_closed(p: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut named = NAMED.lock();
+        let Some(name) = named.iter().find(|(_, (e, _))| *e == p).map(|(k, _)| k.clone()) else { return };
+        if let Some((_, n)) = named.get_mut(&name) {
+            *n -= 1;
+            if *n == 0 {
+                named.remove(&name);
+            }
+        }
+    })
+}
 
 /// ZwCreateEvent(EventHandle*, DesiredAccess, ObjectAttributes*,
 /// EventType, InitialState): an event in pool; a named one can be opened
 /// again (ZwOpenEvent).
 pub extern "win64" fn ZwCreateEvent(out: *mut u64, _access: u32, oa: *const u8, kind: u32, initial: u8) -> NtStatus {
     let name = oa_name(oa).to_ascii_lowercase();
-    let existing = if name.is_empty() { None } else { x86_64::instructions::interrupts::without_interrupts(|| NAMED.lock().get(&name).copied()) };
+    let existing = if name.is_empty() { None } else { open_named(&name) };
     let ev = match existing {
         Some(e) => e,
         None => {
@@ -308,7 +336,7 @@ pub extern "win64" fn ZwCreateEvent(out: *mut u64, _access: u32, oa: *const u8, 
             }
             ke::KeInitializeEvent(e, kind, initial);
             if !name.is_empty() {
-                x86_64::instructions::interrupts::without_interrupts(|| NAMED.lock().insert(name, e as usize));
+                x86_64::instructions::interrupts::without_interrupts(|| NAMED.lock().insert(name, (e as usize, 1)));
             }
             e as usize
         }
@@ -319,7 +347,7 @@ pub extern "win64" fn ZwCreateEvent(out: *mut u64, _access: u32, oa: *const u8, 
 
 pub extern "win64" fn ZwOpenEvent(out: *mut u64, _access: u32, oa: *const u8) -> NtStatus {
     let name = oa_name(oa).to_ascii_lowercase();
-    match x86_64::instructions::interrupts::without_interrupts(|| NAMED.lock().get(&name).copied()) {
+    match open_named(&name) {
         Some(e) => {
             unsafe { out.write(ob::insert(ob::Object::Dispatcher(e))) };
             STATUS_SUCCESS

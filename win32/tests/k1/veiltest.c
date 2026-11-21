@@ -57,7 +57,19 @@ int __cdecl swprintf_s(wchar_t *buffer, size_t size, const wchar_t *format, ...)
 #define T_ZW_SYSINFO   0x4000000
 #define T_BCRYPT       0x8000000
 #define T_HAL_SE       0x10000000
-#define T_ALL      0x1FFFFFFF
+#define T_NX           0x20000000
+#define T_ALL      0x3FFFFFFF
+
+// Driver pages mapped into the calling program (MmMapLockedPagesSpecifyCache
+// with UserMode): MAP returns the program's address of two pages holding
+// (UCHAR)(i * 3); UNMAP takes them back.
+#define IOCTL_VEIL_MAP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_VEIL_UNMAP CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+static PMDL g_user_mdl;
+static PVOID g_user_va, g_user_kva;
+
+// A `ret` in a writable data section: executing it must fault (NX).
+static UCHAR g_data_code[16] = { 0xC3 };
 
 typedef struct _VEIL_EXT {
     KSPIN_LOCK Lock;
@@ -146,6 +158,35 @@ NTSTATUS VeilIoctl(PDEVICE_OBJECT dev, PIRP irp) {
         if (!dst) { st = STATUS_INSUFFICIENT_RESOURCES; break; }
         for (ULONG i = 0; i < out; i++) dst[i] = (UCHAR)(seed + i * 7);
         info = out;
+        break;
+    }
+    case IOCTL_VEIL_MAP: {
+        PHYSICAL_ADDRESS low = { 0 }, high, skip = { 0 };
+        high.QuadPart = -1LL;
+        if (out < sizeof(PVOID) || g_user_mdl) { st = STATUS_INVALID_DEVICE_REQUEST; break; }
+        g_user_mdl = MmAllocatePagesForMdlEx(low, high, skip, 2 * PAGE_SIZE, MmCached, 0);
+        if (!g_user_mdl) { st = STATUS_INSUFFICIENT_RESOURCES; break; }
+        g_user_kva = MmMapLockedPagesSpecifyCache(g_user_mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+        if (g_user_kva) {
+            for (ULONG i = 0; i < 2 * PAGE_SIZE; i++) ((UCHAR *)g_user_kva)[i] = (UCHAR)(i * 3);
+            g_user_va = MmMapLockedPagesSpecifyCache(g_user_mdl, UserMode, MmCached, NULL, FALSE, NormalPagePriority);
+        }
+        if (!g_user_va) { st = STATUS_INSUFFICIENT_RESOURCES; break; }
+        RtlCopyMemory(buf, &g_user_va, sizeof(PVOID));
+        info = sizeof(PVOID);
+        break;
+    }
+    case IOCTL_VEIL_UNMAP: {
+        // What the program wrote at offset 100 comes back as the answer.
+        UCHAR seen = g_user_kva ? ((UCHAR *)g_user_kva)[100] : 0;
+        if (!g_user_mdl) { st = STATUS_INVALID_DEVICE_REQUEST; break; }
+        if (g_user_va) MmUnmapLockedPages(g_user_va, g_user_mdl);
+        if (g_user_kva) MmUnmapLockedPages(g_user_kva, g_user_mdl);
+        MmFreePagesFromMdl(g_user_mdl);
+        ExFreePool(g_user_mdl);
+        g_user_mdl = NULL;
+        g_user_va = g_user_kva = NULL;
+        if (out >= 1) { buf[0] = seen; info = 1; }
         break;
     }
     case IOCTL_VEIL_NEITHER: {
@@ -801,6 +842,17 @@ static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
 
     g_passed |= RuntimeTest();
     g_passed |= ZwTest(reg);
+
+    // Section protection: the data section isn't executable.
+    {
+        ULONG code = 0;
+        __try {
+            ((void (*)(void))(ULONG_PTR)g_data_code)();
+        } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        }
+        if (code == STATUS_ACCESS_VIOLATION) g_passed |= T_NX;
+        DbgPrint("veiltest: calling into .data: %08lx (CR0.WP %d)\n", code, (int)((__readcr0() >> 16) & 1));
+    }
     DbgPrint("veiltest: Zw, BCrypt, HAL, SeExports: %lx of %x\n", g_passed & 0x1F800000, 0x1F800000);
 
     // The KPCR fields the WDK reads through GS without calling in.

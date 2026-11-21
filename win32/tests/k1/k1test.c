@@ -82,6 +82,21 @@ int main(void) {
         check("driver Zw: system and module information", ok && (mask & 0x4000000));
         check("driver BCrypt: SHA-256, HMAC, AES, RNG", ok && (mask & 0x8000000));
         check("driver HAL PCI config, SeExports", ok && (mask & 0x10000000));
+        check("driver image: .data not executable", ok && (mask & 0x20000000));
+    }
+    {
+        // Driver pages mapped into this program, read and written here.
+        UCHAR *p = NULL, seen = 0;
+        int good = 0;
+        BOOL ok = DeviceIoControl(h, CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS), NULL, 0, &p, sizeof p, &got, NULL);
+        if (ok && p) {
+            good = 1;
+            for (ULONG i = 0; i < 8192 && good; i++) good = p[i] == (UCHAR)(i * 3);
+            p[100] = 0x5E;
+        }
+        ok = ok && DeviceIoControl(h, CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS), NULL, 0, &seen, 1, &got, NULL);
+        check("driver pages mapped into this program", ok && good && seen == 0x5E);
+        printf("k1test: mapped at %p\n", (void *)p);
     }
     {
         // METHOD_OUT_DIRECT: the driver writes straight into this buffer

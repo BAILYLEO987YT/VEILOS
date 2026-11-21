@@ -46,6 +46,10 @@ pub fn get(h: u64) -> Option<Object> {
 
 pub extern "win64" fn ZwClose(h: u64) -> NtStatus {
     match x86_64::instructions::interrupts::without_interrupts(|| HANDLES.lock().remove(&h)) {
+        Some(Object::Dispatcher(p)) => {
+            super::zw::dispatcher_closed(p);
+            STATUS_SUCCESS
+        }
         Some(_) => STATUS_SUCCESS,
         None => STATUS_INVALID_HANDLE,
     }
