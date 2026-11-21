@@ -143,7 +143,7 @@ echo reversed, its counters, and `STATUS_INVALID_DEVICE_REQUEST` for an
 unknown code; `DRIVER UNLOAD` runs its unload routine.
 
 Still to do in W1: the rest of the census list; Win32 programs reaching
-devices (`CreateFile("\.\VeilTest")`, `DeviceIoControl` → IRPs with file
+devices (`CreateFile("\\.\VeilTest")`, `DeviceIoControl` → IRPs with file
 objects); SEH in drivers (`__C_specific_handler` with the image's `.pdata`);
 per-section protection; freeing an unloaded image; system threads, DPCs,
 timers and work items; the registry for drivers (`ZwOpenKey` & co. on
