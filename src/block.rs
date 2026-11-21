@@ -17,10 +17,11 @@
 // On top of a disk sit `Partition`s (MBR primary entries, GPT entries, or
 // the whole disk for a superfloppy). Each is a `vfs::BlockDevice` with
 // partition-relative LBAs and bounds checking. `mount_disk` probes every
-// partition for a filesystem and mounts what it finds. Only a volume that
-// names itself VEILOS's (`VOLUME_MARKER` at its root) becomes `/`; every other
-// filesystem goes to `/mnt/<disk>p<n>` read-only (`d<port>` for AHCI,
-// `ram` for the RAM disk).
+// partition for a filesystem and mounts what it finds read-only at
+// `/mnt/<disk>p<n>` (`d<port>` for AHCI, `ram` for the RAM disk). Only a
+// volume that names itself VEILOS's (`VOLUME_MARKER` at its root) can become
+// `/`, and with more than one, `choose_root` picks the one on the disk the
+// kernel booted from (see "which VEILOS volume is `/`" below).
 //
 // Root-volume safety. On a real PC the first filesystem is usually the EFI
 // System Partition (FAT32), and before this the kernel made it `/` and wrote
@@ -34,7 +35,8 @@
 // only inside the ranges `allow_writes` opened, which is only ever the root
 // volume's partition, so no driver, cache or crash path can write elsewhere.
 // The one exception is the installer (install.rs): while INSTALL <disk>
-// ERASE runs, typed by an administrator, it opens that whole disk.
+// ERASE or UPDATE <disk> runs, typed by an administrator, it opens that
+// whole disk.
 // With no VEILOS volume the kernel stops at boot (main.rs) and writes nothing.
 //
 // Buffers passed to `BlockDevice` are kernel virtual addresses (heap,
@@ -677,10 +679,159 @@ fn is_veilos_volume(fs: &dyn crate::vfs::FileSystem, device: &Partition) -> bool
     }
 }
 
-/// Probe every partition of `disk` and mount each filesystem found: the
-/// first VEILOS volume writable at `/`, everything else read-only.
+/// The filesystem on `device` if it is a VEILOS volume (install.rs's UPDATE).
+pub fn open_veilos_volume(device: &Partition) -> Option<(Box<dyn crate::vfs::FileSystem>, &'static str)> {
+    let (fs, name) = detect_filesystem(device)?;
+    is_veilos_volume(&*fs, device).then_some((fs, name))
+}
+
+// -----| which VEILOS volume is `/` |-----
+//
+// A PC can have more than one VEILOS volume: VEILOS installed on its SSD and
+// a newer build on the USB stick it was started from. `/` must be the one
+// that goes with the running kernel, or the new kernel runs with the old
+// system's files. Disks are found in the order their drivers bind (RAM disk,
+// then AHCI and NVMe, then USB), so the first volume found is not the
+// answer. Instead every disk is mounted read-only first and each VEILOS
+// volume noted as a candidate; once USB has bound, `choose_root` picks:
+//
+//   1. the RAM disk, when the bootloader loaded one (it came with the kernel);
+//   2. the volume on the disk the kernel booted from: the one whose boot
+//      partition holds the very kernel that is running. The bootloader
+//      reports where it loaded the kernel's ELF file (BootInfo kernel_addr
+//      and kernel_len); its images keep that file as `kernel-x86_64` at the
+//      root of the FAT boot partition. Writable sections are left out of the
+//      comparison (the kernel writes to them in place), the rest must match
+//      byte for byte;
+//   3. failing that, the first candidate found.
+//
+// Disks that turn up later (a stick plugged in) are mounted read-only.
+
+/// The running kernel's ELF file in physical memory (address, length).
+static KERNEL_IMAGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// From BootInfo: where the bootloader put the kernel's ELF file.
+pub fn set_kernel_image(phys: u64, len: u64) {
+    if len > 0 {
+        *KERNEL_IMAGE.lock() = Some((phys, len));
+    }
+}
+
+/// The name of the kernel file on a bootloader 0.11 boot partition.
+const KERNEL_FILE: &str = "/kernel-x86_64";
+/// And the RAM disk image beside it on a RAM-disk image.
+const RAMDISK_FILE: &str = "/ramdisk";
+
+/// A VEILOS volume waiting for `choose_root`.
+struct Candidate {
+    disk: Arc<Disk>,
+    n: usize,
+    part: PartitionInfo,
+    fs: Box<dyn crate::vfs::FileSystem>,
+    fs_name: &'static str,
+}
+
+struct RootChoice {
+    settled: bool,
+    candidates: Vec<Candidate>,
+    /// Disks whose boot partition holds the running kernel, and whether
+    /// that partition also carries a RAM disk image.
+    boot_disks: Vec<(String, bool)>,
+    /// Why `/` is where it is, for the screen and INSTALL/UPDATE.
+    reason: String,
+}
+
+static CHOICE: Mutex<RootChoice> =
+    Mutex::new(RootChoice { settled: false, candidates: Vec::new(), boot_disks: Vec::new(), reason: String::new() });
+
+/// Why `/` is the volume it is ("" before `choose_root`).
+pub fn root_reason() -> String {
+    CHOICE.lock().reason.clone()
+}
+
+/// The disks whose boot partition holds the running kernel (name, whether
+/// that partition also holds a RAM disk image).
+pub fn boot_disks() -> Vec<(String, bool)> {
+    CHOICE.lock().boot_disks.clone()
+}
+
+/// The ELF file of the running kernel, as the bootloader loaded it.
+fn running_kernel() -> Option<&'static [u8]> {
+    let (phys, len) = (*KERNEL_IMAGE.lock())?;
+    let virt = crate::memory::get_phys_mem_offset().as_u64() + phys;
+    // SAFETY: the bootloader loaded the file there and maps all physical
+    // memory at that offset; its frames are reported as in use.
+    Some(unsafe { core::slice::from_raw_parts(virt as *const u8, len as usize) })
+}
+
+/// Is `file` the running kernel's ELF? Compares the ELF header, the program
+/// and section header tables, and every section the kernel can't write to
+/// (code, read-only data). Sections, not segments: VEILOS's linker script
+/// puts everything in one writable segment, and the kernel writes to its
+/// data in place, in this very copy of the file.
+fn same_kernel(running: &[u8], file: &[u8]) -> bool {
+    if running.len() != file.len() || running.len() < 64 || running[..64] != file[..64] || &file[..4] != b"ELF" {
+        return false;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([file[o], file[o + 1]]) as usize;
+    let u32_at = |o: usize| u32::from_le_bytes(file[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(file[o..o + 8].try_into().unwrap()) as usize;
+    let same = |off: usize, size: usize| off.checked_add(size).is_some_and(|e| e <= file.len() && running[off..e] == file[off..e]);
+    let (phoff, phentsize, phnum) = (u64_at(32), u16_at(54), u16_at(56));
+    let (shoff, shentsize, shnum) = (u64_at(40), u16_at(58), u16_at(60));
+    if shentsize < 64 || shnum == 0 || !same(phoff, phentsize * phnum) || !same(shoff, shentsize * shnum) {
+        return false;
+    }
+    let mut compared = 0usize;
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        const SHT_NOBITS: u32 = 8;
+        const SHF_WRITE: usize = 1;
+        if u32_at(sh + 4) == SHT_NOBITS || u64_at(sh + 8) & SHF_WRITE != 0 {
+            continue;
+        }
+        let (off, size) = (u64_at(sh + 24), u64_at(sh + 32));
+        if !same(off, size) {
+            return false;
+        }
+        compared += size;
+    }
+    compared > 0
+}
+
+/// Does this (non-VEILOS) filesystem hold the running kernel? Then it is
+/// the boot partition the kernel came from. Returns whether it does, and
+/// whether a RAM disk image sits beside it.
+fn holds_running_kernel(fs: &dyn crate::vfs::FileSystem, device: &Partition) -> Option<bool> {
+    let running = running_kernel()?;
+    let st = fs.stat(device, KERNEL_FILE)?;
+    if st.is_dir || st.size != running.len() as u64 {
+        crate::serial_println!("[BLOCK]   a kernel of {} bytes, not the running one ({} bytes)", st.size, running.len());
+        return None;
+    }
+    let file = fs.read_file(device, KERNEL_FILE).ok()?;
+    if !same_kernel(running, &file) {
+        crate::serial_println!("[BLOCK]   a kernel of the same size, but not the running one");
+        return None;
+    }
+    Some(fs.stat(device, RAMDISK_FILE).is_some())
+}
+
+/// Mount one filesystem (not `/`) read-only and note it.
+fn mount_other(disk: &Arc<Disk>, n: usize, p: &PartitionInfo, fs: Box<dyn crate::vfs::FileSystem>, fs_name: &str, how: &str) {
+    let device = Partition { disk: disk.clone(), start: p.start, sectors: p.sectors };
+    let path = format!("/mnt/{}p{}", disk.name, n);
+    let line = format!("{} on disk {} partition {} ({} MiB) at {}, {}", fs_name, disk.name, n, p.sectors / 2048, path, how);
+    crate::println!("  -> Mounted {}", line);
+    crate::serial_println!("[BLOCK]   mounted {}", line);
+    FOUND.lock().push(line);
+    crate::vfs::VFS.mount(path, fs, Box::new(device), true);
+}
+
+/// Probe every partition of `disk` and mount each filesystem found,
+/// read-only. Until `choose_root` has run, VEILOS volumes are held back as
+/// candidates for `/`; after it, they too are mounted read-only.
 pub fn mount_disk(disk: Arc<Disk>) {
-    use core::sync::atomic::Ordering;
     let parts = read_partitions(&disk);
     crate::println!("     - {} partition(s)", parts.len());
     for (n, p) in parts.iter().enumerate() {
@@ -693,27 +844,86 @@ pub fn mount_disk(disk: Arc<Disk>) {
             crate::serial_println!("[BLOCK]   no filesystem recognised");
             continue;
         };
-        let veilos = is_veilos_volume(&*fs, &device);
-        let root = veilos && !ROOT_FOUND.swap(true, Ordering::AcqRel);
-        let (path, how) = if root {
-            disk.allow_writes(p.start, p.sectors);
-            *ROOT_AT.lock() = Some((disk.clone(), p.start, p.sectors));
-            (String::from("/"), "writable: the VEILOS volume")
-        } else if veilos {
-            (format!("/mnt/{}p{}", disk.name, n), "read-only: another VEILOS volume")
-        } else {
-            (format!("/mnt/{}p{}", disk.name, n), "read-only: not VEILOS's")
-        };
-        let line = format!("{} on disk {} partition {} ({} MiB) at {}, {}", name, disk.name, n, p.sectors / 2048, path, how);
-        crate::println!("  -> Mounted {}", line);
-        crate::serial_println!("[BLOCK]   mounted {}", line);
-        FOUND.lock().push(line);
-        crate::vfs::VFS.mount(path, fs, Box::new(device), !root);
+        if is_veilos_volume(&*fs, &device) {
+            let mut choice = CHOICE.lock();
+            if !choice.settled {
+                crate::serial_println!("[BLOCK]   VEILOS volume on disk {} partition {}: a candidate for /", disk.name, n);
+                choice.candidates.push(Candidate { disk: disk.clone(), n, part: p.clone(), fs, fs_name: name });
+                continue;
+            }
+            drop(choice);
+            mount_other(&disk, n, p, fs, name, "read-only: another VEILOS volume");
+            continue;
+        }
+        let settled = CHOICE.lock().settled;
+        if let Some(ramdisk) = (!settled).then(|| holds_running_kernel(&*fs, &device)).flatten() {
+            crate::serial_println!(
+                "[BLOCK]   disk {} partition {} holds the running kernel{}",
+                disk.name, n, if ramdisk { " (and a RAM disk image)" } else { "" }
+            );
+            CHOICE.lock().boot_disks.push((disk.name.clone(), ramdisk));
+        }
+        mount_other(&disk, n, p, fs, name, "read-only: not VEILOS's");
     }
 }
 
-/// The RAM disk the bootloader loaded (main.rs), if there is one: probed
-/// before any other disk, so a VEILOS volume on it becomes `/`. Booting from
+/// Once every disk present at boot has been probed (main.rs, after USB):
+/// make one VEILOS volume `/`, writable, and the others read-only mounts.
+/// Says on screen and in the serial log which and why. Does nothing if
+/// there is no VEILOS volume (main.rs stops then).
+pub fn choose_root() {
+    let mut choice = CHOICE.lock();
+    choice.settled = true;
+    let mut candidates = core::mem::take(&mut choice.candidates);
+    let boot: Vec<String> = choice.boot_disks.iter().map(|(d, _)| d.clone()).collect();
+    if candidates.is_empty() {
+        choice.reason = String::from("no VEILOS volume was found");
+        return;
+    }
+    let names = |c: &[Candidate]| c.iter().map(|c| format!("{}p{}", c.disk.name, c.n)).collect::<Vec<_>>().join(", ");
+    let (pick, reason) = if let Some(i) = candidates.iter().position(|c| c.disk.name == "ram") {
+        (i, String::from("the RAM disk the bootloader loaded with the kernel always comes first"))
+    } else if let Some(i) = candidates.iter().position(|c| boot.contains(&c.disk.name)) {
+        let also: Vec<&Candidate> = candidates.iter().enumerate().filter(|&(j, c)| j != i && boot.contains(&c.disk.name)).map(|(_, c)| c).collect();
+        let mut r = format!("disk {} is the boot disk (its boot partition holds the running kernel)", candidates[i].disk.name);
+        if !also.is_empty() {
+            r.push_str(&format!("; the same kernel is also on {}, so this is a guess", also.iter().map(|c| c.disk.name.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        (i, r)
+    } else {
+        let why = if KERNEL_IMAGE.lock().is_none() {
+            "the bootloader didn't say where the kernel is"
+        } else {
+            "no disk's boot partition holds the running kernel"
+        };
+        (0, format!("{}, so the first VEILOS volume found", why))
+    };
+    let all = names(&candidates);
+    choice.reason = reason.clone();
+    drop(choice);
+
+    let c = candidates.remove(pick);
+    let device = Partition { disk: c.disk.clone(), start: c.part.start, sectors: c.part.sectors };
+    c.disk.allow_writes(c.part.start, c.part.sectors);
+    *ROOT_AT.lock() = Some((c.disk.clone(), c.part.start, c.part.sectors));
+    ROOT_FOUND.store(true, core::sync::atomic::Ordering::Release);
+    let line = format!(
+        "{} on disk {} partition {} ({} MiB) at /, writable: the VEILOS volume",
+        c.fs_name, c.disk.name, c.n, c.part.sectors / 2048
+    );
+    crate::println!("  -> Mounted {}", line);
+    crate::println!("     / is disk {} partition {}: {}", c.disk.name, c.n, reason);
+    crate::serial_println!("[BLOCK] / is disk {} partition {} (VEILOS volumes: {}): {}", c.disk.name, c.n, all, reason);
+    FOUND.lock().push(line);
+    crate::vfs::VFS.mount(String::from("/"), c.fs, Box::new(device), false);
+
+    for o in candidates {
+        mount_other(&o.disk, o.n, &o.part, o.fs, o.fs_name, "read-only: another VEILOS volume");
+    }
+}
+
+/// The RAM disk the bootloader loaded (main.rs), if there is one: a VEILOS
+/// volume on it always becomes `/` (`choose_root`). Booting from
 /// a RAM-disk image is how VEILOS runs from a USB stick before it has a USB
 /// storage driver: everything works, and nothing written survives a restart.
 static RAM_DISK: Mutex<Option<(u64, usize)>> = Mutex::new(None);
@@ -734,7 +944,7 @@ pub fn mount_ram_disk() {
 
 /// Is `/` on the RAM disk? (Nothing written there is kept.)
 pub fn root_on_ram_disk() -> bool {
-    FOUND.lock().iter().any(|l| l.contains("disk ram ") && l.contains("writable"))
+    ROOT_AT.lock().as_ref().is_some_and(|(d, _, _)| d.name == "ram")
 }
 
 /// Try each filesystem driver on `device`.

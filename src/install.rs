@@ -22,8 +22,28 @@
 // and unmounts what was mounted from it first (its read-only mounts would
 // otherwise read the new data as the old filesystem).
 //
-// It runs on a kernel thread of its own, yielding as it goes, so the desktop
-// keeps working; `INSTALL STATUS` shows how far it is.
+// `UPDATE <disk>` (administrators) upgrades a VEILOS already installed on
+// another disk from the running one, keeping its users and data:
+//
+//   1. Its boot partitions are rewritten sector for sector from the running
+//      disk's (the new bootloader and kernel). Both disks must have the same
+//      boot partitions, at the same places with the same types (they do when
+//      both came from the same kind of image or one was INSTALLed from the
+//      other); otherwise it refuses and INSTALL is the way.
+//   2. Every file of `/` is copied onto its VEILOS volume, overwriting what
+//      is there, except what belongs to the people using it: `/etc` (users,
+//      the last user, settings, the registry, Wi-Fi networks and keys),
+//      `/home`, `/var`, `/tmp`, `/net` and `/config.vsh` only get what is
+//      missing there. `/system` and `/tests` are replaced: files the new
+//      build doesn't have are removed.
+//
+// Its partition table and volume are left as they are. From a RAM-disk boot
+// it refuses: that image's boot partition carries the RAM disk, and copying
+// it would make the updated disk start from memory too.
+//
+// Both run on a kernel thread of their own, yielding as they go, so the
+// desktop keeps working; `INSTALL STATUS` (or `UPDATE STATUS`) shows how far
+// one is.
 
 use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -95,7 +115,7 @@ pub fn start(target: &str) -> Result<(), String> {
     }
     let plan = Plan::new(&src, root_start, root_sectors, &dst)?;
     if RUNNING.swap(true, Ordering::AcqRel) {
-        return Err(String::from("an install is already running"));
+        return Err(String::from("an install or update is already running"));
     }
     status(format!("starting: {} onto {}", src.name, dst.name));
     crate::kthread::spawn("install", move || {
@@ -136,45 +156,98 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
-impl Plan {
-    fn new(src: &Disk, root_start: u64, _root_sectors: u64, dst: &Disk) -> Result<Self, String> {
+/// A disk's GPT: its header (sector 1) and entry array.
+struct Gpt {
+    header: [u8; SECTOR],
+    entries: Vec<u8>,
+    entry_size: usize,
+    count: usize,
+    entry_sectors: u64,
+}
+
+impl Gpt {
+    fn read(disk: &Disk) -> Option<Result<Self, String>> {
         let mut header = [0u8; SECTOR];
-        if !src.read(1, &mut header) || &header[0..8] != b"EFI PART" {
-            return Err(String::from("the disk VEILOS runs from has no GPT (only the UEFI image can be installed)"));
+        if !disk.read(1, &mut header) || &header[0..8] != b"EFI PART" {
+            return None;
         }
         let entries_lba = u64_at(&header, 72);
         let count = u32_at(&header, 80) as usize;
         let entry_size = u32_at(&header, 84) as usize;
         if !(128..=SECTOR).contains(&entry_size) || SECTOR % entry_size != 0 || count == 0 || count > 1024 {
-            return Err(String::from("its GPT has an entry layout this can't copy"));
+            return Some(Err(format!("the GPT of {} has an entry layout this can't copy", disk.name)));
         }
         let entry_sectors = ((count * entry_size + SECTOR - 1) / SECTOR) as u64;
         let mut entries = vec![0u8; entry_sectors as usize * SECTOR];
-        if !src.read(entries_lba, &mut entries) {
-            return Err(String::from("couldn't read its GPT entries"));
+        if !disk.read(entries_lba, &mut entries) {
+            return Some(Err(format!("couldn't read the GPT entries of {}", disk.name)));
         }
+        Some(Ok(Self { header, entries, entry_size, count, entry_sectors }))
+    }
 
+    /// The used entries: (index, type GUID, first LBA, last LBA).
+    fn used(&self) -> Vec<(usize, [u8; 16], u64, u64)> {
+        (0..self.count)
+            .filter_map(|i| {
+                let e = &self.entries[i * self.entry_size..(i + 1) * self.entry_size];
+                if e[0..16].iter().all(|&b| b == 0) {
+                    return None;
+                }
+                Some((i, e[0..16].try_into().unwrap(), u64_at(e, 32), u64_at(e, 40)))
+            })
+            .collect()
+    }
+
+    /// Split into the VEILOS volume's entry (the one starting at
+    /// `volume_start`) and the boot partitions (every other), checked.
+    fn layout(&self, disk: &Disk, volume_start: u64) -> Result<(usize, Vec<([u8; 16], u64, u64)>), String> {
         let mut volume_entry = None;
         let mut boot = Vec::new();
-        for i in 0..count {
-            let e = &entries[i * entry_size..(i + 1) * entry_size];
-            if e[0..16].iter().all(|&b| b == 0) {
-                continue;
-            }
-            let (first, last) = (u64_at(e, 32), u64_at(e, 40));
-            if first == root_start {
+        for (i, kind, first, last) in self.used() {
+            if first == volume_start {
                 volume_entry = Some(i);
             } else if last >= first {
-                boot.push((first, last));
+                boot.push((kind, first, last));
             }
         }
-        let volume_entry = volume_entry.ok_or_else(|| String::from("the VEILOS volume isn't in its GPT"))?;
+        let volume_entry = volume_entry.ok_or_else(|| format!("the VEILOS volume of {} isn't in its GPT", disk.name))?;
         if boot.is_empty() {
-            return Err(String::from("it has no boot partition to copy"));
+            return Err(format!("{} has no boot partition", disk.name));
         }
-        if boot.iter().any(|&(_, last)| last >= root_start) {
-            return Err(String::from("a boot partition lies after the VEILOS volume"));
+        if boot.iter().any(|&(_, _, last)| last >= volume_start) {
+            return Err(format!("a boot partition of {} lies after its VEILOS volume", disk.name));
         }
+        Ok((volume_entry, boot))
+    }
+}
+
+/// Copy sectors `first..=last` of `src` to the same place on `dst`.
+fn copy_sectors(src: &Disk, dst: &Disk, first: u64, last: u64, buf: &mut [u8]) -> Result<(), String> {
+    let mut lba = first;
+    while lba <= last {
+        let n = ((last + 1 - lba) as usize).min(buf.len() / SECTOR);
+        let b = &mut buf[..n * SECTOR];
+        if !src.read(lba, b) {
+            return Err(format!("reading {} sector {}", src.name, lba));
+        }
+        if !dst.write_through(lba, b) {
+            return Err(format!("writing {} sector {}", dst.name, lba));
+        }
+        lba += n as u64;
+        crate::kthread::yield_if_slice_used(10);
+    }
+    Ok(())
+}
+
+impl Plan {
+    fn new(src: &Disk, root_start: u64, _root_sectors: u64, dst: &Disk) -> Result<Self, String> {
+        let gpt = match Gpt::read(src) {
+            Some(g) => g?,
+            None => return Err(String::from("the disk VEILOS runs from has no GPT (only the UEFI image can be installed)")),
+        };
+        let (volume_entry, boot) = gpt.layout(src, root_start)?;
+        let boot = boot.into_iter().map(|(_, f, l)| (f, l)).collect();
+        let Gpt { header, entries, entry_size, count, entry_sectors } = gpt;
 
         // The backup entry array and header take the last entry_sectors + 1
         // sectors of the target.
@@ -211,19 +284,7 @@ impl Plan {
         // 1. Boot partitions, as they are.
         let mut buf = vec![0u8; CHUNK];
         for &(first, last) in &self.boot {
-            let mut lba = first;
-            while lba <= last {
-                let n = ((last + 1 - lba) as usize).min(CHUNK / SECTOR);
-                let b = &mut buf[..n * SECTOR];
-                if !src.read(lba, b) {
-                    return Err(format!("reading {} sector {}", src.name, lba));
-                }
-                if !dst.write_through(lba, b) {
-                    return Err(format!("writing {} sector {}", dst.name, lba));
-                }
-                lba += n as u64;
-                crate::kthread::yield_if_slice_used(10);
-            }
+            copy_sectors(src, dst, first, last, &mut buf)?;
             status(format!("copied boot partition ({} MiB)", (last + 1 - first) / 2048));
         }
 
@@ -344,6 +405,238 @@ fn copy_tree(
             }
         }
         crate::kthread::yield_if_slice_used(10);
+    }
+    Ok(())
+}
+
+// -----| UPDATE |-----
+
+/// Disks UPDATE could upgrade, one line each: every other disk with a
+/// VEILOS volume.
+pub fn update_targets() -> Vec<String> {
+    let root = crate::block::root_location().map(|(d, _, _)| d.name.clone());
+    let mut out = Vec::new();
+    for l in crate::block::found_volumes() {
+        if l.contains("another VEILOS volume") && !root.as_ref().is_some_and(|r| l.contains(&format!("disk {} ", r))) {
+            let disk = l.split("disk ").nth(1).and_then(|r| r.split(' ').next()).unwrap_or("?");
+            out.push(format!("  {}: {}", disk.to_ascii_uppercase(), l.split(" at ").next().unwrap_or(&l)));
+        }
+    }
+    out
+}
+
+/// Start updating the VEILOS installed on disk `target` from the running
+/// one, keeping its users and data. Checks what it can first; the copy runs
+/// on its own thread.
+pub fn start_update(target: &str) -> Result<(), String> {
+    let (src, root_start, _) =
+        crate::block::root_location().ok_or_else(|| String::from("no VEILOS volume at /"))?;
+    if src.name == "ram" || crate::block::boot_disks().iter().any(|(_, ramdisk)| *ramdisk) {
+        return Err(String::from(
+            "this VEILOS runs from a RAM disk, and the boot partition it started from carries that RAM disk: \
+             copied, it would make the updated disk start from memory too. Start from the disk image \
+             (veilos-uefi-disk.img) to update.",
+        ));
+    }
+    let dst = crate::block::disks()
+        .into_iter()
+        .find(|d| d.name.eq_ignore_ascii_case(target))
+        .ok_or_else(|| format!("no disk {}", target))?;
+    if Arc::ptr_eq(&src, &dst) {
+        return Err(String::from("that is the disk VEILOS is running from"));
+    }
+    let plan = Update::new(&src, root_start, &dst)?;
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return Err(String::from("an install or update is already running"));
+    }
+    status(format!("starting: updating {} from {}", dst.name, src.name));
+    crate::kthread::spawn("install", move || {
+        let result = plan.run(&src, &dst);
+        dst.set_install_window(false);
+        match result {
+            Ok(msg) => status(msg),
+            Err(e) => status(format!("FAILED: {}", e)),
+        }
+        RUNNING.store(false, Ordering::Release);
+    });
+    Ok(())
+}
+
+/// What UPDATE does, worked out (and checked) before anything is written.
+struct Update {
+    /// (first, last) LBAs of each boot partition, the same on both disks.
+    boot: Vec<(u64, u64)>,
+    /// The target's VEILOS volume: start and sectors.
+    vol_start: u64,
+    vol_sectors: u64,
+}
+
+impl Update {
+    fn new(src: &Disk, root_start: u64, dst: &Arc<Disk>) -> Result<Self, String> {
+        let from = match Gpt::read(src) {
+            Some(g) => g?,
+            None => return Err(String::from("the disk VEILOS runs from has no GPT (only a UEFI image can update another disk)")),
+        };
+        let (_, boot) = from.layout(src, root_start)?;
+        let to = match Gpt::read(dst) {
+            Some(g) => g?,
+            None => return Err(format!("{} has no GPT, so no VEILOS installed by INSTALL: use INSTALL {} ERASE", dst.name, dst.name)),
+        };
+        // Its VEILOS volume: the GPT entry whose filesystem has the marker.
+        let mut volume = None;
+        for (_, _, first, last) in to.used() {
+            if last < first {
+                continue;
+            }
+            let part = Partition { disk: dst.clone(), start: first, sectors: last - first + 1 };
+            if let Some((_, fs_name)) = crate::block::open_veilos_volume(&part) {
+                if !fs_name.starts_with("FAT") {
+                    return Err(format!("the VEILOS volume of {} is {}, which this can't write", dst.name, fs_name));
+                }
+                volume = Some((first, last - first + 1));
+                break;
+            }
+        }
+        let (vol_start, vol_sectors) =
+            volume.ok_or_else(|| format!("{} has no VEILOS volume to update (INSTALL {} ERASE puts VEILOS on it)", dst.name, dst.name))?;
+        let (_, dst_boot) = to.layout(dst, vol_start)?;
+        let describe = |b: &[([u8; 16], u64, u64)]| {
+            b.iter().map(|&(_, f, l)| format!("{}..{}", f, l)).collect::<Vec<_>>().join(", ")
+        };
+        if dst_boot != boot {
+            return Err(format!(
+                "the boot partitions of {} (sectors {}) aren't laid out like this disk's (sectors {}): \
+                 UPDATE can only rewrite matching ones. INSTALL {} ERASE replaces everything instead.",
+                dst.name,
+                describe(&dst_boot),
+                describe(&boot),
+                dst.name
+            ));
+        }
+        Ok(Self { boot: boot.into_iter().map(|(_, f, l)| (f, l)).collect(), vol_start, vol_sectors })
+    }
+
+    fn run(&self, src: &Arc<Disk>, dst: &Arc<Disk>) -> Result<String, String> {
+        let gone = crate::vfs::VFS.unmount_disk(&dst.name);
+        if gone > 0 {
+            status(format!("unmounted {} filesystem(s) of {}", gone, dst.name));
+        }
+        dst.set_install_window(true);
+
+        // 1. Boot partitions: the new bootloader and kernel.
+        let mut buf = vec![0u8; CHUNK];
+        let mut boot_mib = 0;
+        for &(first, last) in &self.boot {
+            copy_sectors(src, dst, first, last, &mut buf)?;
+            boot_mib += (last + 1 - first) / 2048;
+        }
+        drop(buf);
+        status(format!("rewrote the boot partitions ({} MiB)", boot_mib));
+
+        // 2. The system's files onto its volume, keeping its people's.
+        let volume = Partition { disk: dst.clone(), start: self.vol_start, sectors: self.vol_sectors };
+        let (fs, _) = crate::block::open_veilos_volume(&volume)
+            .ok_or_else(|| String::from("its VEILOS volume no longer reads as one"))?;
+        let root = crate::vfs::VFS.root_mount().ok_or_else(|| String::from("nothing mounted at /"))?;
+        let mut n = Counts::default();
+        update_tree(&*root.fs, &*root.device, &*fs, &volume, "/", Mode::Overwrite, &mut n)?;
+        crate::block::flush_all();
+        Ok(format!(
+            "DONE: updated VEILOS on {}: boot partitions ({} MiB) rewritten, {} files written ({} MiB), \
+             {} kept, {} old ones removed. Start from {} to run this build.",
+            dst.name.to_ascii_uppercase(),
+            boot_mib,
+            n.written,
+            n.bytes >> 20,
+            n.kept,
+            n.removed,
+            dst.name.to_ascii_uppercase()
+        ))
+    }
+}
+
+#[derive(Default)]
+struct Counts {
+    written: u64,
+    bytes: u64,
+    kept: u64,
+    removed: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Write every file, replacing what's there.
+    Overwrite,
+    /// As Overwrite, and remove files the source doesn't have.
+    Replace,
+    /// Write only files the target doesn't have: its users' data.
+    MissingOnly,
+}
+
+/// What UPDATE does with a top-level name of the volume.
+fn mode_for(name: &str) -> Mode {
+    const KEEP: [&str; 6] = ["etc", "home", "var", "tmp", "net", "config.vsh"];
+    const REPLACE: [&str; 2] = ["system", "tests"];
+    if KEEP.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+        Mode::MissingOnly
+    } else if REPLACE.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+        Mode::Replace
+    } else {
+        Mode::Overwrite
+    }
+}
+
+/// Copy directory `path` of `from` onto `to` the UPDATE way.
+fn update_tree(
+    from: &dyn FileSystem,
+    from_dev: &dyn BlockDevice,
+    to: &dyn FileSystem,
+    to_dev: &dyn BlockDevice,
+    path: &str,
+    mode: Mode,
+    n: &mut Counts,
+) -> Result<(), String> {
+    let list = from.list_dir(from_dev, path).map_err(|e| format!("listing {}: {:?}", path, e))?;
+    let mut names = Vec::new();
+    for entry in &list {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        names.push(entry.name.to_ascii_lowercase());
+        let child = if path == "/" { format!("/{}", entry.name) } else { format!("{}/{}", path, entry.name) };
+        let mode = if path == "/" { mode_for(&entry.name) } else { mode };
+        match entry.file_type {
+            FileType::Directory => {
+                to.create_dir(to_dev, &child).map_err(|e| format!("making {}: {:?}", child, e))?;
+                update_tree(from, from_dev, to, to_dev, &child, mode, n)?;
+            }
+            FileType::File => {
+                if mode == Mode::MissingOnly && to.stat(to_dev, &child).is_some() {
+                    n.kept += 1;
+                    continue;
+                }
+                let data = from.read_file(from_dev, &child).map_err(|e| format!("reading {}: {:?}", child, e))?;
+                to.write_file(to_dev, &child, &data).map_err(|e| format!("writing {}: {:?}", child, e))?;
+                n.written += 1;
+                n.bytes += data.len() as u64;
+                if n.written % 50 == 0 {
+                    status(format!("updating files: {} ({} MiB)", n.written, n.bytes >> 20));
+                }
+            }
+        }
+        crate::kthread::yield_if_slice_used(10);
+    }
+    if mode == Mode::Replace && path != "/" {
+        // Files of the old build the new one doesn't ship.
+        let old = to.list_dir(to_dev, path).map_err(|e| format!("listing {} on the target: {:?}", path, e))?;
+        for entry in old {
+            if entry.file_type != FileType::File || names.contains(&entry.name.to_ascii_lowercase()) {
+                continue;
+            }
+            let child = format!("{}/{}", path, entry.name);
+            to.delete_file(to_dev, &child).map_err(|e| format!("removing {}: {:?}", child, e))?;
+            n.removed += 1;
+        }
     }
     Ok(())
 }
