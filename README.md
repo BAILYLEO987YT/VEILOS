@@ -4,6 +4,7 @@
 
 [![Build and release](https://github.com/BAILYLEO987YT/VEILOS/actions/workflows/release.yml/badge.svg)](https://github.com/BAILYLEO987YT/VEILOS/actions/workflows/release.yml)
 [![License: OCVSAL 1.0](https://img.shields.io/badge/license-OCVSAL%201.0-lightgrey)](LICENSE)
+
 [![OctoCounts](https://api.octocounts.com/badge/BAILYLEO987YT/VEILOS/branch/main)](https://octocounts.com/github/BAILYLEO987YT/VEILOS/tree/main)
 
 > [!WARNING]
