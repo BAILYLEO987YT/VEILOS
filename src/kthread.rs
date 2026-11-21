@@ -43,12 +43,34 @@ pub const FOREGROUND_SLICE_MS: u64 = 30;
 /// The process owning the focused window (desktop.rs), 0 for none.
 pub static FOREGROUND_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Saved state of a switched-out thread. `fx` must be 16-byte aligned.
-#[repr(C, align(16))]
+/// Saved state of a switched-out thread. `fx` (at offset 64) is the
+/// FXSAVE area, or the XSAVE area when the CPU has XSAVE (`smp::XSAVE_MASK`:
+/// x87, SSE and, where the CPU has them, AVX and AVX-512), which must be
+/// 64-byte aligned.
+#[repr(C, align(64))]
 struct SavedState {
     rsp: u64,
-    _pad: u64,
-    fx: [u8; 512],
+    _pad: [u64; 7],
+    fx: [u8; crate::smp::XSAVE_AREA],
+}
+
+impl SavedState {
+    const fn new(rsp: u64) -> Self {
+        Self { rsp, _pad: [0; 7], fx: [0; crate::smp::XSAVE_AREA] }
+    }
+}
+
+/// Save this CPU's FPU/SSE/AVX state at `area` (a `SavedState::fx`).
+unsafe fn save_fpu(area: *mut u8) {
+    let mask = crate::smp::XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        if mask != 0 {
+            core::arch::asm!("xsave64 [{}]", in(reg) area,
+                in("eax") mask as u32, in("edx") (mask >> 32) as u32, options(nostack));
+        } else {
+            core::arch::asm!("fxsave64 [{}]", in(reg) area, options(nostack));
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,7 +143,7 @@ impl CpuThreads {
                 user: UserCtx::new(0),
                 gs_base: 0,
                 kernel_gs_base: 0,
-                saved: SavedState { rsp: 0, _pad: 0, fx: [0; 512] },
+                saved: SavedState::new(0),
                 stack: None,
                 entry: None,
                 cr3: 0,
@@ -143,7 +165,7 @@ fn now_ms() -> u64 {
     crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Save the current thread's callee-saved registers, RFLAGS and FPU/SSE state
+/// Save the current thread's callee-saved registers, RFLAGS and FPU/SSE/AVX state
 /// into `old`, then resume the thread whose state is in `new`.
 #[unsafe(naked)]
 unsafe extern "C" fn switch_context(old: *mut SavedState, new: *const SavedState) {
@@ -155,10 +177,22 @@ unsafe extern "C" fn switch_context(old: *mut SavedState, new: *const SavedState
         "push r13",
         "push r14",
         "push r15",
-        "fxsave64 [rdi + 16]",
+        "mov rax, qword ptr [rip + {mask}]",
+        "test rax, rax",
+        "jz 2f",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "xsave64 [rdi + 64]",
         "mov [rdi], rsp",
         "mov rsp, [rsi]",
-        "fxrstor64 [rsi + 16]",
+        "xrstor64 [rsi + 64]",
+        "jmp 3f",
+        "2:",
+        "fxsave64 [rdi + 64]",
+        "mov [rdi], rsp",
+        "mov rsp, [rsi]",
+        "fxrstor64 [rsi + 64]",
+        "3:",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -167,6 +201,7 @@ unsafe extern "C" fn switch_context(old: *mut SavedState, new: *const SavedState
         "pop rbp",
         "popfq",
         "ret",
+        mask = sym crate::smp::XSAVE_MASK,
     );
 }
 
@@ -264,15 +299,13 @@ fn spawn_with(name: &'static str, cr3: u64, pid: u32, stack_size: usize, f: impl
         user: UserCtx::new(pid),
         gs_base: 0,
         kernel_gs_base: crate::smp::percpu_base(cpu),
-        saved: SavedState { rsp, _pad: 0, fx: [0; 512] },
+        saved: SavedState::new(rsp),
         stack: Some(stack),
         entry: Some(Box::new(f)),
         cr3,
     });
     // Start from this CPU's current FPU/SSE control state (MXCSR, x87 CW).
-    unsafe {
-        core::arch::asm!("fxsave64 [{}]", in(reg) thread.saved.fx.as_mut_ptr(), options(nostack));
-    }
+    unsafe { save_fpu(thread.saved.fx.as_mut_ptr()) };
 
     without_interrupts(|| {
         let mut ct = CPUS[cpu].lock();
