@@ -58,6 +58,11 @@ int main(void) {
         check("driver self-test: DPC at DISPATCH_LEVEL", ok && (mask & 0x04));
         check("driver self-test: periodic timer + DPC", ok && (mask & 0x08));
         check("driver self-test: work item", ok && (mask & 0x10));
+        check("driver SEH: page fault into __except", ok && (mask & 0x20));
+        check("driver SEH: ExRaiseStatus through 2 frames", ok && (mask & 0x40));
+        check("driver SEH: both __finally blocks ran", ok && (mask & 0x80));
+        check("driver SEH: ProbeForRead", ok && (mask & 0x100));
+        check("driver SEH: EXCEPTION_CONTINUE_EXECUTION", ok && (mask & 0x200));
     }
     {
         BOOL ok = DeviceIoControl(h, CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8FF, METHOD_BUFFERED, FILE_ANY_ACCESS), NULL, 0, NULL, 0, &got, NULL);

@@ -47,19 +47,38 @@ pub struct Trap {
     ss: u64,
 }
 
+// A fault in ring 3 goes to `common_entry` (a Windows exception for the
+// program). In ring 0, one whose RIP is in the driver image region
+// (ntos::pool::IMAGE_BASE, 64 GiB: one value of RIP >> 36) goes to
+// `kernel_entry` (a Windows exception for the driver, ntos/seh.rs); any other
+// to the kernel's own handler, as before.
+const DRIVER_RIP_TAG: u64 = crate::ntos::pool::IMAGE_BASE >> 36;
+
 macro_rules! entry {
     ($name:ident, $vector:expr, $old:path, no_error) => {
         #[unsafe(naked)]
         pub unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
                 "test qword ptr [rsp + 8], 3", // CS of the interrupted code
-                "jz {old}",
+                "jnz 3f",
+                "push rax",
+                "mov rax, [rsp + 8]", // RIP
+                "shr rax, 36",
+                "cmp rax, {tag}",
+                "pop rax",
+                "jne {old}",
+                "push 0",
+                "push {vector}",
+                "jmp {kernel}",
+                "3:",
                 "push 0",
                 "push {vector}",
                 "jmp {common}",
                 old = sym $old,
                 vector = const $vector,
+                tag = const DRIVER_RIP_TAG,
                 common = sym common_entry,
+                kernel = sym kernel_entry,
             )
         }
     };
@@ -68,15 +87,57 @@ macro_rules! entry {
         pub unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
                 "test qword ptr [rsp + 16], 3",
-                "jz {old}",
+                "jnz 3f",
+                "push rax",
+                "mov rax, [rsp + 16]", // RIP (above the error code)
+                "shr rax, 36",
+                "cmp rax, {tag}",
+                "pop rax",
+                "jne {old}",
+                "push {vector}",
+                "jmp {kernel}",
+                "3:",
                 "push {vector}",
                 "jmp {common}",
                 old = sym $old,
                 vector = const $vector,
+                tag = const DRIVER_RIP_TAG,
                 common = sym common_entry,
+                kernel = sym kernel_entry,
             )
         }
     };
+}
+
+/// A fault in a Windows driver: save everything as `ntos::seh::KernelTrap`
+/// and hand it to the driver's exception handlers. Never returns here: the
+/// handler that takes it resumes the driver, or nothing does and it's a bug
+/// check.
+#[unsafe(naked)]
+unsafe extern "C" fn kernel_entry() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "sub rsp, 512",
+        "fxsave [rsp]",
+        "mov rdi, rsp",
+        "call {fault}",
+        "ud2",
+        fault = sym crate::ntos::seh::kernel_fault,
+    )
 }
 
 entry!(divide_error, 0, interrupts::divide_error_handler, no_error);

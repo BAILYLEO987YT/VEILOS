@@ -1,6 +1,6 @@
 // What VEILOS's ntoskrnl.exe and hal.dll export to drivers: name -> address.
 
-use super::{cm, dpc, io, ke, ob, pool, ps, rtl};
+use super::{cm, dpc, io, ke, ob, pool, ps, rtl, seh};
 
 // -----| pool |-----
 
@@ -90,7 +90,18 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
                 ob::ObDereferenceObjectDeferDelete,
                 cm::ZwCreateKey, cm::ZwOpenKey, cm::ZwQueryValueKey, cm::ZwSetValueKey, cm::ZwDeleteValueKey,
                 cm::ZwDeleteKey, cm::RtlWriteRegistryValue,
+                // structured exception handling
+                seh::__C_specific_handler, seh::RtlRaiseException, seh::ExRaiseStatus, seh::RtlUnwindEx, seh::RtlUnwind,
+                seh::ProbeForRead, seh::ProbeForWrite, seh::RtlCaptureContext, seh::RtlRestoreContext,
+                seh::RtlLookupFunctionEntry, seh::RtlVirtualUnwind, seh::RtlPcToFileHeader,
             );
+            // Data exports.
+            match name {
+                "MmUserProbeAddress" => return Some(&raw const seh::MM_USER_PROBE_ADDRESS as u64),
+                "MmHighestUserAddress" => return Some(&raw const seh::MM_HIGHEST_USER_ADDRESS as u64),
+                "MmSystemRangeStart" => return Some(&raw const seh::MM_SYSTEM_RANGE_START as u64),
+                _ => {}
+            }
             None
         }
         "hal.dll" => {

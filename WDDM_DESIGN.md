@@ -171,9 +171,39 @@ METHOD_NEITHER IOCTLs, the create on its handle, the self-test results,
 and an unknown code failing with `ERROR_INVALID_FUNCTION`. In QEMU: all
 passed (self-test `1f of 1f`, `k1test: 0 failed`).
 
+### W1 third slice: SEH in drivers (2026-11-21)
+
+`src/ntos/seh.rs` brings `__try`/`__except`/`__finally` to drivers. It is
+adapted from VEILOS's user-mode SEH (ntdll's unwinder and dispatcher, and
+ucrtbase's `__C_specific_handler`).
+
+- **CPU faults** in ring 0 whose RIP lies in the driver image region:
+  nt_exception's entry stubs send them to `kernel_entry`. That builds a
+  `CONTEXT` and `EXCEPTION_RECORD`, moves off the IST stack onto the
+  driver's own, and dispatches through the driver's `.pdata` with the
+  interrupt flag as it was.
+- **Software exceptions**: `RtlRaiseException`, `ExRaiseStatus`,
+  `ProbeForRead/Write` and `RtlUnwind(Ex)` are assembly stubs that capture
+  their caller's registers first. VEILOS's own frames have no Windows
+  unwind tables, so every walk starts in driver code.
+- An unwind made during a dispatch starts from the context that exception
+  was raised in (kept per thread).
+- **Unhandled**: an exception no driver frame takes is bug check 0x1E, as
+  on Windows.
+- Data exports `MmUserProbeAddress`, `MmHighestUserAddress` and
+  `MmSystemRangeStart`.
+
+K1's driver is now built with MSVC, as vendors build theirs. clang-cl's
+`__try` only catches exceptions raised by calls; MSVC also catches a fault
+in the `__try` body itself. In QEMU every part passed, and `k1test` checks
+each:
+- a page fault caught by `__except` (`STATUS_ACCESS_VIOLATION`);
+- `ExRaiseStatus` caught two calls up, with both `__finally` blocks run;
+- `ProbeForRead` refusing a kernel address and passing a user one;
+- `EXCEPTION_CONTINUE_EXECUTION` resuming after `RtlRaiseException`.
+
 Still to do in W1:
 - the rest of the census list;
-- SEH in drivers (`__C_specific_handler` with the image's `.pdata`);
 - per-section protection;
 - freeing an unloaded image;
 - METHOD_IN/OUT_DIRECT (MDLs);

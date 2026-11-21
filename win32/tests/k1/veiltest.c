@@ -9,6 +9,9 @@
 // DriverUnload removes the link and the device and frees the pool.
 #include <ntddk.h>
 
+// Exported by ntoskrnl, but only declared in the user-mode headers.
+NTSYSAPI VOID NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
+
 #define IOCTL_VEIL_ECHO  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_VEIL_ADD   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_VEIL_STATS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -21,7 +24,12 @@
 #define T_DPC      0x04
 #define T_TIMER    0x08
 #define T_WORKITEM 0x10
-#define T_ALL      0x1F
+#define T_SEH_FAULT    0x20
+#define T_SEH_RAISE    0x40
+#define T_SEH_FINALLY  0x80
+#define T_SEH_PROBE    0x100
+#define T_SEH_CONTINUE 0x200
+#define T_ALL      0x3FF
 
 typedef struct _VEIL_EXT {
     KSPIN_LOCK Lock;
@@ -142,6 +150,84 @@ static VOID VeilWork(PDEVICE_OBJECT dev, PVOID ctx) {
     KeSetEvent(&g_done, IO_NO_INCREMENT, FALSE);
 }
 
+// -----| structured exception handling |-----
+
+// An address nothing maps: the far end of VEILOS's driver image region
+// (on Windows, any unmapped kernel address faults the same way).
+static volatile ULONG_PTR g_bad = 0xFFFFE07F00000000ULL;
+static volatile LONG g_finally_runs;
+
+static ULONG SehFault(void) {
+    ULONG code = 0;
+    __try {
+        *(volatile ULONG *)g_bad = 1;
+    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("veiltest: page fault caught, code %08lx\n", code);
+    }
+    return code;
+}
+
+// Raised two calls down, through a __finally in each that must run on the
+// way out.
+static __declspec(noinline) void Inner(void) {
+    __try {
+        ExRaiseStatus(STATUS_INSUFFICIENT_RESOURCES);
+    } __finally {
+        g_finally_runs++;
+    }
+}
+
+static __declspec(noinline) void Middle(void) {
+    __try {
+        Inner();
+    } __finally {
+        g_finally_runs++;
+    }
+}
+
+static NTSTATUS SehRaise(void) {
+    NTSTATUS st = STATUS_SUCCESS;
+    __try {
+        Middle();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        st = GetExceptionCode();
+    }
+    return st;
+}
+
+static BOOLEAN SehProbe(void) {
+    BOOLEAN bad_caught = FALSE, good_passed = FALSE;
+    __try {
+        ProbeForRead((PVOID)0xFFFF800000001000ULL, 16, 1); // a kernel address: refused
+    } __except (GetExceptionCode() == STATUS_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        bad_caught = TRUE;
+    }
+    __try {
+        ProbeForRead((PVOID)0x10000, 16, 4); // a user address: passes
+        good_passed = TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return bad_caught && good_passed;
+}
+
+// A continuable exception whose filter says to continue: execution goes on
+// after RtlRaiseException.
+static LONG ContinueFilter(PEXCEPTION_POINTERS p) {
+    return p->ExceptionRecord->ExceptionCode == 0x20001234 ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static BOOLEAN SehContinue(void) {
+    volatile BOOLEAN after = FALSE;
+    EXCEPTION_RECORD r = { 0 };
+    r.ExceptionCode = 0x20001234;
+    __try {
+        RtlRaiseException(&r);
+        after = TRUE;
+    } __except (ContinueFilter(GetExceptionInformation())) {
+    }
+    return after;
+}
+
 static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
     LARGE_INTEGER second, due;
     NTSTATUS st;
@@ -220,6 +306,21 @@ static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
             DbgPrint("veiltest: work item wait %08lx\n", st);
             IoFreeWorkItem(w);
         }
+    }
+    // Structured exception handling.
+    {
+        ULONG fault = SehFault();
+        NTSTATUS raised;
+        if (fault == STATUS_ACCESS_VIOLATION) g_passed |= T_SEH_FAULT;
+        g_finally_runs = 0;
+        raised = SehRaise();
+        if (raised == STATUS_INSUFFICIENT_RESOURCES) g_passed |= T_SEH_RAISE;
+        if (g_finally_runs == 2) g_passed |= T_SEH_FINALLY;
+        DbgPrint("veiltest: ExRaiseStatus caught %08lx, %ld __finally blocks ran\n", raised, g_finally_runs);
+        if (SehProbe()) g_passed |= T_SEH_PROBE;
+        if (SehContinue()) g_passed |= T_SEH_CONTINUE;
+        DbgPrint("veiltest: ProbeForRead %s, continue-execution %s\n", (g_passed & T_SEH_PROBE) ? "ok" : "FAILED",
+                 (g_passed & T_SEH_CONTINUE) ? "ok" : "FAILED");
     }
     DbgPrint("veiltest: self-test %lx of %x\n", g_passed, T_ALL);
 }
