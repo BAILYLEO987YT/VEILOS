@@ -207,9 +207,29 @@ Still to do in W1:
 - per-section protection;
 - freeing an unloaded image;
 - METHOD_IN/OUT_DIRECT (MDLs);
-- `RtlQueryRegistryValues`;
-- waits inside a system call. These run with interrupts off, so a driver
-  that blocks in an IOCTL waits for a tick that doesn't come on that CPU.
+- `RtlQueryRegistryValues`.
+
+### Waits inside a program's request (2026-11-21)
+
+A driver's IOCTL runs inside the program's system call, with interrupts
+off. The concern was that its waits would never see the 1 ms tick that
+fires timers and DPCs. A negative control with the old loop (yield, then
+spin) passed every wait too: yielding hands the CPU to another thread (on
+the boot CPU, the desktop's), which runs with interrupts on, so ticks
+still came. Waits below DISPATCH_LEVEL now pause the way VEILOS's own
+system calls do (`ke::pause`): another ready thread on this CPU, else HLT
+with interrupts on until the next interrupt, and off again after. That's
+the same result without spinning when nothing else is ready.
+
+The bug the test did find was in the clock: `KeQuerySystemTime(Precise)`
+came from the 1 ms tick count, which lags whenever ticks arrive late
+(WHPX delivers them in bursts), so a 30 ms delay could measure under
+20 ms. It now comes from the TSC (plus the NTP offset): 29.5–29.8 ms in
+four runs.
+
+K1's `IOCTL_VEIL_WAITTEST`, sent by `k1test`, waits inside the request on
+a system thread, a timer object, `KeDelayExecutionThread`, a work item and
+a timer's DPC. All five passed in QEMU on 1 CPU (twice) and on 2 CPUs.
 
 Opening a device after its driver unloads fails with `ERROR_INVALID_NAME`
 where Windows says `ERROR_FILE_NOT_FOUND`. The system time drivers see is

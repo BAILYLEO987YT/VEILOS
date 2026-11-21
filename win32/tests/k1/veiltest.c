@@ -17,6 +17,8 @@ NTSYSAPI VOID NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
 #define IOCTL_VEIL_STATS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_VEIL_SELFTEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_VEIL_NEITHER  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_NEITHER, FILE_ANY_ACCESS)
+// Waits inside the request itself (a program's system call): see WaitTest.
+#define IOCTL_VEIL_WAITTEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // Self-test results (bits), run in DriverEntry and reported by SELFTEST.
 #define T_REGISTRY 0x01
@@ -64,6 +66,8 @@ NTSTATUS VeilCreateClose(PDEVICE_OBJECT dev, PIRP irp) {
     return STATUS_SUCCESS;
 }
 
+static ULONG WaitTest(PDEVICE_OBJECT dev);
+
 NTSTATUS VeilIoctl(PDEVICE_OBJECT dev, PIRP irp) {
     VEIL_EXT *x = (VEIL_EXT *)dev->DeviceExtension;
     PIO_STACK_LOCATION sl = IoGetCurrentIrpStackLocation(irp);
@@ -102,6 +106,14 @@ NTSTATUS VeilIoctl(PDEVICE_OBJECT dev, PIRP irp) {
         RtlCopyMemory(buf, &g_passed, sizeof g_passed);
         info = sizeof g_passed;
         break;
+    case IOCTL_VEIL_WAITTEST: {
+        ULONG mask;
+        if (out < sizeof(ULONG)) { st = STATUS_BUFFER_TOO_SMALL; break; }
+        mask = WaitTest(dev);
+        RtlCopyMemory(buf, &mask, sizeof mask);
+        info = sizeof mask;
+        break;
+    }
     case IOCTL_VEIL_NEITHER: {
         // The caller's own buffers: the sum of its input bytes, as a ULONG.
         UCHAR *src = (UCHAR *)sl->Parameters.DeviceIoControl.Type3InputBuffer;
@@ -323,6 +335,89 @@ static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
                  (g_passed & T_SEH_CONTINUE) ? "ok" : "FAILED");
     }
     DbgPrint("veiltest: self-test %lx of %x\n", g_passed, T_ALL);
+}
+
+// -----| waiting inside a program's request |-----
+//
+// Everything here runs in the IOCTL a program sent (DeviceIoControl), and
+// each step waits for something another thread or the clock must do.
+// Result bits: 1 a system thread's object, 2 a timer object, 4
+// KeDelayExecutionThread, 8 a work item, 0x10 a timer's DPC.
+
+static KEVENT g_wt_event;
+static KTIMER g_wt_timer;
+static KDPC g_wt_dpc;
+static volatile LONG g_wt_dpc_runs;
+
+static VOID WtThread(PVOID ctx) {
+    UNREFERENCED_PARAMETER(ctx);
+    g_thread_value = 9;
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static VOID WtWork(PDEVICE_OBJECT dev, PVOID ctx) {
+    UNREFERENCED_PARAMETER(dev); UNREFERENCED_PARAMETER(ctx);
+    KeSetEvent(&g_wt_event, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID WtDpc(PKDPC dpc, PVOID ctx, PVOID a1, PVOID a2) {
+    UNREFERENCED_PARAMETER(dpc); UNREFERENCED_PARAMETER(ctx); UNREFERENCED_PARAMETER(a1); UNREFERENCED_PARAMETER(a2);
+    InterlockedIncrement(&g_wt_dpc_runs);
+    KeSetEvent(&g_wt_event, IO_NO_INCREMENT, FALSE);
+}
+
+static ULONG WaitTest(PDEVICE_OBJECT dev) {
+    ULONG mask = 0;
+    LARGE_INTEGER two_s, due, before, after;
+    NTSTATUS st;
+    two_s.QuadPart = -20000000LL;
+
+    {
+        HANDLE th;
+        PVOID obj;
+        g_thread_value = 0;
+        if (NT_SUCCESS(PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL, NULL, NULL, WtThread, NULL)) &&
+            NT_SUCCESS(ObReferenceObjectByHandle(th, SYNCHRONIZE, NULL, KernelMode, &obj, NULL))) {
+            st = KeWaitForSingleObject(obj, Executive, KernelMode, FALSE, &two_s);
+            if (st == STATUS_SUCCESS && g_thread_value == 9) mask |= 1;
+            ObDereferenceObject(obj);
+            ZwClose(th);
+        }
+    }
+
+    KeInitializeTimer(&g_wt_timer);
+    due.QuadPart = -200000LL; // 20 ms
+    KeSetTimer(&g_wt_timer, due, NULL);
+    st = KeWaitForSingleObject(&g_wt_timer, Executive, KernelMode, FALSE, &two_s);
+    if (st == STATUS_SUCCESS) mask |= 2;
+
+    KeQuerySystemTimePrecise(&before);
+    due.QuadPart = -300000LL; // 30 ms
+    st = KeDelayExecutionThread(KernelMode, FALSE, &due);
+    KeQuerySystemTimePrecise(&after);
+    DbgPrint("veiltest: 30 ms delay took %I64d (100 ns), %08lx\n", after.QuadPart - before.QuadPart, st);
+    if (after.QuadPart - before.QuadPart >= 200000LL) mask |= 4;
+
+    KeInitializeEvent(&g_wt_event, SynchronizationEvent, FALSE);
+    {
+        PIO_WORKITEM w = IoAllocateWorkItem(dev);
+        if (w) {
+            IoQueueWorkItem(w, WtWork, DelayedWorkQueue, NULL);
+            if (KeWaitForSingleObject(&g_wt_event, Executive, KernelMode, FALSE, &two_s) == STATUS_SUCCESS) mask |= 8;
+            IoFreeWorkItem(w);
+        }
+    }
+
+    g_wt_dpc_runs = 0;
+    KeInitializeDpc(&g_wt_dpc, WtDpc, NULL);
+    KeInitializeTimer(&g_wt_timer);
+    due.QuadPart = -100000LL; // 10 ms
+    KeSetTimer(&g_wt_timer, due, &g_wt_dpc);
+    if (KeWaitForSingleObject(&g_wt_event, Executive, KernelMode, FALSE, &two_s) == STATUS_SUCCESS && g_wt_dpc_runs == 1)
+        mask |= 0x10;
+
+    DbgPrint("veiltest: waits inside a request: %lx of 1f\n", mask);
+    return mask;
 }
 
 void VeilUnload(PDRIVER_OBJECT drv) {

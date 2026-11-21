@@ -8,8 +8,8 @@
 // VEILOS's PIT tick (0x20) and PS/2 IRQs wait until it drops; USB (0x50) and
 // the AP timer (0x40) still come.
 //
-// Waits poll the object (with the other kernel threads on this CPU getting
-// turns): nothing in W1 needs a wait list.
+// Waits poll the object between pauses (`pause`: another thread's turn, or
+// a sleep until the next interrupt); nothing in W1 needs a wait list.
 
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
@@ -238,9 +238,30 @@ fn wait_until(mut done: impl FnMut() -> bool, timeout: *const i64) -> NtStatus {
             return STATUS_TIMEOUT;
         }
         if irql() < DISPATCH_LEVEL {
-            crate::kthread::yield_now();
+            pause();
+        } else {
+            core::hint::spin_loop();
         }
-        core::hint::spin_loop();
+    }
+}
+
+/// Between looks at what a wait waits for, below DISPATCH_LEVEL: another
+/// thread on this CPU if one is ready (a driver's own system thread or work
+/// item, say), else sleep until the next interrupt. A program's system call
+/// runs with interrupts off, and a driver's IOCTL waits inside one: then
+/// interrupts are on only for the HLT, as VEILOS's own waits
+/// (nt_syscalls::wait_a_little) do it, so the tick that fires timers and
+/// DPCs still comes. Elsewhere they're left as they were.
+fn pause() {
+    use x86_64::instructions::interrupts;
+    if crate::kthread::others_ready() {
+        crate::kthread::yield_now();
+        return;
+    }
+    let were_on = interrupts::are_enabled();
+    interrupts::enable_and_hlt();
+    if !were_on {
+        interrupts::disable();
     }
 }
 
@@ -301,8 +322,8 @@ pub extern "win64" fn KeDelayExecutionThread(_mode: u8, _alertable: u8, interval
 
 /// Windows system time: 100 ns units since 1601-01-01 UTC.
 pub fn system_time() -> i64 {
-    const UNIX_TO_1601_MS: i64 = 11_644_473_600_000;
-    (crate::network::wall_clock_ms() + UNIX_TO_1601_MS) * 10_000
+    const UNIX_TO_1601_US: i64 = 11_644_473_600_000_000;
+    (crate::network::wall_clock_us() + UNIX_TO_1601_US) * 10
 }
 
 pub extern "win64" fn KeQuerySystemTimePrecise(out: *mut i64) {

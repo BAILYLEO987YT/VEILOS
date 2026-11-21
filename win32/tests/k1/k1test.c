@@ -65,6 +65,15 @@ int main(void) {
         check("driver SEH: EXCEPTION_CONTINUE_EXECUTION", ok && (mask & 0x200));
     }
     {
+        ULONG mask = 0;
+        BOOL ok = DeviceIoControl(h, CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS), NULL, 0, &mask, sizeof mask, &got, NULL);
+        check("in a request: wait on a system thread", ok && (mask & 0x01));
+        check("in a request: wait on a timer", ok && (mask & 0x02));
+        check("in a request: KeDelayExecutionThread", ok && (mask & 0x04));
+        check("in a request: wait for a work item", ok && (mask & 0x08));
+        check("in a request: wait for a timer's DPC", ok && (mask & 0x10));
+    }
+    {
         BOOL ok = DeviceIoControl(h, CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8FF, METHOD_BUFFERED, FILE_ANY_ACCESS), NULL, 0, NULL, 0, &got, NULL);
         check("unknown code fails (ERROR_INVALID_FUNCTION)", !ok && GetLastError() == ERROR_INVALID_FUNCTION);
     }
