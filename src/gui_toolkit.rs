@@ -968,5 +968,5 @@ pub fn init() {
     println!("[GUI]   Theme: {:?}", ACTIVE_THEME.lock().kind);
     println!("[GUI]   Widgets: Label Button TextInput Checkbox Slider ScrollView");
     println!("[GUI]   Layout:  StackLayout FlexLayout AbsoluteLayout");
-    println!("[GUI]   Renderer: GPU-accelerated (Performance) / back-buffer (Security)");
+    println!("[GUI]   Renderer: back buffer, drawn on the CPU (every core)");
 }

@@ -1,11 +1,13 @@
 // -----| VEILOS Graphics API Translation Layer |-----
 //
-// Phase 6 roadmap items implemented here:
-//
-//   [x] Integrate or reimplement DXVK (DirectX 9/10/11 → Vulkan)
-//   [x] Integrate or reimplement vkd3d (DirectX 12 → Vulkan)
-//   [x] Add Vulkan ICD loader for VEILOS
-//   [x] Add OpenGL translation layer (optional)
+// STATUS: a stub. The Phase 6 roadmap planned DXVK (D3D9/10/11 -> Vulkan),
+// vkd3d (D3D12 -> Vulkan), a Vulkan ICD loader and an OpenGL layer; none of
+// them exists. The types below define the shape of such a stack, the
+// "SPIR-V" it emits is placeholder bytes, and its commands end in
+// gpu_driver.rs, which runs them on the CPU. Real Direct3D and OpenGL
+// programs don't come through here: win32/d3d9, win32/d3d11 and
+// win32/opengl32 render on the CPU (raster3d.rs). Hardware GPUs are the
+// WDDM plan (WDDM_DESIGN.md).
 //
 // Architecture
 // ------------
@@ -741,9 +743,6 @@ pub fn vk_submit(pid: u32, cmd: VkIrCommand) -> u64 {
 
 /// Initialise the graphics API translation layer.
 pub fn init() {
-    println!("[GFX-API] Translation layer ready.");
-    println!("[GFX-API]   DXVK  (D3D9/10/11 → VkIR → GPU)");
-    println!("[GFX-API]   vkd3d (D3D12      → VkIR → GPU)");
-    println!("[GFX-API]   GL    (OpenGL      → VkIR → GPU)");
-    println!("[GFX-API]   SPIR-V stub shaders loaded (real compiler: Phase 8)");
+    println!("[GFX-API] Translation layer: a stub (no DXVK, vkd3d or shader compiler).");
+    println!("[GFX-API]   Direct3D and OpenGL programs run on the CPU renderer (raster3d).");
 }

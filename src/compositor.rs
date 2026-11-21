@@ -640,6 +640,6 @@ pub fn init() {
     COMPOSITOR.lock().init_desktop();
     println!("[COMPOSITOR] Window compositor initialised.");
     println!("[COMPOSITOR]   Double-buffered surfaces, per-surface dirty tracking");
-    println!("[COMPOSITOR]   VRAM-backed swapchains, frame pacing @ 60 Hz");
-    println!("[COMPOSITOR]   GPU-accelerated FillRect / BitBlt draw primitives");
+    println!("[COMPOSITOR]   Frame pacing @ 60 Hz");
+    println!("[COMPOSITOR]   FillRect / BitBlt drawn on the CPU (no GPU driver yet)");
 }
