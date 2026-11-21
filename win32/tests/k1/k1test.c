@@ -67,6 +67,14 @@ int main(void) {
         check("driver memory: MmMapIoSpace of it", ok && (mask & 0x800));
         check("driver memory: MDL over pool", ok && (mask & 0x1000));
         check("driver memory: pages for an MDL, mapped", ok && (mask & 0x2000));
+        check("driver CRT: sprintf_s / swprintf_s", ok && (mask & 0x4000));
+        check("driver Rtl: counted strings, numbers", ok && (mask & 0x8000));
+        check("driver Rtl: bitmaps", ok && (mask & 0x10000));
+        check("driver Rtl: generic tables", ok && (mask & 0x20000));
+        check("driver Ex: resources, fast/guarded mutexes", ok && (mask & 0x40000));
+        check("driver Ex: lookaside lists, SLists", ok && (mask & 0x80000));
+        check("driver Rtl: time fields, RtlQueryRegistryValues", ok && (mask & 0x100000));
+        check("driver Ex: timer, callback object", ok && (mask & 0x200000));
     }
     {
         // METHOD_OUT_DIRECT: the driver writes straight into this buffer

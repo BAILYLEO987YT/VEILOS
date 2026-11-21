@@ -1,6 +1,6 @@
 // What VEILOS's ntoskrnl.exe and hal.dll export to drivers: name -> address.
 
-use super::{cm, dpc, io, ke, mm, ob, pool, ps, rtl, seh};
+use super::{cm, crt, dpc, ex, io, ke, misc, mm, ob, pool, ps, rtl, rtlx, seh};
 
 // -----| pool |-----
 
@@ -102,7 +102,82 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
                 mm::MmAllocateContiguousMemorySpecifyCache, mm::MmAllocateContiguousMemory, mm::MmAllocateNonCachedMemory,
                 mm::MmFreeContiguousMemory, mm::MmFreeContiguousMemorySpecifyCache, mm::MmFreeNonCachedMemory,
                 mm::MmMapIoSpace, mm::MmMapIoSpaceEx, mm::MmUnmapIoSpace,
+                // C runtime
+                crt::_vsnprintf, crt::_vsnwprintf, crt::_vsnprintf_s, crt::_vsnwprintf_s, crt::sprintf_s, crt::swprintf_s,
+                crt::_snprintf_s, crt::_snwprintf_s, crt::_snprintf, crt::_snwprintf,
+                crt::strcpy_s, crt::strncpy_s, crt::strcat_s, crt::strncat_s, crt::wcscpy_s, crt::wcsncpy_s, crt::wcscat_s,
+                crt::wcsncat_s, crt::strnlen, crt::wcsnlen, crt::wcsncmp, crt::_wcsicmp, crt::wcschr, crt::wcsrchr,
+                crt::strstr, crt::wcsstr, crt::toupper, crt::tolower, crt::sqrt, crt::_purecall,
+                // run-time library
+                rtlx::RtlAnsiStringToUnicodeString, rtlx::RtlUnicodeStringToAnsiString, rtlx::RtlFreeUnicodeString,
+                rtlx::RtlFreeAnsiString, rtlx::RtlCreateUnicodeString, rtlx::RtlAppendUnicodeStringToString,
+                rtlx::RtlAppendUnicodeToString, rtlx::RtlUnicodeStringToInteger, rtlx::RtlCharToInteger,
+                rtlx::RtlUpcaseUnicodeChar, rtlx::RtlAnsiCharToUnicodeChar, rtlx::RtlMultiByteToUnicodeN,
+                rtlx::RtlUnicodeToMultiByteN, rtlx::RtlUnicodeToMultiByteSize, rtlx::RtlZeroMemory,
+                rtlx::RtlInitializeBitMap, rtlx::RtlClearAllBits, rtlx::RtlSetAllBits, rtlx::RtlSetBit, rtlx::RtlClearBit,
+                rtlx::RtlTestBit, rtlx::RtlSetBits, rtlx::RtlClearBits, rtlx::RtlAreBitsSet, rtlx::RtlAreBitsClear,
+                rtlx::RtlFindClearBits, rtlx::RtlFindSetBits, rtlx::RtlFindClearBitsAndSet, rtlx::RtlFindNextForwardRunClear,
+                rtlx::RtlNumberOfSetBits,
+                rtlx::RtlInitializeGenericTable, rtlx::RtlInsertElementGenericTable, rtlx::RtlLookupElementGenericTable,
+                rtlx::RtlDeleteElementGenericTable, rtlx::RtlEnumerateGenericTableWithoutSplaying,
+                rtlx::RtlEnumerateGenericTable, rtlx::RtlGetElementGenericTable, rtlx::RtlNumberGenericTableElements,
+                rtlx::RtlLengthSid, rtlx::RtlValidSid, rtlx::RtlEqualSid, rtlx::RtlConvertSidToUnicodeString,
+                rtlx::RtlCreateAcl, rtlx::RtlAddAccessAllowedAce, rtlx::RtlCreateSecurityDescriptor,
+                rtlx::RtlSetDaclSecurityDescriptor, rtlx::RtlGetDaclSecurityDescriptor, rtlx::RtlGetSaclSecurityDescriptor,
+                rtlx::RtlGetOwnerSecurityDescriptor, rtlx::RtlGetGroupSecurityDescriptor, rtlx::RtlLengthSecurityDescriptor,
+                rtlx::RtlAbsoluteToSelfRelativeSD, rtlx::SeCaptureSecurityDescriptor,
+                rtlx::RtlTimeToTimeFields, rtlx::RtlRandomEx, rtlx::RtlCaptureStackBackTrace, rtlx::RtlVolumeDeviceToDosName,
+                rtlx::RtlCmDecodeMemIoResource, rtlx::RtlCmEncodeMemIoResource, rtlx::RtlIoDecodeMemIoResource,
+                rtlx::RtlIoEncodeMemIoResource, rtlx::RtlCheckRegistryKey, rtlx::RtlCreateRegistryKey,
+                rtlx::RtlQueryRegistryValues,
+                // executive support
+                ex::ExInitializeResourceLite, ex::ExReinitializeResourceLite, ex::ExDeleteResourceLite,
+                ex::ExAcquireResourceExclusiveLite, ex::ExAcquireResourceSharedLite, ex::ExAcquireSharedStarveExclusive,
+                ex::ExAcquireSharedWaitForExclusive, ex::ExReleaseResourceLite, ex::ExReleaseResourceForThreadLite,
+                ex::ExIsResourceAcquiredExclusiveLite, ex::ExIsResourceAcquiredSharedLite, ex::ExConvertExclusiveToSharedLite,
+                ex::ExGetExclusiveWaiterCount, ex::ExGetSharedWaiterCount, ex::ExSetResourceOwnerPointer,
+                ex::ExEnterCriticalRegionAndAcquireResourceExclusive, ex::ExEnterCriticalRegionAndAcquireResourceShared,
+                ex::ExReleaseResourceAndLeaveCriticalRegion,
+                ex::KeInitializeGuardedMutex, ex::ExAcquireFastMutex, ex::ExReleaseFastMutex, ex::ExTryToAcquireFastMutex,
+                ex::ExAcquireFastMutexUnsafe, ex::ExReleaseFastMutexUnsafe, ex::KeAcquireGuardedMutex, ex::KeReleaseGuardedMutex,
+                ex::KeAcquireGuardedMutexUnsafe, ex::KeReleaseGuardedMutexUnsafe,
+                ex::InitializeSListHead, ex::ExpInterlockedPushEntrySList, ex::ExpInterlockedPopEntrySList,
+                ex::ExpInterlockedFlushSList, ex::ExQueryDepthSList, ex::FirstEntrySList,
+                ex::ExInitializeNPagedLookasideList, ex::ExInitializePagedLookasideList, ex::ExDeleteNPagedLookasideList,
+                ex::ExDeletePagedLookasideList, ex::ExAllocateFromNPagedLookasideList, ex::ExFreeToNPagedLookasideList,
+                ex::ExAllocateFromPagedLookasideList, ex::ExFreeToPagedLookasideList,
+                ex::ExInterlockedInsertTailList, ex::ExInterlockedInsertHeadList, ex::ExInterlockedRemoveHeadList,
+                ex::ExCreateCallback, ex::ExRegisterCallback, ex::ExUnregisterCallback, ex::ExNotifyCallback,
+                ex::ExAllocateTimer, ex::ExSetTimer, ex::ExCancelTimer, ex::ExDeleteTimer,
+                ex::ExUuidCreate, ex::ExGetPreviousMode, ex::ExQueryTimerResolution, ex::ExSetTimerResolution,
+                ex::ExAllocatePoolWithQuotaTag,
+                // queues, Ke, Ps, Po, Cm, Etw, Mm odds and ends
+                misc::KeInitializeQueue, misc::KeInsertQueue, misc::KeInsertHeadQueue, misc::KeRemoveQueue, misc::KeRundownQueue,
+                misc::KePulseEvent, misc::KeReadStateSemaphore, misc::KeQueryActiveProcessors, misc::KeQueryMaximumProcessorCount,
+                misc::KeQueryMaximumProcessorCountEx, misc::KeQueryLogicalProcessorRelationship, misc::KeQueryPriorityThread,
+                misc::KeSetPriorityThread, misc::KeQueryUnbiasedInterruptTime, misc::KeInvalidateAllCaches,
+                misc::KeSaveExtendedProcessorState, misc::KeRestoreExtendedProcessorState,
+                misc::KeRegisterBugCheckReasonCallback, misc::KeDeregisterBugCheckReasonCallback,
+                misc::KeInitializeApc, misc::KeInsertQueueApc, misc::KeStackAttachProcess, misc::KeUnstackDetachProcess,
+                misc::KdRefreshDebuggerNotPresent,
+                misc::PsGetVersion, misc::PsGetProcessId, misc::PsLookupProcessByProcessId, misc::PsGetProcessCreateTimeQuadPart,
+                misc::PsSetCreateProcessNotifyRoutineEx, misc::PsSetCreateThreadNotifyRoutine,
+                misc::PsRemoveCreateThreadNotifyRoutine, misc::PsSetLoadImageNotifyRoutine, misc::PsRemoveLoadImageNotifyRoutine,
+                misc::PsReferencePrimaryToken, misc::PsDereferencePrimaryToken, misc::PsReferenceImpersonationToken,
+                misc::PsDereferenceImpersonationToken, misc::SeTokenIsAdmin, misc::SeQueryInformationToken,
+                misc::PsChargePoolQuota, misc::PsReturnPoolQuota,
+                misc::PoRegisterPowerSettingCallback, misc::PoUnregisterPowerSettingCallback, misc::PoSetPowerState,
+                misc::CmRegisterCallbackEx, misc::CmUnRegisterCallback,
+                misc::EtwRegister, misc::EtwUnregister, misc::EtwProviderEnabled, misc::EtwSetInformation, misc::EtwWrite,
+                misc::EtwWriteTransfer,
+                misc::MmIsDriverVerifying, misc::MmLockPagableDataSection, misc::MmLockPagableSectionByHandle,
+                misc::MmUnlockPagableImageSection, misc::MmUnsecureVirtualMemory, misc::MmGetPhysicalMemoryRanges,
+                misc::MmCopyMemory, misc::MmAllocateMappingAddress, misc::MmFreeMappingAddress,
+                misc::MmMapLockedPagesWithReservedMapping, misc::MmUnmapReservedMapping,
             );
+            if let Some(a) = ex::data_export(name) {
+                return Some(a);
+            }
             // Data exports.
             match name {
                 "MmUserProbeAddress" => return Some(&raw const seh::MM_USER_PROBE_ADDRESS as u64),

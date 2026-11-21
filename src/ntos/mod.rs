@@ -23,6 +23,9 @@
 //     raised exceptions dispatched through their unwind tables.
 //   * `mm`: MDLs, contiguous memory, device memory, physical addresses.
 //   * `ob`: kernel handles; `cm`: the registry (Zw*Key on nt_registry).
+//   * `crt`, `rtlx`: the C runtime and run-time library beyond the basics.
+//   * `ex`: resources, fast mutexes, SLists, lookaside lists, callbacks,
+//     Ex timers; `misc`: queues, Ps, Po, Cm, Etw and Mm odds and ends.
 //   * `exports`: the name -> address tables of ntoskrnl.exe and hal.dll.
 //
 // The structures drivers read directly (DRIVER_OBJECT, DEVICE_OBJECT, IRP,
@@ -40,16 +43,20 @@
 #![allow(non_snake_case)]
 
 pub mod cm;
+pub mod crt;
 pub mod dpc;
+pub mod ex;
 pub mod exports;
 pub mod image;
 pub mod io;
 pub mod ke;
+pub mod misc;
 pub mod mm;
 pub mod ob;
 pub mod pool;
 pub mod ps;
 pub mod rtl;
+pub mod rtlx;
 pub mod seh;
 
 pub type NtStatus = i32;
@@ -71,6 +78,7 @@ pub const STATUS_INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009Au32 as i32;
 /// the process is made, so the region's tables must already be there.
 pub fn init() {
     pool::init();
+    ex::init();
 }
 
 /// From the BSP's 1 ms timer interrupt: due timers and queued DPCs.

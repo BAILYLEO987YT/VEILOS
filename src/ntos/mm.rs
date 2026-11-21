@@ -252,6 +252,27 @@ pub extern "win64" fn MmMapLockedPagesSpecifyCache(mdl: *mut u8, mode: u8, cache
     }
 }
 
+/// Map an MDL's pages at `va` (reserved address space): the mapped address.
+pub fn map_mdl_at(mdl: *mut u8, va: u64, cache: u32) -> u64 {
+    let mut mapper = unsafe { crate::memory::get_mapper() };
+    let mut frames = crate::memory::GlobalFrameAllocator;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::GLOBAL | cache_flags(cache);
+    for i in 0..mdl_pages(mdl) {
+        let pfn = unsafe { pfn_array(mdl).add(i as usize).read() };
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va + i * 4096));
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(pfn * 4096));
+        if crate::memory::map_page_checked(page, frame, flags, &mut mapper, &mut frames).is_err() {
+            return 0;
+        }
+    }
+    unsafe {
+        let mapped = va + rd::<u32>(mdl, MDL_BYTE_OFFSET) as u64;
+        wr::<u64>(mdl, MDL_MAPPED_VA, mapped);
+        wr::<u16>(mdl, MDL_FLAGS, rd::<u16>(mdl, MDL_FLAGS) | MDL_MAPPED_TO_SYSTEM_VA);
+        mapped
+    }
+}
+
 pub extern "win64" fn MmMapLockedPages(mdl: *mut u8, mode: u8) -> u64 {
     MmMapLockedPagesSpecifyCache(mdl, mode, 1, 0, 0, 0)
 }

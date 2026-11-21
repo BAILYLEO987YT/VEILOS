@@ -228,6 +228,21 @@ fn deadline(timeout: *const i64) -> Option<u64> {
     })
 }
 
+/// Wait until `done()` (another part of ntos's own wait: KeRemoveQueue).
+pub fn wait_for(done: impl FnMut() -> bool, timeout: *const i64) -> NtStatus {
+    wait_until(done, timeout)
+}
+
+/// While spinning on a lock or a busy object: pause below DISPATCH_LEVEL,
+/// just spin at or above it.
+pub fn pause_at_current_irql() {
+    if irql() < DISPATCH_LEVEL {
+        pause();
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
 fn wait_until(mut done: impl FnMut() -> bool, timeout: *const i64) -> NtStatus {
     let end = deadline(timeout);
     loop {

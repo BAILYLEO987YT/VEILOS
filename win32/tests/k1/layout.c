@@ -2,7 +2,7 @@
 // at compile time (build.sh compiles this; it makes no output file worth
 // keeping). Keep it in step with the constants in src/ntos/io.rs, ke.rs and
 // rtl.rs.
-#include <ntddk.h>
+#include <ntifs.h> // ntddk.h plus the file-system structures (SECURITY_DESCRIPTOR)
 #include <stddef.h>
 
 #define AT(type, field, off) static_assert(offsetof(type, field) == (off), #type "." #field)
@@ -116,6 +116,71 @@ static_assert(MDL_MAPPED_TO_SYSTEM_VA == 0x1 && MDL_PAGES_LOCKED == 0x2 && MDL_S
 static_assert(METHOD_IN_DIRECT == 1 && METHOD_OUT_DIRECT == 2, "METHOD_ direct");
 static_assert(MmNonCached == 0 && MmCached == 1 && MmWriteCombined == 2, "MEMORY_CACHING_TYPE");
 static_assert(PAGE_NOCACHE == 0x200 && PAGE_WRITECOMBINE == 0x400, "PAGE_ cache flags");
+
+// ex.rs: fast and guarded mutexes, resources, SLists, lookaside lists
+AT(FAST_MUTEX, Count, 0x00);
+AT(FAST_MUTEX, Owner, 0x08);
+AT(FAST_MUTEX, Contention, 0x10);
+AT(FAST_MUTEX, Event, 0x18);
+AT(FAST_MUTEX, OldIrql, 0x30);
+SIZE(FAST_MUTEX, 0x38);
+SIZE(KGUARDED_MUTEX, 0x38);
+static_assert(sizeof(ERESOURCE) >= 0x18, "ERESOURCE room for VEILOS's fields");
+SIZE(SLIST_HEADER, 0x10);
+AT(GENERAL_LOOKASIDE, ListHead, 0x00);
+AT(GENERAL_LOOKASIDE, Depth, 0x10);
+AT(GENERAL_LOOKASIDE, MaximumDepth, 0x12);
+AT(GENERAL_LOOKASIDE, TotalAllocates, 0x14);
+AT(GENERAL_LOOKASIDE, AllocateMisses, 0x18);
+AT(GENERAL_LOOKASIDE, TotalFrees, 0x1C);
+AT(GENERAL_LOOKASIDE, FreeMisses, 0x20);
+AT(GENERAL_LOOKASIDE, Type, 0x24);
+AT(GENERAL_LOOKASIDE, Tag, 0x28);
+AT(GENERAL_LOOKASIDE, Size, 0x2C);
+AT(GENERAL_LOOKASIDE, Allocate, 0x30);
+AT(GENERAL_LOOKASIDE, Free, 0x38);
+AT(GENERAL_LOOKASIDE, ListEntry, 0x40);
+AT(NPAGED_LOOKASIDE_LIST, L, 0x00);
+
+// rtlx.rs: bitmaps, generic tables, registry query table, security, resources
+AT(RTL_BITMAP, SizeOfBitMap, 0);
+AT(RTL_BITMAP, Buffer, 8);
+AT(RTL_GENERIC_TABLE, OrderedPointer, 0x18);
+AT(RTL_GENERIC_TABLE, NumberGenericTableElements, 0x24);
+AT(RTL_GENERIC_TABLE, CompareRoutine, 0x28);
+AT(RTL_GENERIC_TABLE, AllocateRoutine, 0x30);
+AT(RTL_GENERIC_TABLE, FreeRoutine, 0x38);
+AT(RTL_GENERIC_TABLE, TableContext, 0x40);
+SIZE(TIME_FIELDS, 16);
+AT(TIME_FIELDS, Weekday, 14);
+SIZE(RTL_QUERY_REGISTRY_TABLE, 0x38);
+AT(RTL_QUERY_REGISTRY_TABLE, Flags, 0x08);
+AT(RTL_QUERY_REGISTRY_TABLE, Name, 0x10);
+AT(RTL_QUERY_REGISTRY_TABLE, EntryContext, 0x18);
+AT(RTL_QUERY_REGISTRY_TABLE, DefaultType, 0x20);
+AT(RTL_QUERY_REGISTRY_TABLE, DefaultData, 0x28);
+AT(RTL_QUERY_REGISTRY_TABLE, DefaultLength, 0x30);
+static_assert(RTL_QUERY_REGISTRY_SUBKEY == 1 && RTL_QUERY_REGISTRY_TOPKEY == 2 && RTL_QUERY_REGISTRY_REQUIRED == 4 &&
+              RTL_QUERY_REGISTRY_NOVALUE == 8 && RTL_QUERY_REGISTRY_DIRECT == 0x20, "RTL_QUERY_REGISTRY_");
+static_assert(RTL_REGISTRY_ABSOLUTE == 0 && RTL_REGISTRY_SERVICES == 1 && RTL_REGISTRY_CONTROL == 2 &&
+              RTL_REGISTRY_WINDOWS_NT == 3 && RTL_REGISTRY_DEVICEMAP == 4 && RTL_REGISTRY_USER == 5, "RTL_REGISTRY_");
+AT(SECURITY_DESCRIPTOR, Control, 2);
+AT(SECURITY_DESCRIPTOR, Owner, 0x08);
+AT(SECURITY_DESCRIPTOR, Group, 0x10);
+AT(SECURITY_DESCRIPTOR, Sacl, 0x18);
+AT(SECURITY_DESCRIPTOR, Dacl, 0x20);
+AT(ACL, AclSize, 2);
+AT(ACL, AceCount, 4);
+AT(CM_PARTIAL_RESOURCE_DESCRIPTOR, Flags, 2);
+AT(CM_PARTIAL_RESOURCE_DESCRIPTOR, u.Memory.Start, 4);
+AT(CM_PARTIAL_RESOURCE_DESCRIPTOR, u.Memory.Length, 0xC);
+static_assert(CmResourceTypeMemory == 3 && CmResourceTypeMemoryLarge == 7, "CmResourceType");
+static_assert(CM_RESOURCE_MEMORY_LARGE_40 == 0x200 && CM_RESOURCE_MEMORY_LARGE_48 == 0x400 &&
+              CM_RESOURCE_MEMORY_LARGE_64 == 0x800, "CM_RESOURCE_MEMORY_LARGE");
+AT(IO_RESOURCE_DESCRIPTOR, u.Memory.Length, 8);
+AT(IO_RESOURCE_DESCRIPTOR, u.Memory.Alignment, 0xC);
+AT(IO_RESOURCE_DESCRIPTOR, u.Memory.MinimumAddress, 0x10);
+AT(IO_RESOURCE_DESCRIPTOR, u.Memory.MaximumAddress, 0x18);
 
 // ke.rs: dispatcher objects, queued spinlock handle
 SIZE(DISPATCHER_HEADER, 0x18);

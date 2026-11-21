@@ -226,12 +226,51 @@ written, and a `METHOD_OUT_DIRECT` request writing 9000 bytes across three
 of the program's pages (and nothing either side). All passed in QEMU
 (`3fff of 3fff`, `k1test: 0 failed`). 163 exports now.
 
+### W1 census, most of the way (2026-11-21)
+
+386 functions and 12 data exports now. The NVIDIA and Arc kernel drivers
+together lack 97 imports, down from 399:
+
+- `crt.rs`: the sprintf family, narrow and wide, with one printf engine for
+  all of ntos (MSVC sizes: `l` is 32-bit); bounded and `_s` string
+  functions; `sqrt`.
+- `rtlx.rs`: counted-string conversions and numbers, bitmaps, generic
+  tables, SIDs, ACLs and security descriptors, `RtlTimeToTimeFields`,
+  resource-descriptor encoding, `RtlCheckRegistryKey`,
+  `RtlCreateRegistryKey`, and `RtlQueryRegistryValues` (direct values,
+  query routines, subkeys, defaults).
+- `ex.rs`: ERESOURCE (recursive exclusive, shared), fast and guarded
+  mutexes, SLists in Windows' header layout, lookaside lists, interlocked
+  lists, callback objects, Ex timers, UUIDs, and the object-type and
+  debugger data exports.
+- `misc.rs`: kernel queues, processor queries, and accepted-but-unused
+  registrations (process and image notifications, power settings, ETW,
+  registry callbacks, bug-check callbacks). Also tokens, pageable-section
+  calls, reserved mappings and `MmCopyMemory`.
+
+K1 checks each group in its self-test (now 22 parts, `3fffff`), and
+layout.c checks the new structures against the WDK (with ntifs.h for
+SECURITY_DESCRIPTOR). In QEMU: `3fffff of 3fffff`, `k1test: 0 failed`.
+
+The 97 left, by area:
+- **Device stacks and PnP** (attach and detach, remove locks, device
+  interfaces and properties, device registry keys, PnP notifications, error
+  log, `IoConnectInterruptEx`, PCI config through `HalGet/SetBusDataByOffset`,
+  `PoRequestPowerIrp`): that's W2.
+- **`Zw*` files, sections, events, processes, tokens and system
+  information**: on VEILOS's VFS and objects.
+- **BCrypt from `ksecdd.sys`** (15) and the network module registrar from
+  `netio.sys` (4).
+- **`SeExports`.**
+
 Still to do in W1:
-- the rest of the census list;
+- the `Zw*` group, BCrypt, Nmr and `SeExports`;
 - per-section protection;
 - freeing an unloaded image;
 - mapping an MDL into a program (`UserMode`);
-- `RtlQueryRegistryValues`.
+- `KeGetCurrentThread` and the other gs-based inlines: the WDK reads the
+  current thread from `gs:[0x188]` (KPCR.Prcb), which VEILOS's per-CPU
+  block doesn't yet hold.
 
 ### Waits inside a program's request (2026-11-21)
 

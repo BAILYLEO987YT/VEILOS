@@ -11,6 +11,8 @@
 
 // Exported by ntoskrnl, but only declared in the user-mode headers.
 NTSYSAPI VOID NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
+int __cdecl sprintf_s(char *buffer, size_t size, const char *format, ...);
+int __cdecl swprintf_s(wchar_t *buffer, size_t size, const wchar_t *format, ...);
 
 #define IOCTL_VEIL_ECHO  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_VEIL_ADD   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -38,7 +40,15 @@ NTSYSAPI VOID NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
 #define T_IOSPACE      0x800
 #define T_MDL_POOL     0x1000
 #define T_MDL_PAGES    0x2000
-#define T_ALL      0x3FFF
+#define T_PRINTF       0x4000
+#define T_STRINGS      0x8000
+#define T_BITMAP       0x10000
+#define T_GENTABLE     0x20000
+#define T_LOCKS        0x40000
+#define T_LOOKASIDE    0x80000
+#define T_TIME_REG     0x100000
+#define T_EXTIMER_CB   0x200000
+#define T_ALL      0x3FFFFF
 
 typedef struct _VEIL_EXT {
     KSPIN_LOCK Lock;
@@ -255,6 +265,208 @@ static BOOLEAN SehContinue(void) {
     return after;
 }
 
+// -----| the run-time library and executive support |-----
+
+static RTL_GENERIC_COMPARE_RESULTS NTAPI GtCompare(PRTL_GENERIC_TABLE t, PVOID a, PVOID b) {
+    ULONG x = *(ULONG *)a, y = *(ULONG *)b;
+    UNREFERENCED_PARAMETER(t);
+    return x < y ? GenericLessThan : x > y ? GenericGreaterThan : GenericEqual;
+}
+static PVOID NTAPI GtAlloc(PRTL_GENERIC_TABLE t, CLONG size) {
+    UNREFERENCED_PARAMETER(t);
+    return ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'liev');
+}
+static VOID NTAPI GtFree(PRTL_GENERIC_TABLE t, PVOID p) {
+    UNREFERENCED_PARAMETER(t);
+    ExFreePoolWithTag(p, 'liev');
+}
+
+static KEVENT g_rt_event;
+static volatile LONG g_cb_value;
+
+static VOID ExTimerCallback(PEX_TIMER timer, PVOID ctx) {
+    UNREFERENCED_PARAMETER(timer);
+    if (ctx == (PVOID)0x77) KeSetEvent(&g_rt_event, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID NamedCallback(PVOID ctx, PVOID a1, PVOID a2) {
+    g_cb_value = (LONG)(ULONG_PTR)ctx + (LONG)(ULONG_PTR)a1 + (LONG)(ULONG_PTR)a2;
+}
+
+static ULONG RuntimeTest(void) {
+    ULONG mask = 0;
+
+    // printf, narrow and wide.
+    {
+        char nb[64];
+        WCHAR wb[64];
+        int n = sprintf_s(nb, sizeof nb, "%s-%d-%04x-%ls|%-4s|%+d", "a", -5, 0xab, L"w", "ab", 7);
+        int m = swprintf_s(wb, 64, L"%s|%S|%5.2d|%c", L"wide", "narrow", 7, L'z');
+        if (n == 19 && strcmp(nb, "a--5-00ab-w|ab  |+7") == 0 && m == 19 && wcscmp(wb, L"wide|narrow|   07|z") == 0)
+            mask |= T_PRINTF;
+        DbgPrint("veiltest: printf \"%s\" (%d)\n", nb, n);
+    }
+    // Counted strings and numbers.
+    {
+        ANSI_STRING a;
+        UNICODE_STRING u, hex;
+        WCHAR room[32];
+        ULONG v = 0, w = 0;
+        UNICODE_STRING dst = { 0, sizeof room, room };
+        RtlInitAnsiString(&a, "Veil");
+        if (NT_SUCCESS(RtlAnsiStringToUnicodeString(&u, &a, TRUE))) {
+            RtlAppendUnicodeStringToString(&dst, &u);
+            RtlAppendUnicodeToString(&dst, L"OS");
+            RtlFreeUnicodeString(&u);
+        }
+        RtlInitUnicodeString(&hex, L"0x1F");
+        RtlUnicodeStringToInteger(&hex, 0, &v);
+        RtlCharToInteger("-12", 10, &w);
+        if (dst.Length == 12 && wcsncmp(room, L"VeilOS", 6) == 0 && v == 31 && (LONG)w == -12) mask |= T_STRINGS;
+    }
+    // Bitmaps.
+    {
+        ULONG words[4] = { 0 };
+        RTL_BITMAP bm;
+        RtlInitializeBitMap(&bm, words, 100);
+        RtlSetBits(&bm, 10, 10);
+        if (RtlFindClearBits(&bm, 5, 8) == 20 && RtlNumberOfSetBits(&bm) == 10 && RtlTestBit(&bm, 15) &&
+            !RtlTestBit(&bm, 20) && RtlAreBitsSet(&bm, 10, 10) && RtlAreBitsClear(&bm, 20, 80) && words[0] == 0x000FFC00)
+            mask |= T_BITMAP;
+    }
+    // Generic tables: kept in order, found, deleted.
+    {
+        RTL_GENERIC_TABLE t;
+        ULONG k, *e1, *e2, *e3;
+        PVOID restart = NULL;
+        BOOLEAN isnew;
+        RtlInitializeGenericTable(&t, GtCompare, GtAlloc, GtFree, NULL);
+        k = 5; RtlInsertElementGenericTable(&t, &k, sizeof k, &isnew);
+        k = 1; RtlInsertElementGenericTable(&t, &k, sizeof k, &isnew);
+        k = 3; RtlInsertElementGenericTable(&t, &k, sizeof k, &isnew);
+        k = 3; RtlInsertElementGenericTable(&t, &k, sizeof k, &isnew); // already there
+        e1 = (ULONG *)RtlEnumerateGenericTableWithoutSplaying(&t, &restart);
+        e2 = (ULONG *)RtlEnumerateGenericTableWithoutSplaying(&t, &restart);
+        e3 = (ULONG *)RtlEnumerateGenericTableWithoutSplaying(&t, &restart);
+        k = 3;
+        if (!isnew && e1 && e2 && e3 && *e1 == 1 && *e2 == 3 && *e3 == 5 && RtlLookupElementGenericTable(&t, &k) == e2 &&
+            RtlDeleteElementGenericTable(&t, &k) && RtlNumberGenericTableElements(&t) == 2 && !RtlLookupElementGenericTable(&t, &k))
+            mask |= T_GENTABLE;
+        k = 1; RtlDeleteElementGenericTable(&t, &k);
+        k = 5; RtlDeleteElementGenericTable(&t, &k);
+    }
+    // Resources (recursive exclusive, shared inside it), fast and guarded mutexes.
+    {
+        ERESOURCE *r = (ERESOURCE *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(ERESOURCE), 'liev');
+        FAST_MUTEX fm;
+        KGUARDED_MUTEX gm;
+        BOOLEAN ok = FALSE;
+        KIRQL inside;
+        if (r) {
+            ExInitializeResourceLite(r);
+            ok = ExAcquireResourceExclusiveLite(r, TRUE) && ExAcquireResourceSharedLite(r, TRUE) &&
+                 ExIsResourceAcquiredExclusiveLite(r);
+            ExReleaseResourceLite(r);
+            ExReleaseResourceLite(r);
+            ok = ok && !ExIsResourceAcquiredExclusiveLite(r) && ExAcquireResourceSharedLite(r, TRUE) &&
+                 ExIsResourceAcquiredSharedLite(r) > 0;
+            ExReleaseResourceLite(r);
+            ExDeleteResourceLite(r);
+            ExFreePoolWithTag(r, 'liev');
+        }
+        ExInitializeFastMutex(&fm);
+        ExAcquireFastMutex(&fm);
+        inside = KeGetCurrentIrql();
+        ok = ok && !ExTryToAcquireFastMutex(&fm);
+        ExReleaseFastMutex(&fm);
+        ok = ok && inside == APC_LEVEL && KeGetCurrentIrql() == PASSIVE_LEVEL && ExTryToAcquireFastMutex(&fm);
+        ExReleaseFastMutex(&fm);
+        KeInitializeGuardedMutex(&gm);
+        KeAcquireGuardedMutex(&gm);
+        KeReleaseGuardedMutex(&gm);
+        if (ok) mask |= T_LOCKS;
+    }
+    // Lookaside lists (a freed block comes back) and SLists.
+    {
+        NPAGED_LOOKASIDE_LIST *l = (NPAGED_LOOKASIDE_LIST *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof *l, 'liev');
+        SLIST_HEADER head;
+        SLIST_ENTRY *items = (SLIST_ENTRY *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 3 * sizeof(SLIST_ENTRY), 'liev');
+        BOOLEAN ok = FALSE;
+        if (l && items) {
+            PVOID p, q;
+            ExInitializeNPagedLookasideList(l, NULL, NULL, 0, 64, 'liev', 0);
+            p = ExAllocateFromNPagedLookasideList(l);
+            ExFreeToNPagedLookasideList(l, p);
+            q = ExAllocateFromNPagedLookasideList(l);
+            ok = p && p == q;
+            ExFreeToNPagedLookasideList(l, q);
+            ExDeleteNPagedLookasideList(l);
+
+            InitializeSListHead(&head);
+            for (int i = 0; i < 3; i++) InterlockedPushEntrySList(&head, &items[i]);
+            ok = ok && ExQueryDepthSList(&head) == 3 && InterlockedPopEntrySList(&head) == &items[2] &&
+                 ExQueryDepthSList(&head) == 2;
+        }
+        if (l) ExFreePoolWithTag(l, 'liev');
+        if (items) ExFreePoolWithTag(items, 'liev');
+        if (ok) mask |= T_LOOKASIDE;
+    }
+    // Time fields, and RtlQueryRegistryValues (the Answer value DriverEntry
+    // stored, and a default for one that isn't there).
+    {
+        LARGE_INTEGER epoch;
+        TIME_FIELDS tf;
+        ULONG answer = 0, missing = 0, dflt = 99;
+        RTL_QUERY_REGISTRY_TABLE q[3];
+        NTSTATUS st;
+        epoch.QuadPart = 116444736000000000LL; // 1970-01-01, a Thursday
+        RtlTimeToTimeFields(&epoch, &tf);
+        RtlZeroMemory(q, sizeof q);
+        q[0].Flags = RTL_QUERY_REGISTRY_DIRECT;
+        q[0].Name = L"Answer";
+        q[0].EntryContext = &answer;
+        q[1].Flags = RTL_QUERY_REGISTRY_DIRECT;
+        q[1].Name = L"NotThere";
+        q[1].EntryContext = &missing;
+        q[1].DefaultType = REG_DWORD;
+        q[1].DefaultData = &dflt;
+        q[1].DefaultLength = sizeof dflt;
+        st = RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, L"veiltest\\Parameters", q, NULL, NULL);
+        if (tf.Year == 1970 && tf.Month == 1 && tf.Day == 1 && tf.Weekday == 4 && st == STATUS_SUCCESS && answer == 42 && missing == 99)
+            mask |= T_TIME_REG;
+        DbgPrint("veiltest: %d-%d-%d (weekday %d); registry query %08lx, Answer %lu\n", tf.Year, tf.Month, tf.Day, tf.Weekday, st, answer);
+    }
+    // An Ex timer, and a named callback object.
+    {
+        LARGE_INTEGER second;
+        PEX_TIMER t = ExAllocateTimer(ExTimerCallback, (PVOID)0x77, 0);
+        PCALLBACK_OBJECT cb = NULL;
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING name;
+        BOOLEAN ok = FALSE;
+        second.QuadPart = -10000000LL;
+        KeInitializeEvent(&g_rt_event, NotificationEvent, FALSE);
+        if (t) {
+            ExSetTimer(t, -100000LL, 0, NULL); // 10 ms
+            ok = KeWaitForSingleObject(&g_rt_event, Executive, KernelMode, FALSE, &second) == STATUS_SUCCESS;
+            ExDeleteTimer(t, TRUE, FALSE, NULL);
+        }
+        RtlInitUnicodeString(&name, L"\\Callback\\VeilTest");
+        InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(ExCreateCallback(&cb, &oa, TRUE, TRUE))) {
+            PVOID reg = ExRegisterCallback(cb, NamedCallback, (PVOID)1);
+            ExNotifyCallback(cb, (PVOID)10, (PVOID)100);
+            ok = ok && g_cb_value == 111;
+            ExUnregisterCallback(reg);
+            ObDereferenceObject(cb);
+        } else {
+            ok = FALSE;
+        }
+        if (ok) mask |= T_EXTIMER_CB;
+    }
+    return mask;
+}
+
 static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
     LARGE_INTEGER second, due;
     NTSTATUS st;
@@ -403,6 +615,9 @@ static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
     }
     DbgPrint("veiltest: memory: contiguous %d, I/O space %d, pool MDL %d, MDL pages %d\n", !!(g_passed & T_CONTIGUOUS),
              !!(g_passed & T_IOSPACE), !!(g_passed & T_MDL_POOL), !!(g_passed & T_MDL_PAGES));
+
+    g_passed |= RuntimeTest();
+    DbgPrint("veiltest: run-time library and executive: %lx of %x\n", g_passed & 0x3FC000, 0x3FC000);
 
     // Structured exception handling.
     {
