@@ -397,6 +397,15 @@ pub fn current_user() -> *mut UserCtx {
     })
 }
 
+/// The running thread's id (unique on its CPU's list; with the CPU, unique).
+pub fn current_id() -> u64 {
+    let cpu = crate::smp::cpu_index();
+    without_interrupts(|| {
+        let ct = CPUS[cpu].lock();
+        ct.threads.get(ct.current).map_or(0, |t| t.id) | (cpu as u64) << 48
+    })
+}
+
 /// The process the running thread belongs to (0: a kernel thread).
 pub fn current_pid() -> u32 {
     unsafe { (*current_user()).pid }

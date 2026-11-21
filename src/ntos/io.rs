@@ -44,6 +44,7 @@ pub const IRP_USER_IOSB: usize = 0x48;
 pub const IRP_USER_EVENT: usize = 0x50;
 pub const IRP_USER_BUFFER: usize = 0x70;
 pub const IRP_CURRENT_STACK: usize = 0xB8;
+pub const IRP_ORIGINAL_FILE_OBJECT: usize = 0xC0;
 
 // IO_STACK_LOCATION (0x48 bytes)
 pub const STACK_SIZE: usize = 0x48;
@@ -51,12 +52,23 @@ pub const SL_MAJOR: usize = 0x00;
 pub const SL_CONTROL: usize = 0x03;
 pub const SL_PARAMETERS: usize = 0x08;
 pub const SL_DEVICE_OBJECT: usize = 0x28;
+pub const SL_FILE_OBJECT: usize = 0x30;
 pub const SL_COMPLETION_ROUTINE: usize = 0x38;
 pub const SL_CONTEXT: usize = 0x40;
 // Parameters.DeviceIoControl
 pub const SL_OUTPUT_LENGTH: usize = 0x08;
 pub const SL_INPUT_LENGTH: usize = 0x10;
 pub const SL_IOCTL_CODE: usize = 0x18;
+pub const SL_TYPE3_INPUT: usize = 0x20;
+
+// FILE_OBJECT (0xD8 bytes)
+pub const FO_SIZE: usize = 0xD8;
+pub const FO_DEVICE_OBJECT: usize = 0x08;
+pub const FO_FILE_NAME: usize = 0x58;
+
+const METHOD_BUFFERED: u32 = 0;
+const METHOD_NEITHER: u32 = 3;
+const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005u32 as i32;
 
 const SL_PENDING_RETURNED: u8 = 0x01;
 const SL_INVOKE_ON_CANCEL: u8 = 0x20;
@@ -67,6 +79,7 @@ const STATUS_CANCELLED: NtStatus = 0xC000_0120u32 as i32;
 
 pub const IRP_MJ_CREATE: u8 = 0x00;
 pub const IRP_MJ_CLOSE: u8 = 0x02;
+pub const IRP_MJ_CLEANUP: u8 = 0x12;
 pub const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
 
 unsafe fn rd<T: Copy>(base: *mut u8, off: usize) -> T {
@@ -283,56 +296,193 @@ pub extern "win64" fn IofCompleteRequest(irp: *mut u8, _boost: i8) {
     }
 }
 
-/// Send a METHOD_BUFFERED device control to `dev` and wait for it: the
-/// kernel's own test path (the terminal's DRIVER IOCTL), the way
-/// NtDeviceIoControlFile will once Win32 programs can open devices.
-pub fn device_control(dev: *mut u8, code: u32, input: &[u8], out_len: usize) -> (NtStatus, Vec<u8>) {
+/// Send an IRP to `dev` (for `file`, a FILE_OBJECT or null) and wait for it
+/// to complete. `setup` fills the driver's stack location and the IRP's
+/// buffer fields; `finish` reads what the driver left before the IRP is
+/// freed. Returns the final status and IoStatus.Information.
+pub fn send(
+    dev: *mut u8,
+    file: *mut u8,
+    major: u8,
+    setup: impl FnOnce(*mut u8, *mut u8),
+    finish: impl FnOnce(*mut u8),
+) -> (NtStatus, u64) {
     unsafe {
         let irp = IoAllocateIrp(rd(dev, DEV_STACK_SIZE), 0);
-        let buf = pool::alloc_tracked(input.len().max(out_len).max(1));
         let ev = pool::alloc_tracked(0x18);
         let iosb = pool::alloc_tracked(16);
-        if irp.is_null() || buf.is_null() || ev.is_null() || iosb.is_null() {
-            return (STATUS_NO_MEMORY, Vec::new());
+        if irp.is_null() || ev.is_null() || iosb.is_null() {
+            pool::free_tracked(irp);
+            pool::free_tracked(ev);
+            pool::free_tracked(iosb);
+            return (STATUS_NO_MEMORY, 0);
         }
-        core::ptr::copy_nonoverlapping(input.as_ptr(), buf, input.len());
         super::ke::KeInitializeEvent(ev, 0, 0);
-        wr(irp, IRP_SYSTEM_BUFFER, buf);
         wr(irp, IRP_USER_EVENT, ev);
         wr(irp, IRP_USER_IOSB, iosb);
+        wr(irp, IRP_ORIGINAL_FILE_OBJECT, file);
         let sl = rd::<*mut u8>(irp, IRP_CURRENT_STACK).sub(STACK_SIZE);
-        wr::<u8>(sl, SL_MAJOR, IRP_MJ_DEVICE_CONTROL);
-        wr::<u32>(sl, SL_OUTPUT_LENGTH, out_len as u32);
-        wr::<u32>(sl, SL_INPUT_LENGTH, input.len() as u32);
-        wr::<u32>(sl, SL_IOCTL_CODE, code);
+        wr::<u8>(sl, SL_MAJOR, major);
+        wr(sl, SL_FILE_OBJECT, file);
+        setup(irp, sl);
         let mut status = IofCallDriver(dev, irp);
         if status == STATUS_PENDING {
             super::ke::KeWaitForSingleObject(ev, 0, 0, 0, core::ptr::null());
             status = rd(iosb, 0);
         }
-        let info = (rd::<u64>(irp, IRP_INFORMATION) as usize).min(out_len);
-        let out = core::slice::from_raw_parts(buf, info).to_vec();
+        let info = rd::<u64>(irp, IRP_INFORMATION);
+        finish(irp);
         IoFreeIrp(irp);
-        pool::free_tracked(buf);
         pool::free_tracked(ev);
         pool::free_tracked(iosb);
-        (status, out)
+        (status, info)
     }
 }
 
-/// IRP_MJ_CREATE or IRP_MJ_CLOSE to `dev` (no file object yet: W1).
-pub fn create_close(dev: *mut u8, major: u8) -> NtStatus {
-    unsafe {
-        let irp = IoAllocateIrp(rd(dev, DEV_STACK_SIZE), 0);
-        if irp.is_null() {
-            return STATUS_NO_MEMORY;
-        }
-        let sl = rd::<*mut u8>(irp, IRP_CURRENT_STACK).sub(STACK_SIZE);
-        wr::<u8>(sl, SL_MAJOR, major);
-        let status = IofCallDriver(dev, irp);
-        IoFreeIrp(irp);
-        status
+/// A METHOD_BUFFERED device control from the kernel itself (the terminal's
+/// DRIVER IOCTL): the reply, at most `out_len` bytes.
+pub fn device_control(dev: *mut u8, code: u32, input: &[u8], out_len: usize) -> (NtStatus, Vec<u8>) {
+    let buf = pool::alloc_tracked(input.len().max(out_len).max(1));
+    if buf.is_null() {
+        return (STATUS_NO_MEMORY, Vec::new());
     }
+    unsafe { core::ptr::copy_nonoverlapping(input.as_ptr(), buf, input.len()) };
+    let mut out = Vec::new();
+    let (status, _) = send(
+        dev,
+        core::ptr::null_mut(),
+        IRP_MJ_DEVICE_CONTROL,
+        |irp, sl| unsafe {
+            wr(irp, IRP_SYSTEM_BUFFER, buf);
+            wr::<u32>(sl, SL_OUTPUT_LENGTH, out_len as u32);
+            wr::<u32>(sl, SL_INPUT_LENGTH, input.len() as u32);
+            wr::<u32>(sl, SL_IOCTL_CODE, code);
+        },
+        |irp| unsafe {
+            let info = (rd::<u64>(irp, IRP_INFORMATION) as usize).min(out_len);
+            out = core::slice::from_raw_parts(buf, info).to_vec();
+        },
+    );
+    pool::free_tracked(buf);
+    (status, out)
+}
+
+/// IRP_MJ_CREATE or IRP_MJ_CLOSE to `dev` with no file object (the
+/// terminal's DRIVER OPEN).
+pub fn create_close(dev: *mut u8, major: u8) -> NtStatus {
+    send(dev, core::ptr::null_mut(), major, |_, _| {}, |_| {}).0
+}
+
+// -----| device handles for Windows programs |-----
+
+/// A program's handle to a driver's device: CreateFile("\\.\Name") made
+/// IRP_MJ_CREATE with this FILE_OBJECT; closing the last handle sends
+/// IRP_MJ_CLEANUP and IRP_MJ_CLOSE and frees it.
+pub struct DeviceHandle {
+    dev: usize,
+    file: usize,
+}
+
+// The FILE_OBJECT and device are pool memory the driver owns jointly with
+// the I/O manager; the handle only passes the pointers along.
+unsafe impl Send for DeviceHandle {}
+unsafe impl Sync for DeviceHandle {}
+
+impl Drop for DeviceHandle {
+    fn drop(&mut self) {
+        let (dev, file) = (self.dev as *mut u8, self.file as *mut u8);
+        let _ = send(dev, file, IRP_MJ_CLEANUP, |_, _| {}, |_| {});
+        let _ = send(dev, file, IRP_MJ_CLOSE, |_, _| {}, |_| {});
+        unsafe { pool::free_tracked(rd(file, FO_FILE_NAME + 8)) };
+        pool::free_tracked(file);
+    }
+}
+
+/// NtCreateFile on a device name ("\??\Name", "\Device\Name"): None when no
+/// driver made a device of that name (the name is then a file path).
+pub fn open_device(nt_name: &str) -> Option<Result<DeviceHandle, NtStatus>> {
+    let dev = device_by_name(nt_name)?;
+    let file = pool::alloc_tracked(FO_SIZE);
+    if file.is_null() {
+        return Some(Err(STATUS_NO_MEMORY));
+    }
+    unsafe {
+        wr::<u16>(file, 0, 5); // IO_TYPE_FILE
+        wr::<u16>(file, 2, FO_SIZE as u16);
+        wr(file, FO_DEVICE_OBJECT, dev);
+        // FileName: what follows the device name (nothing here).
+        let name_buf = pool::alloc_tracked(2);
+        wr::<u16>(file, FO_FILE_NAME + 2, 2);
+        wr(file, FO_FILE_NAME + 8, name_buf);
+    }
+    let (status, _) = send(dev, file, IRP_MJ_CREATE, |_, _| {}, |_| {});
+    if status < 0 {
+        unsafe { pool::free_tracked(rd(file, FO_FILE_NAME + 8)) };
+        pool::free_tracked(file);
+        return Some(Err(status));
+    }
+    Some(Ok(DeviceHandle { dev: dev as usize, file: file as usize }))
+}
+
+/// NtDeviceIoControlFile for a program. METHOD_BUFFERED copies through a
+/// pool buffer; METHOD_NEITHER hands the driver the program's own
+/// pointers, which it reads with SMAP lifted, as Windows drivers expect;
+/// the direct methods need MDLs (not yet).
+pub fn program_device_control(h: &DeviceHandle, iosb: u64, code: u32, input: u64, in_len: usize, output: u64, out_len: usize) -> NtStatus {
+    use crate::nt_file::ptr_ok;
+    let (dev, file) = (h.dev as *mut u8, h.file as *mut u8);
+    if (in_len > 0 && !ptr_ok(input, in_len)) || (out_len > 0 && !ptr_ok(output, out_len)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let (status, info) = match code & 3 {
+        METHOD_BUFFERED => {
+            let buf = pool::alloc_tracked(in_len.max(out_len).max(1));
+            if buf.is_null() {
+                return STATUS_NO_MEMORY;
+            }
+            crate::smp::user_access(|| unsafe { core::ptr::copy_nonoverlapping(input as *const u8, buf, in_len) });
+            let r = send(
+                dev,
+                file,
+                IRP_MJ_DEVICE_CONTROL,
+                |irp, sl| unsafe {
+                    wr(irp, IRP_SYSTEM_BUFFER, buf);
+                    wr::<u32>(sl, SL_OUTPUT_LENGTH, out_len as u32);
+                    wr::<u32>(sl, SL_INPUT_LENGTH, in_len as u32);
+                    wr::<u32>(sl, SL_IOCTL_CODE, code);
+                },
+                |irp| unsafe {
+                    let n = (rd::<u64>(irp, IRP_INFORMATION) as usize).min(out_len);
+                    crate::smp::user_access(|| core::ptr::copy_nonoverlapping(buf, output as *mut u8, n));
+                },
+            );
+            pool::free_tracked(buf);
+            r
+        }
+        METHOD_NEITHER => crate::smp::user_access(|| {
+            send(
+                dev,
+                file,
+                IRP_MJ_DEVICE_CONTROL,
+                |irp, sl| unsafe {
+                    wr::<u64>(irp, IRP_USER_BUFFER, output);
+                    wr::<u32>(sl, SL_OUTPUT_LENGTH, out_len as u32);
+                    wr::<u32>(sl, SL_INPUT_LENGTH, in_len as u32);
+                    wr::<u32>(sl, SL_IOCTL_CODE, code);
+                    wr::<u64>(sl, SL_TYPE3_INPUT, input);
+                },
+                |_| {},
+            )
+        }),
+        _ => (super::STATUS_NOT_IMPLEMENTED, 0),
+    };
+    if ptr_ok(iosb, 16) {
+        crate::smp::user_access(|| unsafe {
+            (iosb as *mut u64).write(status as u32 as u64);
+            (iosb as *mut u64).add(1).write(info);
+        });
+    }
+    status
 }
 
 // -----| processes and threads, as far as W1's drivers ask |-----

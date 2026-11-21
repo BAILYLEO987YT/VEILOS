@@ -288,6 +288,22 @@ pub fn create_file(proc: &crate::process::Process, out: u64, access: u64, oa: u6
         return status::ACCESS_VIOLATION;
     }
     let Some(name) = read_object_name(oa) else { return status::ACCESS_VIOLATION };
+    // A device a Windows driver made ("\??\Name" from CreateFile("\\.\Name"),
+    // or "\Device\Name"): IRP_MJ_CREATE to its driver.
+    if let Some(r) = crate::ntos::io::open_device(&name) {
+        return match r {
+            Ok(dev) => {
+                let inherit = unsafe { (*(oa as *const ObjectAttributes)).attributes } & 2 != 0; // OBJ_INHERIT
+                let kept = if inherit { 0 } else { crate::nt_objects::HANDLE_NO_INHERIT };
+                let obj = crate::nt_objects::KernelObjectRef::Device(alloc::sync::Arc::new(dev));
+                let h = proc.handles.lock().allocate_ref(obj, access, kept);
+                unsafe { *(out as *mut u64) = h as u64 };
+                write_iosb(iosb, status::SUCCESS, file::OPENED);
+                status::SUCCESS
+            }
+            Err(s) => s,
+        };
+    }
     // OBJECT_ATTRIBUTES.RootDirectory: the name is relative to that directory.
     let root = unsafe { (*(oa as *const ObjectAttributes)).root_directory } as u64;
     let path = if root != 0 {

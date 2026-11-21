@@ -1038,6 +1038,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     crate::debugger::profiler_tick(tick);
     crate::audio::tick(tick);
     crate::usb::tick(tick);
+    crate::ntos::tick(crate::time::now_ms());
     crate::power::poll_button();
     crate::entropy::stir(stack_frame.instruction_pointer.as_u64());
 

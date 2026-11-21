@@ -193,6 +193,33 @@ pub unsafe extern "system" fn CreateFileW(name: *const u16, access: u32, _share:
         crate::SetLastError(0);
         return h;
     }
+    // "\\.\Name": a device a Windows driver made (\DosDevices\Name), opened
+    // by its NT name "\??\Name"; full_path would make it a file on C:.
+    let bs = b'\\' as u16;
+    if name.len() > 4 && name[0] == bs && name[1] == bs && name[2] == b'.' as u16 && name[3] == bs {
+        let mut nt = WBuf::new();
+        nt.push_str("\\??\\");
+        nt.extend(&name[4..]);
+        let us = UnicodeString { length: (nt.len * 2) as u16, maximum_length: (nt.len * 2 + 2) as u16, buffer: nt.as_ptr() };
+        let oa = ObjectAttributes {
+            length: core::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: 0,
+            object_name: &us,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: 0,
+            security_quality_of_service: 0,
+        };
+        let mut h: Handle = 0;
+        let mut iosb = IoStatusBlock::default();
+        let s = unsafe { crate::NtCreateFile(&mut h, access | SYNCHRONIZE, &oa, &mut iosb, core::ptr::null(), 0, 7, nf::OPEN, 0, 0, 0) };
+        if !status::is_success(s) {
+            fail(s);
+            return INVALID_HANDLE_VALUE;
+        }
+        crate::process::apply_inherit(h, security);
+        crate::SetLastError(0);
+        return h;
+    }
     let disposition = match creation {
         1 => nf::CREATE,       // CREATE_NEW
         2 => nf::OVERWRITE_IF, // CREATE_ALWAYS

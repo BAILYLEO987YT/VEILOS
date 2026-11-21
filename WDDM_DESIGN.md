@@ -142,13 +142,48 @@ created); `DRIVER OPEN` sends create and close; `DRIVER IOCTL` gets its
 echo reversed, its counters, and `STATUS_INVALID_DEVICE_REQUEST` for an
 unknown code; `DRIVER UNLOAD` runs its unload routine.
 
-Still to do in W1: the rest of the census list; Win32 programs reaching
-devices (`CreateFile("\\.\VeilTest")`, `DeviceIoControl` → IRPs with file
-objects); SEH in drivers (`__C_specific_handler` with the image's `.pdata`);
-per-section protection; freeing an unloaded image; system threads, DPCs,
-timers and work items; the registry for drivers (`ZwOpenKey` & co. on
-VEILOS's registry). The system time drivers see is VEILOS's wall clock,
-which is 1970 until NTP has answered.
+### W1 second slice (2026-11-21)
+
+124 exports now. Added:
+- **Windows programs reach drivers.** `CreateFile("\\.\Name")` opens a
+  device: `NtCreateFile` sees a device name, sends IRP_MJ_CREATE with a
+  real `FILE_OBJECT`, and the handle sends IRP_MJ_CLEANUP and IRP_MJ_CLOSE
+  when it closes. `DeviceIoControl` is a new system call,
+  `NtDeviceIoControlFile`: METHOD_BUFFERED goes through a pool buffer;
+  METHOD_NEITHER hands the driver the program's own pointers, with SMAP
+  lifted.
+- **System threads** (`PsCreateSystemThread`, waitable, and
+  `PsTerminateSystemThread`).
+- **DPCs**: run at once, at DISPATCH_LEVEL, when queued below it; at the
+  next 1 ms tick otherwise.
+- **Timers**: one-shot and periodic, checked every tick, signalling
+  waiters and queueing their DPC.
+- **Work items**: `IoQueueWorkItem(Ex)` and `ExQueueWorkItem`, each on a
+  thread of its own.
+- **Registry**: `Zw*Key` and `RtlWriteRegistryValue` on VEILOS's registry
+  through kernel handles. A driver's Services key exists before its
+  `DriverEntry` runs.
+
+K1 grew to match. Its driver self-tests all of the above in `DriverEntry`,
+and `k1test.exe`, an ordinary Windows program, opens `\\.\VeilTest` and
+checks the following through `DeviceIoControl`: buffered and
+METHOD_NEITHER IOCTLs, the create on its handle, the self-test results,
+and an unknown code failing with `ERROR_INVALID_FUNCTION`. In QEMU: all
+passed (self-test `1f of 1f`, `k1test: 0 failed`).
+
+Still to do in W1:
+- the rest of the census list;
+- SEH in drivers (`__C_specific_handler` with the image's `.pdata`);
+- per-section protection;
+- freeing an unloaded image;
+- METHOD_IN/OUT_DIRECT (MDLs);
+- `RtlQueryRegistryValues`;
+- waits inside a system call. These run with interrupts off, so a driver
+  that blocks in an IOCTL waits for a tick that doesn't come on that CPU.
+
+Opening a device after its driver unloads fails with `ERROR_INVALID_NAME`
+where Windows says `ERROR_FILE_NOT_FOUND`. The system time drivers see is
+VEILOS's wall clock, which is 1970 until NTP has answered.
 
 W1 to W3 need no GPU and run in QEMU. From W4 on, testing is on real
 hardware only: QEMU on a Windows host can't pass a GPU through. Logs go to

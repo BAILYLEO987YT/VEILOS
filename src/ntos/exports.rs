@@ -1,6 +1,6 @@
 // What VEILOS's ntoskrnl.exe and hal.dll export to drivers: name -> address.
 
-use super::{io, ke, pool, rtl};
+use super::{cm, dpc, io, ke, ob, pool, ps, rtl};
 
 // -----| pool |-----
 
@@ -77,6 +77,19 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
                 rtl::memcpy, rtl::memmove, rtl::memset, rtl::memcmp, rtl::strlen, rtl::wcslen,
                 rtl::strcmp, rtl::strncmp, rtl::_stricmp, rtl::wcscmp, rtl::__chkstk,
                 rtl::DbgPrint, rtl::DbgPrintEx, rtl::vDbgPrintEx,
+                // DPCs, timers, threads, work items
+                dpc::KeInitializeDpc, dpc::KeInitializeThreadedDpc, dpc::KeSetImportanceDpc, dpc::KeInsertQueueDpc,
+                dpc::KeRemoveQueueDpc, dpc::KeFlushQueuedDpcs,
+                dpc::KeInitializeTimer, dpc::KeInitializeTimerEx, dpc::KeSetTimer, dpc::KeSetTimerEx,
+                dpc::KeSetCoalescableTimer, dpc::KeCancelTimer, dpc::KeReadStateTimer,
+                ps::PsCreateSystemThread, ps::PsTerminateSystemThread, ps::PsIsSystemThread,
+                ps::IoSizeofWorkItem, ps::IoAllocateWorkItem, ps::IoInitializeWorkItem, ps::IoUninitializeWorkItem,
+                ps::IoFreeWorkItem, ps::IoQueueWorkItem, ps::IoQueueWorkItemEx, ps::ExQueueWorkItem,
+                // handles, objects, registry
+                ob::ZwClose, ob::ObReferenceObjectByHandle, ob::ObfReferenceObject, ob::ObfDereferenceObject,
+                ob::ObDereferenceObjectDeferDelete,
+                cm::ZwCreateKey, cm::ZwOpenKey, cm::ZwQueryValueKey, cm::ZwSetValueKey, cm::ZwDeleteValueKey,
+                cm::ZwDeleteKey, cm::RtlWriteRegistryValue,
             );
             None
         }

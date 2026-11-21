@@ -63,6 +63,44 @@ static_assert(SL_PENDING_RETURNED == 0x01 && SL_INVOKE_ON_CANCEL == 0x20 &&
               SL_INVOKE_ON_SUCCESS == 0x40 && SL_INVOKE_ON_ERROR == 0x80, "SL_ flags");
 static_assert(IRP_MJ_CREATE == 0 && IRP_MJ_CLOSE == 2 && IRP_MJ_DEVICE_CONTROL == 0x0E, "IRP_MJ_");
 
+// io.rs: FILE_OBJECT, and the IRP and stack location fields for it
+SIZE(FILE_OBJECT, 0xD8);
+AT(FILE_OBJECT, DeviceObject, 0x08);
+AT(FILE_OBJECT, FileName, 0x58);
+AT(IRP, Tail.Overlay.OriginalFileObject, 0xC0);
+AT(IO_STACK_LOCATION, FileObject, 0x30);
+AT(IO_STACK_LOCATION, Parameters.DeviceIoControl.Type3InputBuffer, 0x20);
+static_assert(IRP_MJ_CLEANUP == 0x12, "IRP_MJ_CLEANUP");
+static_assert(METHOD_BUFFERED == 0 && METHOD_NEITHER == 3, "METHOD_");
+
+// dpc.rs: KDPC and KTIMER
+SIZE(KDPC, 0x40);
+AT(KDPC, DeferredRoutine, 0x18);
+AT(KDPC, DeferredContext, 0x20);
+AT(KDPC, SystemArgument1, 0x28);
+AT(KDPC, SystemArgument2, 0x30);
+AT(KDPC, DpcData, 0x38);
+SIZE(KTIMER, 0x40);
+AT(KTIMER, DueTime, 0x18);
+AT(KTIMER, Dpc, 0x30);
+AT(KTIMER, Period, 0x3C);
+
+// ps.rs: WORK_QUEUE_ITEM
+AT(WORK_QUEUE_ITEM, WorkerRoutine, 0x10);
+AT(WORK_QUEUE_ITEM, Parameter, 0x18);
+
+// cm.rs, ob.rs: OBJECT_ATTRIBUTES, key value information
+AT(OBJECT_ATTRIBUTES, RootDirectory, 0x08);
+AT(OBJECT_ATTRIBUTES, ObjectName, 0x10);
+AT(KEY_VALUE_PARTIAL_INFORMATION, Type, 4);
+AT(KEY_VALUE_PARTIAL_INFORMATION, DataLength, 8);
+AT(KEY_VALUE_PARTIAL_INFORMATION, Data, 12);
+AT(KEY_VALUE_FULL_INFORMATION, DataOffset, 8);
+AT(KEY_VALUE_FULL_INFORMATION, NameLength, 16);
+AT(KEY_VALUE_FULL_INFORMATION, Name, 20);
+AT(KEY_VALUE_BASIC_INFORMATION, NameLength, 8);
+AT(KEY_VALUE_BASIC_INFORMATION, Name, 12);
+
 // ke.rs: dispatcher objects, queued spinlock handle
 SIZE(DISPATCHER_HEADER, 0x18);
 AT(DISPATCHER_HEADER, SignalState, 0x04);

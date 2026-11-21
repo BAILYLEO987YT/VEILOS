@@ -221,6 +221,8 @@ pub fn load(path: &str) -> Result<(String, NtStatus), String> {
         return Err(String::from("no memory for the driver object"));
     }
     let registry = pool_unicode(&format!("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{}", name));
+    // Its Services key, which drivers read their settings from.
+    let _ = crate::nt_registry::kernel_key(&format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{}", name), true);
     let drv_name = pool_unicode(&format!("\\Driver\\{}", name));
     unsafe {
         (drv as *mut u16).write(4); // IO_TYPE_DRIVER

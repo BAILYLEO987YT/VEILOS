@@ -26,3 +26,18 @@ echo "layout: every offset matches the WDK"
     build/veiltest.obj "/LIBPATH:$KITS/Lib/$VER/km/x64" ntoskrnl.lib hal.lib /OUT:build/veiltest.sys
 cp build/veiltest.sys "$OUT/"
 echo "built: veiltest.sys"
+
+# k1test.exe: the Windows program that opens \.\VeilTest (MSVC, /MD, like
+# the other win32/tests). It needs the driver, so it has no Windows run to
+# compare with.
+VC="C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231"
+KIT_VER=10.0.26100.0
+unset INCLUDE
+"$VC/bin/Hostx64/x64/cl.exe" /nologo /c /O1 /MD /W3 /GS- /D_CRT_SECURE_NO_WARNINGS \
+    "/I$VC/include" "/I$KITS/Include/$KIT_VER/ucrt" "/I$KITS/Include/$KIT_VER/um" "/I$KITS/Include/$KIT_VER/shared" \
+    k1test.c /Fobuild/k1test.obj
+"$LLVM/lld-link.exe" /nologo /MACHINE:X64 /SUBSYSTEM:CONSOLE build/k1test.obj "/LIBPATH:$VC/lib/x64" \
+    "/LIBPATH:$KITS/Lib/$KIT_VER/ucrt/x64" "/LIBPATH:$KITS/Lib/$KIT_VER/um/x64" \
+    msvcrt.lib vcruntime.lib ucrt.lib kernel32.lib /OUT:build/k1test.exe
+cp build/k1test.exe "$OUT/"
+echo "built: k1test.exe"

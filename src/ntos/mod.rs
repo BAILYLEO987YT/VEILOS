@@ -18,6 +18,8 @@
 //     IoCallDriver / IoCompleteRequest, device names and symbolic links.
 //   * `rtl`: strings, version, the C runtime functions ntoskrnl exports,
 //     DbgPrint (to the serial log).
+//   * `dpc`: DPCs and timers; `ps`: system threads and work items.
+//   * `ob`: kernel handles; `cm`: the registry (Zw*Key on nt_registry).
 //   * `exports`: the name -> address tables of ntoskrnl.exe and hal.dll.
 //
 // The structures drivers read directly (DRIVER_OBJECT, DEVICE_OBJECT, IRP,
@@ -34,11 +36,15 @@
 // Exported functions keep the names drivers link against.
 #![allow(non_snake_case)]
 
+pub mod cm;
+pub mod dpc;
 pub mod exports;
 pub mod image;
 pub mod io;
 pub mod ke;
+pub mod ob;
 pub mod pool;
+pub mod ps;
 pub mod rtl;
 
 pub type NtStatus = i32;
@@ -60,4 +66,9 @@ pub const STATUS_INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009Au32 as i32;
 /// the process is made, so the region's tables must already be there.
 pub fn init() {
     pool::init();
+}
+
+/// From the BSP's 1 ms timer interrupt: due timers and queued DPCs.
+pub fn tick(now_ms: u64) {
+    dpc::tick(now_ms);
 }

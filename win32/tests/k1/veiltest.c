@@ -12,6 +12,16 @@
 #define IOCTL_VEIL_ECHO  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_VEIL_ADD   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_VEIL_STATS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_VEIL_SELFTEST CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_VEIL_NEITHER  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_NEITHER, FILE_ANY_ACCESS)
+
+// Self-test results (bits), run in DriverEntry and reported by SELFTEST.
+#define T_REGISTRY 0x01
+#define T_THREAD   0x02
+#define T_DPC      0x04
+#define T_TIMER    0x08
+#define T_WORKITEM 0x10
+#define T_ALL      0x1F
 
 typedef struct _VEIL_EXT {
     KSPIN_LOCK Lock;
@@ -20,6 +30,13 @@ typedef struct _VEIL_EXT {
 
 static PVOID g_scratch;
 static UNICODE_STRING g_link;
+static ULONG g_passed;
+
+static KEVENT g_go, g_done;
+static volatile LONG g_thread_value, g_ticks;
+static volatile KIRQL g_dpc_irql = 0xFF;
+static KDPC g_dpc, g_timer_dpc;
+static KTIMER g_timer;
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD VeilUnload;
@@ -72,6 +89,21 @@ NTSTATUS VeilIoctl(PDEVICE_OBJECT dev, PIRP irp) {
         info = sizeof a;
         break;
     }
+    case IOCTL_VEIL_SELFTEST:
+        if (out < sizeof(ULONG)) { st = STATUS_BUFFER_TOO_SMALL; break; }
+        RtlCopyMemory(buf, &g_passed, sizeof g_passed);
+        info = sizeof g_passed;
+        break;
+    case IOCTL_VEIL_NEITHER: {
+        // The caller's own buffers: the sum of its input bytes, as a ULONG.
+        UCHAR *src = (UCHAR *)sl->Parameters.DeviceIoControl.Type3InputBuffer;
+        ULONG sum = 0;
+        if (out < sizeof(ULONG) || !irp->UserBuffer) { st = STATUS_BUFFER_TOO_SMALL; break; }
+        for (ULONG i = 0; i < in; i++) sum += src[i];
+        *(ULONG *)irp->UserBuffer = sum;
+        info = sizeof sum;
+        break;
+    }
     case IOCTL_VEIL_STATS:
         if (out < 3 * sizeof(ULONG)) { st = STATUS_BUFFER_TOO_SMALL; break; }
         RtlCopyMemory(buf, &x->Creates, 3 * sizeof(ULONG));
@@ -85,6 +117,111 @@ NTSTATUS VeilIoctl(PDEVICE_OBJECT dev, PIRP irp) {
     irp->IoStatus.Information = info;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return st;
+}
+
+static VOID VeilThread(PVOID ctx) {
+    UNREFERENCED_PARAMETER(ctx);
+    KeWaitForSingleObject(&g_go, Executive, KernelMode, FALSE, NULL);
+    g_thread_value = 7;
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static VOID VeilDpc(PKDPC dpc, PVOID ctx, PVOID a1, PVOID a2) {
+    UNREFERENCED_PARAMETER(dpc); UNREFERENCED_PARAMETER(ctx); UNREFERENCED_PARAMETER(a1); UNREFERENCED_PARAMETER(a2);
+    g_dpc_irql = KeGetCurrentIrql();
+}
+
+static VOID VeilTimerDpc(PKDPC dpc, PVOID ctx, PVOID a1, PVOID a2) {
+    UNREFERENCED_PARAMETER(dpc); UNREFERENCED_PARAMETER(ctx); UNREFERENCED_PARAMETER(a1); UNREFERENCED_PARAMETER(a2);
+    if (++g_ticks == 3) KeSetEvent(&g_done, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID VeilWork(PDEVICE_OBJECT dev, PVOID ctx) {
+    UNREFERENCED_PARAMETER(dev);
+    DbgPrint("veiltest: work item at irql %d, context %p\n", KeGetCurrentIrql(), ctx);
+    KeSetEvent(&g_done, IO_NO_INCREMENT, FALSE);
+}
+
+static void SelfTest(PUNICODE_STRING reg, PDEVICE_OBJECT dev) {
+    LARGE_INTEGER second, due;
+    NTSTATUS st;
+    second.QuadPart = -10000000LL;
+
+    // Registry: a Parameters key under our Services key, a value set and read back.
+    {
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING sub, val;
+        HANDLE svc, params;
+        ULONG answer = 42, disp = 0, got = 0;
+        UCHAR info[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 8];
+        InitializeObjectAttributes(&oa, reg, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        st = ZwOpenKey(&svc, KEY_ALL_ACCESS, &oa);
+        if (NT_SUCCESS(st)) {
+            RtlInitUnicodeString(&sub, L"Parameters");
+            InitializeObjectAttributes(&oa, &sub, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, svc, NULL);
+            st = ZwCreateKey(&params, KEY_ALL_ACCESS, &oa, 0, NULL, 0, &disp);
+            if (NT_SUCCESS(st)) {
+                RtlInitUnicodeString(&val, L"Answer");
+                ZwSetValueKey(params, &val, 0, REG_DWORD, &answer, sizeof answer);
+                st = ZwQueryValueKey(params, &val, KeyValuePartialInformation, info, sizeof info, &got);
+                if (NT_SUCCESS(st) && ((PKEY_VALUE_PARTIAL_INFORMATION)info)->Type == REG_DWORD &&
+                    *(ULONG *)((PKEY_VALUE_PARTIAL_INFORMATION)info)->Data == 42)
+                    g_passed |= T_REGISTRY;
+                DbgPrint("veiltest: registry key %s, value read back %08lx\n", disp == REG_CREATED_NEW_KEY ? "created" : "opened", st);
+                ZwClose(params);
+            }
+            ZwClose(svc);
+        }
+        RtlWriteRegistryValue(RTL_REGISTRY_SERVICES, L"veiltest\\Parameters", L"Greeting", REG_SZ, L"hello", 12);
+    }
+
+    // A system thread: waits for g_go, sets a value, ends; we wait on its object.
+    {
+        HANDLE th;
+        PVOID obj;
+        KeInitializeEvent(&g_go, SynchronizationEvent, FALSE);
+        st = PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL, NULL, NULL, VeilThread, NULL);
+        if (NT_SUCCESS(st) && NT_SUCCESS(ObReferenceObjectByHandle(th, SYNCHRONIZE, NULL, KernelMode, &obj, NULL))) {
+            KeSetEvent(&g_go, IO_NO_INCREMENT, FALSE);
+            st = KeWaitForSingleObject(obj, Executive, KernelMode, FALSE, &second);
+            if (st == STATUS_SUCCESS && g_thread_value == 7) g_passed |= T_THREAD;
+            DbgPrint("veiltest: system thread wait %08lx, value %ld\n", st, g_thread_value);
+            ObDereferenceObject(obj);
+            ZwClose(th);
+        }
+    }
+
+    // A DPC queued at PASSIVE_LEVEL runs at once, at DISPATCH_LEVEL.
+    KeInitializeDpc(&g_dpc, VeilDpc, NULL);
+    KeInsertQueueDpc(&g_dpc, NULL, NULL);
+    KeFlushQueuedDpcs();
+    if (g_dpc_irql == DISPATCH_LEVEL) g_passed |= T_DPC;
+    DbgPrint("veiltest: DPC ran at irql %d\n", g_dpc_irql);
+
+    // A periodic timer (10 ms, then every 5 ms) whose DPC sets g_done on its third run.
+    KeInitializeEvent(&g_done, NotificationEvent, FALSE);
+    KeInitializeDpc(&g_timer_dpc, VeilTimerDpc, NULL);
+    KeInitializeTimer(&g_timer);
+    due.QuadPart = -100000LL;
+    KeSetTimerEx(&g_timer, due, 5, &g_timer_dpc);
+    st = KeWaitForSingleObject(&g_done, Executive, KernelMode, FALSE, &second);
+    KeCancelTimer(&g_timer);
+    if (st == STATUS_SUCCESS && g_ticks >= 3) g_passed |= T_TIMER;
+    DbgPrint("veiltest: timer wait %08lx after %ld DPC runs\n", st, g_ticks);
+
+    // A work item, run on a thread of its own at PASSIVE_LEVEL.
+    {
+        PIO_WORKITEM w = IoAllocateWorkItem(dev);
+        KeClearEvent(&g_done);
+        if (w) {
+            IoQueueWorkItem(w, VeilWork, DelayedWorkQueue, (PVOID)(ULONG_PTR)0x1234);
+            st = KeWaitForSingleObject(&g_done, Executive, KernelMode, FALSE, &second);
+            if (st == STATUS_SUCCESS) g_passed |= T_WORKITEM;
+            DbgPrint("veiltest: work item wait %08lx\n", st);
+            IoFreeWorkItem(w);
+        }
+    }
+    DbgPrint("veiltest: self-test %lx of %x\n", g_passed, T_ALL);
 }
 
 void VeilUnload(PDRIVER_OBJECT drv) {
@@ -147,6 +284,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg) {
     drv->MajorFunction[IRP_MJ_DEVICE_CONTROL] = VeilIoctl;
     drv->DriverUnload = VeilUnload;
     dev->Flags &= ~DO_DEVICE_INITIALIZING;
+    SelfTest(reg, dev);
     DbgPrint("veiltest: \\Device\\VeilTest ready (stack size %d)\n", dev->StackSize);
     return STATUS_SUCCESS;
 }

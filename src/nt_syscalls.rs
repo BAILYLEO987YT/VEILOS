@@ -79,6 +79,19 @@ fn dispatch_inner(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         sys::NT_DELETE_FILE => crate::nt_file::delete(a0),
         sys::NT_FLUSH_BUFFERS_FILE => with_file(&proc, a0, |f| crate::nt_file::flush(f, a1)),
+        sys::NT_DEVICE_IO_CONTROL_FILE => match object(&proc, a0) {
+            Some(KernelObjectRef::Device(d)) => crate::ntos::io::program_device_control(
+                &d,
+                stack(4).unwrap_or(0),
+                stack(5).unwrap_or(0) as u32,
+                stack(6).unwrap_or(0),
+                stack(7).unwrap_or(0) as u32 as usize,
+                stack(8).unwrap_or(0),
+                stack(9).unwrap_or(0) as u32 as usize,
+            ),
+            Some(_) => status::OBJECT_TYPE_MISMATCH,
+            None => status::INVALID_HANDLE,
+        },
         sys::NT_CREATE_EVENT => crate::nt_ipc::create_event(&proc, a0, a1, a2, a3, stack(4).unwrap_or(0)),
         sys::NT_SET_EVENT => set_event(&proc, a0, a1, true),
         sys::NT_RESET_EVENT => set_event(&proc, a0, a1, false),

@@ -93,6 +93,8 @@ unsafe extern "system" {
     pub(crate) fn NtQueryAttributesFile(attrs: *const ObjectAttributes, info: *mut u8) -> NtStatus;
     pub(crate) fn NtDeleteFile(attrs: *const ObjectAttributes) -> NtStatus;
     pub(crate) fn NtFlushBuffersFile(file: Handle, iosb: *mut IoStatusBlock) -> NtStatus;
+    pub(crate) fn NtDeviceIoControlFile(file: Handle, event: Handle, apc: usize, apc_context: usize, iosb: *mut IoStatusBlock,
+                                        code: u32, input: usize, in_length: u32, output: usize, out_length: u32) -> NtStatus;
     pub(crate) fn NtCreateEvent(handle: *mut Handle, access: u32, attrs: *const ObjectAttributes, kind: u32, initial: u8) -> NtStatus;
     pub(crate) fn NtSetEvent(event: Handle, previous: *mut i32) -> NtStatus;
     pub(crate) fn NtResetEvent(event: Handle, previous: *mut i32) -> NtStatus;

@@ -125,6 +125,7 @@ const NOTIFICATION_EVENT: u8 = 0;
 const SYNCHRONIZATION_EVENT: u8 = 1;
 const MUTANT: u8 = 2;
 const SEMAPHORE: u8 = 5;
+const SYNCHRONIZATION_TIMER: u8 = 9;
 
 fn header_init(obj: *mut u8, kind: u8, size_bytes: usize, state: i32) {
     unsafe {
@@ -195,7 +196,7 @@ fn try_take(obj: *mut u8) -> bool {
     match kind {
         NOTIFICATION_EVENT => s.load(Ordering::Acquire) > 0,
         // Satisfying a wait on these consumes a signal.
-        SYNCHRONIZATION_EVENT | MUTANT => s.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok(),
+        SYNCHRONIZATION_EVENT | MUTANT | SYNCHRONIZATION_TIMER => s.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok(),
         SEMAPHORE => {
             let mut v = s.load(Ordering::Acquire);
             while v > 0 {
