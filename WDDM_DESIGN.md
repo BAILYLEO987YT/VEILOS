@@ -1,6 +1,7 @@
 # VEILOS: GPU drivers through WDDM
 
-**Status:** planned (2026-11-21). Nothing below exists yet except stage W0.
+**Status:** planned (2026-11-21). Stage W0 is done and W1's import census
+has been run (below); no driver-host code exists yet.
 
 ## Goal
 
@@ -86,6 +87,39 @@ Each stage ends in something that works and can be tested on its own.
 | **W5** | **VidMm and VidSch.** Allocations, segments / GPU virtual memory, paging buffers, residency, monitored fences, contexts and submission, `DxgkDdiSubmitCommand`, interrupts → DPC → fence completion, TDR | A `D3DKMT`-level test program allocates, submits a vendor-built command buffer through the UMD and waits on its fence | Real hardware |
 | **W6** | **User mode.** `NtGdiDdDDI*` system calls; VEILOS's `d3d11`/`dxgi` drive the vendor UMD through the D3D11 DDI; present through dxgkrnl | A D3D11 triangle and the D3D test programs (`storage/tests/d3d*`, `dx*`) render on the GPU, matching their `.ref` images | Real hardware |
 | **W7** | D3D12 DDI; OpenGL ICD in `opengl32`; Vulkan loader and ICD; video decode; installing from the vendor's package; several GPUs | Games run on the GPU | Real hardware |
+
+### W1 import census (2026-11-21)
+
+`tools/import_census.py` on two current driver packages (read only, kept
+out of the repository): NVIDIA 581.80 (R580, the last branch for
+Maxwell/Pascal; lists the GTX 745, `DEV_1382`) and Intel Arc 32.0.101.9175
+(the A770 in the main PC, from its driver store).
+
+| Driver part | NVIDIA 581.80 | Intel Arc 32.0.101.9175 | VEILOS has today |
+|---|---|---|---|
+| Kernel driver | `nvlddmkm.sys`: 336 imports (327 ntoskrnl, 4 hal, 4 netio, 1 ksecdd) | `igdkmdnd64.sys`: 259 (240 ntoskrnl, 15 ksecdd BCrypt, 4 hal) | none |
+| D3D11/D3D12 UMD | `nvwgf2umx.dll` 342, `nvd3dumx.dll` 288 | `igd10umt64xe.dll` 215, `igd12um64xe2.dll` 222 | 89–96 % |
+| OpenGL ICD | `nvoglv64.dll` 385 | `igxe2hpgicd64.dll` 213 | 89–95 % |
+| Vulkan | (in `nvoglv64.dll`) | `igvk64.dll` 196 | 94 % |
+| Loader / shader compiler | `nvldumdx.dll` 135, `nvgpucomp64.dll` 187 | `igc-default64.dll` 184 | 97–99 % |
+
+- **Kernel:** the two drivers together use 399 distinct ntoskrnl functions,
+  168 of them shared. By area: Rtl 68 (strings, bitmaps, generic tables,
+  security descriptors), Ke 68 (IRQL, spinlocks, DPCs, timers, events,
+  waits), Io 57 (devices, IRPs, work items, interrupts, PnP and interface
+  registration), Ex 46 (pool, resources, fast mutexes, SLists, callbacks),
+  Zw 41 (registry, files, sections), C runtime 38, Mm 32 (contiguous and I/O
+  memory, MDLs), Ps 21, a few Etw/Ob/Se/Po/Cm/Kd. hal: 4 (PCI config,
+  performance counter, stall). That is W1's list; most entries are small.
+- **Neither kernel driver imports dxgkrnl.** Both reach it at run time
+  (`IoGetDeviceObjectPointer` on `\Device\DxgKrnl`, from `displib`), so the
+  DxgkDdi/DxgkCb interface, VidPN, VidMm and VidSch don't show in an import
+  list: they are W3–W5's work and the largest part.
+- **User mode is mostly there already:** VEILOS's own DLLs provide 89–99 % of
+  what the vendors' UMDs and ICDs import; each lacks a few dozen functions,
+  mostly in kernel32, user32 and advapi32. The UMDs' real dependency is the
+  D3DKMT calls and the runtimes' DDI, which an import list doesn't show
+  either (they go through gdi32's `D3DKMT*`, a handful of exports).
 
 W1 to W3 need no GPU and run in QEMU. From W4 on, testing is on real
 hardware only: QEMU on a Windows host can't pass a GPU through. Logs go to
