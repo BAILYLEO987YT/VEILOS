@@ -1,6 +1,6 @@
 //! VEILOS `ws2_32.dll`: Winsock (WIN32_DESIGN.md, S4).
 //!
-//! A SOCKET is a kernel handle to a socket object (src/nt_socket.rs); every
+//! A SOCKET is a kernel handle to a socket object (src/nt/socket.rs); every
 //! call here is one VEIL_SOCKET syscall plus Winsock's shapes: sockaddr,
 //! fd_set, WSAPOLLFD, addrinfo, hostent. IPv4 only so far. Errors go to
 //! WSASetLastError, which is SetLastError, as on Windows.

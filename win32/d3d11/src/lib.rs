@@ -1,7 +1,7 @@
 //! VEILOS `d3d11.dll` (and, forwarded to it, `dxgi.dll`): Direct3D 11 and
 //! DXGI (WIN32_DESIGN.md G5f).
 //!
-//! Drawing goes to the kernel's rasterizer (src/raster3d.rs) as d3d9.dll's
+//! Drawing goes to the kernel's rasterizer (src/gfx/raster3d.rs) as d3d9.dll's
 //! does: vertex shaders run here, pixel shaders become the kernel's
 //! programs and run on its raster workers.
 //!

@@ -2,7 +2,7 @@
 //!
 //! The fixed-function pipeline runs here, in user mode with real floating
 //! point; what comes out is window-space primitives in fixed point, drawn by
-//! the kernel's rasterizer (src/raster3d.rs, through VEIL_GPU3D) on every
+//! the kernel's rasterizer (src/gfx/raster3d.rs, through VEIL_GPU3D) on every
 //! CPU, with Direct3D's texture stages as its own combiner. Frames are shown
 //! with StretchDIBits at Present.
 //!

@@ -1,5 +1,5 @@
 //! Pixel shaders: SM4/SM5 instructions turned into the kernel's PsIns
-//! (src/raster3d.rs), which run on its raster workers.
+//! (src/gfx/raster3d.rs), which run on its raster workers.
 //!
 //! Registers: r# are the kernel's temporaries from 0, x# arrays after
 //! them, and four scratch ones at the end. Constant buffers, the

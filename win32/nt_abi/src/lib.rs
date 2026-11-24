@@ -161,7 +161,7 @@ pub mod sys {
     pub const VEIL_WAIT_ADDRESS: u32 = BASE + 56;
     /// VEIL_WAKE_ADDRESS(addr).
     pub const VEIL_WAKE_ADDRESS: u32 = BASE + 57;
-    /// VEIL_PIPE(op, a, b, c): named pipes (src/nt_ipc.rs).
+    /// VEIL_PIPE(op, a, b, c): named pipes (src/nt/ipc.rs).
     pub const VEIL_PIPE: u32 = BASE + 58;
     /// VEIL_MUTEX(op, a, b): create (owned, out*) or release (handle).
     pub const VEIL_MUTEX: u32 = BASE + 59;
@@ -169,9 +169,9 @@ pub mod sys {
     pub const VEIL_SYSINFO: u32 = BASE + 60;
     /// NtOpenProcess(handle*, access, attributes*, client_id*).
     pub const NT_OPEN_PROCESS: u32 = BASE + 61;
-    /// VEIL_SOCKET(op, a, b, c, [d, e]): Winsock's sockets (src/nt_socket.rs).
+    /// VEIL_SOCKET(op, a, b, c, [d, e]): Winsock's sockets (src/nt/socket.rs).
     pub const VEIL_SOCKET: u32 = BASE + 62;
-    /// VEIL_CONSOLE(op, handle, a, b, [c, d]): the console calls (src/nt_console.rs).
+    /// VEIL_CONSOLE(op, handle, a, b, [c, d]): the console calls (src/nt/console_calls.rs).
     pub const VEIL_CONSOLE: u32 = BASE + 63;
     /// NtReadVirtualMemory(process, address, buffer*, size, read*).
     pub const NT_READ_VIRTUAL_MEMORY: u32 = BASE + 64;
@@ -215,7 +215,7 @@ pub mod sys {
     /// One past the last number in use.
     /// NtQueryDirectoryObject(dir, buffer*, length, single, restart, context*, returned*).
     pub const NT_QUERY_DIRECTORY_OBJECT: u32 = BASE + 86;
-    /// VEIL_GPU3D(op, a, b, c): the 3D rasterizer (src/raster3d.rs). Ops:
+    /// VEIL_GPU3D(op, a, b, c): the 3D rasterizer (src/gfx/raster3d.rs). Ops:
     /// 0 create a target with colour, depth and stencil (width, height,
     /// handle out*), 1 clear (target, ClearArgs*, depth target), 2 draw
     /// (target, DrawArgs*, depth target), 3 read pixels (target,
@@ -225,21 +225,21 @@ pub mod sys {
     /// pixel shader (0, PsArgs*, handle out*). A depth
     /// target (0: the target's own) lends its depth and stencil buffers.
     pub const VEIL_GPU3D: u32 = BASE + 87;
-    /// VEIL_SOUND(op, a, b, c): sound streams (src/nt_sound.rs). Ops: 0 open
+    /// VEIL_SOUND(op, a, b, c): sound streams (src/nt/sound.rs). Ops: 0 open
     /// (rate, bits << 8 | channels, handle out*), 1 write (stream,
     /// SoundWrite*), 2 info (stream, SoundInfo* out), 3 control (stream,
     /// 0 pause / 1 resume / 2 flush / 3 volume, value), 4 device
     /// (SoundDevice* out). STATUS_DEVICE_DOES_NOT_EXIST with no sound device.
     pub const VEIL_SOUND: u32 = BASE + 88;
     /// VEIL_CRED(op, a, b, c): the signed-in user's saved credentials and
-    /// DPAPI (src/credentials.rs). Ops: 0 seal, 1 open (ProtectArgs*), 2
+    /// DPAPI (src/security/credentials.rs). Ops: 0 seal, 1 open (ProtectArgs*), 2
     /// write (CredKey*, record, length), 3 read (CredKey*, CredOut*), 4
     /// delete (CredKey*), 5 list (CredOut*). STATUS_NO_SUCH_LOGON_SESSION
     /// with nobody signed in.
     pub const VEIL_CRED: u32 = BASE + 89;
     /// NtDeviceIoControlFile(file, event, apc, apc_context, iosb*, code,
     /// in*, in_length, out*, out_length): an IRP_MJ_DEVICE_CONTROL to the
-    /// Windows driver behind a device handle (src/ntos/io.rs).
+    /// Windows driver behind a device handle (src/nt/ntos/io.rs).
     pub const NT_DEVICE_IO_CONTROL_FILE: u32 = BASE + 90;
     pub const END: u32 = BASE + 91;
 }

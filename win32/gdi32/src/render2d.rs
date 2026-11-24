@@ -1,4 +1,4 @@
-//! What the kernel's font engine (src/font.rs, compiled into gdi32) needs
+//! What the kernel's font engine (src/gfx/font.rs, compiled into gdi32) needs
 //! from the kernel's 2D renderer. gdi32 draws glyph coverage itself, so the
 //! engine's own text drawing (`draw_text`, used by its demo) draws nothing.
 

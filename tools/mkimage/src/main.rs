@@ -11,7 +11,7 @@
 //!
 //! --ramdisk IMAGE puts a disk image (tools/mkdisk.py) beside the kernel:
 //! the firmware loads it into memory with the kernel and VEILOS runs from it
-//! (src/block.rs), for machines where VEILOS can't reach its disk yet (a USB
+//! (src/fs/block.rs), for machines where VEILOS can't reach its disk yet (a USB
 //! stick). Those images are named veilos-bios-ram.img and veilos-uefi-ram.img.
 //!
 //! Run through tools/build.sh, which builds the kernel first and runs this

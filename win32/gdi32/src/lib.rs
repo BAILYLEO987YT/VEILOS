@@ -19,7 +19,7 @@ mod dib;
 #[path = "../../dllrt.rs"]
 mod dllrt;
 mod draw;
-#[path = "../../../src/font.rs"]
+#[path = "../../../src/gfx/font.rs"]
 #[allow(dead_code)]
 mod font;
 mod font_data;

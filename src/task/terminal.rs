@@ -1,4 +1,4 @@
-use crate::vfs::VFS;
+use crate::fs::vfs::VFS;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -71,7 +71,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 Ok(entries) => {
                     history.push(alloc::format!("  {}", path));
                     for e in entries {
-                        let s = if e.file_type == crate::vfs::FileType::Directory {
+                        let s = if e.file_type == crate::fs::vfs::FileType::Directory {
                             alloc::format!("  [DIR]  {}", e.name)
                         } else {
                             alloc::format!("  [FILE] {}  ({} B)", e.name, e.size)
@@ -133,7 +133,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let path = normalize_path(parts[1]);
             match VFS.create_dir(&path) {
                 Ok(_)  => history.push(alloc::format!("mkdir: created directory '{}'", path)),
-                Err(crate::vfs::VfsError::FileNotFound) =>
+                Err(crate::fs::vfs::VfsError::FileNotFound) =>
                     history.push(alloc::format!("mkdir: cannot create '{}': parent directory does not exist", path)),
                 Err(_) =>
                     history.push(alloc::format!("mkdir: cannot create '{}': filesystem is read-only or unsupported", path)),
@@ -144,9 +144,9 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let path = normalize_path(parts[1]);
             match VFS.delete_file(&path) {
                 Ok(_)  => history.push(alloc::format!("rm: removed '{}'", path)),
-                Err(crate::vfs::VfsError::FileNotFound) =>
+                Err(crate::fs::vfs::VfsError::FileNotFound) =>
                     history.push(alloc::format!("rm: cannot remove '{}': no such file", path)),
-                Err(crate::vfs::VfsError::IsDirectory) =>
+                Err(crate::fs::vfs::VfsError::IsDirectory) =>
                     history.push(alloc::format!("rm: cannot remove '{}': directory not empty", path)),
                 Err(_) =>
                     history.push(alloc::format!("rm: cannot remove '{}': filesystem is read-only or unsupported", path)),
@@ -156,7 +156,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         // -----| process management |-----
         "PS" => {
             history.push(String::from("  PID  NAME            ALIVE  CAPS"));
-            let pm = crate::process::PROCESSOR.lock();
+            let pm = crate::sched::process::PROCESSOR.lock();
             for p in &pm.processes {
                 let caps = p.capabilities.lock().effective;
                 history.push(alloc::format!("  {:3}  {:15} {}  {:#018x}",
@@ -167,7 +167,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "KILL" => {
             if parts.len() < 2 { history.push(String::from("USAGE: KILL [PID]")); return; }
             if let Ok(pid) = parts[1].parse::<u32>() {
-                if let Some(p) = crate::process::PROCESSOR.lock().find(pid) {
+                if let Some(p) = crate::sched::process::PROCESSOR.lock().find(pid) {
                     p.terminate(-9);
                     history.push(alloc::format!("KILLED PID {}", pid));
                 } else {
@@ -179,7 +179,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         }
         "CAPS" => {
             let pid = if parts.len() > 1 { parts[1].parse::<u32>().unwrap_or(0) } else { 0 };
-            if let Some(p) = crate::process::PROCESSOR.lock().find(pid) {
+            if let Some(p) = crate::sched::process::PROCESSOR.lock().find(pid) {
                 let caps = p.capabilities.lock();
                 history.push(alloc::format!("  CAPS FOR PID {}:", pid));
                 for name in caps.describe_effective() {
@@ -195,14 +195,14 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             if parts.len() >= 3 && parts[1] == "SET" {
                 let profile = parts[2];
                 let pid = parts.get(3).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
-                match crate::sandbox::POLICY_ENGINE.lock().apply_profile(pid, profile) {
+                match crate::security::sandbox::POLICY_ENGINE.lock().apply_profile(pid, profile) {
                     Ok(_)  => history.push(alloc::format!("APPLIED '{}' TO PID {}", profile, pid)),
                     Err(e) => history.push(alloc::format!("ERROR: {}", e)),
                 }
             } else {
-                let mode = crate::policy::POLICY.lock().get_mode();
+                let mode = crate::security::policy::POLICY.lock().get_mode();
                 history.push(alloc::format!("CURRENT MODE: {:?}", mode).to_uppercase());
-                let engine = crate::sandbox::POLICY_ENGINE.lock();
+                let engine = crate::security::sandbox::POLICY_ENGINE.lock();
                 history.push(alloc::format!("  PROFILES: {}", engine.profiles.len()));
                 for p in &engine.profiles {
                     history.push(alloc::format!("    - {}", p.name));
@@ -216,7 +216,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             match sub {
                 "LIST" => {
                     history.push(String::from("  INSTALLED PACKAGES:"));
-                    let reg = crate::pkgmgr::PACKAGE_REGISTRY.lock();
+                    let reg = crate::userland::pkgmgr::PACKAGE_REGISTRY.lock();
                     for pkg in reg.list_installed() {
                         history.push(alloc::format!("    {} v{}.{}.{}  {}",
                             pkg.manifest.name,
@@ -229,7 +229,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 "INSTALL" => {
                     let name = parts.get(2).copied().unwrap_or("");
                     if name.is_empty() { history.push(String::from("USAGE: PKG INSTALL [NAME]")); return; }
-                    match crate::pkgmgr::PACKAGE_REGISTRY.lock().install(name) {
+                    match crate::userland::pkgmgr::PACKAGE_REGISTRY.lock().install(name) {
                         Ok(_)  => history.push(alloc::format!("INSTALLED: {}", name)),
                         Err(e) => history.push(alloc::format!("ERROR: {}", e)),
                     }
@@ -237,7 +237,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 "REMOVE" => {
                     let name = parts.get(2).copied().unwrap_or("");
                     if name.is_empty() { history.push(String::from("USAGE: PKG REMOVE [NAME]")); return; }
-                    crate::pkgmgr::PACKAGE_REGISTRY.lock().remove(name);
+                    crate::userland::pkgmgr::PACKAGE_REGISTRY.lock().remove(name);
                     history.push(alloc::format!("REMOVED: {}", name));
                 }
                 _ => history.push(String::from("USAGE: PKG [LIST|INSTALL|REMOVE] [NAME]")),
@@ -247,7 +247,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         // -----| trace log |-----
         "TRACE" => {
             let n = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
-            let log = crate::debugger::TRACE_LOG.lock();
+            let log = crate::sys::debugger::TRACE_LOG.lock();
             let events = log.recent(n);
             if events.is_empty() { history.push(String::from("  (no trace events)")); }
             for ev in events {
@@ -261,20 +261,20 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("REPORT");
             match sub {
                 "START" => {
-                    crate::debugger::PROFILER.lock().enabled = true;
+                    crate::sys::debugger::PROFILER.lock().enabled = true;
                     history.push(String::from("PROFILER STARTED"));
                 }
                 "STOP" => {
-                    crate::debugger::PROFILER.lock().enabled = false;
+                    crate::sys::debugger::PROFILER.lock().enabled = false;
                     history.push(String::from("PROFILER STOPPED"));
                 }
                 "RESET" => {
-                    crate::debugger::PROFILER.lock().reset();
+                    crate::sys::debugger::PROFILER.lock().reset();
                     history.push(String::from("PROFILER RESET"));
                 }
                 _ => {
                     // Print top 10 hot spots into history.
-                    let prof = crate::debugger::PROFILER.lock();
+                    let prof = crate::sys::debugger::PROFILER.lock();
                     let hist = prof.histogram();
                     history.push(alloc::format!("  TOP HOTSPOTS ({} SAMPLES):", prof.total_samples));
                     for (i, &(pid, rip, hits)) in hist.iter().take(8).enumerate() {
@@ -292,11 +292,11 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("STATUS");
             match sub {
                 "ATTACH" => {
-                    crate::debugger::DEBUGGER.lock().attach();
+                    crate::sys::debugger::DEBUGGER.lock().attach();
                     history.push(String::from("KERNEL DEBUGGER ATTACHED"));
                 }
                 "DETACH" => {
-                    crate::debugger::DEBUGGER.lock().detach();
+                    crate::sys::debugger::DEBUGGER.lock().detach();
                     history.push(String::from("KERNEL DEBUGGER DETACHED"));
                 }
                 "BP" => {
@@ -304,7 +304,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0X"), 16).ok())
                         .unwrap_or(0);
                     if addr == 0 { history.push(String::from("USAGE: DBG BP [HEX_ADDR]")); return; }
-                    let set = crate::debugger::DEBUGGER.lock().set_breakpoint(addr, 0, false);
+                    let set = crate::sys::debugger::DEBUGGER.lock().set_breakpoint(addr, 0, false);
                     history.push(if set {
                         alloc::format!("BREAKPOINT SET AT {:#x}", addr)
                     } else {
@@ -312,14 +312,14 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     });
                 }
                 "BPS" => {
-                    let bps = crate::debugger::DEBUGGER.lock().breakpoints.list();
+                    let bps = crate::sys::debugger::DEBUGGER.lock().breakpoints.list();
                     history.push(alloc::format!("  {} BREAKPOINT(S):", bps.len()));
                     for bp in bps {
                         history.push(alloc::format!("    {:#x} pid={} hits={}", bp.addr, bp.pid, bp.hit_count));
                     }
                 }
                 "STATUS" => {
-                    let dbg = crate::debugger::DEBUGGER.lock();
+                    let dbg = crate::sys::debugger::DEBUGGER.lock();
                     history.push(alloc::format!("  ACTIVE: {}  STATE: {:?}", dbg.active, dbg.state));
                 }
                 _ => history.push(String::from("USAGE: DBG [ATTACH|DETACH|BP|BPS|STATUS]")),
@@ -331,18 +331,18 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("INFO");
             match sub {
                 "INFO" => {
-                    let t = &crate::toolchain::VEILOS_TARGET;
+                    let t = &crate::userland::toolchain::VEILOS_TARGET;
                     history.push(alloc::format!("  TARGET:  {}", t.triple));
                     history.push(alloc::format!("  CPU:     {}", t.cpu));
                     history.push(alloc::format!("  ABI:     {}", t.abi));
                     history.push(alloc::format!("  LINKER:  {}", t.linker));
-                    for c in crate::toolchain::SDK_COMPONENTS {
+                    for c in crate::userland::toolchain::SDK_COMPONENTS {
                         history.push(alloc::format!("  {:?}: {} v{}", c.kind, c.name, c.version));
                     }
                 }
                 "HEADERS" => {
                     history.push(String::from("  VEILOS SDK HEADERS:"));
-                    for h in crate::toolchain::HEADERS {
+                    for h in crate::userland::toolchain::HEADERS {
                         history.push(alloc::format!("    {}", h.path));
                     }
                 }
@@ -355,37 +355,37 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("STATUS");
             match sub {
                 "KERNEL" => {
-                    crate::stability::KERNEL_FUZZER.enabled.store(true, Ordering::Relaxed);
-                    crate::stability::KERNEL_FUZZER.run_batch(200);
-                    crate::stability::KERNEL_FUZZER.report();
+                    crate::sys::stability::KERNEL_FUZZER.enabled.store(true, Ordering::Relaxed);
+                    crate::sys::stability::KERNEL_FUZZER.run_batch(200);
+                    crate::sys::stability::KERNEL_FUZZER.report();
                     history.push(String::from("KERNEL FUZZ PASS COMPLETE"));
                 }
                 "SYSCALL" => {
-                    crate::stability::SYSCALL_FUZZER.enabled.store(true, Ordering::Relaxed);
-                    crate::stability::SYSCALL_FUZZER.run_pass();
-                    crate::stability::SYSCALL_FUZZER.report();
+                    crate::sys::stability::SYSCALL_FUZZER.enabled.store(true, Ordering::Relaxed);
+                    crate::sys::stability::SYSCALL_FUZZER.run_pass();
+                    crate::sys::stability::SYSCALL_FUZZER.report();
                     history.push(String::from("SYSCALL FUZZ PASS COMPLETE"));
                 }
                 "STATUS" => {
                     history.push(alloc::format!("  KERNEL:  {} iters, {} failures",
-                        crate::stability::KERNEL_FUZZER.iterations.load(Ordering::Relaxed),
-                        crate::stability::KERNEL_FUZZER.failures.load(Ordering::Relaxed)));
+                        crate::sys::stability::KERNEL_FUZZER.iterations.load(Ordering::Relaxed),
+                        crate::sys::stability::KERNEL_FUZZER.failures.load(Ordering::Relaxed)));
                     history.push(alloc::format!("  SYSCALL: {} calls, {} anomalies",
-                        crate::stability::SYSCALL_FUZZER.iterations.load(Ordering::Relaxed),
-                        crate::stability::SYSCALL_FUZZER.panics.load(Ordering::Relaxed)));
+                        crate::sys::stability::SYSCALL_FUZZER.iterations.load(Ordering::Relaxed),
+                        crate::sys::stability::SYSCALL_FUZZER.panics.load(Ordering::Relaxed)));
                 }
                 _ => history.push(String::from("USAGE: FUZZ [KERNEL|SYSCALL|STATUS]")),
             }
         }
         "AUDIT" => {
-            crate::stability::MEM_AUDITOR.run();
-            crate::stability::MEM_AUDITOR.report();
-            let f = crate::stability::MEM_AUDITOR.findings.lock();
+            crate::sys::stability::MEM_AUDITOR.run();
+            crate::sys::stability::MEM_AUDITOR.report();
+            let f = crate::sys::stability::MEM_AUDITOR.findings.lock();
             history.push(alloc::format!("AUDIT COMPLETE: {} findings", f.len()));
         }
         "STRESS" => {
             if parts.get(1).copied() == Some("DRIVERS") {
-                crate::stability::DRIVER_STRESS.run();
+                crate::sys::stability::DRIVER_STRESS.run();
                 history.push(String::from("DRIVER STRESS COMPLETE"));
             } else {
                 history.push(String::from("USAGE: STRESS DRIVERS"));
@@ -400,20 +400,20 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // the update channel's. UPDATE alone: the disks it could update.
             // CHECK, APPLY and ENROLL-LTS: the update channel (distribution.rs).
             let admin = {
-                let user = crate::users::SESSION.lock().username.clone();
-                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+                let user = crate::security::users::SESSION.lock().username.clone();
+                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
             };
             match parts.get(1).copied() {
-                Some("CHECK")      => { crate::distribution::UPDATE_SYSTEM.lock().check(); history.push(String::from("UPDATE CHECK COMPLETE")); }
-                Some("APPLY")      => { crate::distribution::UPDATE_SYSTEM.lock().apply(); history.push(String::from("UPDATE APPLIED")); }
-                Some("ENROLL-LTS") => { crate::distribution::LTS_CHANNEL.lock().enroll(); history.push(String::from("ENROLLED IN LTS")); }
+                Some("CHECK")      => { crate::userland::distribution::UPDATE_SYSTEM.lock().check(); history.push(String::from("UPDATE CHECK COMPLETE")); }
+                Some("APPLY")      => { crate::userland::distribution::UPDATE_SYSTEM.lock().apply(); history.push(String::from("UPDATE APPLIED")); }
+                Some("ENROLL-LTS") => { crate::userland::distribution::LTS_CHANNEL.lock().enroll(); history.push(String::from("ENROLLED IN LTS")); }
                 Some("STATUS") => {
-                    let s = crate::install::state();
+                    let s = crate::sys::install::state();
                     if s.is_empty() { history.push(String::from("  No install or update has run.")) } else { history.extend(wrap_lines(&s)) }
-                    crate::distribution::LTS_CHANNEL.lock().status();
+                    crate::userland::distribution::LTS_CHANNEL.lock().status();
                 }
                 Some(_) if !admin => history.push(String::from("UPDATE: administrators only")),
-                Some(disk) => match crate::install::start_update(disk) {
+                Some(disk) => match crate::sys::install::start_update(disk) {
                     Ok(()) => {
                         history.extend(wrap_lines(&alloc::format!(
                             "Updating VEILOS on {}: its boot partitions and system files are being replaced.                              Users, home folders and settings stay. UPDATE STATUS shows progress.",
@@ -425,7 +425,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 None => {
                     history.push(String::from("  Upgrade the VEILOS installed on another disk to this build."));
                     history.push(String::from("  Keeps its users, home folders, Wi-Fi networks and settings. Disks:"));
-                    let t = crate::install::update_targets();
+                    let t = crate::sys::install::update_targets();
                     if t.is_empty() {
                         history.push(String::from("    (no other disk has a VEILOS volume)"));
                     }
@@ -442,14 +442,14 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             match sub {
                 "LIST" => {
                     history.push(String::from("  DOCUMENTATION PAGES:"));
-                    for (path, title) in crate::distribution::list_docs() {
+                    for (path, title) in crate::userland::distribution::list_docs() {
                         history.push(alloc::format!("    {} — {}", path, title));
                     }
                 }
                 "READ" => {
                     let path = parts.get(2).copied().unwrap_or("");
                     if path.is_empty() { history.push(String::from("USAGE: DOCS READ [path]")); return; }
-                    match crate::distribution::get_doc(path) {
+                    match crate::userland::distribution::get_doc(path) {
                         Some(doc) => {
                             history.push(alloc::format!("=== {} ===", doc.title));
                             for line in doc.content.lines().take(15) {
@@ -472,7 +472,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(String::from("USAGE: VSH [FILE_PATH | -c \"SCRIPT_LINE\"]"));
             } else if parts[1] == "-C" || parts[1] == "-c" {
                 let script_line = parts[2..].join(" ");
-                let mut eng = crate::vscript::GLOBAL_ENGINE.lock();
+                let mut eng = crate::vsh::vscript::GLOBAL_ENGINE.lock();
                 for out in eng.execute(&script_line) {
                     history.push(out);
                 }
@@ -481,7 +481,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 match VFS.read_file(&path) {
                     Ok(bytes) => {
                         let script = core::str::from_utf8(&bytes).unwrap_or("");
-                        let mut eng = crate::vscript::GLOBAL_ENGINE.lock();
+                        let mut eng = crate::vsh::vscript::GLOBAL_ENGINE.lock();
                         for out in eng.execute(script) {
                             history.push(out);
                         }
@@ -498,26 +498,26 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "GFXTEST" => {
             let secs = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(8);
             if secs == 0 {
-                crate::render2d_kernel::hide_test_card();
+                crate::gfx::render2d_kernel::hide_test_card();
                 history.push(String::from("GFXTEST: hidden"));
             } else {
-                crate::render2d_kernel::show_test_card(secs);
+                crate::gfx::render2d_kernel::show_test_card(secs);
                 history.push(String::from("GFXTEST: drawing the renderer test card (cycle counts go to the serial log)"));
             }
         }
         // -----| fonts |-----
         "FONTS" => {
-            let (ok, bad) = crate::render2d_kernel::load_fonts();
+            let (ok, bad) = crate::gfx::render2d_kernel::load_fonts();
             history.push(alloc::format!("FONTS: {} loaded, {} failed (details on the serial log)", ok, bad));
         }
 
         // -----| Phase 18: user management |-----
         "WHOAMI" => {
-            let s = crate::users::SESSION.lock();
+            let s = crate::security::users::SESSION.lock();
             if s.logged_in {
                 history.push(alloc::format!("  {} ({})",
                     s.username,
-                    crate::users::USER_DB.lock()
+                    crate::security::users::USER_DB.lock()
                         .find(&s.username)
                         .map(|u| u.role.name())
                         .unwrap_or("unknown"),
@@ -527,9 +527,9 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             }
         }
         "LOGOUT" => {
-            crate::users::SESSION.lock().logout();
-            crate::desktop::DESKTOP_PHASE.store(
-                crate::desktop::DesktopPhase::Login as u8,
+            crate::security::users::SESSION.lock().logout();
+            crate::gui::desktop::DESKTOP_PHASE.store(
+                crate::gui::desktop::DesktopPhase::Login as u8,
                 Ordering::Release,
             );
             history.push(String::from("Logged out."));
@@ -541,12 +541,12 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 return;
             }
             let role = match parts.get(3).copied().unwrap_or("standard") {
-                "admin"  => crate::users::UserRole::Admin,
-                "guest"  => crate::users::UserRole::Guest,
-                _        => crate::users::UserRole::Standard,
+                "admin"  => crate::security::users::UserRole::Admin,
+                "guest"  => crate::security::users::UserRole::Guest,
+                _        => crate::security::users::UserRole::Standard,
             };
-            let user = crate::users::User::new(parts[1], parts[2], role);
-            match crate::users::USER_DB.lock().add(user) {
+            let user = crate::security::users::User::new(parts[1], parts[2], role);
+            match crate::security::users::USER_DB.lock().add(user) {
                 Ok(_)  => history.push(alloc::format!("useradd: created '{}'", parts[1])),
                 Err(e) => history.push(alloc::format!("useradd: {}", e)),
             }
@@ -556,7 +556,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(String::from("USAGE: USERDEL <username>"));
                 return;
             }
-            match crate::users::USER_DB.lock().remove(parts[1]) {
+            match crate::security::users::USER_DB.lock().remove(parts[1]) {
                 Ok(_)  => history.push(alloc::format!("userdel: removed '{}'", parts[1])),
                 Err(e) => history.push(alloc::format!("userdel: {}", e)),
             }
@@ -568,8 +568,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(String::from("USAGE: PASSWD <username|oldpwd> <newpwd>"));
                 return;
             }
-            let me = crate::users::SESSION.lock().username.clone();
-            let mut db = crate::users::USER_DB.lock();
+            let me = crate::security::users::SESSION.lock().username.clone();
+            let mut db = crate::security::users::USER_DB.lock();
             // If parts[1] looks like a username that exists, do admin reset.
             if db.find(parts[1]).is_some() && parts[1] != me {
                 if let Some(u) = db.find_mut(parts[1]) {
@@ -595,7 +595,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(String::from("USAGE: UNLOCK <username>"));
                 return;
             }
-            let mut db = crate::users::USER_DB.lock();
+            let mut db = crate::security::users::USER_DB.lock();
             if let Some(u) = db.find_mut(parts[1]) {
                 u.unlock();
                 db.save();
@@ -606,7 +606,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         }
         "USERS" => {
             history.push(String::from("  USERNAME        ROLE       LOCKED  FAILS"));
-            let db = crate::users::USER_DB.lock();
+            let db = crate::security::users::USER_DB.lock();
             for u in &db.users {
                 history.push(alloc::format!("  {:<15} {:<10} {}       {}",
                     u.username, u.role.name(),
@@ -621,7 +621,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(parts[1..].join(" "));
         }
         "DATE" => {
-            let ms  = crate::interrupts::TICKS.load(Ordering::Relaxed);
+            let ms  = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
             let sec = ms / 1_000;
             let hh  = (sec / 3_600) % 24;
             let mm  = (sec / 60) % 60;
@@ -629,10 +629,10 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(alloc::format!("  {:02}:{:02}:{:02} (ticks: {})", hh, mm, ss, ms));
         }
         "UPTIME" => {
-            let ms   = crate::interrupts::TICKS.load(Ordering::Relaxed);
+            let ms   = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
             let secs = ms / 1_000;
             history.push(alloc::format!("  Up {} h {} m {} s", secs/3600, (secs/60)%60, secs%60));
-            let s = crate::users::SESSION.lock();
+            let s = crate::security::users::SESSION.lock();
             if s.logged_in {
                 history.push(alloc::format!("  Session: {} m {} s",
                     s.duration_secs()/60, s.duration_secs()%60));
@@ -641,7 +641,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "WORKERS" => {
             // Worker-pool benchmark: 64 chunks of busy work, run on this CPU
             // alone and then spread over every CPU (workers::for_each).
-            let (seq, par, per_cpu) = crate::workers::benchmark(64, 2_000_000);
+            let (seq, par, per_cpu) = crate::sched::workers::benchmark(64, 2_000_000);
             history.push(alloc::format!("workers: 64 chunks  1 CPU {} ms  all CPUs {} ms  speedup {}.{}x",
                 seq / 1000, par / 1000, seq / par.max(1), (seq * 10 / par.max(1)) % 10));
             history.push(alloc::format!("chunks run per CPU: {:?}", per_cpu));
@@ -650,8 +650,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // KEYS: the keys in memory. KEYS TEST: save a new key and encrypt a
             // file with it. KEYS CHECK: decrypt that file with the saved keys
             // (after a reboot and sign-in). See encryption.rs, Section 8.
-            use crate::encryption as cen;
-            let me = crate::users::SESSION.lock().username.clone();
+            use crate::security::encryption as cen;
+            let me = crate::security::users::SESSION.lock().username.clone();
             let file = alloc::format!("/home/{}/keytest.bin", me);
             let mut out: Vec<String> = Vec::new();
             match parts.get(1).copied() {
@@ -661,14 +661,14 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                         .and_then(|h| cen::cen_encrypt(h, b"VEILOS key ledger test", None));
                     match r {
                         Ok(enc) => {
-                            let ok = crate::vfs::VFS.write_file(&file, &enc).is_ok();
+                            let ok = crate::fs::vfs::VFS.write_file(&file, &enc).is_ok();
                             out.push(alloc::format!("keys: saved a key; {} bytes encrypted to {} ({})", enc.len(), file, if ok { "written" } else { "write failed" }));
                         }
                         Err(e) => out.push(alloc::format!("keys: {}", e)),
                     }
                 }
                 Some("CHECK") => {
-                    let enc = crate::vfs::VFS.read_file(&file).unwrap_or_default();
+                    let enc = crate::fs::vfs::VFS.read_file(&file).unwrap_or_default();
                     let keys = cen::cen_load_keys(cen::FeatureTag::new("selftest")).unwrap_or_default();
                     let hit = keys.iter().find_map(|&h| cen::cen_decrypt(h, &enc, None).ok());
                     out.push(match hit {
@@ -693,9 +693,9 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "SOUND" => {
             // SOUND [0-100]: the sound device, and the master volume (audio.rs).
             if let Some(v) = parts.get(1).and_then(|v| v.parse::<u8>().ok()) {
-                crate::audio::set_volume(v);
+                crate::drivers::audio::set_volume(v);
             }
-            history.push(alloc::format!("  {}", crate::audio::describe()));
+            history.push(alloc::format!("  {}", crate::drivers::audio::describe()));
         }
         "RUN" => {
             // RUN <path>: start a Windows program (as double-clicking it does).
@@ -706,19 +706,19 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let path = arg.to_ascii_lowercase();
             let name = String::from(path.rsplit('/').next().unwrap_or(&path));
             history.push(alloc::format!("  starting {}", path));
-            crate::apps::open_file_absolute(&path, &name);
+            crate::userland::apps::open_file_absolute(&path, &name);
         }
         "SLOTS" => {
             // PCIe hot-plug slots (hotplug.rs).
-            history.extend(crate::hotplug::describe());
+            history.extend(crate::hal::hotplug::describe());
         }
         "DISPLAYS" => {
             // The heads behind the one logical display (HAL 7D).
-            history.extend(crate::graphics::describe_heads());
+            history.extend(crate::gfx::graphics::describe_heads());
         }
         "GPUTEST" => {
             // A gpu_driver batch through the logical GPU, checked and timed.
-            for line in crate::gpu_driver::self_test() {
+            for line in crate::gfx::gpu_driver::self_test() {
                 crate::serial_println!("[GPU] {}", line);
                 history.push(line);
             }
@@ -727,16 +727,16 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // INSTALL: disks VEILOS could go on. INSTALL <DISK> ERASE: put
             // this system on it (install.rs). INSTALL STATUS: how far it is.
             let admin = {
-                let user = crate::users::SESSION.lock().username.clone();
-                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+                let user = crate::security::users::SESSION.lock().username.clone();
+                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
             };
             match (parts.get(1).copied(), parts.get(2).copied()) {
                 (Some("STATUS"), _) => {
-                    let s = crate::install::state();
+                    let s = crate::sys::install::state();
                     if s.is_empty() { history.push(String::from("  No install has run.")) } else { history.extend(wrap_lines(&s)) }
                 }
                 (Some(_), Some("ERASE")) if !admin => history.push(String::from("INSTALL: administrators only")),
-                (Some(disk), Some("ERASE")) => match crate::install::start(disk) {
+                (Some(disk), Some("ERASE")) => match crate::sys::install::start(disk) {
                     Ok(()) => {
                         history.push(alloc::format!("  Installing onto {}: EVERYTHING ON IT IS BEING ERASED.", disk));
                         history.push(String::from("  This takes a few minutes. INSTALL STATUS shows progress."));
@@ -746,7 +746,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 _ => {
                     history.push(String::from("  Put VEILOS on another disk, to start without the stick."));
                     history.push(String::from("  ERASES EVERYTHING on that disk. Disks:"));
-                    let t = crate::install::targets();
+                    let t = crate::sys::install::targets();
                     if t.is_empty() {
                         history.push(String::from("    (none besides the one VEILOS runs from)"));
                     }
@@ -759,22 +759,22 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "DRIVER" => {
             // Windows kernel drivers (ntos, WDDM_DESIGN.md W1).
             let admin = {
-                let user = crate::users::SESSION.lock().username.clone();
-                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+                let user = crate::security::users::SESSION.lock().username.clone();
+                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
             };
             match parts.get(1).copied() {
                 Some("LOAD") | Some("UNLOAD") | Some("IOCTL") | Some("OPEN") if !admin => {
                     history.push(String::from("DRIVER: administrators only"));
                 }
                 Some("LOAD") => match parts.get(2) {
-                    Some(p) => match crate::ntos::image::load(&p.to_ascii_lowercase()) {
+                    Some(p) => match crate::nt::ntos::image::load(&p.to_ascii_lowercase()) {
                         Ok((name, st)) => history.push(alloc::format!("  {}: DriverEntry returned {:#010X}", name, st as u32)),
                         Err(e) => history.push(alloc::format!("  DRIVER LOAD: {}", e)),
                     },
                     None => history.push(String::from("USAGE: DRIVER LOAD <path.sys>")),
                 },
                 Some("UNLOAD") => match parts.get(2) {
-                    Some(n) => match crate::ntos::image::unload(&n.to_ascii_lowercase()) {
+                    Some(n) => match crate::nt::ntos::image::unload(&n.to_ascii_lowercase()) {
                         Ok(()) => history.push(alloc::format!("  {} unloaded", n)),
                         Err(e) => history.push(alloc::format!("  DRIVER UNLOAD: {}", e)),
                     },
@@ -782,10 +782,10 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 },
                 Some("OPEN") => {
                     // DRIVER OPEN <\Device\X or \??\X>: IRP_MJ_CREATE, then CLOSE.
-                    match parts.get(2).and_then(|n| crate::ntos::io::device_by_name(n)) {
+                    match parts.get(2).and_then(|n| crate::nt::ntos::io::device_by_name(n)) {
                         Some(dev) => {
-                            let c = crate::ntos::io::create_close(dev, crate::ntos::io::IRP_MJ_CREATE);
-                            let d = crate::ntos::io::create_close(dev, crate::ntos::io::IRP_MJ_CLOSE);
+                            let c = crate::nt::ntos::io::create_close(dev, crate::nt::ntos::io::IRP_MJ_CREATE);
+                            let d = crate::nt::ntos::io::create_close(dev, crate::nt::ntos::io::IRP_MJ_CLOSE);
                             history.push(alloc::format!("  create {:#010X}, close {:#010X}", c as u32, d as u32));
                         }
                         None => history.push(String::from("  DRIVER OPEN: no such device")),
@@ -793,12 +793,12 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 }
                 Some("IOCTL") => {
                     // DRIVER IOCTL <device> <code hex> [text]: METHOD_BUFFERED, shows the reply.
-                    let dev = parts.get(2).and_then(|n| crate::ntos::io::device_by_name(n));
+                    let dev = parts.get(2).and_then(|n| crate::nt::ntos::io::device_by_name(n));
                     let code = parts.get(3).and_then(|c| u32::from_str_radix(c.trim_start_matches("0X").trim_start_matches("0x"), 16).ok());
                     match (dev, code) {
                         (Some(dev), Some(code)) => {
                             let text = parts.get(4..).map(|p| p.join(" ")).unwrap_or_default();
-                            let (st, out) = crate::ntos::io::device_control(dev, code, text.as_bytes(), 256);
+                            let (st, out) = crate::nt::ntos::io::device_control(dev, code, text.as_bytes(), 256);
                             let shown: String = out.iter().map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
                             let hex: String = out.iter().take(16).map(|b| alloc::format!("{:02X} ", b)).collect();
                             history.push(alloc::format!("  status {:#010X}, {} byte(s): \"{}\"  {}", st as u32, out.len(), shown, hex));
@@ -807,7 +807,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     }
                 }
                 _ => {
-                    let list = crate::ntos::image::DRIVERS.lock();
+                    let list = crate::nt::ntos::image::DRIVERS.lock();
                     if list.is_empty() {
                         history.push(String::from("  No Windows drivers loaded."));
                     }
@@ -820,7 +820,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         }
         "USB" => {
             // xHCI controllers, how their events arrive, and their devices.
-            history.extend(crate::usb::xhci::status());
+            history.extend(crate::drivers::usb::xhci::status());
         }
         "DEVICES" => {
             // Every PCI device and the driver bound to it (hal::describe).
@@ -832,8 +832,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // Report heap usage via the allocator stats if available.
             // Fallback: report compile-time heap size constant.
             history.push(String::from("  MEMORY USAGE (approximate):"));
-            let heap_start = crate::allocator::HEAP_START;
-            let heap_size  = crate::allocator::heap_usage().1;
+            let heap_start = crate::mm::allocator::HEAP_START;
+            let heap_size  = crate::mm::allocator::heap_usage().1;
             history.push(alloc::format!("  Heap base: {:#x}  size: {} KiB",
                 heap_start, heap_size / 1024));
             history.push(String::from("  (per-allocation tracking not yet implemented)"));
@@ -842,35 +842,35 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("STATUS");
             match sub {
                 "STATUS" => {
-                    if crate::network::is_ready() {
-                        history.push(String::from(if crate::network::on_fallback_address() {
+                    if crate::net::network::is_ready() {
+                        history.push(String::from(if crate::net::network::on_fallback_address() {
                             "  Network: NO DHCP ANSWER (fallback address; still asking)"
                         } else {
                             "  Network: ONLINE"
                         }));
-                        let cfg = crate::network::NETWORK_CONFIG.lock();
+                        let cfg = crate::net::network::NETWORK_CONFIG.lock();
                         history.push(alloc::format!("  IP:      {}/{}", cfg.ip.address(), cfg.ip.prefix_len()));
                         if let Some(gw) = cfg.gateway { history.push(alloc::format!("  Gateway: {}", gw)); }
                         if let Some(dns) = cfg.dns     { history.push(alloc::format!("  DNS:     {}", dns)); }
                         drop(cfg);
                         // The NICs behind the one logical interface (HAL 7E).
-                        history.extend(crate::network::nic_status());
+                        history.extend(crate::net::network::nic_status());
                     } else {
                         history.push(String::from("  Network: OFFLINE (no NIC or DHCP pending)"));
                         // Still show the NICs: "no link" and "no DHCP answer" differ.
-                        history.extend(crate::network::nic_status());
+                        history.extend(crate::net::network::nic_status());
                     }
                 }
                 _ => history.push(String::from("USAGE: NET STATUS")),
             }
         }
         "PEERS" => {
-            let mesh = crate::distributed::NODE_MESH.lock();
+            let mesh = crate::net::distributed::NODE_MESH.lock();
             if mesh.peers.is_empty() {
                 history.push(String::from("  No distributed peers discovered."));
             } else {
                 history.push(alloc::format!("  {} peer(s):", mesh.peers.len()));
-                let now = crate::interrupts::TICKS.load(Ordering::Relaxed);
+                let now = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
                 for (i, (id, p)) in mesh.peers.iter().enumerate() {
                     let age_ms = now.saturating_sub(p.last_seen);
                     history.push(alloc::format!("    peer{}  {}  id:{}  ip:{}  caps:{:#x}  seen:{}ms ago",
@@ -882,22 +882,22 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "DIAG" => {
             history.push(String::from("  === VEILOS DIAGNOSTICS ==="));
             // Network status
-            if crate::network::is_ready() {
-                let cfg = crate::network::NETWORK_CONFIG.lock();
+            if crate::net::network::is_ready() {
+                let cfg = crate::net::network::NETWORK_CONFIG.lock();
                 history.push(alloc::format!("  NET: ONLINE  IP: {}/{}", cfg.ip.address(), cfg.ip.prefix_len()));
                 if let Some(gw) = cfg.gateway { history.push(alloc::format!("  GW:  {}", gw)); }
             } else {
                 history.push(String::from("  NET: OFFLINE (no NIC or DHCP pending)"));
             }
             // Mesh status
-            let mesh = crate::distributed::NODE_MESH.lock();
+            let mesh = crate::net::distributed::NODE_MESH.lock();
             history.push(alloc::format!("  MESH: {} peer(s)", mesh.peer_count()));
             history.push(alloc::format!("  LOCAL ID: {}", mesh.local_id.to_hex()));
             // Policy mode
-            let mode = crate::policy::POLICY.lock().get_mode();
+            let mode = crate::security::policy::POLICY.lock().get_mode();
             history.push(alloc::format!("  POLICY: {:?}", mode));
             // Process list
-            let pm = crate::process::PROCESSOR.lock();
+            let pm = crate::sched::process::PROCESSOR.lock();
             history.push(alloc::format!("  PROCESSES: {}", pm.processes.len()));
             for p in &pm.processes {
                 let caps = p.capabilities.lock().effective;
@@ -917,35 +917,35 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 return;
             }
             let target_ip = smoltcp::wire::Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]);
-            if !crate::network::is_ready() {
+            if !crate::net::network::is_ready() {
                 history.push(String::from("ERROR: Network not ready"));
                 return;
             }
             // Send a test announcement to the target
-            if let Some(ref mut stack) = *crate::network::NETWORK.lock() {
+            if let Some(ref mut stack) = *crate::net::network::NETWORK.lock() {
                 if let Ok(handle) = stack.open_udp(0) {
                     let _ = stack.udp_bind(handle, 0);
                     let (local_id, mesh_size) = {
-                        let mesh = crate::distributed::NODE_MESH.lock();
+                        let mesh = crate::net::distributed::NODE_MESH.lock();
                         (mesh.local_id, mesh.local_mesh_size())
                     };
-                    let payload = crate::distributed::encode_announcement(
+                    let payload = crate::net::distributed::encode_announcement(
                         &local_id,
-                        crate::distributed::NodeType::Controller,
+                        crate::net::distributed::NodeType::Controller,
                         0,
                         "PING",
                         mesh_size,
                     );
-                    let msg = crate::distributed::encode_message(
-                        crate::distributed::MessageType::NodeAnnouncement,
+                    let msg = crate::net::distributed::encode_message(
+                        crate::net::distributed::MessageType::NodeAnnouncement,
                         &payload,
                     );
                     let dst = smoltcp::wire::IpEndpoint::new(
                         smoltcp::wire::IpAddress::Ipv4(target_ip),
-                        crate::distributed::DISCOVERY_PORT,
+                        crate::net::distributed::DISCOVERY_PORT,
                     );
                     match stack.udp_send(handle, &msg, dst) {
-                        Ok(()) => history.push(alloc::format!("  PING sent to {}:{}", target_ip, crate::distributed::DISCOVERY_PORT)),
+                        Ok(()) => history.push(alloc::format!("  PING sent to {}:{}", target_ip, crate::net::distributed::DISCOVERY_PORT)),
                         Err(e) => history.push(alloc::format!("  PING failed: {:?}", e)),
                     }
                     stack.close_socket(handle);
@@ -964,15 +964,15 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(String::from("  NODE_ID_OR_ALIAS can be the full hex ID or a short alias like peer1 — see PEERS."));
                 return;
             }
-            let node_id = match crate::distributed::NODE_MESH.lock().resolve_target(parts[1]) {
+            let node_id = match crate::net::distributed::NODE_MESH.lock().resolve_target(parts[1]) {
                 Some(id) => id,
                 None => { history.push(String::from("ERROR: Unknown node (expected a hex ID or peerN alias, see PEERS)")); return; }
             };
             let command = String::from(parts[2]);
             let args = if parts.len() > 3 { parts[3..].join(" ") } else { String::new() };
-            let task = crate::distributed::RemoteTask::new(&command, &args);
+            let task = crate::net::distributed::RemoteTask::new(&command, &args);
             history.push(alloc::format!("  Sending to {}: {} {}", node_id.to_hex(), command, args));
-            match crate::distributed::remote_exec(&node_id, task) {
+            match crate::net::distributed::remote_exec(&node_id, task) {
                 Ok(stdout) => {
                     match core::str::from_utf8(&stdout) {
                         Ok(s) => { for line in s.lines() { history.push(alloc::format!("  {}", line)); } }
@@ -990,12 +990,12 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(String::from("  NODE_ID_OR_ALIAS can be the full hex ID or a short alias like peer1 — see PEERS."));
                 return;
             }
-            let node_id = match crate::distributed::NODE_MESH.lock().resolve_target(parts[1]) {
+            let node_id = match crate::net::distributed::NODE_MESH.lock().resolve_target(parts[1]) {
                 Some(id) => id,
                 None => { history.push(String::from("ERROR: Unknown node (expected a hex ID or peerN alias, see PEERS)")); return; }
             };
             let net_path = alloc::format!("/net/{}/{}", node_id.to_hex(), parts[2].trim_start_matches('/'));
-            match crate::distributed::DistributedFs::read_file(&net_path) {
+            match crate::net::distributed::DistributedFs::read_file(&net_path) {
                 Ok(data) => {
                     if parts.len() > 3 {
                         let local_path = normalize_path(parts[3]);
@@ -1022,7 +1022,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 return;
             }
             let local_path = normalize_path(parts[1]);
-            let node_id = match crate::distributed::NODE_MESH.lock().resolve_target(parts[2]) {
+            let node_id = match crate::net::distributed::NODE_MESH.lock().resolve_target(parts[2]) {
                 Some(id) => id,
                 None => { history.push(String::from("ERROR: Unknown node (expected a hex ID or peerN alias, see PEERS)")); return; }
             };
@@ -1031,7 +1031,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 Err(e) => { history.push(alloc::format!("ERROR reading local file: {:?}", e)); return; }
             };
             let net_path = alloc::format!("/net/{}/{}", node_id.to_hex(), parts[3].trim_start_matches('/'));
-            match crate::distributed::DistributedFs::write_file(&net_path, &data) {
+            match crate::net::distributed::DistributedFs::write_file(&net_path, &data) {
                 Ok(()) => history.push(alloc::format!("  Sent {} bytes to {}", data.len(), net_path)),
                 Err(e) => history.push(alloc::format!("ERROR: {:?}", e)),
             }
@@ -1040,15 +1040,15 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("STATUS");
             match sub {
                 "SECURITY" => {
-                    crate::policy::POLICY.lock().set_mode(crate::policy::PolicyMode::Security);
+                    crate::security::policy::POLICY.lock().set_mode(crate::security::policy::PolicyMode::Security);
                     history.push(String::from("Switched to SECURITY mode."));
                 }
                 "PERFORMANCE" => {
-                    crate::policy::POLICY.lock().set_mode(crate::policy::PolicyMode::Performance);
+                    crate::security::policy::POLICY.lock().set_mode(crate::security::policy::PolicyMode::Performance);
                     history.push(String::from("Switched to PERFORMANCE mode."));
                 }
                 _ => {
-                    let mode = crate::policy::POLICY.lock().get_mode();
+                    let mode = crate::security::policy::POLICY.lock().get_mode();
                     history.push(alloc::format!("  Current mode: {:?}", mode));
                     history.push(String::from("  Usage: MODE [SECURITY|PERFORMANCE]"));
                 }
@@ -1056,13 +1056,13 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         }
         "WIFI" => {
             // The Intel 7265 Wi-Fi card (iwlwifi.rs).
-            history.extend(crate::iwlwifi::command(&parts[1..]));
+            history.extend(crate::drivers::net::iwlwifi::command(&parts[1..]));
         }
         "DMESG" => {
             // The kernel log, for machines with no serial port (klog.rs):
             // the last 30 lines, or those containing the text given.
             let filter = parts[1..].join(" ");
-            let lines = crate::klog::lines(&filter, 30);
+            let lines = crate::sys::klog::lines(&filter, 30);
             if lines.is_empty() {
                 history.push(alloc::format!("DMESG: nothing containing '{}'", filter));
             }
@@ -1074,15 +1074,15 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // Saves like power-off, then resets (power.rs). A method name
             // tries only that one, then the triple fault.
             let method = match parts.get(1).copied() {
-                None => Some(crate::power::Method::Any),
-                Some("ACPI") => Some(crate::power::Method::Acpi),
-                Some("CF9") => Some(crate::power::Method::Cf9),
-                Some("KBD") => Some(crate::power::Method::Kbd),
-                Some("TRIPLE") => Some(crate::power::Method::Triple),
+                None => Some(crate::sys::power::Method::Any),
+                Some("ACPI") => Some(crate::sys::power::Method::Acpi),
+                Some("CF9") => Some(crate::sys::power::Method::Cf9),
+                Some("KBD") => Some(crate::sys::power::Method::Kbd),
+                Some("TRIPLE") => Some(crate::sys::power::Method::Triple),
                 Some(_) => None,
             };
             match method {
-                Some(m) => crate::power::reboot(m),
+                Some(m) => crate::sys::power::reboot(m),
                 None => history.push(String::from("Usage: REBOOT [ACPI|CF9|KBD|TRIPLE]")),
             }
         }
@@ -1090,8 +1090,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // CRASH TEST: stop the system on purpose, to see the crash screen
             // and the saved log (crash.rs). Administrators only.
             let admin = {
-                let user = crate::users::SESSION.lock().username.clone();
-                crate::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::users::UserRole::Admin | crate::users::UserRole::Root))
+                let user = crate::security::users::SESSION.lock().username.clone();
+                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
             };
             match parts.get(1).copied() {
                 Some("TEST") if admin => panic!("CRASH TEST typed in the terminal"),
@@ -1102,24 +1102,24 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "SYSPROF" => {
             // Time per NT service (sysprof.rs), dumped to the serial log.
             match parts.get(1).copied() {
-                Some("START") => { crate::sysprof::start(); history.push(String::from("SYSPROF: on")); }
-                Some("STOP") => { crate::sysprof::stop(); history.push(String::from("SYSPROF: off")); }
-                Some("DUMP") => { crate::sysprof::dump(); history.push(String::from("SYSPROF: written to the serial log")); }
+                Some("START") => { crate::nt::sysprof::start(); history.push(String::from("SYSPROF: on")); }
+                Some("STOP") => { crate::nt::sysprof::stop(); history.push(String::from("SYSPROF: off")); }
+                Some("DUMP") => { crate::nt::sysprof::dump(); history.push(String::from("SYSPROF: written to the serial log")); }
                 _ => history.push(String::from("Usage: SYSPROF START | STOP | DUMP")),
             }
         }
         "SAMPLE" => {
             match parts.get(1).map(|s| s.to_uppercase()).as_deref() {
                 Some("START") => {
-                    crate::sampler::start();
+                    crate::sys::sampler::start();
                     history.push(String::from("SAMPLE: recording (1 sample/ms, ring holds 16 s). Do the slow thing, then SAMPLE STOP."));
                 }
                 Some("STOP") => {
-                    crate::sampler::stop();
-                    history.push(alloc::format!("SAMPLE: stopped, {} samples. Run SAMPLE DUMP.", crate::sampler::total()));
+                    crate::sys::sampler::stop();
+                    history.push(alloc::format!("SAMPLE: stopped, {} samples. Run SAMPLE DUMP.", crate::sys::sampler::total()));
                 }
                 Some("DUMP") => {
-                    crate::sampler::dump();
+                    crate::sys::sampler::dump();
                     history.push(String::from("SAMPLE: histogram written to the serial log."));
                 }
                 _ => history.push(String::from("Usage: SAMPLE START | STOP | DUMP")),
@@ -1130,15 +1130,15 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             if parts.len() < 2 { history.push(String::from("USAGE: OPEN [TERMINAL|HUB|EXPLORER|LAUNCHER|SETTINGS]")); return; }
             match parts[1] {
                 "TERMINAL" => {
-                    crate::apps::open_terminal(80, 80, 550, 380, 0);
+                    crate::userland::apps::open_terminal(80, 80, 550, 380, 0);
                     history.push(String::from("OPENED: TERMINAL"));
                 }
                 "EXPLORER" => {
-                    crate::apps::open_file_manager(50, 60, 480, 360, 0);
+                    crate::userland::apps::open_file_manager(50, 60, 480, 360, 0);
                     history.push(String::from("OPENED: FILE MANAGER"));
                 }
                 "LAUNCHER" => {
-                    crate::apps::open_app_launcher(180, 50, 440, 380, 0);
+                    crate::userland::apps::open_app_launcher(180, 50, 440, 380, 0);
                     history.push(String::from("OPENED: APP LAUNCHER"));
                 }
                 _ => {
@@ -1153,7 +1153,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
 
         // THREADS — list all active worker threads with offload eligibility
         "THREADS" => {
-            let mgr = crate::process::THREAD_MANAGER.lock();
+            let mgr = crate::sched::process::THREAD_MANAGER.lock();
             let count = mgr.thread_count();
             history.push(alloc::format!("  {} worker thread(s) registered:", count));
             if count == 0 {
@@ -1168,7 +1168,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 // Iterate all known PIDs so we catch threads for every process,
                 // including pid 0 (kernel) and any user processes.
                 let pids: alloc::vec::Vec<u32> = {
-                    crate::process::PROCESSOR.lock()
+                    crate::sched::process::PROCESSOR.lock()
                         .processes.iter()
                         .map(|p| p.pid)
                         .collect()
@@ -1178,12 +1178,12 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     for t in mgr.threads_for_pid(*pid) {
                         printed = true;
                         let sub_label = match t.subsystem {
-                            crate::process::ThreadSubsystem::Native => "Native ",
-                            crate::process::ThreadSubsystem::Win32  => "Win32  ",
+                            crate::sched::process::ThreadSubsystem::Native => "Native ",
+                            crate::sched::process::ThreadSubsystem::Win32  => "Win32  ",
                         };
                         let elig_label = if !t.offload_eligible {
                             "no (flagged off)"
-                        } else if t.subsystem == crate::process::ThreadSubsystem::Win32 {
+                        } else if t.subsystem == crate::sched::process::ThreadSubsystem::Win32 {
                             if t.is_offload_candidate() {
                                 "yes (best-effort)"
                             } else {
@@ -1210,13 +1210,13 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("STATUS");
             if sub == "STATUS" {
                 history.push(String::from("  [OFFLOAD BROKER STATUS]"));
-                let broker = crate::scheduler::OFFLOAD_BROKER.lock();
+                let broker = crate::sched::scheduler::OFFLOAD_BROKER.lock();
                 for line in broker.status_lines() {
                     history.push(line);
                 }
                 history.push(alloc::format!(
                     "  Policy: {:?}",
-                    crate::scheduler::OffloadBroker::read_policy()
+                    crate::sched::scheduler::OffloadBroker::read_policy()
                 ));
             } else {
                 history.push(String::from("USAGE: BROKER STATUS"));
@@ -1228,7 +1228,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let sub = parts.get(1).copied().unwrap_or("LIST");
             if sub == "LIST" {
                 history.push(String::from("  [CHECKPOINTS on local node]"));
-                for line in crate::checkpoint::CheckpointManager::list_all() {
+                for line in crate::net::checkpoint::CheckpointManager::list_all() {
                     history.push(line);
                 }
             } else {
@@ -1245,7 +1245,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let id_str = parts[1].trim_start_matches("0x").trim_start_matches("0X");
             match u64::from_str_radix(id_str, 16) {
                 Ok(job_id) => {
-                    crate::scheduler::OFFLOAD_BROKER.lock().approve(job_id);
+                    crate::sched::scheduler::OFFLOAD_BROKER.lock().approve(job_id);
                     history.push(alloc::format!("  Approved offload job {:#x}", job_id));
                 }
                 Err(_) => history.push(String::from("ERROR: invalid job_id (expected hex)")),
@@ -1261,7 +1261,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let id_str = parts[1].trim_start_matches("0x").trim_start_matches("0X");
             match u64::from_str_radix(id_str, 16) {
                 Ok(job_id) => {
-                    crate::scheduler::OFFLOAD_BROKER.lock().deny(job_id);
+                    crate::sched::scheduler::OFFLOAD_BROKER.lock().deny(job_id);
                     history.push(alloc::format!("  Denied offload job {:#x}", job_id));
                 }
                 Err(_) => history.push(String::from("ERROR: invalid job_id (expected hex)")),
@@ -1280,25 +1280,25 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             let target_str = parts[1];
             let cmd_str: alloc::string::String = parts[2..].join(" ");
 
-            let node_id = crate::distributed::NODE_MESH.lock().resolve_target(target_str);
+            let node_id = crate::net::distributed::NODE_MESH.lock().resolve_target(target_str);
             match node_id {
                 None => {
                     history.push(alloc::format!("ERROR: unknown peer '{}'", target_str));
                 }
                 Some(nid) => {
-                    let job_id = crate::task_capsule::alloc_job_id();
-                    let capsule = crate::task_capsule::TaskCapsule::new(
+                    let job_id = crate::net::task_capsule::alloc_job_id();
+                    let capsule = crate::net::task_capsule::TaskCapsule::new(
                         job_id,
                         0, 0, 0, true,
                         cmd_str.into_bytes(),
                         alloc::vec::Vec::new(),
                         30_000,
-                        crate::distributed::CAP_EXEC as u64,
+                        crate::net::distributed::CAP_EXEC as u64,
                     );
                     history.push(alloc::format!(
                         "  Offloading job={:#x} to {}…", job_id, nid.to_hex()
                     ));
-                    match crate::distributed::remote_exec_capsule(&nid, &capsule) {
+                    match crate::net::distributed::remote_exec_capsule(&nid, &capsule) {
                         Ok(result) => {
                             history.push(alloc::format!(
                                 "  Result: success={}", result.success
@@ -1324,8 +1324,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "CAPSULE" => {
             let sub = parts.get(1).copied().unwrap_or("TEST");
             if sub == "TEST" {
-                let job_id = crate::task_capsule::alloc_job_id();
-                let capsule = crate::task_capsule::TaskCapsule::new(
+                let job_id = crate::net::task_capsule::alloc_job_id();
+                let capsule = crate::net::task_capsule::TaskCapsule::new(
                     job_id,
                     42,   // owner_pid
                     7,    // thread_id
@@ -1336,12 +1336,12 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                         alloc::string::String::from("/net/aabbccdd/data/asset.bin"),
                     ],
                     15_000,
-                    crate::distributed::CAP_EXEC as u64
-                        | crate::distributed::CAP_GPU as u64,
+                    crate::net::distributed::CAP_EXEC as u64
+                        | crate::net::distributed::CAP_GPU as u64,
                 );
                 let bytes = capsule.serialise();
                 history.push(alloc::format!("  Serialised: {} bytes", bytes.len()));
-                match crate::task_capsule::TaskCapsule::deserialise(&bytes) {
+                match crate::net::task_capsule::TaskCapsule::deserialise(&bytes) {
                     Some(c) => {
                         history.push(String::from("  Deserialise: OK"));
                         history.push(alloc::format!("  {}", c.describe()));
@@ -1367,22 +1367,22 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "SHELL" => {
             match parts.get(1).map(|s| s.to_uppercase()).as_deref() {
                 Some("ON") => {
-                    let path = parts.get(2).copied().unwrap_or(crate::shell::DEFAULT_PATH);
-                    match crate::shell::start(path) {
+                    let path = parts.get(2).copied().unwrap_or(crate::vsh::shell::DEFAULT_PATH);
+                    match crate::vsh::shell::start(path) {
                         Ok(m) => history.push(m),
                         Err(e) => history.push(alloc::format!("SHELL: {}", e)),
                     }
                 }
-                Some("RELOAD") => match crate::shell::reload() {
+                Some("RELOAD") => match crate::vsh::shell::reload() {
                     Ok(m) => history.push(m),
                     Err(e) => history.push(alloc::format!("SHELL: {}", e)),
                 },
                 Some("OFF") => {
-                    crate::shell::stop();
+                    crate::vsh::shell::stop();
                     history.push(String::from("SHELL: off (the built-in panel keeps working)"));
                 }
                 _ => {
-                    history.push(crate::shell::status());
+                    history.push(crate::vsh::shell::status());
                     history.push(String::from("Usage: SHELL ON [path] | RELOAD | OFF"));
                 }
             }

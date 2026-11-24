@@ -342,7 +342,7 @@ pub extern "system" fn ExitProcess(code: u32) -> ! {
 #[no_mangle]
 pub extern "system" fn DllMain(_module: usize, reason: u32, _reserved: usize) -> i32 {
     // DLL_PROCESS_ATTACH: VEILOS_MISSING_CALLS=zero asks for missing calls
-    // to return 0 rather than end the program (src/subsystem.rs);
+    // to return 0 rather than end the program (src/nt/subsystem.rs);
     // VEILOS_TRACE_SYSCALLS=1 logs this process's system calls.
     if reason == 1 {
         console::register_ctrl_routine();

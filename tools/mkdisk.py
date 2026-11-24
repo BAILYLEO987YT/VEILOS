@@ -11,7 +11,7 @@ shouldn't be in the repository (toolchains and the like). Times are the host's.
 
 The disk gets VEILOS.VOL at its root (storage/ has it; it is added if the
 folder doesn't), the marker VEILOS needs before it mounts a volume as `/` and
-writes to it (src/block.rs). --no-marker makes a data disk VEILOS only reads.
+writes to it (src/fs/block.rs). --no-marker makes a data disk VEILOS only reads.
 
 --boot BOOTIMG makes one bootable disk (a USB stick, or a VM's only disk):
 the bootloader's image from tools/build.sh, then this volume as a partition

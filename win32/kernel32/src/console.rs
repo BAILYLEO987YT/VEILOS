@@ -1,5 +1,5 @@
 //! The console (S5): screen buffers and input, through VEIL_CONSOLE
-//! (src/nt_console.rs). Output handles are screen buffers, input handles the
+//! (src/nt/console_calls.rs). Output handles are screen buffers, input handles the
 //! console itself; COORDs travel packed, X low and Y high, as Windows packs them.
 
 use crate::util::wstr;
@@ -438,7 +438,7 @@ fn hresult(s: i32) -> i32 {
     }
 }
 
-// -----| pseudo-consoles (src/pty.rs) |-----
+// -----| pseudo-consoles (src/nt/pty.rs) |-----
 
 /// CreatePseudoConsole(size, input pipe's read end, output pipe's write end,
 /// flags, HPCON out*): an HPCON is a handle to the console.

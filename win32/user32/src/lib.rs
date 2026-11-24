@@ -1,6 +1,6 @@
 //! VEILOS `user32.dll`: windows, messages and painting (WIN32_DESIGN.md, G1).
 //!
-//! A top-level window is the kernel's (nt_user.rs): a desktop window whose
+//! A top-level window is the kernel's (nt/user.rs): a desktop window whose
 //! client area shows pixels this DLL presents. Child windows exist only
 //! here: each is a rectangle of its top-level window's pixels. Messages are
 //! the kernel's per-thread queue (posted messages, input, timers) plus

@@ -2,7 +2,7 @@
 """addmarker.py IMAGE
 
 Add VEILOS.VOL to the root of a FAT32 disk image made before VEILOS needed
-it (src/block.rs: without it the volume is mounted read-only and VEILOS
+it (src/fs/block.rs: without it the volume is mounted read-only and VEILOS
 stops at boot). Leaves everything else as it is. The image must be a
 whole-disk FAT32 volume, as tools/mkdisk.py makes. Does nothing if the
 marker is already there.

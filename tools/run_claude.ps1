@@ -23,7 +23,7 @@ $qemu = 'C:\Program Files\qemu\qemu-system-x86_64.exe'
 
 if (-not (Test-Path $boot)) { throw "No kernel at $boot. Run: sh tools/build.sh" }
 if (-not (Test-Path $disk)) { throw "No disk at $disk." }
-# Disks made before VEILOS needed its volume marker (src/block.rs) get it now.
+# Disks made before VEILOS needed its volume marker (src/fs/block.rs) get it now.
 & python (Join-Path $PSScriptRoot 'addmarker.py') $disk
 if ($LASTEXITCODE -ne 0) { throw "Couldn't add VEILOS.VOL to $disk." }
 if (-not (Test-Path $qemu)) { throw "QEMU isn't at $qemu." }

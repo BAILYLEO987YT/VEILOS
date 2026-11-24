@@ -2,7 +2,7 @@
 //! floating point (vertex fetch through declarations and FVFs, transform,
 //! lighting, texture coordinate generation and transforms, fog, clipping,
 //! culling, primitive assembly), down to window-space primitives in fixed
-//! point for the kernel's rasterizer (src/raster3d.rs), whose texture stages
+//! point for the kernel's rasterizer (src/gfx/raster3d.rs), whose texture stages
 //! are Direct3D's own. Clear and Present too.
 //!
 //! Direct3D 9 puts pixel centres on integer coordinates; the rasterizer

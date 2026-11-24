@@ -1,0 +1,963 @@
+// =============================================================================
+// VEILOS: block layer
+// =============================================================================
+//
+// One `Disk` per device, shared by everything that uses that disk, with a
+// lock around it so two CPUs can never drive it at once. What moves the
+// sectors is the disk's `Transport`: an AHCI port (`AhciTransport`, with a
+// 64 KiB DMA bounce buffer, 128 sectors per command) or memory (`RamDisk`,
+// the image the bootloader loaded); NVMe and USB storage will be more. Each
+// disk has a sector cache, which is also the FAT cache: FAT and directory sectors are
+// re-read constantly and come from memory. In Security Mode the cache is
+// write-through and holds 1 MiB; in Performance Mode it is write-back (dirty
+// sectors go to the disk within a second, sorted and merged into large
+// commands, and on FlushFileBuffers, power-off and leaving the mode) and holds
+// 64 MiB. Bulk reads bypass it in both modes.
+//
+// On top of a disk sit `Partition`s (MBR primary entries, GPT entries, or
+// the whole disk for a superfloppy). Each is a `vfs::BlockDevice` with
+// partition-relative LBAs and bounds checking. `mount_disk` probes every
+// partition for a filesystem and mounts what it finds read-only at
+// `/mnt/<disk>p<n>` (`d<port>` for AHCI, `ram` for the RAM disk). Only a
+// volume that names itself VEILOS's (`VOLUME_MARKER` at its root) can become
+// `/`, and with more than one, `choose_root` picks the one on the disk the
+// kernel booted from (see "which VEILOS volume is `/`" below).
+//
+// Root-volume safety. On a real PC the first filesystem is usually the EFI
+// System Partition (FAT32), and before this the kernel made it `/` and wrote
+// its registry, users, logs and caches there. Now a volume must say it is
+// VEILOS's: a marker file is the test because it works the same on every
+// layout VEILOS meets (a superfloppy, MBR, GPT, QEMU's vvfat folder, a USB
+// stick), nothing else puts that file there by accident, and it needs no
+// filesystem driver beyond reading. A volume label is too easy to collide
+// with and a GPT type GUID exists only on GPT. Writes are refused twice: the
+// mount is read-only (callers get an error) and each `Disk` accepts writes
+// only inside the ranges `allow_writes` opened, which is only ever the root
+// volume's partition, so no driver, cache or crash path can write elsewhere.
+// The one exception is the installer (install.rs): while INSTALL <disk>
+// ERASE or UPDATE <disk> runs, typed by an administrator, it opens that
+// whole disk.
+// With no VEILOS volume the kernel stops at boot (main.rs) and writes nothing.
+//
+// Buffers passed to `BlockDevice` are kernel virtual addresses (heap,
+// stack); the bounce buffer handles the DMA side.
+
+use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
+use spin::Mutex;
+
+use crate::drivers::storage::ahci::HbaPort;
+
+/// What moves sectors for a `Disk`: a controller port, or memory. Called
+/// with the disk's lock held, so one request at a time.
+pub trait Transport: Send {
+    /// Read `buf.len() / 512` sectors starting at `lba`.
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool;
+    /// Write `buf.len() / 512` sectors starting at `lba`.
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool;
+    /// Make what was written durable (the device's own write cache).
+    fn flush(&mut self) -> bool {
+        true
+    }
+}
+
+/// An AHCI port. Commands go through a DMA bounce buffer: callers' buffers
+/// are kernel virtual memory (heap, stack) that may not be contiguous.
+pub struct AhciTransport {
+    port: *mut HbaPort,
+    bounce_phys: u64,
+    bounce_virt: *mut u8,
+}
+
+// The port pointer is only used under the owning disk's lock.
+unsafe impl Send for AhciTransport {}
+
+impl AhciTransport {
+    pub fn new(port: &'static mut HbaPort) -> Option<Self> {
+        let (bounce_phys, bounce_virt) = crate::mm::memory::DmaRegion::new(BOUNCE_BYTES)?.leak();
+        Some(Self { port, bounce_phys, bounce_virt })
+    }
+}
+
+impl Transport for AhciTransport {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        let count = (buf.len() / SECTOR) as u32;
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(BOUNCE_SECTORS);
+            let bytes = chunk as usize * SECTOR;
+            if !unsafe { &mut *self.port }.read_sectors(lba + done as u64, chunk, self.bounce_phys, crate::mm::memory::get_phys_mem_offset()) {
+                return false;
+            }
+            let dst = &mut buf[done as usize * SECTOR..done as usize * SECTOR + bytes];
+            unsafe { core::ptr::copy_nonoverlapping(self.bounce_virt, dst.as_mut_ptr(), bytes) };
+            done += chunk;
+        }
+        true
+    }
+
+    fn write(&mut self, lba: u64, src: &[u8]) -> bool {
+        let count = (src.len() / SECTOR) as u32;
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(BOUNCE_SECTORS);
+            let bytes = chunk as usize * SECTOR;
+            let part = &src[done as usize * SECTOR..done as usize * SECTOR + bytes];
+            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), self.bounce_virt, bytes) };
+            if !unsafe { &mut *self.port }.write_sectors(lba + done as u64, chunk, self.bounce_phys, crate::mm::memory::get_phys_mem_offset()) {
+                return false;
+            }
+            done += chunk;
+        }
+        true
+    }
+}
+
+/// A disk image in memory: the RAM disk the bootloader loaded beside the
+/// kernel (main.rs). What's written to it is gone at the next start.
+pub struct RamDisk {
+    base: *mut u8,
+    sectors: u64,
+}
+
+// The memory is the bootloader's mapping, reserved for this, used under the
+// owning disk's lock.
+unsafe impl Send for RamDisk {}
+
+impl RamDisk {
+    /// # Safety
+    /// `base..base + len` must be mapped, writable and used by nothing else.
+    pub unsafe fn new(base: *mut u8, len: usize) -> Self {
+        Self { base, sectors: (len / SECTOR) as u64 }
+    }
+
+    fn range(&self, lba: u64, len: usize) -> Option<usize> {
+        let end = lba.checked_add((len / SECTOR) as u64)?;
+        (end <= self.sectors).then_some(lba as usize * SECTOR)
+    }
+}
+
+impl Transport for RamDisk {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        let Some(at) = self.range(lba, buf.len()) else { return false };
+        unsafe { core::ptr::copy_nonoverlapping(self.base.add(at), buf.as_mut_ptr(), buf.len()) };
+        true
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8]) -> bool {
+        let Some(at) = self.range(lba, buf.len()) else { return false };
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), self.base.add(at), buf.len()) };
+        true
+    }
+}
+use crate::fs::vfs::BlockDevice;
+
+pub const SECTOR: usize = 512;
+
+/// Bounce buffer size: sectors moved per AHCI command.
+const BOUNCE_BYTES: usize = 64 * 1024;
+const BOUNCE_SECTORS: u32 = (BOUNCE_BYTES / SECTOR) as u32;
+
+/// Sectors kept in each disk's cache: 1 MiB in Security Mode, 64 MiB in
+/// Performance Mode (P2).
+const CACHE_SECTORS: usize = 2048;
+const CACHE_SECTORS_PERF: usize = 131_072;
+/// Reads larger than this bypass the cache (bulk file data would only evict
+/// the metadata the cache is for). Measured: caching them sector by sector
+/// cost more than it saved, even in Performance Mode.
+const CACHEABLE_READ_SECTORS: u32 = 64;
+/// Performance Mode writes back what's dirty at least this often (ms).
+const WRITE_BACK_MS: u64 = 1000;
+
+fn performance() -> bool {
+    crate::security::policy::performance()
+}
+
+struct Entry {
+    used: u64,
+    /// Newer than the disk (Performance Mode's write-back).
+    dirty: bool,
+    data: Box<[u8; SECTOR]>,
+}
+
+struct SectorCache {
+    map: BTreeMap<u64, Entry>,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+    dirty: usize,
+}
+
+impl SectorCache {
+    const fn new() -> Self {
+        Self { map: BTreeMap::new(), clock: 0, hits: 0, misses: 0, dirty: 0 }
+    }
+
+    fn get(&mut self, lba: u64) -> Option<&[u8; SECTOR]> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.map.get_mut(&lba).map(|e| {
+            e.used = clock;
+            &*e.data
+        })
+    }
+
+    /// Store a sector. `dirty`: it isn't on the disk yet. A clean copy never
+    /// replaces a dirty one (`keep_dirty`), so a read can't undo a write.
+    fn put(&mut self, lba: u64, data: &[u8], dirty: bool, keep_dirty: bool) {
+        self.clock += 1;
+        let clock = self.clock;
+        match self.map.get_mut(&lba) {
+            Some(e) => {
+                e.used = clock;
+                if e.dirty && keep_dirty && !dirty {
+                    return;
+                }
+                e.data.copy_from_slice(data);
+                if e.dirty != dirty {
+                    if dirty { self.dirty += 1 } else { self.dirty -= 1 }
+                    e.dirty = dirty;
+                }
+            }
+            None => {
+                let mut buf = Box::new([0u8; SECTOR]);
+                buf.copy_from_slice(data);
+                self.map.insert(lba, Entry { used: clock, dirty, data: buf });
+                if dirty {
+                    self.dirty += 1;
+                }
+            }
+        }
+    }
+
+    fn forget(&mut self, lba: u64) {
+        if let Some(e) = self.map.remove(&lba) {
+            if e.dirty {
+                self.dirty -= 1;
+            }
+        }
+    }
+}
+
+struct DiskInner {
+    transport: alloc::boxed::Box<dyn Transport>,
+    cache: SectorCache,
+    /// Absolute sector ranges [start, end) writes may touch: the root
+    /// volume's partition, or nothing.
+    writable: Vec<(u64, u64)>,
+}
+
+impl DiskInner {
+    fn may_write(&self, lba: u64, count: u64) -> bool {
+        let Some(end) = lba.checked_add(count) else { return false };
+        self.writable.iter().any(|&(s, e)| lba >= s && end <= e)
+    }
+
+    fn write_disk(&mut self, lba: u64, src: &[u8]) -> bool {
+        self.transport.write(lba, src)
+    }
+
+    /// Write the dirty sectors among `lbas` (sorted), contiguous ones in one
+    /// command each, and mark them clean.
+    fn write_back(&mut self, lbas: &[u64]) -> bool {
+        let mut ok = true;
+        let mut i = 0;
+        while i < lbas.len() {
+            let start = lbas[i];
+            let mut run: Vec<u8> = Vec::new();
+            let mut n = 0u64;
+            while i < lbas.len() && lbas[i] == start + n && n < BOUNCE_SECTORS as u64 {
+                run.extend_from_slice(&*self.cache.map[&lbas[i]].data);
+                n += 1;
+                i += 1;
+            }
+            if self.write_disk(start, &run) {
+                for k in 0..n {
+                    if let Some(e) = self.cache.map.get_mut(&(start + k)) {
+                        if e.dirty {
+                            e.dirty = false;
+                            self.cache.dirty -= 1;
+                        }
+                    }
+                }
+            } else {
+                crate::serial_println!("[BLOCK] write-back of {} sector(s) at {} failed", n, start);
+                ok = false;
+            }
+        }
+        ok
+    }
+
+    /// Everything dirty to the disk.
+    fn flush(&mut self) -> bool {
+        if self.cache.dirty == 0 {
+            return true;
+        }
+        let lbas: Vec<u64> = self.cache.map.iter().filter(|(_, e)| e.dirty).map(|(&l, _)| l).collect();
+        self.write_back(&lbas)
+    }
+
+    /// Over the limit: drop the least recently used quarter, writing back
+    /// what's dirty among it first.
+    fn trim(&mut self, limit: usize) {
+        if self.cache.map.len() <= limit {
+            return;
+        }
+        let mut stamps: Vec<u64> = self.cache.map.values().map(|e| e.used).collect();
+        stamps.sort_unstable();
+        let cutoff = stamps[stamps.len() / 4];
+        let victims: Vec<u64> = self.cache.map.iter().filter(|(_, e)| e.used <= cutoff).map(|(&l, _)| l).collect();
+        let dirty: Vec<u64> = victims.iter().copied().filter(|l| self.cache.map[l].dirty).collect();
+        if !dirty.is_empty() && !self.write_back(&dirty) {
+            // Keep what couldn't be written rather than lose it.
+            for l in victims {
+                if !self.cache.map[&l].dirty {
+                    self.cache.forget(l);
+                }
+            }
+            return;
+        }
+        for l in victims {
+            self.cache.forget(l);
+        }
+    }
+}
+
+/// A disk. Clone the `Arc` to share it.
+pub struct Disk {
+    /// Its name in logs and mount points: `d<port>` (AHCI), `ram`.
+    pub name: String,
+    pub sectors: u64,
+    inner: Mutex<DiskInner>,
+}
+
+/// A write outside the root volume, refused. Logged a limited number of
+/// times so a driver retrying in a loop can't flood the serial port.
+fn refused(disk: &str, lba: u64, count: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+        crate::serial_println!("[BLOCK] refused write: disk {} lba {} +{} is not the VEILOS volume", disk, lba, count);
+    }
+}
+
+/// Every disk, for write-back.
+static DISKS: Mutex<Vec<Arc<Disk>>> = Mutex::new(Vec::new());
+static LAST_FLUSH_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Write every disk's dirty sectors now (FlushFileBuffers, power-off,
+/// leaving Performance Mode).
+pub fn flush_all() {
+    let disks: Vec<Arc<Disk>> = DISKS.lock().clone();
+    for d in disks {
+        let mut inner = d.inner.lock();
+        inner.flush();
+        inner.transport.flush();
+    }
+}
+
+/// From the main loop: Performance Mode's lazy writer.
+pub fn tick(now_ms: u64) {
+    use core::sync::atomic::Ordering;
+    let last = LAST_FLUSH_MS.load(Ordering::Relaxed);
+    if now_ms.wrapping_sub(last) < WRITE_BACK_MS {
+        return;
+    }
+    LAST_FLUSH_MS.store(now_ms, Ordering::Relaxed);
+    let disks: Vec<Arc<Disk>> = match DISKS.try_lock() {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    for d in disks {
+        if let Some(mut inner) = d.inner.try_lock() {
+            inner.flush();
+        }
+    }
+}
+
+impl Disk {
+    pub fn new(transport: alloc::boxed::Box<dyn Transport>, name: String, sectors: u64) -> Arc<Self> {
+        let disk = Arc::new(Self {
+            name,
+            sectors,
+            inner: Mutex::new(DiskInner { transport, cache: SectorCache::new(), writable: Vec::new() }),
+        });
+        DISKS.lock().push(disk.clone());
+        disk
+    }
+
+    /// Read `buf.len() / 512` sectors from absolute `lba`. Cached sectors
+    /// (dirty ones in particular) win over what's on the disk.
+    pub fn read(&self, lba: u64, buf: &mut [u8]) -> bool {
+        let count = (buf.len() / SECTOR) as u32;
+        let perf = performance();
+        let cacheable = count <= CACHEABLE_READ_SECTORS;
+        let mut d = self.inner.lock();
+
+        let all_cached = (0..count as u64).all(|i| d.cache.map.contains_key(&(lba + i)));
+        if all_cached {
+            for i in 0..count as usize {
+                let s = d.cache.get(lba + i as u64).unwrap();
+                buf[i * SECTOR..(i + 1) * SECTOR].copy_from_slice(s);
+            }
+            d.cache.hits += 1;
+            return true;
+        }
+        d.cache.misses += 1;
+
+        if !d.transport.read(lba, &mut buf[..count as usize * SECTOR]) {
+            return false;
+        }
+        // What the cache holds is at least as new as the disk.
+        let end = lba + count as u64;
+        let cached: Vec<u64> = d.cache.map.range(lba..end).map(|(&l, _)| l).collect();
+        for l in &cached {
+            let i = (l - lba) as usize;
+            let s = d.cache.get(*l).unwrap();
+            buf[i * SECTOR..(i + 1) * SECTOR].copy_from_slice(s);
+        }
+        if cacheable {
+            for i in 0..count as usize {
+                d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], false, true);
+            }
+            d.trim(if perf { CACHE_SECTORS_PERF } else { CACHE_SECTORS });
+        }
+        true
+    }
+
+    /// Write `buf.len() / 512` sectors to absolute `lba`. Security Mode
+    /// writes through; Performance Mode (P1) keeps them dirty in the cache
+    /// for the lazy writer (`tick`), at most `WRITE_BACK_MS` behind.
+    pub fn write(&self, lba: u64, buf: &[u8]) -> bool {
+        let count = (buf.len() / SECTOR) as u32;
+        let perf = performance();
+        let mut d = self.inner.lock();
+        if !d.may_write(lba, count as u64) {
+            drop(d);
+            refused(&self.name, lba, count);
+            return false;
+        }
+        if perf {
+            for i in 0..count as usize {
+                d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], true, false);
+            }
+            d.trim(CACHE_SECTORS_PERF);
+            return true;
+        }
+        if !d.write_disk(lba, buf) {
+            // Unknown what reached the disk: forget the range.
+            for i in 0..count as u64 {
+                d.cache.forget(lba + i);
+            }
+            return false;
+        }
+        for i in 0..count as usize {
+            d.cache.put(lba + i as u64, &buf[i * SECTOR..(i + 1) * SECTOR], false, false);
+        }
+        d.trim(CACHE_SECTORS);
+        true
+    }
+
+    /// At a kernel panic, with the other CPUs stopped: write straight to the
+    /// disk, past the cache (whose memory may be in any state), taking the
+    /// disk even if it was held when everything stopped.
+    pub fn panic_write(&self, lba: u64, data: &[u8]) -> bool {
+        if self.inner.try_lock().is_none() {
+            unsafe { self.inner.force_unlock() };
+        }
+        match self.inner.try_lock() {
+            Some(mut d) if d.may_write(lba, (data.len() / SECTOR) as u64) => d.write_disk(lba, data),
+            _ => false,
+        }
+    }
+
+    /// Let writes reach sectors [start, start + sectors): the root volume.
+    fn allow_writes(&self, start: u64, sectors: u64) {
+        self.inner.lock().writable.push((start, start + sectors));
+    }
+
+    /// The installer (install.rs) only: let writes reach the whole disk
+    /// while it puts VEILOS on it (`open`), and close that again after. The
+    /// one other way a disk becomes writable, besides holding the root volume.
+    pub fn set_install_window(&self, open: bool) {
+        let whole = (0, self.sectors);
+        let mut d = self.inner.lock();
+        d.writable.retain(|&r| r != whole);
+        if open {
+            d.writable.push(whole);
+        }
+    }
+
+    /// Write straight to the disk, past the cache (and dropping what the
+    /// cache held for those sectors): for the installer's large writes,
+    /// which would only push everything else out of the cache.
+    pub fn write_through(&self, lba: u64, buf: &[u8]) -> bool {
+        let count = (buf.len() / SECTOR) as u64;
+        let mut d = self.inner.lock();
+        if !d.may_write(lba, count) {
+            drop(d);
+            refused(&self.name, lba, count as u32);
+            return false;
+        }
+        for i in 0..count {
+            d.cache.forget(lba + i);
+        }
+        d.write_disk(lba, buf)
+    }
+
+    /// (hits, misses) of the sector cache, for diagnostics.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        let d = self.inner.lock();
+        (d.cache.hits, d.cache.misses)
+    }
+}
+
+/// A partition (or a whole disk) as a block device. LBAs are relative to the
+/// partition start and bounds-checked.
+pub struct Partition {
+    pub disk: Arc<Disk>,
+    pub start: u64,
+    pub sectors: u64,
+}
+
+impl Partition {
+    fn in_bounds(&self, lba: u64, count: u32) -> bool {
+        lba.checked_add(count as u64).is_some_and(|end| end <= self.sectors)
+    }
+}
+
+impl BlockDevice for Partition {
+    fn read_sectors(&self, lba: u64, count: u32, buffer_virt: u64) -> bool {
+        if !self.in_bounds(lba, count) {
+            crate::serial_println!("[BLOCK] read past partition end: lba {} + {} > {}", lba, count, self.sectors);
+            return false;
+        }
+        let buf = unsafe { core::slice::from_raw_parts_mut(buffer_virt as *mut u8, count as usize * SECTOR) };
+        self.disk.read(self.start + lba, buf)
+    }
+
+    fn write_sectors(&self, lba: u64, count: u32, buffer_virt: u64) -> bool {
+        if !self.in_bounds(lba, count) {
+            crate::serial_println!("[BLOCK] write past partition end: lba {} + {} > {}", lba, count, self.sectors);
+            return false;
+        }
+        let buf = unsafe { core::slice::from_raw_parts(buffer_virt as *const u8, count as usize * SECTOR) };
+        self.disk.write(self.start + lba, buf)
+    }
+
+    fn on_disk(&self) -> Option<(Arc<Disk>, u64)> {
+        Some((self.disk.clone(), self.start))
+    }
+}
+
+// -----| partition tables |-----
+
+#[derive(Clone, Debug)]
+pub struct PartitionInfo {
+    pub start: u64,
+    pub sectors: u64,
+    pub kind: String,
+}
+
+/// Read the partition table: GPT (behind a protective MBR), MBR primary
+/// entries, or — if sector 0 holds no valid table — the whole disk.
+pub fn read_partitions(disk: &Disk) -> Vec<PartitionInfo> {
+    let whole = || vec![PartitionInfo { start: 0, sectors: disk.sectors, kind: String::from("whole disk") }];
+    let mut mbr = [0u8; SECTOR];
+    if !disk.read(0, &mut mbr) {
+        return Vec::new();
+    }
+    if u16::from_le_bytes([mbr[510], mbr[511]]) != 0xAA55 {
+        return whole();
+    }
+
+    let mut parts = Vec::new();
+    for i in 0..4 {
+        let e = &mbr[446 + i * 16..446 + (i + 1) * 16];
+        let boot = e[0];
+        let kind = e[4];
+        let start = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+        let sectors = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
+        if kind == 0 {
+            continue;
+        }
+        // A FAT boot sector has code here, not a table: reject anything that
+        // doesn't look like a real entry and treat the disk as unpartitioned.
+        if (boot != 0x00 && boot != 0x80) || start == 0 || sectors == 0 || start + sectors > disk.sectors {
+            return whole();
+        }
+        match kind {
+            0xEE => return read_gpt(disk).unwrap_or_else(whole),
+            0x05 | 0x0F | 0x85 => {
+                crate::serial_println!("[BLOCK] disk {}: extended partition {} not read yet", disk.name, i + 1);
+            }
+            _ => parts.push(PartitionInfo { start, sectors, kind: format!("MBR #{} type {:#04x}", i + 1, kind) }),
+        }
+    }
+    if parts.is_empty() { whole() } else { parts }
+}
+
+fn read_gpt(disk: &Disk) -> Option<Vec<PartitionInfo>> {
+    let mut hdr = [0u8; SECTOR];
+    if !disk.read(1, &mut hdr) || &hdr[0..8] != b"EFI PART" {
+        crate::serial_println!("[BLOCK] disk {}: protective MBR but no GPT header", disk.name);
+        return None;
+    }
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let entries_lba = u64_at(&hdr, 72);
+    let count = u32_at(&hdr, 80).min(128) as usize;
+    let size = u32_at(&hdr, 84) as usize;
+    if size < 128 || size > SECTOR || SECTOR % size != 0 {
+        return None;
+    }
+
+    let total = count * size;
+    let mut table = vec![0u8; (total + SECTOR - 1) / SECTOR * SECTOR];
+    if !disk.read(entries_lba, &mut table) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for i in 0..count {
+        let e = &table[i * size..(i + 1) * size];
+        if e[0..16].iter().all(|&b| b == 0) {
+            continue; // unused entry
+        }
+        let first = u64_at(e, 32);
+        let last = u64_at(e, 40);
+        if last < first || last >= disk.sectors {
+            continue;
+        }
+        let name: String = e[56..128]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .map(|c| char::from_u32(c as u32).unwrap_or('?'))
+            .collect();
+        parts.push(PartitionInfo { start: first, sectors: last - first + 1, kind: format!("GPT #{} '{}'", i + 1, name) });
+    }
+    Some(parts)
+}
+
+// -----| mounting |-----
+
+/// The file at the root of a VEILOS system volume, and how it starts.
+/// tools/mkdisk.py writes it; storage/ carries it for QEMU's vvfat disk.
+pub const VOLUME_MARKER: &str = "/VEILOS.VOL";
+const MARKER_MAGIC: &[u8] = b"VEILOS SYSTEM VOLUME";
+
+static ROOT_FOUND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The disk and partition (start, sectors) mounted at `/`.
+static ROOT_AT: Mutex<Option<(Arc<Disk>, u64, u64)>> = Mutex::new(None);
+
+/// Where `/` is: its disk, and the partition's start and length in sectors.
+pub fn root_location() -> Option<(Arc<Disk>, u64, u64)> {
+    ROOT_AT.lock().clone()
+}
+
+/// Every disk found, in the order found.
+pub fn disks() -> Vec<Arc<Disk>> {
+    DISKS.lock().clone()
+}
+/// Every filesystem seen, for the no-system-volume screen (main.rs).
+static FOUND: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// What was found on each disk: "NTFS, disk 1 partition 2 (64 MiB) at ...".
+pub fn found_volumes() -> Vec<String> {
+    FOUND.lock().clone()
+}
+
+/// Whether a VEILOS volume is mounted at `/`.
+pub fn root_mounted() -> bool {
+    ROOT_FOUND.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Does this filesystem carry the VEILOS marker? Reads only.
+fn is_veilos_volume(fs: &dyn crate::fs::vfs::FileSystem, device: &Partition) -> bool {
+    match fs.read_file(device, VOLUME_MARKER) {
+        Ok(data) => data.starts_with(MARKER_MAGIC),
+        Err(_) => false,
+    }
+}
+
+/// The filesystem on `device` if it is a VEILOS volume (install.rs's UPDATE).
+pub fn open_veilos_volume(device: &Partition) -> Option<(Box<dyn crate::fs::vfs::FileSystem>, &'static str)> {
+    let (fs, name) = detect_filesystem(device)?;
+    is_veilos_volume(&*fs, device).then_some((fs, name))
+}
+
+// -----| which VEILOS volume is `/` |-----
+//
+// A PC can have more than one VEILOS volume: VEILOS installed on its SSD and
+// a newer build on the USB stick it was started from. `/` must be the one
+// that goes with the running kernel, or the new kernel runs with the old
+// system's files. Disks are found in the order their drivers bind (RAM disk,
+// then AHCI and NVMe, then USB), so the first volume found is not the
+// answer. Instead every disk is mounted read-only first and each VEILOS
+// volume noted as a candidate; once USB has bound, `choose_root` picks:
+//
+//   1. the RAM disk, when the bootloader loaded one (it came with the kernel);
+//   2. the volume on the disk the kernel booted from: the one whose boot
+//      partition holds the very kernel that is running. The bootloader
+//      reports where it loaded the kernel's ELF file (BootInfo kernel_addr
+//      and kernel_len); its images keep that file as `kernel-x86_64` at the
+//      root of the FAT boot partition. Writable sections are left out of the
+//      comparison (the kernel writes to them in place), the rest must match
+//      byte for byte;
+//   3. failing that, the first candidate found.
+//
+// Disks that turn up later (a stick plugged in) are mounted read-only.
+
+/// The running kernel's ELF file in physical memory (address, length).
+static KERNEL_IMAGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// From BootInfo: where the bootloader put the kernel's ELF file.
+pub fn set_kernel_image(phys: u64, len: u64) {
+    if len > 0 {
+        *KERNEL_IMAGE.lock() = Some((phys, len));
+    }
+}
+
+/// The name of the kernel file on a bootloader 0.11 boot partition.
+const KERNEL_FILE: &str = "/kernel-x86_64";
+/// And the RAM disk image beside it on a RAM-disk image.
+const RAMDISK_FILE: &str = "/ramdisk";
+
+/// A VEILOS volume waiting for `choose_root`.
+struct Candidate {
+    disk: Arc<Disk>,
+    n: usize,
+    part: PartitionInfo,
+    fs: Box<dyn crate::fs::vfs::FileSystem>,
+    fs_name: &'static str,
+}
+
+struct RootChoice {
+    settled: bool,
+    candidates: Vec<Candidate>,
+    /// Disks whose boot partition holds the running kernel, and whether
+    /// that partition also carries a RAM disk image.
+    boot_disks: Vec<(String, bool)>,
+    /// Why `/` is where it is, for the screen and INSTALL/UPDATE.
+    reason: String,
+}
+
+static CHOICE: Mutex<RootChoice> =
+    Mutex::new(RootChoice { settled: false, candidates: Vec::new(), boot_disks: Vec::new(), reason: String::new() });
+
+/// Why `/` is the volume it is ("" before `choose_root`).
+pub fn root_reason() -> String {
+    CHOICE.lock().reason.clone()
+}
+
+/// The disks whose boot partition holds the running kernel (name, whether
+/// that partition also holds a RAM disk image).
+pub fn boot_disks() -> Vec<(String, bool)> {
+    CHOICE.lock().boot_disks.clone()
+}
+
+/// The ELF file of the running kernel, as the bootloader loaded it.
+fn running_kernel() -> Option<&'static [u8]> {
+    let (phys, len) = (*KERNEL_IMAGE.lock())?;
+    let virt = crate::mm::memory::get_phys_mem_offset().as_u64() + phys;
+    // SAFETY: the bootloader loaded the file there and maps all physical
+    // memory at that offset; its frames are reported as in use.
+    Some(unsafe { core::slice::from_raw_parts(virt as *const u8, len as usize) })
+}
+
+/// Is `file` the running kernel's ELF? Compares the ELF header, the program
+/// and section header tables, and every section the kernel can't write to
+/// (code, read-only data). Sections, not segments: VEILOS's linker script
+/// puts everything in one writable segment, and the kernel writes to its
+/// data in place, in this very copy of the file.
+fn same_kernel(running: &[u8], file: &[u8]) -> bool {
+    if running.len() != file.len() || running.len() < 64 || running[..64] != file[..64] || &file[..4] != b"ELF" {
+        return false;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([file[o], file[o + 1]]) as usize;
+    let u32_at = |o: usize| u32::from_le_bytes(file[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(file[o..o + 8].try_into().unwrap()) as usize;
+    let same = |off: usize, size: usize| off.checked_add(size).is_some_and(|e| e <= file.len() && running[off..e] == file[off..e]);
+    let (phoff, phentsize, phnum) = (u64_at(32), u16_at(54), u16_at(56));
+    let (shoff, shentsize, shnum) = (u64_at(40), u16_at(58), u16_at(60));
+    if shentsize < 64 || shnum == 0 || !same(phoff, phentsize * phnum) || !same(shoff, shentsize * shnum) {
+        return false;
+    }
+    let mut compared = 0usize;
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        const SHT_NOBITS: u32 = 8;
+        const SHF_WRITE: usize = 1;
+        if u32_at(sh + 4) == SHT_NOBITS || u64_at(sh + 8) & SHF_WRITE != 0 {
+            continue;
+        }
+        let (off, size) = (u64_at(sh + 24), u64_at(sh + 32));
+        if !same(off, size) {
+            return false;
+        }
+        compared += size;
+    }
+    compared > 0
+}
+
+/// Does this (non-VEILOS) filesystem hold the running kernel? Then it is
+/// the boot partition the kernel came from. Returns whether it does, and
+/// whether a RAM disk image sits beside it.
+fn holds_running_kernel(fs: &dyn crate::fs::vfs::FileSystem, device: &Partition) -> Option<bool> {
+    let running = running_kernel()?;
+    let st = fs.stat(device, KERNEL_FILE)?;
+    if st.is_dir || st.size != running.len() as u64 {
+        crate::serial_println!("[BLOCK]   a kernel of {} bytes, not the running one ({} bytes)", st.size, running.len());
+        return None;
+    }
+    let file = fs.read_file(device, KERNEL_FILE).ok()?;
+    if !same_kernel(running, &file) {
+        crate::serial_println!("[BLOCK]   a kernel of the same size, but not the running one");
+        return None;
+    }
+    Some(fs.stat(device, RAMDISK_FILE).is_some())
+}
+
+/// Mount one filesystem (not `/`) read-only and note it.
+fn mount_other(disk: &Arc<Disk>, n: usize, p: &PartitionInfo, fs: Box<dyn crate::fs::vfs::FileSystem>, fs_name: &str, how: &str) {
+    let device = Partition { disk: disk.clone(), start: p.start, sectors: p.sectors };
+    let path = format!("/mnt/{}p{}", disk.name, n);
+    let line = format!("{} on disk {} partition {} ({} MiB) at {}, {}", fs_name, disk.name, n, p.sectors / 2048, path, how);
+    crate::println!("  -> Mounted {}", line);
+    crate::serial_println!("[BLOCK]   mounted {}", line);
+    FOUND.lock().push(line);
+    crate::fs::vfs::VFS.mount(path, fs, Box::new(device), true);
+}
+
+/// Probe every partition of `disk` and mount each filesystem found,
+/// read-only. Until `choose_root` has run, VEILOS volumes are held back as
+/// candidates for `/`; after it, they too are mounted read-only.
+pub fn mount_disk(disk: Arc<Disk>) {
+    let parts = read_partitions(&disk);
+    crate::println!("     - {} partition(s)", parts.len());
+    for (n, p) in parts.iter().enumerate() {
+        crate::serial_println!(
+            "[BLOCK] disk {} part {}: {} start {} ({} MiB)",
+            disk.name, n, p.kind, p.start, p.sectors / 2048
+        );
+        let device = Partition { disk: disk.clone(), start: p.start, sectors: p.sectors };
+        let Some((fs, name)) = detect_filesystem(&device) else {
+            crate::serial_println!("[BLOCK]   no filesystem recognised");
+            continue;
+        };
+        if is_veilos_volume(&*fs, &device) {
+            let mut choice = CHOICE.lock();
+            if !choice.settled {
+                crate::serial_println!("[BLOCK]   VEILOS volume on disk {} partition {}: a candidate for /", disk.name, n);
+                choice.candidates.push(Candidate { disk: disk.clone(), n, part: p.clone(), fs, fs_name: name });
+                continue;
+            }
+            drop(choice);
+            mount_other(&disk, n, p, fs, name, "read-only: another VEILOS volume");
+            continue;
+        }
+        let settled = CHOICE.lock().settled;
+        if let Some(ramdisk) = (!settled).then(|| holds_running_kernel(&*fs, &device)).flatten() {
+            crate::serial_println!(
+                "[BLOCK]   disk {} partition {} holds the running kernel{}",
+                disk.name, n, if ramdisk { " (and a RAM disk image)" } else { "" }
+            );
+            CHOICE.lock().boot_disks.push((disk.name.clone(), ramdisk));
+        }
+        mount_other(&disk, n, p, fs, name, "read-only: not VEILOS's");
+    }
+}
+
+/// Once every disk present at boot has been probed (main.rs, after USB):
+/// make one VEILOS volume `/`, writable, and the others read-only mounts.
+/// Says on screen and in the serial log which and why. Does nothing if
+/// there is no VEILOS volume (main.rs stops then).
+pub fn choose_root() {
+    let mut choice = CHOICE.lock();
+    choice.settled = true;
+    let mut candidates = core::mem::take(&mut choice.candidates);
+    let boot: Vec<String> = choice.boot_disks.iter().map(|(d, _)| d.clone()).collect();
+    if candidates.is_empty() {
+        choice.reason = String::from("no VEILOS volume was found");
+        return;
+    }
+    let names = |c: &[Candidate]| c.iter().map(|c| format!("{}p{}", c.disk.name, c.n)).collect::<Vec<_>>().join(", ");
+    let (pick, reason) = if let Some(i) = candidates.iter().position(|c| c.disk.name == "ram") {
+        (i, String::from("the RAM disk the bootloader loaded with the kernel always comes first"))
+    } else if let Some(i) = candidates.iter().position(|c| boot.contains(&c.disk.name)) {
+        let also: Vec<&Candidate> = candidates.iter().enumerate().filter(|&(j, c)| j != i && boot.contains(&c.disk.name)).map(|(_, c)| c).collect();
+        let mut r = format!("disk {} is the boot disk (its boot partition holds the running kernel)", candidates[i].disk.name);
+        if !also.is_empty() {
+            r.push_str(&format!("; the same kernel is also on {}, so this is a guess", also.iter().map(|c| c.disk.name.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        (i, r)
+    } else {
+        let why = if KERNEL_IMAGE.lock().is_none() {
+            "the bootloader didn't say where the kernel is"
+        } else {
+            "no disk's boot partition holds the running kernel"
+        };
+        (0, format!("{}, so the first VEILOS volume found", why))
+    };
+    let all = names(&candidates);
+    choice.reason = reason.clone();
+    drop(choice);
+
+    let c = candidates.remove(pick);
+    let device = Partition { disk: c.disk.clone(), start: c.part.start, sectors: c.part.sectors };
+    c.disk.allow_writes(c.part.start, c.part.sectors);
+    *ROOT_AT.lock() = Some((c.disk.clone(), c.part.start, c.part.sectors));
+    ROOT_FOUND.store(true, core::sync::atomic::Ordering::Release);
+    let line = format!(
+        "{} on disk {} partition {} ({} MiB) at /, writable: the VEILOS volume",
+        c.fs_name, c.disk.name, c.n, c.part.sectors / 2048
+    );
+    crate::println!("  -> Mounted {}", line);
+    crate::serial_println!("[BLOCK]   mounted {}", line);
+    crate::println!("     / is disk {} partition {}: {}", c.disk.name, c.n, reason);
+    crate::serial_println!("[BLOCK] / is disk {} partition {} (VEILOS volumes: {}): {}", c.disk.name, c.n, all, reason);
+    FOUND.lock().push(line);
+    crate::fs::vfs::VFS.mount(String::from("/"), c.fs, Box::new(device), false);
+
+    for o in candidates {
+        mount_other(&o.disk, o.n, &o.part, o.fs, o.fs_name, "read-only: another VEILOS volume");
+    }
+}
+
+/// The RAM disk the bootloader loaded (main.rs), if there is one: a VEILOS
+/// volume on it always becomes `/` (`choose_root`). Booting from
+/// a RAM-disk image is how VEILOS runs from a USB stick before it has a USB
+/// storage driver: everything works, and nothing written survives a restart.
+static RAM_DISK: Mutex<Option<(u64, usize)>> = Mutex::new(None);
+
+pub fn set_ram_disk(virt: u64, len: usize) {
+    *RAM_DISK.lock() = Some((virt, len));
+}
+
+pub fn mount_ram_disk() {
+    let Some((virt, len)) = *RAM_DISK.lock() else { return };
+    crate::println!("RAM disk: {} MiB (changes are not kept)", len >> 20);
+    crate::serial_println!("[BLOCK] RAM disk at {:#x}, {} MiB", virt, len >> 20);
+    // SAFETY: the bootloader mapped the image here for the kernel alone and
+    // reports its frames as in use (memory.rs never hands them out).
+    let ram = unsafe { RamDisk::new(virt as *mut u8, len) };
+    mount_disk(Disk::new(Box::new(ram), String::from("ram"), (len / SECTOR) as u64));
+}
+
+/// Is `/` on the RAM disk? (Nothing written there is kept.)
+pub fn root_on_ram_disk() -> bool {
+    ROOT_AT.lock().as_ref().is_some_and(|(d, _, _)| d.name == "ram")
+}
+
+/// Try each filesystem driver on `device`.
+fn detect_filesystem(device: &Partition) -> Option<(Box<dyn crate::fs::vfs::FileSystem>, &'static str)> {
+    if let Some(fs) = crate::fs::ntfs::detect(device) { return Some((fs, "NTFS")); }
+    if let Some(fs) = crate::fs::exfat::detect(device) { return Some((fs, "exFAT")); }
+    if let Some((fs, name)) = crate::fs::fat::detect(device) { return Some((fs, name)); }
+    None
+}
+
+/// Read sector 0 of `device` (a filesystem's boot sector).
+pub fn read_boot_sector(device: &dyn BlockDevice) -> Option<[u8; SECTOR]> {
+    let mut buf = [0u8; SECTOR];
+    device.read_sectors(0, 1, buf.as_mut_ptr() as u64).then_some(buf)
+}

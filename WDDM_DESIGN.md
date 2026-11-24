@@ -32,7 +32,7 @@ Windows programs, so the user-mode half of a Windows driver fits what it has.
   "D3D → VkIR → GPU". Stage W0 corrected them.
 - What helps: Windows user-mode programs run (PE loader, ntdll, kernel32,
   user32, gdi32, d3d9/11, opengl32 of VEILOS's own), an NT object/handle
-  model, a registry (`nt_registry.rs`), PCI with MSI/MSI-X (`pci.rs`), and a
+  model, a registry (`nt/registry.rs`), PCI with MSI/MSI-X (`pci.rs`), and a
   PE image mapper (`modules.rs`).
 
 ## What a Windows display driver needs
@@ -123,7 +123,7 @@ Maxwell/Pascal; lists the GTX 745, `DEV_1382`) and Intel Arc 32.0.101.9175
 
 ### W1 kernel driver host, first slice (2026-11-21)
 
-`src/ntos/`: VEILOS's own implementation of the kernel interface, 89
+`src/nt/ntos/`: VEILOS's own implementation of the kernel interface, 89
 exports so far (pool, IRQL as CR8, spinlocks including queued ones, events,
 semaphores, mutexes and waits, time, DriverObject/DeviceObject/IRPs with
 IoCallDriver and IoCompleteRequest and its completion routines, device
@@ -173,7 +173,7 @@ passed (self-test `1f of 1f`, `k1test: 0 failed`).
 
 ### W1 third slice: SEH in drivers (2026-11-21)
 
-`src/ntos/seh.rs` brings `__try`/`__except`/`__finally` to drivers. It is
+`src/nt/ntos/seh.rs` brings `__try`/`__except`/`__finally` to drivers. It is
 adapted from VEILOS's user-mode SEH (ntdll's unwinder and dispatcher, and
 ucrtbase's `__C_specific_handler`).
 
@@ -204,7 +204,7 @@ each:
 
 ### W1 memory for drivers (2026-11-21)
 
-`src/ntos/mm.rs`:
+`src/nt/ntos/mm.rs`:
 - **MDLs**: `IoAllocateMdl`, `MmBuildMdlForNonPagedPool`,
   `MmProbeAndLockPages` (raising into the driver's `__try` for a bad
   page; a program's not-yet-made pages are touched first),

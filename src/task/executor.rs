@@ -40,7 +40,7 @@ impl Executor {
             self.run_ready_tasks();
             // Between task polls this thread holds no locks: a safe point to
             // let a user thread on this CPU run if we've had the CPU a while.
-            crate::kthread::yield_if_slice_used(EXECUTOR_SLICE_MS);
+            crate::sched::kthread::yield_if_slice_used(EXECUTOR_SLICE_MS);
             self.sleep_if_idle();
         }
     }
@@ -92,15 +92,15 @@ impl Executor {
         // If we didn't disable interrupts first, an interrupt could sneak in right
         // after `is_empty()`, wake a task, and then we'd halt indefinitely!
         interrupts::disable();
-        if self.task_queue.is_empty() && crate::kthread::others_ready() {
+        if self.task_queue.is_empty() && crate::sched::kthread::others_ready() {
             // Nothing to poll but another thread (a user process) can run:
             // hand it the CPU instead of halting.
             interrupts::enable();
-            crate::kthread::yield_now();
+            crate::sched::kthread::yield_now();
         } else if self.task_queue.is_empty() {
             let t0 = unsafe { core::arch::x86_64::_rdtsc() };
             interrupts::enable_and_hlt();
-            crate::shell::note_idle(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+            crate::vsh::shell::note_idle(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
         } else {
             interrupts::enable();
         }

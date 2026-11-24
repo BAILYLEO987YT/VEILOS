@@ -2,7 +2,7 @@
 """mkwindisk.py OUT
 
 A test disk shaped like a PC's Windows install, for checking that VEILOS
-never writes to a disk that isn't its own (src/block.rs):
+never writes to a disk that isn't its own (src/fs/block.rs):
 
     GPT
       1  EFI System Partition   FAT32, 300 MiB   \\EFI\\Microsoft\\Boot\\..., \\EFI\\Boot\\BOOTX64.EFI

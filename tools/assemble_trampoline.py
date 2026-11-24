@@ -1,5 +1,5 @@
 ﻿"""
-AP trampoline assembler — regenerates AP_TRAMPOLINE_BYTES in src/smp.rs.
+AP trampoline assembler — regenerates AP_TRAMPOLINE_BYTES in src/arch/smp.rs.
 
 Usage: python tools/assemble_trampoline.py
 Outputs the Rust static array to stdout. Paste it into the static in smp.rs.

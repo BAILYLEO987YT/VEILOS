@@ -7,116 +7,24 @@
 
 extern crate alloc;
 
-#[macro_use]
-pub mod encryption;
-pub mod vga_buffer;
-pub mod power;
-pub mod usb;
-pub mod e1000;
-pub mod nvme;
-pub mod r8169;
-pub mod iwlwifi;
-pub mod wpa;
-pub mod klog;
-pub mod interrupts;
-pub mod gdt;
-pub mod allocator;
-pub mod memory;
-pub mod task;
-pub mod pci;
-pub mod ahci;
-pub mod ide;
-pub mod vfs;
-pub mod fat;
-pub mod exfat;
-pub mod ntfs;
-pub mod executable;
-pub mod policy;
-pub mod subsystem;
-pub mod sampler;
-pub mod process;
-pub mod loader;
-pub mod dll;
-pub mod graphics;
-pub mod ui;
-pub mod nt_objects;
-pub mod nt_memory;
-pub mod nt_thread;
-pub mod win32_user;
-pub mod gpu_driver;
-pub mod gfx_api;
-pub mod compositor;
-pub mod capability;
-pub mod sandbox;
-pub mod toolchain;
-pub mod debugger;
-pub mod pkgmgr;
-pub mod gui_toolkit;
-pub mod desktop;
-pub mod apps;
-pub mod stability;
-pub mod distribution;
-pub mod scheduler;
-pub mod vnr;
-pub mod app_repo;
-pub mod smp;
-pub mod time;
-pub mod ioapic;
-pub mod kthread;
-pub mod address_space;
-pub mod block;
-pub mod install;
-pub mod ntos;
-pub mod hal;
-pub mod hotplug;
-pub mod modules;
-pub mod console;
-pub mod nt_syscalls;
-pub mod kusd;
-pub mod nt_file;
-pub mod nt_exception;
-pub mod nt_process;
-pub mod nt_user;
-pub mod nt_registry;
-pub mod nt_demand;
-pub mod nt_ipc;
-pub mod nt_section;
-pub mod nt_socket;
-pub mod conbuf;
-pub mod nt_console;
-pub mod pty;
-pub mod workers;
-pub mod lgpu;
-pub mod raster3d;
-pub mod nt_gpu3d;
-pub mod nt_sound;
-pub mod credentials;
-pub mod crash;
-pub mod entropy;
-pub mod security;
-pub mod sysprof;
-pub mod aslr;
-pub mod virtio_net;
-pub mod game_sdk;
-pub mod network;
-pub mod hypervisor;
-pub mod tls;
-pub mod anticheat;
-pub mod distributed;
-pub mod task_capsule;
-pub mod checkpoint;
-pub mod users;
-pub mod vscript;
-pub mod vsh_lang;
-pub mod audio;
-pub mod gif_decoder;
-pub mod clipboard;
-pub mod compression;
-pub mod font;
-pub mod render2d;
-pub mod render2d_kernel;
-pub mod ui_runtime;
-pub mod shell;
+// -----| kernel modules |-----
+
+pub mod arch;      // GDT, interrupts, APICs, SMP, timebase
+pub mod mm;        // physical memory, the heap, address spaces
+pub mod sched;     // processes, threads, the scheduler
+pub mod hal;       // device model, PCI, hot-plug
+pub mod drivers;   // storage, network, USB, audio
+pub mod fs;        // VFS, block layer, file systems
+pub mod net;       // network stack, TLS, distributed mesh
+pub mod security;  // capabilities, sandboxing, policy, users, crypto
+pub mod exec;      // PE images and loaders
+pub mod nt;        // the Windows NT personality
+pub mod gfx;       // framebuffers and rendering
+pub mod gui;       // windows, widgets, desktop
+pub mod vsh;       // the shell and its language
+pub mod sys;       // logging, crash, power, diagnostics
+pub mod userland;  // native apps, packages, SDKs
+pub mod task;      // async executor, input and the terminal
 use core::panic::PanicInfo;
 use core::fmt::{self, Write};
 use spin::Mutex;
@@ -171,7 +79,7 @@ macro_rules! trace_println {
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => ($crate::vga_buffer::_print(format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::gfx::vga_buffer::_print(format_args!($($arg)*)));
 }
 
 #[macro_export]
@@ -187,7 +95,7 @@ pub fn _serial_print(args: fmt::Arguments) {
         SERIAL_WRITER.lock().write_fmt(args).expect("Printing to serial failed");
     });
     // Kept in memory too, for DMESG on machines with no serial port.
-    crate::klog::record(args);
+    crate::sys::klog::record(args);
 }
 
 // -----| kernel entry point |-----
@@ -216,9 +124,9 @@ macro_rules! boot_assert {
             Ok(v) => v,
             Err(e) => {
                 $crate::serial_println!("[BOOT FATAL] {}: {:?}", $msg, e);
-                $crate::vga_buffer::VGA_WRITER.lock().set_colour(
-                    $crate::vga_buffer::VgaColour::White,
-                    $crate::vga_buffer::VgaColour::Red,
+                $crate::gfx::vga_buffer::VGA_WRITER.lock().set_colour(
+                    $crate::gfx::vga_buffer::VgaColour::White,
+                    $crate::gfx::vga_buffer::VgaColour::Red,
                 );
                 $crate::println!("\n[BOOT FATAL] {}", $msg);
                 loop { unsafe { core::arch::asm!("hlt"); } }
@@ -233,21 +141,21 @@ macro_rules! boot_assert {
 fn take_boot_info(boot_info: &mut BootInfo) {
     use bootloader_api::info::PixelFormat;
     if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
-        crate::smp::set_rsdp(rsdp);
+        crate::arch::smp::set_rsdp(rsdp);
     }
     if let Some(addr) = boot_info.ramdisk_addr.into_option() {
-        crate::block::set_ram_disk(addr, boot_info.ramdisk_len as usize);
+        crate::fs::block::set_ram_disk(addr, boot_info.ramdisk_len as usize);
     }
-    // Where the kernel's ELF file is: block::choose_root finds the disk it
+    // Where the kernel's ELF file is: fs::block::choose_root finds the disk it
     // came from by looking for it on each boot partition.
-    crate::block::set_kernel_image(boot_info.kernel_addr, boot_info.kernel_len);
+    crate::fs::block::set_kernel_image(boot_info.kernel_addr, boot_info.kernel_len);
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         let info = fb.info();
         let virt = fb.buffer_mut().as_mut_ptr() as u64;
         let pixels = match info.pixel_format {
-            PixelFormat::Rgb => Some(vga_buffer::Pixels::Rgb),
-            PixelFormat::Bgr => Some(vga_buffer::Pixels::Bgr),
-            PixelFormat::U8 => Some(vga_buffer::Pixels::Grey),
+            PixelFormat::Rgb => Some(gfx::vga_buffer::Pixels::Rgb),
+            PixelFormat::Bgr => Some(gfx::vga_buffer::Pixels::Bgr),
+            PixelFormat::U8 => Some(gfx::vga_buffer::Pixels::Grey),
             _ => None,
         };
         serial_println!(
@@ -257,7 +165,7 @@ fn take_boot_info(boot_info: &mut BootInfo) {
         if let Some(pixels) = pixels {
             // The bootloader maps the framebuffer at `virt`; its physical
             // address is found again once paging is known (graphics.rs).
-            vga_buffer::init_framebuffer(vga_buffer::FirmwareFb {
+            gfx::vga_buffer::init_framebuffer(gfx::vga_buffer::FirmwareFb {
                 virt,
                 byte_len: info.byte_len,
                 width: info.width,
@@ -275,22 +183,22 @@ fn take_boot_info(boot_info: &mut BootInfo) {
 /// No disk holds a VEILOS volume (block.rs: the `VEILOS.VOL` marker). Stop
 /// here, before anything is written: every other volume stays untouched.
 fn no_system_volume() -> ! {
-    vga_buffer::VGA_WRITER.lock().set_colour(vga_buffer::VgaColour::White, vga_buffer::VgaColour::Red);
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(gfx::vga_buffer::VgaColour::White, gfx::vga_buffer::VgaColour::Red);
     println!();
     println!(" VEILOS could not find its system volume.                                       ");
-    vga_buffer::VGA_WRITER.lock().set_colour(vga_buffer::VgaColour::LightGray, vga_buffer::VgaColour::Black);
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(gfx::vga_buffer::VgaColour::LightGray, gfx::vga_buffer::VgaColour::Black);
     println!();
-    println!(" No disk has a filesystem with {} at its root, so VEILOS has", crate::block::VOLUME_MARKER);
+    println!(" No disk has a filesystem with {} at its root, so VEILOS has", crate::fs::block::VOLUME_MARKER);
     println!(" stopped here. It has written nothing to any disk. The volumes it found");
     println!(" are listed above; they were only read.");
     println!();
     println!(" Make a VEILOS disk with tools/mkdisk.py, or copy storage/VEILOS.VOL to the");
     println!(" root of the FAT32 volume VEILOS should use. Press any key to restart.");
-    serial_println!("[BOOT] no VEILOS system volume ({} not found on any disk): stopped, nothing written", crate::block::VOLUME_MARKER);
+    serial_println!("[BOOT] no VEILOS system volume ({} not found on any disk): stopped, nothing written", crate::fs::block::VOLUME_MARKER);
     // The same on a framebuffer, for machines with no VGA text mode (UEFI,
     // a display with no VGA core). Binding the display writes to no disk.
     crate::hal::bind(crate::hal::DeviceClass::Display);
-    let volumes = crate::block::found_volumes();
+    let volumes = crate::fs::block::found_volumes();
     let mut body = alloc::string::String::from("Volumes found (each was only read):\n");
     if volumes.is_empty() {
         body.push_str("  none\n");
@@ -300,7 +208,7 @@ fn no_system_volume() -> ! {
         body.push_str(v);
         body.push('\n');
     }
-    crate::crash::paint_stop(
+    crate::sys::crash::paint_stop(
         b"VEILOS COULD NOT FIND ITS SYSTEM VOLUME.",
         &[
             b"NO DISK HAS A FILESYSTEM WITH VEILOS.VOL AT ITS ROOT, SO VEILOS STOPPED HERE.",
@@ -310,7 +218,7 @@ fn no_system_volume() -> ! {
         ],
         body.as_bytes(),
     );
-    crate::power::wait_key_then_reset()
+    crate::sys::power::wait_key_then_reset()
 }
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
@@ -334,39 +242,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("\n\n\n");
     
     // Welcome message to Screen
-    vga_buffer::VGA_WRITER.lock().set_colour(
-        vga_buffer::VgaColour::LightCyan, 
-        vga_buffer::VgaColour::Black
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(
+        gfx::vga_buffer::VgaColour::LightCyan, 
+        gfx::vga_buffer::VgaColour::Black
     );
     println!("VEILOS v0.1.0");
     
-    vga_buffer::VGA_WRITER.lock().set_colour(
-        vga_buffer::VgaColour::LightGreen, 
-        vga_buffer::VgaColour::Black
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(
+        gfx::vga_buffer::VgaColour::LightGreen, 
+        gfx::vga_buffer::VgaColour::Black
     );
     println!("System starting...");
 
     // Set up GDT and TSS for Double Fault handling
-    gdt::init();
+    arch::gdt::init();
 
-    // Enable SSE on the BSP (APs do the same in smp::ap_entry).
-    crate::smp::enable_sse();
+    // Enable SSE on the BSP (APs do the same in arch::smp::ap_entry).
+    crate::arch::smp::enable_sse();
     // Write-combining memory type for framebuffers (same PAT on every CPU).
-    crate::smp::init_pat();
+    crate::arch::smp::init_pat();
     crate::serial_println!("[INIT] SSE enabled (CR4.OSFXSR+OSXMMEXCPT, CR0.EM/TS cleared)");
 
     // Calibrate the TSC against the PIT: the clock for delay_us and driver timeouts.
-    crate::time::init();
-    crate::entropy::init();
+    crate::arch::time::init();
+    crate::security::entropy::init();
 
     // Set up IDT and Hardware Interrupts (PIC)
-    interrupts::init_idt();
-    unsafe { interrupts::PICS.lock().initialize() };
+    arch::interrupts::init_idt();
+    unsafe { arch::interrupts::PICS.lock().initialize() };
     // Which lines start enabled: the timer, the keyboard and the cascade (the
     // mouse enables IRQ 12 itself). `initialize` keeps the firmware's masks,
     // and the I/O APIC set-up copies them: a BIOS leaves these open, but UEFI
     // firmware masks every line, and then no timer tick or key ever arrived.
-    unsafe { interrupts::PICS.lock().write_masks(0xF8, 0xFF) };
+    unsafe { arch::interrupts::PICS.lock().write_masks(0xF8, 0xFF) };
     x86_64::instructions::interrupts::enable();
     
     // Set up Advanced Memory Management (Paging and Frame Allocation)
@@ -375,76 +283,76 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let phys_mem_offset = VirtAddr::new(
         boot_info.physical_memory_offset.into_option().expect("the bootloader didn't map physical memory"),
     );
-    let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    memory::init_frame_allocator(&boot_info.memory_regions);
-    let mut frame_allocator = memory::GlobalFrameAllocator;
+    let mut mapper = unsafe { mm::memory::init(phys_mem_offset) };
+    mm::memory::init_frame_allocator(&boot_info.memory_regions);
+    let mut frame_allocator = mm::memory::GlobalFrameAllocator;
     
     println!("Memory Map loaded.");
     
     // Set up Global Allocator for Heap memory (Vec, Box, String)
     boot_assert!(
-        allocator::init_heap(&mut mapper, &mut frame_allocator),
+        mm::allocator::init_heap(&mut mapper, &mut frame_allocator),
         "Heap initialization failed — cannot continue"
     );
 
     // Heap is now live — safe to initialise the adaptive scheduler.
-    crate::scheduler::init();
+    crate::sched::scheduler::init();
     // Windows drivers' pool and image region: before any process exists, so
     // every address space shares its tables (ntos/pool.rs).
-    crate::ntos::init();
+    crate::nt::ntos::init();
     println!("Heap Initialized with Physical RAM Paging.");
     // Without PIT channel 2 or a CPUID rate: the TSC against the HPET.
-    crate::time::calibrate_late();
+    crate::arch::time::calibrate_late();
 
     // Register kernel process (PID 0) with full capabilities for system services.
-    crate::process::PROCESSOR.lock().register_kernel();
+    crate::sched::process::PROCESSOR.lock().register_kernel();
 
     // -----| SMP: start Application Processors |-----
     // Must happen after the heap (so the LAPIC page can be mapped), after
     // GDT+IDT are live (APs load them immediately on wake), and before the
     // scheduler tries to dispatch work across CPUs.
-    crate::smp::init(&mut mapper, &mut frame_allocator);
+    crate::arch::smp::init(&mut mapper, &mut frame_allocator);
 
-    // Move device IRQs from the 8259 to the I/O APIC (needs the LAPIC from smp::init).
-    crate::ioapic::init(&mut mapper, &mut frame_allocator);
+    // Move device IRQs from the 8259 to the I/O APIC (needs the LAPIC from arch::smp::init).
+    crate::arch::ioapic::init(&mut mapper, &mut frame_allocator);
     // ACPI power management: FADT, \_S5, ACPI mode, the power button.
-    crate::power::init();
+    crate::sys::power::init();
 
     // -----| Hardware Enumeration |-----
-    vga_buffer::VGA_WRITER.lock().set_colour(
-        vga_buffer::VgaColour::LightCyan, 
-        vga_buffer::VgaColour::Black
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(
+        gfx::vga_buffer::VgaColour::LightCyan, 
+        gfx::vga_buffer::VgaColour::Black
     );
     println!("\nScanning Peripheral Component Interconnect (PCI) Bus...");
-    vga_buffer::VGA_WRITER.lock().set_colour(
-        vga_buffer::VgaColour::White, 
-        vga_buffer::VgaColour::Black
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(
+        gfx::vga_buffer::VgaColour::White, 
+        gfx::vga_buffer::VgaColour::Black
     );
     
     // Enumerate the bus once and populate the device registry. Every driver
     // queries the registry from here on; nothing may rescan the bus.
-    pci::init();
+    hal::pci::init();
     crate::hal::init();
     // Hot-plug slots: empty ones are powered off before drivers bind.
-    crate::hotplug::init();
+    crate::hal::hotplug::init();
 
     // Storage first: the filesystems are needed by most of the rest of boot.
-    crate::block::mount_ram_disk();
+    crate::fs::block::mount_ram_disk();
     crate::hal::bind(crate::hal::DeviceClass::Storage);
     // USB too before the root volume is settled: it may be on a USB stick.
     crate::hal::bind(crate::hal::DeviceClass::SerialBus);
     // Every disk is mounted read-only so far: make the VEILOS volume on the
     // disk the kernel booted from `/` (not just the first one found).
-    crate::block::choose_root();
-    if !crate::block::root_mounted() {
+    crate::fs::block::choose_root();
+    if !crate::fs::block::root_mounted() {
         no_system_volume();
     }
-    crate::vfs::ensure_standard_dirs();
-    crate::scheduler::load_profiles();
-    crate::crash::prepare();
-    if crate::block::root_on_ram_disk() {
-        crate::desktop::notify(
-            crate::desktop::NotifCategory::Warning,
+    crate::fs::vfs::ensure_standard_dirs();
+    crate::sched::scheduler::load_profiles();
+    crate::sys::crash::prepare();
+    if crate::fs::block::root_on_ram_disk() {
+        crate::gui::desktop::notify(
+            crate::gui::desktop::NotifCategory::Warning,
             "VEILOS",
             "Running from memory (RAM disk): nothing you change is kept after a restart",
         );
@@ -455,29 +363,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Phase 15: initialise the hypervisor (VT-x VMX + EPT).
     // Only detects support; VMX root mode is entered when a VM starts.
-    crate::hypervisor::init();
+    crate::sys::hypervisor::init();
 
     // Phase 13 (TLS): load certificate store + initialise TLS layer.
-    crate::tls::init();
+    crate::net::tls::init();
 
     // Phase 14: anti-cheat compatibility layer.
-    crate::anticheat::init();
+    crate::security::anticheat::init();
 
     // Phase 16: distributed VEILOS (node mesh, DFS, remote exec, cloud gaming).
-    crate::distributed::init();
+    crate::net::distributed::init();
 
     // Also check for legacy IDE hardware
-    // ide::init(&hardware_tree);
+    // drivers::storage::ide::init(&hardware_tree);
 
     // Let's reset the colour back to standard for general text
-    vga_buffer::VGA_WRITER.lock().set_colour(
-        vga_buffer::VgaColour::Yellow,
-        vga_buffer::VgaColour::Black
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(
+        gfx::vga_buffer::VgaColour::Yellow,
+        gfx::vga_buffer::VgaColour::Black
     );
     println!("\nInterrupts enabled, Memory mapped, PCI Scanned. Ready. Type away!\n");
-    vga_buffer::VGA_WRITER.lock().set_colour(
-        vga_buffer::VgaColour::LightGray,
-        vga_buffer::VgaColour::Black
+    gfx::vga_buffer::VGA_WRITER.lock().set_colour(
+        gfx::vga_buffer::VgaColour::LightGray,
+        gfx::vga_buffer::VgaColour::Black
     );
 
     // -----| multitasking setup |-----
@@ -486,58 +394,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::hal::bind(crate::hal::DeviceClass::Multimedia);
     // Every class is bound: devices nobody drives can sleep.
     crate::hal::power_down_idle();
-    if crate::graphics::FRAMEBUFFER.lock().is_none() {
+    if crate::gfx::graphics::FRAMEBUFFER.lock().is_none() {
         println!("[GRAPHICS] No supported display adapter. Falling back to VGA Text Mode.");
     }
 
-    serial_println!("[BOOT] >> dll::init ...");
-    crate::dll::init();
-    serial_println!("[BOOT] >> nt_objects::init ...");
-    crate::nt_objects::init();
-    serial_println!("[BOOT] >> nt_thread::init ...");
-    crate::nt_thread::init();
-    serial_println!("[BOOT] >> win32_user::init ...");
-    crate::win32_user::init();
-    serial_println!("[BOOT] >> sandbox::init ...");
-    crate::sandbox::init();
-    serial_println!("[BOOT] >> gpu_driver::init ...");
-    crate::gpu_driver::init();
-    serial_println!("[BOOT] >> gfx_api::init ...");
-    crate::gfx_api::init();
-    serial_println!("[BOOT] >> compositor::init ...");
-    crate::compositor::init();
-    serial_println!("[BOOT] >> toolchain::init ...");
-    crate::toolchain::init();
-    serial_println!("[BOOT] >> debugger::init ...");
-    crate::debugger::init();
-    serial_println!("[BOOT] >> pkgmgr::init ...");
-    crate::pkgmgr::init();
-    serial_println!("[BOOT] >> users::init ...");
-    crate::users::init();
-    serial_println!("[BOOT] >> gui_toolkit::init ...");
-    crate::gui_toolkit::init();
-    serial_println!("[BOOT] >> desktop::init ...");
-    crate::desktop::init();
-    serial_println!("[BOOT] >> apps::init ...");
-    crate::apps::init();
-    serial_println!("[BOOT] >> stability::init ...");
-    crate::stability::init();
-    serial_println!("[BOOT] >> distribution::init ...");
-    crate::distribution::init();
-    serial_println!("[BOOT] >> vnr::init ...");
-    crate::vnr::init();
-    serial_println!("[BOOT] >> app_repo::init ...");
-    crate::app_repo::init();
-    serial_println!("[BOOT] >> game_sdk::init ...");
-    crate::game_sdk::init();
-    serial_println!("[BOOT] >> compression::init ...");
-    crate::compression::init();
+    serial_println!("[BOOT] >> exec::dll::init ...");
+    crate::exec::dll::init();
+    serial_println!("[BOOT] >> nt::objects::init ...");
+    crate::nt::objects::init();
+    serial_println!("[BOOT] >> nt::thread::init ...");
+    crate::nt::thread::init();
+    serial_println!("[BOOT] >> nt::win32_user::init ...");
+    crate::nt::win32_user::init();
+    serial_println!("[BOOT] >> security::sandbox::init ...");
+    crate::security::sandbox::init();
+    serial_println!("[BOOT] >> gfx::gpu_driver::init ...");
+    crate::gfx::gpu_driver::init();
+    serial_println!("[BOOT] >> gfx::gfx_api::init ...");
+    crate::gfx::gfx_api::init();
+    serial_println!("[BOOT] >> gui::compositor::init ...");
+    crate::gui::compositor::init();
+    serial_println!("[BOOT] >> userland::toolchain::init ...");
+    crate::userland::toolchain::init();
+    serial_println!("[BOOT] >> sys::debugger::init ...");
+    crate::sys::debugger::init();
+    serial_println!("[BOOT] >> userland::pkgmgr::init ...");
+    crate::userland::pkgmgr::init();
+    serial_println!("[BOOT] >> security::users::init ...");
+    crate::security::users::init();
+    serial_println!("[BOOT] >> gui::gui_toolkit::init ...");
+    crate::gui::gui_toolkit::init();
+    serial_println!("[BOOT] >> gui::desktop::init ...");
+    crate::gui::desktop::init();
+    serial_println!("[BOOT] >> userland::apps::init ...");
+    crate::userland::apps::init();
+    serial_println!("[BOOT] >> sys::stability::init ...");
+    crate::sys::stability::init();
+    serial_println!("[BOOT] >> userland::distribution::init ...");
+    crate::userland::distribution::init();
+    serial_println!("[BOOT] >> userland::vnr::init ...");
+    crate::userland::vnr::init();
+    serial_println!("[BOOT] >> userland::app_repo::init ...");
+    crate::userland::app_repo::init();
+    serial_println!("[BOOT] >> userland::game_sdk::init ...");
+    crate::userland::game_sdk::init();
+    serial_println!("[BOOT] >> sys::compression::init ...");
+    crate::sys::compression::init();
     serial_println!("[BOOT] << All subsystems initialised.");
 
     // Register Windows in WM
-    crate::interrupts::init_pit();
-    crate::interrupts::check_tick_source();
-    crate::ui::init_back_buffer();
+    crate::arch::interrupts::init_pit();
+    crate::arch::interrupts::check_tick_source();
+    crate::gui::ui::init_back_buffer();
 
     // Initialize Input Subsystems
     task::keyboard::initialize();
@@ -549,17 +457,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Phase 18: the desktop starts at the login screen.
     // paint_desktop() will render the correct phase on the first vsync tick.
     
-    crate::address_space::log_kernel_layout();
+    crate::mm::address_space::log_kernel_layout();
 
     let mut executor = task::executor::Executor::new();
     
     // Spawn core kernel tasks
     executor.spawn(task::Task::new(task::mouse::mouse_tick()));
     executor.spawn(task::Task::new(gui_refresh_task()));
-    executor.spawn(task::Task::new(crate::scheduler::reaper_task()));
-    executor.spawn(task::Task::new(crate::usb::hotplug_task()));
+    executor.spawn(task::Task::new(crate::sched::scheduler::reaper_task()));
+    executor.spawn(task::Task::new(crate::drivers::usb::hotplug_task()));
     
-    // (All non-blocking system apps are initialized in apps::init())
+    // (All non-blocking system apps are initialized in userland::apps::init())
     
     println!("Starting Coöperative App Scheduler...");
     executor.run();
@@ -593,7 +501,7 @@ pub static ALT_HELD: core::sync::atomic::AtomicBool =
 /// genuinely redraws on motion is listed here; when in doubt (a lock is contended) this
 /// answers `true`, i.e. falls back to the old always-repaint behaviour.
 fn motion_needs_repaint() -> bool {
-    use crate::desktop::{CONTEXT_MENU, DESKTOP_WM, PENDING_ROLE_DIALOG};
+    use crate::gui::desktop::{CONTEXT_MENU, DESKTOP_WM, PENDING_ROLE_DIALOG};
     // Any button held: window drag/resize, file drag-and-drop and in-app drags
     // (text selection, scrollbars) all redraw on every move.
     {
@@ -617,11 +525,11 @@ async fn gui_refresh_task() {
     // distinguish "task never started" from "task started but can't render".
     serial_println!("[GUI] gui_refresh_task started.");
     serial_println!("[GUI] TICKS      = {}",
-        crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+        crate::arch::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed));
     serial_println!("[GUI] FRAMEBUFFER present = {}",
-        crate::graphics::FRAMEBUFFER.lock().is_some());
+        crate::gfx::graphics::FRAMEBUFFER.lock().is_some());
     serial_println!("[GUI] BACK_BUFFER present = {}",
-        crate::ui::BACK_BUFFER.lock().is_some());
+        crate::gui::ui::BACK_BUFFER.lock().is_some());
     // ---- end diagnostics ----
 
     let mut last_mb = false;
@@ -643,11 +551,11 @@ async fn gui_refresh_task() {
     let mut diag_stage: [u64; 3] = [0; 3];
 
     loop {
-        let ms = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        let ms = crate::arch::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         // The power button: shut down, saving what power-off saves.
-        if crate::power::take_button_press() {
+        if crate::sys::power::take_button_press() {
             crate::serial_println!("[POWER] power button pressed");
-            crate::shell::power_off();
+            crate::vsh::shell::power_off();
         }
         diag_iters += 1;
         let mut ui_dirty = false;
@@ -667,7 +575,7 @@ async fn gui_refresh_task() {
         }
 
         // Drain profiler ISR ticks from safe task context (no locks in ISR).
-        crate::debugger::pump_profiler_ticks();
+        crate::sys::debugger::pump_profiler_ticks();
 
 
         // Drain all pending scancodes and route them through the desktop
@@ -738,7 +646,7 @@ async fn gui_refresh_task() {
 
                 // Super+L (0xE0 0x5B) — lock the desktop.
                 if extended && sc == 0x5B {
-                    crate::desktop::lock_desktop();
+                    crate::gui::desktop::lock_desktop();
                     continue;
                 }
                 // Decode and dispatch.
@@ -752,7 +660,7 @@ async fn gui_refresh_task() {
 
                 if let Some(ev) = maybe_event {
                     // A Windows program's window gets the key itself too.
-                    let program_key = crate::nt_user::key_event(ev.code, ev.state);
+                    let program_key = crate::nt::user::key_event(ev.code, ev.state);
                     let key_name = match ev.code {
                         pc_keyboard::KeyCode::Escape => "ESC",
                         pc_keyboard::KeyCode::Return => "ENTER",
@@ -770,7 +678,7 @@ async fn gui_refresh_task() {
                     filters.insert(alloc::string::String::from("action"), alloc::string::String::from(action_name));
                     
                     {
-                        let mut eng = crate::vscript::GLOBAL_ENGINE.lock();
+                        let mut eng = crate::vsh::vscript::GLOBAL_ENGINE.lock();
                         let _ = eng.trigger_event("key_event", Some(&filters));
                     }
 
@@ -781,10 +689,10 @@ async fn gui_refresh_task() {
 
                     // A terminal running a console program takes keys whole:
                     // key events with VK codes and modifiers, down and up.
-                    if !program_key && crate::desktop::DesktopPhase::from_u8(crate::desktop::DESKTOP_PHASE.load(core::sync::atomic::Ordering::Acquire)) == crate::desktop::DesktopPhase::Desktop {
+                    if !program_key && crate::gui::desktop::DesktopPhase::from_u8(crate::gui::desktop::DESKTOP_PHASE.load(core::sync::atomic::Ordering::Acquire)) == crate::gui::desktop::DesktopPhase::Desktop {
                         let decoded = match maybe_key { Some(DecodedKey::Unicode(c)) => Some(c), _ => None };
-                        if crate::apps::console_key(ev.code, ev.state, decoded) {
-                            crate::users::SESSION.lock().touch();
+                        if crate::userland::apps::console_key(ev.code, ev.state, decoded) {
+                            crate::security::users::SESSION.lock().touch();
                             ui_dirty = true;
                             continue;
                         }
@@ -794,31 +702,31 @@ async fn gui_refresh_task() {
                         ui_dirty = true;
                         match key {
                             DecodedKey::Unicode(ch) => {
-                                crate::users::SESSION.lock().touch();
+                                crate::security::users::SESSION.lock().touch();
                                 // Intercept Ctrl+letter for clipboard / selection shortcuts.
                                 if CTRL_HELD.load(core::sync::atomic::Ordering::Relaxed) && !program_key {
                                     let lower = ch.to_ascii_lowercase();
                                     match lower {
-                                        'c' => { crate::clipboard::clipboard_copy(); continue; }
-                                        'v' => { crate::clipboard::clipboard_paste(); continue; }
-                                        'x' => { crate::clipboard::clipboard_cut(); continue; }
-                                        'a' => { crate::clipboard::clipboard_select_all(); continue; }
+                                        'c' => { crate::gui::clipboard::clipboard_copy(); continue; }
+                                        'v' => { crate::gui::clipboard::clipboard_paste(); continue; }
+                                        'x' => { crate::gui::clipboard::clipboard_cut(); continue; }
+                                        'a' => { crate::gui::clipboard::clipboard_select_all(); continue; }
                                         _ => {} // Fall through to normal dispatch
                                     }
                                 }
-                                crate::desktop::dispatch_key(ch);
+                                crate::gui::desktop::dispatch_key(ch);
                             }
                             // pc-keyboard 0.7 decodes the US backslash key
                             // (scancode 0x2B) as Oem7, which its Us104 layout
                             // doesn't map: it is '\' (or '|' with Shift).
                             DecodedKey::RawKey(pc_keyboard::KeyCode::Oem7) => {
-                                crate::users::SESSION.lock().touch();
+                                crate::security::users::SESSION.lock().touch();
                                 let shift = SHIFT_HELD.load(core::sync::atomic::Ordering::Relaxed);
-                                crate::desktop::dispatch_key(if shift { '|' } else { '\\' });
+                                crate::gui::desktop::dispatch_key(if shift { '|' } else { '\\' });
                             }
                             DecodedKey::RawKey(key) => {
-                                crate::users::SESSION.lock().touch();
-                                crate::desktop::dispatch_raw_key(key);
+                                crate::security::users::SESSION.lock().touch();
+                                crate::gui::desktop::dispatch_raw_key(key);
                             }
                         }
                     }
@@ -829,16 +737,16 @@ async fn gui_refresh_task() {
         // Tick always-on subsystems.
         // Drive the smoltcp network stack — processes incoming Ethernet
         // frames, runs DHCP/DNS, and delivers UDP/TCP data to sockets.
-        crate::network::poll();
+        crate::net::network::poll();
         // Performance Mode's lazy writer (block.rs).
-        crate::block::tick(crate::time::now_ms());
-        crate::scheduler::flush_if_due(crate::time::now_ms());
-        crate::security::flush_audit(crate::time::now_ms());
+        crate::fs::block::tick(crate::arch::time::now_ms());
+        crate::sched::scheduler::flush_if_due(crate::arch::time::now_ms());
+        crate::security::mode::flush_audit(crate::arch::time::now_ms());
         
         // Drive the distributed mesh layer — sends LAN announcements,
         // polls the discovery UDP socket, and processes incoming packets.
         let tick_ms = ms / 1000;
-        crate::distributed::tick();
+        crate::net::distributed::tick();
         // Periodic debug: log peer count every few seconds.
         // (Previously compared against a copy of `last_sec` taken *after*
         // `last_sec` had already been synced to the current second above,
@@ -846,20 +754,20 @@ async fn gui_refresh_task() {
         // Uses its own tracker now.)
         if tick_ms % 5 == 0 && tick_ms != last_mesh_debug_sec {
             last_mesh_debug_sec = tick_ms;
-            let peer_count = crate::distributed::NODE_MESH.lock().peer_count();
+            let peer_count = crate::net::distributed::NODE_MESH.lock().peer_count();
             crate::serial_println!("[MESH] Active peers: {}", peer_count);
         }
 
         // Tick all live terminal pool slots (cursor blink, etc.).
-        for slot in &crate::apps::TERMINAL_POOL {
+        for slot in &crate::userland::apps::TERMINAL_POOL {
             if let Some(mut term) = slot.try_lock() {
                 if term.window_id != 0 { term.tick(ms); }
             }
         }
-        // crate::compositor::COMPOSITOR.lock().tick(ms); // Disabled: competing with new Desktop WM and causing lag.
+        // crate::gui::compositor::COMPOSITOR.lock().tick(ms); // Disabled: competing with new Desktop WM and causing lag.
 
-        let phase = crate::desktop::DesktopPhase::from_u8(
-            crate::desktop::DESKTOP_PHASE.load(core::sync::atomic::Ordering::Acquire)
+        let phase = crate::gui::desktop::DesktopPhase::from_u8(
+            crate::gui::desktop::DESKTOP_PHASE.load(core::sync::atomic::Ordering::Acquire)
         );
 
         // Read mouse state once — used in both Desktop and login/lock branches.
@@ -875,9 +783,9 @@ async fn gui_refresh_task() {
         // Skip the WM entirely, paint directly to hardware, no cursor.
         // Still handle pending role dialog clicks though.
         // ----------------------------------------------------------------
-        if phase != crate::desktop::DesktopPhase::Desktop {
+        if phase != crate::gui::desktop::DesktopPhase::Desktop {
             // Handle dialog clicks during login/lock phases
-            use crate::desktop::PENDING_ROLE_DIALOG;
+            use crate::gui::desktop::PENDING_ROLE_DIALOG;
             if mb && PENDING_ROLE_DIALOG.try_lock().map(|d| d.visible).unwrap_or(false) {
                 let mut d = PENDING_ROLE_DIALOG.lock();
                 if d.handle_click(mx as i32, my as i32) {
@@ -885,12 +793,12 @@ async fn gui_refresh_task() {
                 }
             }
             if ui_dirty {
-                crate::desktop::paint_desktop(ms);
+                crate::gui::desktop::paint_desktop(ms);
             }
             last_mb = mb;
             last_mx = mx;
             last_my = my;
-            crate::interrupts::SleepFuture::new(16).await;
+            crate::arch::interrupts::SleepFuture::new(16).await;
             continue;
         }
 
@@ -899,28 +807,28 @@ async fn gui_refresh_task() {
         // ----------------------------------------------------------------
 
         // One-shot: load /config.vsh the first time we reach the Desktop phase.
-        // This is deferred from apps::init() because the VFS has no mounts
+        // This is deferred from userland::apps::init() because the VFS has no mounts
         // until after AHCI init completes — which happens well after init().
         {
             static CONFIG_LOADED: core::sync::atomic::AtomicBool =
                 core::sync::atomic::AtomicBool::new(false);
             if !CONFIG_LOADED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-                crate::apps::load_config_vsh();
+                crate::userland::apps::load_config_vsh();
             }
         }
 
         // Poll centrally — this handles window buttons, drags, and content clicks.
         // It works both here and in the timer ISR while a process is running.
-        crate::desktop::poll_input();
-        crate::nt_registry::tick(ms);
+        crate::gui::desktop::poll_input();
+        crate::nt::registry::tick(ms);
 
         // Drain any desktop icon / app launcher clicks that the timer ISR
         // deferred (they involve heavy heap allocations — PNG decode, PE loading —
         // and must not run inside the ISR where the allocator may already be locked).
-        crate::desktop::drain_deferred_clicks();
+        crate::gui::desktop::drain_deferred_clicks();
 
         // VSH shell: handlers, window events, live values, layout, OS actions.
-        if crate::shell::pump(ms) {
+        if crate::vsh::shell::pump(ms) {
             ui_dirty = true;
         }
 
@@ -934,7 +842,7 @@ async fn gui_refresh_task() {
         }
 
         // Advance animations for focused windows or wallpaper
-        if !ui_dirty && (crate::apps::needs_animation_refresh(ms) || crate::desktop::needs_wallpaper_refresh(ms)) {
+        if !ui_dirty && (crate::userland::apps::needs_animation_refresh(ms) || crate::gui::desktop::needs_wallpaper_refresh(ms)) {
             ui_dirty = true;
         }
 
@@ -947,32 +855,32 @@ async fn gui_refresh_task() {
             // made deep inside paint_desktop — bypasses the per-call Mutex
             // and writes directly through the guard's raw pointer.
             // This collapses ~30 lock/unlock round-trips per frame down to 1.
-            let _painter = crate::ui::BackBufferGuard::acquire();
+            let _painter = crate::gui::ui::BackBufferGuard::acquire();
 
             let rdtsc = || unsafe { core::arch::x86_64::_rdtsc() };
             let t_a = rdtsc();
             // (a) Clear the back buffer (through the logical GPU when the painter
             //     fast path is up, which the guard above guarantees).
-            match crate::ui::painter_surface() {
+            match crate::gui::ui::painter_surface() {
                 Some(target) => {
-                    let op = crate::lgpu::Op::Fill {
-                        rect: crate::lgpu::Rect::new(0, 0, crate::ui::screen_w(), crate::ui::screen_h()),
+                    let op = crate::gfx::lgpu::Op::Fill {
+                        rect: crate::gfx::lgpu::Rect::new(0, 0, crate::gui::ui::screen_w(), crate::gui::ui::screen_h()),
                         color: 0x14_14_23, // r 20, g 20, b 35
                     };
-                    if !crate::lgpu::dl_record(op) {
-                        crate::lgpu::execute(&[op], &target);
+                    if !crate::gfx::lgpu::dl_record(op) {
+                        crate::gfx::lgpu::execute(&[op], &target);
                     }
                 }
-                None => crate::ui::draw_rect_atomic(0, 0, crate::ui::screen_w(), crate::ui::screen_h(), crate::graphics::Color { r: 20, g: 20, b: 35 }),
+                None => crate::gui::ui::draw_rect_atomic(0, 0, crate::gui::ui::screen_w(), crate::gui::ui::screen_h(), crate::gfx::graphics::Color { r: 20, g: 20, b: 35 }),
             }
             let t_b = rdtsc();
 
             // (b) Phase 18 DE (panel, app windows, notifs) composites on top.
-            crate::desktop::paint_desktop(ms);
+            crate::gui::desktop::paint_desktop(ms);
             let t_c = rdtsc();
 
             // (c) One full flush to hardware (also uses the fast path).
-            crate::ui::commit_back_buffer();
+            crate::gui::ui::commit_back_buffer();
             let t_d = rdtsc();
             diag_stage[0] += t_b - t_a;
             diag_stage[1] += t_c - t_b;
@@ -983,7 +891,7 @@ async fn gui_refresh_task() {
 
             // (e) Cursor drawn directly on hardware — never in back buffer.
             {
-                let mut wm = crate::ui::WINDOW_MANAGER.lock();
+                let mut wm = crate::gui::ui::WINDOW_MANAGER.lock();
                 wm.cursor_x = mx;
                 wm.cursor_y = my;
                 wm.draw_cursor_hw();
@@ -991,7 +899,7 @@ async fn gui_refresh_task() {
         } else {
             // Cheap per-second clock update: only the panel strip is repainted and flushed.
             if clock_dirty {
-                crate::desktop::repaint_panel_only(ms);
+                crate::gui::desktop::repaint_panel_only(ms);
             }
             // Lightweight cursor movement: restore the pixels under the old cursor from the
             // back buffer, then stamp the new cursor on the hardware framebuffer. Runs AFTER
@@ -999,8 +907,8 @@ async fn gui_refresh_task() {
             // and independently of it, so motion during a clock-update frame is never dropped
             // (that would leave a ghost cursor behind).
             if cursor_moved {
-                crate::ui::commit_dirty_rect(last_mx, last_my, 16, 16);
-                let mut wm = crate::ui::WINDOW_MANAGER.lock();
+                crate::gui::ui::commit_dirty_rect(last_mx, last_my, 16, 16);
+                let mut wm = crate::gui::ui::WINDOW_MANAGER.lock();
                 wm.cursor_x = mx;
                 wm.cursor_y = my;
                 wm.draw_cursor_hw();
@@ -1008,13 +916,13 @@ async fn gui_refresh_task() {
         }
 
         // Process GPU command batches queued since the last iteration.
-        crate::gpu_driver::tick();
+        crate::gfx::gpu_driver::tick();
 
         // Cards inserted into or removed from PCIe hot-plug slots.
-        crate::hotplug::poll();
+        crate::hal::hotplug::poll();
 
         // An app the user closed that kept running without windows.
-        crate::win32_user::check_close_watch();
+        crate::nt::win32_user::check_close_watch();
 
         // ---- frame-time diagnostics ----
         if ui_dirty {
@@ -1027,8 +935,8 @@ async fn gui_refresh_task() {
             let now_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             let avg_mc = if diag_full > 0 { diag_full_cycles / diag_full / 1_000_000 } else { 0 };
             let per = |c: u64| if diag_full > 0 { c / diag_full / 100_000 } else { 0 }; // tenths of Mcycles
-            let (dl_flushes, dl_ops, dl_cycles) = crate::lgpu::take_stats();
-            let shell_cycles = crate::shell::take_paint_cycles();
+            let (dl_flushes, dl_ops, dl_cycles) = crate::gfx::lgpu::take_stats();
+            let shell_cycles = crate::vsh::shell::take_paint_cycles();
             serial_println!(
                 "[GUI] perf: {} loop iters, {} full frames (avg {} Mcycles each: clear {}.{} paint {}.{} flush {}.{}; display list {} flushes, {} ops, {}.{} rendering; shell {}.{}), {} cursor-only; {} Mcycles elapsed over {} ticks",
                 diag_iters, diag_full, avg_mc,
@@ -1055,7 +963,7 @@ async fn gui_refresh_task() {
         last_mx = mx;
         last_my = my;
 
-        crate::interrupts::SleepFuture::new(16).await;
+        crate::arch::interrupts::SleepFuture::new(16).await;
     }
 }
 
@@ -1068,15 +976,15 @@ fn panic(info: &PanicInfo) -> ! {
     // Log reliably to the serial port
     serial_println!("\n!!! KERNEL PANIC !!!\n{}", info);
     // Stop the other CPUs, show the crash screen, save the report (crash.rs).
-    crate::crash::on_panic(info);
+    crate::sys::crash::on_panic(info);
 
     // Tell the user on the screen! (best-effort: if VGA_WRITER is itself the
     // thing that was locked when we panicked, this could still hang here —
     // but the serial_println! above already got the diagnostic out.)
-    if let Some(mut w) = vga_buffer::VGA_WRITER.try_lock() {
+    if let Some(mut w) = gfx::vga_buffer::VGA_WRITER.try_lock() {
         w.set_colour(
-            vga_buffer::VgaColour::White, 
-            vga_buffer::VgaColour::Red
+            gfx::vga_buffer::VgaColour::White, 
+            gfx::vga_buffer::VgaColour::Red
         );
     }
     println!("\n[KERNEL PANIC]\n{}", info);
@@ -1084,5 +992,5 @@ fn panic(info: &PanicInfo) -> ! {
 
     // The crash screen says any key restarts: poll the keyboard with
     // interrupts off (power.rs), then reset without saving anything.
-    crate::power::wait_key_then_reset()
+    crate::sys::power::wait_key_then_reset()
 }
