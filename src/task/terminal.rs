@@ -826,6 +826,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     }
                     drop(list);
                     history.extend(crate::nt::ntos::pnp::describe());
+                    history.extend(crate::nt::dxgk::describe());
                     history.push(String::from("  USAGE: DRIVER LOAD <path.sys> [PCI IDs] | UNLOAD <name> | OPEN <dev> | IOCTL <dev> <code> [text]"));
                 }
             }

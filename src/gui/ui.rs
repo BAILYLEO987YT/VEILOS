@@ -481,6 +481,7 @@ fn commit_from(bb_ptr: *mut u32, x: usize, y: usize, w: usize, h: usize) {
         let target = crate::gfx::lgpu::Surface { ptr: fb.base_addr as *mut u32, width: fb.width, height: fb.height, stride: fb.stride };
         let dst = crate::gfx::lgpu::Rect::new(hx0 - head.x, y, hx1 - head.x, hy1);
         crate::gfx::lgpu::execute(&[crate::gfx::lgpu::Op::Copy { src, src_x: hx0, src_y: y, dst, transparent: None }], &target);
+        crate::gfx::graphics::presented(head, hx0 - head.x, y, hx1 - hx0, hy1 - y);
     }
 }
 
@@ -512,6 +513,7 @@ fn commit_dimmed(bb_ptr: *mut u32, x: usize, y: usize, w: usize, h: usize, k: u3
                 }
             }
         });
+        crate::gfx::graphics::presented(head, hx0 - head.x, y, hx1 - hx0, hy1 - y);
     }
 }
 
@@ -604,6 +606,9 @@ pub fn plot_pixels_hw(x: usize, y: usize, w: usize, h: usize, color: Color) {
             unsafe {
                 core::slice::from_raw_parts_mut(row_ptr, x1 - x0).fill(pixel_val);
             }
+        }
+        if y < fb.height {
+            crate::gfx::graphics::presented(head, x0 - head.x, y, x1 - x0, (y + h).min(fb.height) - y);
         }
     }
 }

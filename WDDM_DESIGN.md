@@ -4,8 +4,10 @@
 and runs Windows kernel drivers, and Windows programs talk to them (see
 [W1 summary](#w1-summary)). **W2 done (2026-11-24, QEMU):** PnP drivers get
 PCI devices with their resources and message-signaled interrupts, one stack
-per device (see [W2 summary](#w2-summary)). Next: W3 (dxgkrnl, display
-only).
+per device (see [W2 summary](#w2-summary)). **W3 done (2026-11-24, QEMU):**
+VEILOS has its own dxgkrnl; a display-only driver takes the POST display
+and VEILOS's desktop presents through it (see [W3 summary](#w3-summary)).
+Next: W4 (a vendor driver, mode-setting).
 
 ## Goal
 
@@ -26,7 +28,9 @@ Windows programs, so the user-mode half of a Windows driver fits what it has.
 
 - **No GPU is driven.** The display is the framebuffer the firmware set up
   (UEFI GOP or VBE) at the firmware's mode, or the Bochs/QEMU adapter. The GPU
-  only scans that memory out to the monitor.
+  only scans that memory out to the monitor. Since W3 a Windows display-only
+  driver can take that framebuffer over and the desktop presents through it,
+  but that is still the CPU copying pixels, not the GPU drawing.
 - **All drawing is on the CPU.** The desktop, `src/gfx/gpu_driver.rs`'s
   command queue and `src/gfx/lgpu.rs` (the "logical GPU": a renderer that
   splits pixel work over every core) run on the CPU. So do Win32 Direct3D
@@ -44,8 +48,12 @@ Windows programs, so the user-mode half of a Windows driver fits what it has.
   images into ring 0 and provides the kernel interface they link against
   (ntoskrnl, hal, ksecdd, netio), including PnP, PCI resources and
   interrupts. Every ntoskrnl, hal and ksecdd import of the NVIDIA and Intel
-  Arc kernel drivers resolves. No GPU driver has been loaded yet: they need
-  dxgkrnl (W3) first, and loading one is W4.
+  Arc kernel drivers resolves.
+- **dxgkrnl exists (W3).** `src/nt/dxgk/` is VEILOS's display port driver:
+  registration through displib, adapter PnP, the DxgkCb callbacks, the VidPN
+  objects, and presenting. NVIDIA's `nvlddmkm.sys` loads and its
+  `DriverEntry` runs to the end, then stops at its registry settings, which
+  its installer would have written (W4).
 
 ## What a Windows display driver needs
 
@@ -94,7 +102,7 @@ Each stage ends in something that works and can be tested on its own.
 | **W0** | Honest status: boot messages, `gpu_driver.rs` / `gfx_api.rs` headers, this document | Nothing on screen claims GPU use that doesn't happen | ✅ Done |
 | **W1** | **Import census, then the kernel driver host.** A host tool lists every import of the vendors' `.sys` and UMD files (by DLL and function) and how many VEILOS provides, which sizes and orders the ntoskrnl work. Then: map a `.sys`, apply relocations, resolve imports (unresolved ones refuse the load and are listed), the security cookie, `DriverEntry`, `DRIVER_OBJECT`/`DEVICE_OBJECT`, IRPs (`IoCallDriver`, `IoCompleteRequest`), pool, IRQL and spinlocks, DPCs, timers, events, system threads | A sample WDM driver (built from Windows-driver-samples) loads, creates its device, answers IOCTLs from a Win32 program and unloads | ✅ Done 2026-11-21, QEMU. Met with K1, VEILOS's own WDM test driver built with MSVC against the WDK, rather than a Windows-driver-samples driver ([W1 summary](#w1-summary)) |
 | **W2** | **PnP, resources and interrupts.** `AddDevice`, `IRP_MN_START_DEVICE` with a `CM_RESOURCE_LIST` from PCI (BARs, MSI), `IoConnectInterruptEx`, power IRPs (`PoRequestPowerIrp`). Driver binding by PCI ID through the HAL (a "Windows driver" `hal::Driver`). The 41 imports the NVIDIA and Arc kernel drivers still lack after W1 are all here: device stacks (attach and detach, remove locks), device interfaces and properties, device registry keys, PnP notifications, the error log, `IoCancelIrp`, `ObOpenObjectByPointer`, `FsRtlRegisterFileSystemFilterCallbacks`. Also: DPCs queued from an interrupt run when IRQL drops, not on the next tick (W1's carried-forward list). `MmMapIoSpaceEx` and contiguous DMA memory already exist (W1) | A sample PCI driver (or a small one of our own built with the WDK headers) drives a QEMU device through its interrupt | ✅ Done 2026-11-24, QEMU. K2, VEILOS's own PnP driver for QEMU's `edu` device, runs two of them at once ([W2 summary](#w2-summary)) |
-| **W3** | **dxgkrnl, display only.** `DxgkInitialize` registration, adapter start, `QueryAdapterInfo`, child relations and status, EDID, the VidPN objects, `CommitVidPn`, `PresentDisplayOnly`. The desktop presents through it | Microsoft's KMDOD sample (a display-only driver over the firmware framebuffer, built from source) runs the VEILOS desktop. Everything dxgkrnl keeps is per adapter from the start ([Several GPUs](#several-gpus)) | QEMU and both PCs |
+| **W3** | **dxgkrnl, display only.** `DxgkInitialize` registration, adapter start, `QueryAdapterInfo`, child relations and status, EDID, the VidPN objects, `CommitVidPn`, `PresentDisplayOnly`. The desktop presents through it | Microsoft's KMDOD sample (a display-only driver over the firmware framebuffer, built from source) runs the VEILOS desktop. Everything dxgkrnl keeps is per adapter from the start ([Several GPUs](#several-gpus)) | ✅ Done 2026-11-24, QEMU. K3, VEILOS's own display-only driver written the way KMDOD works, runs the desktop ([W3 summary](#w3-summary)). Not yet on the PCs |
 | **W4** | **A vendor driver, mode-setting.** Load a real vendor `.sys`, get through `DriverEntry`, `StartDevice` and `QueryAdapterInfo`, enumerate monitors, commit a mode, scan out the desktop. Everything it calls that VEILOS lacks shows up here | The desktop at a mode chosen at run time, through the vendor driver | Real hardware: the test PC (GTX 745, NVIDIA 580.x, the last Maxwell branch) or the main PC (Intel Arc) |
 | **W5** | **VidMm and VidSch.** Allocations, segments / GPU virtual memory, paging buffers, residency, monitored fences, contexts and submission, `DxgkDdiSubmitCommand`, interrupts → DPC → fence completion, TDR | A `D3DKMT`-level test program allocates, submits a vendor-built command buffer through the UMD and waits on its fence | Real hardware |
 | **W6** | **User mode.** `NtGdiDdDDI*` system calls; VEILOS's `d3d11`/`dxgi` drive the vendor UMD through the D3D11 DDI; present through dxgkrnl | A D3D11 triangle and the D3D test programs (`storage/tests/d3d*`, `dx*`) render on the GPU, matching their `.ref` images | Real hardware |
@@ -269,6 +277,89 @@ interrupt it raises on request, MSI capable).
   and **W7**.
 - **Opens by pointer stay open.** `IoGetDeviceObjectPointer`'s file object
   isn't closed when the driver dereferences it (no reference counts yet).
+
+## W3 summary
+
+**Done 2026-11-24, in QEMU.** VEILOS has a dxgkrnl of its own
+(`src/nt/dxgk/`). A WDDM display-only driver registers with it the way it
+does on Windows, takes the display VEILOS was showing, and VEILOS's desktop
+presents through the driver; unloading the driver hands the display back.
+
+### What exists
+
+| Area | Where | What |
+|---|---|---|
+| Registration | `dxgk/mod.rs`, `ntos/zw.rs` | `\Device\DxgKrnl` at boot. displib (the WDK library every display driver links) loads the `DXGKrnl` service (built in: `ZwLoadDriver` answers "already loaded"), opens the device and asks it with internal IOCTLs 0x230047 / 0x23003F (full WDDM) or 0x230043 (display-only) for dxgkrnl's initialize routine; that routine keeps the driver's `DxgkDdi*` table (its own DDI version, per driver) and takes over the driver's AddDevice, dispatch routines and unload |
+| Adapters | `dxgk/mod.rs`, `ntos/pnp.rs`, `src/hal/mod.rs` | A device object per adapter (`\Device\VideoN`) attached above the PDO, `DxgkDdiAddDevice`, then on `IRP_MN_START_DEVICE` `DxgkDdiStartDevice` with `DXGK_START_INFO` (a GUID and LUID per adapter) and the `DXGKRNL_INTERFACE`. A display driver may take a display adapter VEILOS's own display driver runs (`hal::claim_display`); it goes back to VEILOS's driver when the Windows driver unloads. Remove calls `DxgkDdiStopDeviceAndReleasePostDisplayOwnership` (display-only) or `DxgkDdiStopDevice`, then `DxgkDdiRemoveDevice` |
+| Callbacks | `dxgk/cb.rs` | `DxgkCbGetDeviceInformation` (PDO, resources, the Class driver key, memory size), `AcquirePostDisplayOwnership` (the mode and framebuffer of the VEILOS head on the adapter's memory), `Read/WriteDeviceSpace` (config space), `Map/UnmapMemory`, `QueueDpc` (runs `DxgkDdiDpcRoutine`), `SynchronizeExecution`, `IndicateChildStatus`, `ExcludeAdapterAccess`, power components (accepted), ETW (dropped), the VidPN and monitor interfaces. The others answer `STATUS_NOT_SUPPORTED` and are logged once |
+| Bring-up | `dxgk/mod.rs` | After start: `QueryChildRelations`, `QueryChildStatus`, the EDID (`QueryDeviceDescriptor`, header and checksum checked, preferred mode and monitor name read), monitor source modes (`RecommendMonitorModes`), a committed VidPN, `SetVidPnSourceVisibility`, then the head handed over |
+| VidPN | `dxgk/vidpn.rs` | VidPN objects with topologies (paths with Windows' defaults: primary, identity scaling and rotation, sRGB, graphics, no protection, default gamma) and source, target and monitor mode sets (create, add, enumerate, pin, assign, release), through `DXGK_VIDPN_INTERFACE`, its topology and mode set interfaces, and `DXGK_MONITOR_INTERFACE`. A commit: `IsSupportedVidPn`, `EnumVidPnCofuncModality` (no pivot, then with the pinned source as pivot), the modes pinned, `IsSupportedVidPn` again, `CommitVidPn` |
+| Presenting | `src/gfx/graphics.rs`, `src/gui/ui.rs`, `dxgk/mod.rs` | The head the driver took draws into a copy in system memory; every desktop update and cursor draw calls `DxgkDdiPresentDisplayOnly` with that rectangle. The crash screen still draws on the framebuffer itself |
+| Drivers' view of time | `src/nt/kusd.rs` | `KUSER_SHARED_DATA` mapped read-only at `0xFFFFF78000000000` at boot, where drivers read interrupt and system time directly (NVIDIA's DriverEntry does) |
+| Terminal | `src/task/terminal.rs` | `DRIVER` also lists display adapters: driver, kind, mode, presents |
+
+### How it was tested
+
+In QEMU (WHPX), with its standard VGA adapter (Bochs, PCI 1234:1111).
+
+- **K3** (`win32/tests/k3`): `k3dod.sys` is a WDDM display-only driver
+  built with MSVC against the WDK and displib.lib, written the way
+  Microsoft's KMDOD sample works, with `k3dod.inf` naming any VGA adapter
+  (`PCI\CC_0300`). `DRIVER LOAD /tests/k3dod.sys`:
+  - registers (DDI version 0x11007, WDDM 3.2), takes the adapter from
+    VEILOS's Bochs driver, gets its device information (the right PDO,
+    resources, RAM, registry key) and the POST display (1024x768, pitch
+    4096, X8R8G8B8, at 0xFD000000), and maps it with `DxgkCbMapMemory`;
+  - reports one output with an EDID of its own (header and checksum
+    good, "VEILOS K3", 1024x768 preferred), adds its monitor mode, fills
+    the source and target mode sets, and accepts the VidPN dxgkrnl
+    commits (1024x768, the POST mode);
+  - then copies what the desktop presents: about 1000 presents and 250
+    million pixels in the run's half minute, the terminal's output and
+    the moving cursor among them. A screenshot taken after the hand-over
+    shows the desktop, including text typed after it, which only the
+    driver put on the screen.
+  - `DRIVER UNLOAD k3dod` hands the display back (its current mode
+    returned by `StopDeviceAndReleasePostDisplayOwnership`), the head
+    draws directly again, and the adapter returns to VEILOS's driver.
+- `layout.c` checks every structure offset `src/nt/dxgk` uses
+  (initialization tables, `DXGKRNL_INTERFACE`, device and display
+  information, children, present arguments, the VidPN interfaces, paths
+  and modes) against the WDK. All match. K1 and K2 still pass.
+- **Stage criterion.** "Done when" names Microsoft's KMDOD sample. K3
+  follows KMDOD's design but is VEILOS's own, as K1 and K2 are; building
+  KMDOD from Windows-driver-samples needs its source downloaded and stays a
+  check to make.
+- **NVIDIA's driver.** `nvlddmkm.sys` (581.80, loaded from a scratch image,
+  not kept) first read `KUSER_SHARED_DATA` at its kernel address and
+  faulted, which the mapping above fixed. Now its `DriverEntry` runs to the
+  end: it prints its registry path, asks `ZwQueryInformationProcess` for
+  something VEILOS doesn't answer yet, and returns
+  `STATUS_OBJECT_NAME_NOT_FOUND`, a registry value its installer would
+  have written. That is where W4 starts.
+
+### Carried forward from W3
+
+- **One output per adapter, one mode.** dxgkrnl commits one path (source
+  0 to the first connected output) in the POST display's mode, since the
+  desktop can't change size after boot. Several outputs, mode changes and
+  hot-plug (`DxgkCbIndicateChildStatus` is recorded, nothing re-commits)
+  come with **W4**.
+- **Only the POST adapter is shown.** A display driver on another adapter
+  starts and commits, but VEILOS has no head for it: a second GPU's
+  monitors need the desktop to grow heads at run time (**W4**, [Several
+  GPUs](#several-gpus)).
+- **Full WDDM drivers register but don't render.** Their tables are kept
+  and their adapters start; allocations, contexts and submission are
+  **W5**. Their interrupt (`DxgkDdiInterruptRoutine`) isn't connected yet.
+- **No hardware cursor.** K3, like KMDOD, has none; the cursor is drawn
+  into the desktop's copy. `SetPointerPosition/Shape` come with W4.
+- **Presenting is synchronous and whole-rectangle.** Every desktop update
+  is one `PresentDisplayOnly` with one dirty rectangle; no moves, and no
+  `DxgkCbPresentDisplayOnlyProgress`.
+- **Not run on real hardware.** On the test PC the POST display is the
+  firmware's framebuffer on the GTX 745; a display-only driver there would
+  take it the same way.
 
 ## W1 record
 

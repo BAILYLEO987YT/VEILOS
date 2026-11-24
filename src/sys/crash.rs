@@ -193,7 +193,9 @@ fn paint(headline: &[u8], notes: &[&[u8]], report: &[u8]) {
         }
     };
     for head in heads.iter() {
-        let fb = &head.fb;
+        // The framebuffer itself, also for a head a Windows driver presents
+        // (its desktop copy would never reach the screen now).
+        let fb = &head.direct;
         let px = |x: usize, y: usize, c: u32| {
             if x < fb.width && y < fb.height {
                 unsafe { *((fb.base_addr + (y * fb.stride + x) as u64 * 4) as *mut u32) = c };

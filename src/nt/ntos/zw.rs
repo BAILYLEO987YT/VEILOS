@@ -590,6 +590,10 @@ pub extern "win64" fn ZwQuerySystemInformation(class: u32, info: *mut u8, len: u
 pub extern "win64" fn ZwLoadDriver(service: *const u8) -> NtStatus {
     let nt = rtl::unicode_to_string(service);
     let Some(key) = cm::hive_path(&nt) else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    // dxgkrnl is built in (nt/dxgk): displib loads it before registering.
+    if key.to_ascii_lowercase().ends_with(r"\services\dxgkrnl") {
+        return 0xC000_010Eu32 as i32; // STATUS_IMAGE_ALREADY_LOADED
+    }
     let Some((_, data)) = crate::nt::registry::kernel_get(&key, "ImagePath") else { return STATUS_OBJECT_NAME_NOT_FOUND };
     let units: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
     let image_path = String::from_utf16_lossy(&units);

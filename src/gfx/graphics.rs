@@ -70,6 +70,12 @@ pub struct Head {
     pub vram_base: u64,
     pub vram_size: usize,
     pub location: alloc::string::String,
+    /// The adapter's Windows display driver presents this head (dxgk): `fb`
+    /// is then a copy in system memory the desktop draws into, and `direct`
+    /// the framebuffer the head showed before (the crash screen still
+    /// draws there).
+    pub wddm: Option<usize>,
+    pub direct: Framebuffer,
 }
 
 pub static HEADS: Mutex<alloc::vec::Vec<Head>> = Mutex::new(alloc::vec::Vec::new());
@@ -93,6 +99,92 @@ pub fn describe_heads() -> alloc::vec::Vec<alloc::string::String> {
     )).collect();
     out.push(alloc::format!("  logical display: {}x{}", crate::gui::ui::screen_w(), crate::gui::ui::screen_h()));
     out
+}
+
+// -----| heads Windows display drivers present (nt/dxgk) |-----
+
+/// System-memory copies of heads a Windows driver presents: (adapter, the
+/// copy's address, its stride in pixels). Kept apart from `HEADS` because
+/// dxgk::present reads it while `HEADS` is locked.
+static SHADOWS: Mutex<alloc::vec::Vec<(usize, u64, usize)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// The framebuffer of the head showing memory in `ranges` (an adapter's
+/// memory resources): the adapter's POST display, if VEILOS shows one.
+pub fn head_framebuffer(ranges: &[(u64, u64)]) -> Option<Framebuffer> {
+    let heads = HEADS.lock();
+    heads.iter().find(|h| ranges.iter().any(|&(b, l)| h.direct.base_addr >= b && h.direct.base_addr < b + l)).map(|h| h.direct)
+}
+
+/// A Windows display driver takes the head showing `post` (or memory in
+/// `ranges`): from now on the desktop draws into a copy in system memory
+/// and dxgk presents it through the driver. The head's index and the
+/// framebuffer it showed.
+pub fn hand_over(adapter: usize, ranges: &[(u64, u64)], post: Option<u64>) -> Option<(usize, Framebuffer)> {
+    let mut heads = HEADS.lock();
+    let i = heads.iter().position(|h| {
+        h.wddm.is_none() && (post == Some(h.direct.base_addr) || ranges.iter().any(|&(b, l)| h.direct.base_addr >= b && h.direct.base_addr < b + l))
+    })?;
+    let head = &mut heads[i];
+    let fb = head.direct;
+    let mut copy = alloc::vec![0u32; fb.stride * fb.height];
+    unsafe { core::ptr::copy_nonoverlapping(fb.base_addr as *const u32, copy.as_mut_ptr(), copy.len()) };
+    let addr = copy.leak().as_mut_ptr() as u64;
+    SHADOWS.lock().push((adapter, addr, fb.stride));
+    head.fb.base_addr = addr;
+    head.wddm = Some(adapter);
+    let mut first = FRAMEBUFFER.lock();
+    if first.is_some_and(|f| f.base_addr == fb.base_addr) {
+        *first = Some(head.fb);
+    }
+    crate::serial_println!("[GRAPHICS] head {} ({}) handed to Windows display adapter {}", i, head.location, adapter);
+    Some((i, fb))
+}
+
+/// The driver gave the display back (unloaded): the head shows `back` (or
+/// the framebuffer it showed before) directly again, with what the desktop
+/// last drew.
+pub fn give_back(adapter: usize, back: Option<crate::nt::dxgk::Display>) {
+    let mut heads = HEADS.lock();
+    let Some(head) = heads.iter_mut().find(|h| h.wddm == Some(adapter)) else { return };
+    let mut fb = head.direct;
+    if let Some(b) = back.filter(|b| b.width as usize == fb.width && b.height as usize == fb.height && b.phys != 0) {
+        fb.base_addr = b.phys;
+        fb.stride = b.pitch as usize / 4;
+    }
+    let shadow = head.fb;
+    for y in 0..fb.height {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (shadow.base_addr as *const u32).add(y * shadow.stride),
+                (fb.base_addr as *mut u32).add(y * fb.stride),
+                fb.width,
+            );
+        }
+    }
+    head.fb = fb;
+    head.direct = fb;
+    head.wddm = None;
+    let mut first = FRAMEBUFFER.lock();
+    if first.is_some_and(|f| f.base_addr == shadow.base_addr) {
+        *first = Some(fb);
+    }
+    // The copy is left allocated: a present already under way may still
+    // read it.
+    SHADOWS.lock().retain(|s| s.0 != adapter);
+    crate::serial_println!("[GRAPHICS] Windows display adapter {} gave its head back", adapter);
+}
+
+/// The system-memory copy adapter `adapter` presents from: (address, stride).
+pub fn shadow_of(adapter: usize) -> Option<(u64, usize)> {
+    SHADOWS.lock().iter().find(|s| s.0 == adapter).map(|s| (s.1, s.2))
+}
+
+/// The desktop changed part of `head` (head coordinates): if a Windows
+/// driver presents it, present that part.
+pub fn presented(head: &Head, x: usize, y: usize, w: usize, h: usize) {
+    if let Some(a) = head.wddm {
+        crate::nt::dxgk::present(a, x, y, w, h);
+    }
 }
 
 // -----| Bochs DISPI registers |-----
@@ -267,7 +359,7 @@ fn probe_display(dev: &pci::PciDevice) -> Result<(), alloc::string::String> {
     if heads.is_empty() {
         *FRAMEBUFFER.lock() = Some(fb);
     }
-    heads.push(Head { fb, x, vram_base: phys_addr as u64, vram_size, location });
+    heads.push(Head { fb, x, vram_base: phys_addr as u64, vram_size, location, wddm: None, direct: fb });
 
     // Everything sized from the screen (back buffer, clip, layout, mouse)
     // follows the logical display from here on.
@@ -312,7 +404,7 @@ pub fn bind_firmware_framebuffer() {
     fb.clear(Color { r: 20, g: 20, b: 35 });
     let mut heads = HEADS.lock();
     *FRAMEBUFFER.lock() = Some(fb);
-    heads.push(Head { fb, x: 0, vram_base: phys, vram_size: size as usize, location: alloc::string::String::from("firmware") });
+    heads.push(Head { fb, x: 0, vram_base: phys, vram_size: size as usize, location: alloc::string::String::from("firmware"), wddm: None, direct: fb });
     crate::gui::ui::set_screen_size(fw.width, fw.height);
     crate::serial_println!("[GRAPHICS] firmware framebuffer {}x{} stride {} at {:#x} (fixed mode)", fw.width, fw.height, fw.stride, phys);
 }
