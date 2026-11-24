@@ -115,7 +115,7 @@ VEILOS's own `ntdll.dll`, `kernel32.dll`, `user32.dll` and the rest are built fr
 | [V1_CHECKLIST.md](V1_CHECKLIST.md) | What's left before VEILOS could be someone's everyday system |
 | [AUDIT_2026-10.md](AUDIT_2026-10.md) | A code audit from October 2026 |
 | [goal.md](goal.md), [ideas.txt](ideas.txt) | The original goals and the idea backlog |
-| [shell.vsh](storage/shell.vsh), [config.vsh](storage/config.vsh), [dark.vsh](storage/THEMES/dark.vsh) | documented examples of how to use the custom scripting language to control the OS customisation |
+| [SHELL.vsh](storage/SHELL.VSH), [config.vsh](storage/config.vsh), [DARK.vsh](storage/THEMES/DARK.VSH) | documented examples of how to use the custom scripting language to control the OS customisation |
 
 ## Roadmap
 
