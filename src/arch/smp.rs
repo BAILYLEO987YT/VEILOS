@@ -1467,6 +1467,16 @@ pub fn start_bsp_tick() -> bool {
 /// Send an EOI to the LAPIC on the current CPU.
 /// Called at the end of every hardware interrupt handler.
 #[inline(always)]
+/// Interrupt this CPU on `vector` (fixed delivery, the LAPIC's "self"
+/// shorthand). It is taken once interrupts are on and the vector's priority
+/// class is above CR8. False without a local APIC.
+pub fn self_ipi(vector: u8) -> bool {
+    if LAPIC_BASE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    unsafe { send_icr(0, vector as u32 | 1 << 18) }
+}
+
 pub fn lapic_eoi() {
     if LAPIC_BASE.load(Ordering::Relaxed) != 0 {
         unsafe { lapic_write(LAPIC_EOI, 0); }

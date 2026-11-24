@@ -411,6 +411,18 @@ pub fn current_id() -> u64 {
     })
 }
 
+/// The running thread's stack (lowest address, one past the highest), if
+/// VEILOS allocated it (the boot stack and per-CPU idle stacks: None).
+pub fn current_stack() -> Option<(u64, u64)> {
+    let cpu = crate::arch::smp::cpu_index();
+    without_interrupts(|| {
+        let ct = CPUS[cpu].lock();
+        let s = ct.threads.get(ct.current)?.stack.as_ref()?;
+        let lo = s.as_ptr() as u64;
+        Some((lo, lo + s.len() as u64))
+    })
+}
+
 /// The process the running thread belongs to (0: a kernel thread).
 pub fn current_pid() -> u32 {
     unsafe { (*current_user()).pid }

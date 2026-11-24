@@ -235,6 +235,40 @@ pub fn power_down_idle() {
     }
 }
 
+/// A Windows driver (nt/ntos/pnp.rs) takes device `id`: only if no VEILOS
+/// driver has it. Woken to D0 first, as `bind_one` does.
+pub fn claim(id: usize, driver: &'static str) -> bool {
+    let mut devices = DEVICES.lock();
+    let Some(d) = devices.get_mut(id) else { return false };
+    if !matches!(d.state, DeviceState::Unbound | DeviceState::Failed(_)) || (d.driver.is_some() && d.state != DeviceState::Unbound && d.driver != Some(driver)) {
+        return false;
+    }
+    if d.pci.power_state().is_some_and(|s| s != crate::hal::pci::PowerState::D0) {
+        d.pci.set_power_state(crate::hal::pci::PowerState::D0);
+    }
+    d.driver = Some(driver);
+    d.state = DeviceState::Bound;
+    crate::serial_println!("[HAL] {} {:?} -> {} (Windows driver)", d.location(), d.class, driver);
+    true
+}
+
+/// The Windows driver let device `id` go (or failed to start it: `why`).
+pub fn release(id: usize, why: Option<String>) {
+    let mut devices = DEVICES.lock();
+    if let Some(d) = devices.get_mut(id) {
+        if d.state == DeviceState::Removed {
+            return;
+        }
+        d.state = match why {
+            Some(w) => DeviceState::Failed(w),
+            None => DeviceState::Unbound,
+        };
+        if d.state == DeviceState::Unbound {
+            d.driver = None;
+        }
+    }
+}
+
 /// A snapshot of every device.
 pub fn devices() -> Vec<Device> {
     DEVICES.lock().clone()

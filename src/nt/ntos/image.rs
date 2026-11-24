@@ -227,7 +227,7 @@ pub fn map(file: &[u8]) -> Result<Mapped, String> {
 }
 
 /// A UNICODE_STRING (and its buffer) in pool, for the life of the driver.
-fn pool_unicode(s: &str) -> *mut u8 {
+pub fn pool_unicode(s: &str) -> *mut u8 {
     let units: Vec<u16> = s.encode_utf16().chain(core::iter::once(0)).collect();
     let buf = pool::alloc_tracked(units.len() * 2);
     let us = pool::alloc_tracked(16);
@@ -240,9 +240,41 @@ fn pool_unicode(s: &str) -> *mut u8 {
     us
 }
 
+/// The name of the driver whose DRIVER_OBJECT is `drv`.
+pub fn name_of(drv: *mut u8) -> Option<String> {
+    DRIVERS.lock().iter().find(|d| d.object == drv as usize).map(|d| d.name.clone())
+}
+
+/// The VFS path the driver whose DRIVER_OBJECT is `drv` was loaded from.
+pub fn path_of(drv: *mut u8) -> Option<String> {
+    DRIVERS.lock().iter().find(|d| d.object == drv as usize).map(|d| d.path.clone())
+}
+
 /// Load the driver at `path` and run its DriverEntry. Returns its name and
 /// DriverEntry's status.
 pub fn load(path: &str) -> Result<(String, NtStatus), String> {
+    load_with(path, &[]).map(|(n, s, _)| (n, s))
+}
+
+/// `load`, then, for a PnP driver (one with AddDevice), hand it the PCI
+/// devices matching its .inf (beside the .sys) or `ids` (pnp.rs). Also
+/// returns how many devices it started.
+pub fn load_with(path: &str, ids: &[String]) -> Result<(String, NtStatus, usize), String> {
+    let (name, status) = load_driver(path)?;
+    if status < 0 {
+        return Ok((name, status, 0));
+    }
+    let mut wanted: Vec<String> = ids.to_vec();
+    let inf = format!("{}.inf", path.trim_end_matches(".sys").trim_end_matches(".SYS"));
+    if let Ok(text) = crate::fs::vfs::VFS.read_file(&inf) {
+        wanted.extend(super::pnp::inf_ids(&String::from_utf8_lossy(&text)));
+    }
+    let obj = DRIVERS.lock().iter().find(|d| d.name == name).map(|d| d.object).unwrap_or(0);
+    let started = if obj != 0 { super::pnp::start_driver(&name, obj as *mut u8, &wanted) } else { 0 };
+    Ok((name, status, started))
+}
+
+fn load_driver(path: &str) -> Result<(String, NtStatus), String> {
     let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".sys").trim_end_matches(".SYS").to_ascii_lowercase();
     if DRIVERS.lock().iter().any(|d| d.name == name) {
         return Err(format!("{} is already loaded", name));
@@ -295,14 +327,18 @@ extern "win64" fn invalid_request(_dev: *mut u8, irp: *mut u8) -> NtStatus {
     super::STATUS_INVALID_DEVICE_REQUEST
 }
 
-/// Call the driver's DriverUnload and forget it. Its image stays mapped
-/// (a leak until image memory is freed, W2).
+/// Remove the driver's PnP devices, call its DriverUnload, free its image
+/// and forget it.
 pub fn unload(name: &str) -> Result<(), String> {
     let obj = DRIVERS.lock().iter().find(|d| d.name == name).map(|d| d.object).ok_or_else(|| format!("{} isn't loaded", name))?;
     let drv = obj as *mut u8;
     let unload: u64 = unsafe { (drv.add(io::DRV_UNLOAD) as *const u64).read() };
     if unload == 0 {
         return Err(format!("{} has no unload routine", name));
+    }
+    let removed = super::pnp::remove_driver(drv);
+    if removed > 0 {
+        crate::serial_println!("[NTOS] {}: {} device(s) removed", name, removed);
     }
     let f: extern "win64" fn(*mut u8) = unsafe { core::mem::transmute(unload) };
     f(drv);
