@@ -1,6 +1,6 @@
 // What VEILOS's ntoskrnl.exe and hal.dll export to drivers: name -> address.
 
-use super::{bcrypt, cm, crt, dpc, ex, io, ke, misc, mm, ob, pool, ps, rtl, rtlx, seh, zw};
+use super::{bcrypt, cm, crt, dpc, ex, intr, io, iox, ke, misc, mm, ob, pnp, pool, ps, rtl, rtlx, seh, zw};
 
 // -----| pool |-----
 
@@ -106,7 +106,7 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
                 crt::_vsnprintf, crt::_vsnwprintf, crt::_vsnprintf_s, crt::_vsnwprintf_s, crt::sprintf_s, crt::swprintf_s,
                 crt::_snprintf_s, crt::_snwprintf_s, crt::_snprintf, crt::_snwprintf,
                 crt::strcpy_s, crt::strncpy_s, crt::strcat_s, crt::strncat_s, crt::wcscpy_s, crt::wcsncpy_s, crt::wcscat_s,
-                crt::wcsncat_s, crt::strnlen, crt::wcsnlen, crt::wcsncmp, crt::_wcsicmp, crt::wcschr, crt::wcsrchr,
+                crt::wcsncat_s, crt::strnlen, crt::wcsnlen, crt::wcsncmp, crt::_wcsicmp, crt::_wcsnicmp, crt::_strnicmp, crt::wcschr, crt::wcsrchr,
                 crt::strstr, crt::wcsstr, crt::toupper, crt::tolower, crt::sqrt, crt::_purecall,
                 // run-time library
                 rtlx::RtlAnsiStringToUnicodeString, rtlx::RtlUnicodeStringToAnsiString, rtlx::RtlFreeUnicodeString,
@@ -186,6 +186,27 @@ pub fn lookup(module: &str, name: &str) -> Option<u64> {
                 zw::ZwOpenSection, zw::ZwMapViewOfSection, zw::ZwUnmapViewOfSection, zw::ZwOpenProcess,
                 zw::ZwQueryInformationProcess, zw::ZwOpenProcessTokenEx, zw::ZwQueryInformationToken,
                 zw::ZwSetSecurityObject, zw::ZwQueryInformationThread, zw::ZwPowerInformation, zw::ZwSetInformationThread,
+            );
+            table!(name;
+                // PnP: device stacks, built IRPs, cancelling, power (W2)
+                io::IoGetAttachedDevice, io::IoGetAttachedDeviceReference, io::IoGetDeviceAttachmentBaseRef,
+                io::IoAttachDeviceToDeviceStack, io::IoAttachDeviceToDeviceStackSafe, io::IoDetachDevice,
+                io::IoEnumerateDeviceObjectList, io::IoGetDeviceObjectPointer, io::IoBuildDeviceIoControlRequest,
+                io::IoBuildSynchronousFsdRequest, io::IoForwardIrpSynchronously, io::PoCallDriver, io::PoStartNextPowerIrp,
+                io::IoAcquireCancelSpinLock, io::IoReleaseCancelSpinLock, io::IoCancelIrp,
+                pnp::IoGetDeviceProperty, pnp::IoGetDevicePropertyData, pnp::IoSetDevicePropertyData,
+                intr::IoConnectInterruptEx, intr::IoDisconnectInterruptEx, intr::KeSynchronizeExecution,
+                intr::KeAcquireInterruptSpinLock, intr::KeReleaseInterruptSpinLock,
+                iox::IoInitializeRemoveLockEx, iox::IoAcquireRemoveLockEx, iox::IoReleaseRemoveLockEx,
+                iox::IoReleaseRemoveLockAndWaitEx, iox::IoAllocateErrorLogEntry, iox::IoFreeErrorLogEntry,
+                iox::IoWriteErrorLogEntry, iox::IoCreateNotificationEvent, iox::IoCreateSynchronizationEvent,
+                iox::IoInitializeTimer, iox::IoStartTimer, iox::IoStopTimer, iox::IoGetStackLimits,
+                iox::IoOpenDeviceRegistryKey, iox::IoOpenDriverRegistryKey, iox::IoQueryFullDriverPath,
+                iox::IoRegisterDeviceInterface, iox::IoSetDeviceInterfaceState, iox::IoGetDeviceInterfaces,
+                iox::IoOpenDeviceInterfaceRegistryKey, iox::IoRegisterPlugPlayNotification,
+                iox::IoUnregisterPlugPlayNotification, iox::IoUnregisterPlugPlayNotificationEx, iox::PoRequestPowerIrp,
+                iox::ObOpenObjectByPointer, iox::FsRtlRegisterFileSystemFilterCallbacks, iox::IoInvalidateDeviceRelations,
+                iox::IoRequestDeviceEject, iox::IoWMIRegistrationControl,
             );
             if let Some(a) = ex::data_export(name).or_else(|| misc::data_export(name)) {
                 return Some(a);

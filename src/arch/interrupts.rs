@@ -84,6 +84,19 @@ pub const AP_TIMER_VECTOR: u8 = 0x40;
 /// xHCI controllers' MSI/MSI-X interrupt, on the BSP (usb::xhci).
 pub const USB_VECTOR: u8 = 0x50;
 
+/// Windows drivers' DPCs (nt/ntos/dpc.rs): a self-IPI on this vector is
+/// sent when a DPC is queued at DISPATCH_LEVEL or above. Its priority class
+/// is 2, so the local APIC holds it until CR8 (the IRQL) drops below
+/// DISPATCH_LEVEL, then delivers it: Windows' DISPATCH software interrupt.
+/// (Vector 0x2D was the 8259's IRQ 13, the old FPU error line, never used.)
+pub const DPC_VECTOR: u8 = 0x2D;
+
+/// Windows drivers' device interrupts (nt/ntos/intr.rs): one vector per
+/// device, given out from here. The top nibble is the IRQL the driver's
+/// service routine runs at (7 and 8, between DISPATCH_LEVEL and the clock).
+pub const DRIVER_VECTOR_FIRST: u8 = 0x70;
+pub const DRIVER_VECTORS: usize = 32;
+
 /// Vector the LAPIC raises for spurious interrupts (low byte of the SVR, see smp.rs).
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
@@ -151,6 +164,12 @@ lazy_static! {
             .set_handler_fn(spurious_interrupt_handler);
         idt[USB_VECTOR as usize]
             .set_handler_fn(usb_interrupt_handler);
+        idt[DPC_VECTOR as usize]
+            .set_handler_fn(dpc_interrupt_handler);
+        macro_rules! driver_vectors {
+            ($($v:literal),*) => { $( idt[$v].set_handler_fn(driver_interrupt_handler::<$v>); )* };
+        }
+        driver_vectors!(0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F);
         // 8259 spurious IRQs (7 and 15). They can still arrive just after the
         // PIC is masked for the I/O APIC switch.
         idt[(PIC_1_OFFSET + 7) as usize]
@@ -975,6 +994,19 @@ extern "x86-interrupt" fn ap_timer_interrupt_handler(stack_frame: InterruptStack
         crate::exec::loader::kill_if_requested();
         crate::sched::kthread::preempt_from_timer();
     }
+}
+
+/// A Windows driver's DPC was queued at DISPATCH_LEVEL or above and IRQL
+/// has since dropped: run the queue (nt/ntos/dpc.rs).
+extern "x86-interrupt" fn dpc_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::arch::smp::lapic_eoi();
+    crate::nt::ntos::dpc::software_interrupt();
+}
+
+/// A device a Windows driver runs interrupted (nt/ntos/intr.rs).
+extern "x86-interrupt" fn driver_interrupt_handler<const V: u8>(_stack_frame: InterruptStackFrame) {
+    crate::nt::ntos::intr::dispatch(V);
+    crate::arch::smp::lapic_eoi();
 }
 
 /// LAPIC spurious-interrupt vector. A spurious interrupt is not recorded in the ISR, so it

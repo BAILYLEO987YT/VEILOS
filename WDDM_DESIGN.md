@@ -2,7 +2,10 @@
 
 **Status:** in progress. W0 done. **W1 done (2026-11-21):** VEILOS loads
 and runs Windows kernel drivers, and Windows programs talk to them (see
-[W1 summary](#w1-summary)). Next: W2 (PnP, PCI resources and interrupts).
+[W1 summary](#w1-summary)). **W2 done (2026-11-24, QEMU):** PnP drivers get
+PCI devices with their resources and message-signaled interrupts, one stack
+per device (see [W2 summary](#w2-summary)). Next: W3 (dxgkrnl, display
+only).
 
 ## Goal
 
@@ -37,11 +40,12 @@ Windows programs, so the user-mode half of a Windows driver fits what it has.
   user32, gdi32, d3d9/11, opengl32 of VEILOS's own), an NT object/handle
   model, a registry (`src/nt/registry.rs`), PCI with MSI/MSI-X
   (`src/hal/pci.rs`), and a PE image mapper (`src/exec/modules.rs`).
-- **The kernel driver host exists (W1).** `src/nt/ntos/` loads `.sys`
+- **The kernel driver host exists (W1, W2).** `src/nt/ntos/` loads `.sys`
   images into ring 0 and provides the kernel interface they link against
-  (ntoskrnl, hal, ksecdd, netio). Of the NVIDIA and Intel Arc kernel
-  drivers' imports, all but 41 resolve; the 41 are W2's. No GPU driver has
-  been loaded yet: that's W4.
+  (ntoskrnl, hal, ksecdd, netio), including PnP, PCI resources and
+  interrupts. Every ntoskrnl, hal and ksecdd import of the NVIDIA and Intel
+  Arc kernel drivers resolves. No GPU driver has been loaded yet: they need
+  dxgkrnl (W3) first, and loading one is W4.
 
 ## What a Windows display driver needs
 
@@ -89,7 +93,7 @@ Each stage ends in something that works and can be tested on its own.
 |---|---|---|---|
 | **W0** | Honest status: boot messages, `gpu_driver.rs` / `gfx_api.rs` headers, this document | Nothing on screen claims GPU use that doesn't happen | ✅ Done |
 | **W1** | **Import census, then the kernel driver host.** A host tool lists every import of the vendors' `.sys` and UMD files (by DLL and function) and how many VEILOS provides, which sizes and orders the ntoskrnl work. Then: map a `.sys`, apply relocations, resolve imports (unresolved ones refuse the load and are listed), the security cookie, `DriverEntry`, `DRIVER_OBJECT`/`DEVICE_OBJECT`, IRPs (`IoCallDriver`, `IoCompleteRequest`), pool, IRQL and spinlocks, DPCs, timers, events, system threads | A sample WDM driver (built from Windows-driver-samples) loads, creates its device, answers IOCTLs from a Win32 program and unloads | ✅ Done 2026-11-21, QEMU. Met with K1, VEILOS's own WDM test driver built with MSVC against the WDK, rather than a Windows-driver-samples driver ([W1 summary](#w1-summary)) |
-| **W2** | **PnP, resources and interrupts.** `AddDevice`, `IRP_MN_START_DEVICE` with a `CM_RESOURCE_LIST` from PCI (BARs, MSI), `IoConnectInterruptEx`, power IRPs (`PoRequestPowerIrp`). Driver binding by PCI ID through the HAL (a "Windows driver" `hal::Driver`). The 41 imports the NVIDIA and Arc kernel drivers still lack after W1 are all here: device stacks (attach and detach, remove locks), device interfaces and properties, device registry keys, PnP notifications, the error log, `IoCancelIrp`, `ObOpenObjectByPointer`, `FsRtlRegisterFileSystemFilterCallbacks`. Also: DPCs queued from an interrupt run when IRQL drops, not on the next tick (W1's carried-forward list). `MmMapIoSpaceEx` and contiguous DMA memory already exist (W1) | A sample PCI driver (or a small one of our own built with the WDK headers) drives a QEMU device through its interrupt | QEMU |
+| **W2** | **PnP, resources and interrupts.** `AddDevice`, `IRP_MN_START_DEVICE` with a `CM_RESOURCE_LIST` from PCI (BARs, MSI), `IoConnectInterruptEx`, power IRPs (`PoRequestPowerIrp`). Driver binding by PCI ID through the HAL (a "Windows driver" `hal::Driver`). The 41 imports the NVIDIA and Arc kernel drivers still lack after W1 are all here: device stacks (attach and detach, remove locks), device interfaces and properties, device registry keys, PnP notifications, the error log, `IoCancelIrp`, `ObOpenObjectByPointer`, `FsRtlRegisterFileSystemFilterCallbacks`. Also: DPCs queued from an interrupt run when IRQL drops, not on the next tick (W1's carried-forward list). `MmMapIoSpaceEx` and contiguous DMA memory already exist (W1) | A sample PCI driver (or a small one of our own built with the WDK headers) drives a QEMU device through its interrupt | ✅ Done 2026-11-24, QEMU. K2, VEILOS's own PnP driver for QEMU's `edu` device, runs two of them at once ([W2 summary](#w2-summary)) |
 | **W3** | **dxgkrnl, display only.** `DxgkInitialize` registration, adapter start, `QueryAdapterInfo`, child relations and status, EDID, the VidPN objects, `CommitVidPn`, `PresentDisplayOnly`. The desktop presents through it | Microsoft's KMDOD sample (a display-only driver over the firmware framebuffer, built from source) runs the VEILOS desktop. Everything dxgkrnl keeps is per adapter from the start ([Several GPUs](#several-gpus)) | QEMU and both PCs |
 | **W4** | **A vendor driver, mode-setting.** Load a real vendor `.sys`, get through `DriverEntry`, `StartDevice` and `QueryAdapterInfo`, enumerate monitors, commit a mode, scan out the desktop. Everything it calls that VEILOS lacks shows up here | The desktop at a mode chosen at run time, through the vendor driver | Real hardware: the test PC (GTX 745, NVIDIA 580.x, the last Maxwell branch) or the main PC (Intel Arc) |
 | **W5** | **VidMm and VidSch.** Allocations, segments / GPU virtual memory, paging buffers, residency, monitored fences, contexts and submission, `DxgkDdiSubmitCommand`, interrupts → DPC → fence completion, TDR | A `D3DKMT`-level test program allocates, submits a vendor-built command buffer through the UMD and waits on its fence | Real hardware |
@@ -155,15 +159,10 @@ All in QEMU (WHPX), on 1 and 2 CPUs. Nothing has run on real hardware yet.
 
 Known gaps, each with the stage that needs it:
 
-- **DPCs queued at DISPATCH_LEVEL or above wait for the next 1 ms tick on
-  the BSP.** `KeLowerIrql` only writes CR8, and the WDK inlines IRQL
-  changes as CR8 writes, so VEILOS can't run waiting DPCs when IRQL drops.
-  Windows uses a software interrupt at IRQL 2 for this. The equivalent
-  here is a self-IPI on a vector in priority class 2, which the local APIC
-  holds until CR8 drops below 2, then delivers on the CPU that queued it.
-  This is fine for K1, but an ISR's DPC runs on every GPU interrupt
-  (vblank, fence completion), so it's needed by **W2** (interrupts) and
-  matters for latency in **W5**.
+- ~~**DPCs queued at DISPATCH_LEVEL or above wait for the next 1 ms tick
+  on the BSP.**~~ Done in W2: queuing one sends the CPU a self-IPI on a
+  priority-class-2 vector, which the local APIC delivers as soon as CR8
+  drops below 2 ([W2 summary](#w2-summary)).
 - **Not supported yet, returning `STATUS_NOT_SUPPORTED` and logged the first
   time:** process virtual memory, sections, process and token queries and
   power information through `Zw*`; BCrypt asymmetric keys, signature
@@ -181,6 +180,95 @@ Known gaps, each with the stage that needs it:
 - **Small differences from Windows:** opening a device after its driver
   unloads fails with `ERROR_INVALID_NAME` (Windows: `ERROR_FILE_NOT_FOUND`).
   The system time drivers see is 1970 until NTP has answered.
+
+## W2 summary
+
+**Done 2026-11-24, in QEMU.** Windows PnP drivers get PCI devices the way
+Windows' PnP manager gives them: a device stack per device, started with
+its resources, with a message-signaled interrupt whose service routine
+queues a DPC that runs as soon as IRQL drops. Each device is separate, so
+two devices of one make share a driver and nothing else, which is what
+[Several GPUs](#several-gpus) needs from here on.
+
+### What exists
+
+| Area | Where | What |
+|---|---|---|
+| Binding | `pnp.rs`, `image.rs`, `src/hal/mod.rs` | `DRIVER LOAD` of a driver with `AddDevice` hands it every PCI device no VEILOS driver runs whose hardware or compatible IDs (Windows' forms: `PCI\VEN_&DEV_&SUBSYS_&REV_`, `&CC_`, ...) match the `PCI\VEN_` IDs in its `.inf` beside the `.sys`, or IDs typed after the path. The HAL marks the device as the Windows driver's (`hal::claim`); `DRIVER UNLOAD` gives it back |
+| PDOs | `pnp.rs` | VEILOS's own "PCI bus driver" makes `\Device\NTPNP_PCInnnn` for each device and answers what function drivers pass down: start (decode and bus mastering on), remove, capabilities (S0→D0, else D3), IDs, device text, bus information, target relations, `BUS_INTERFACE_STANDARD` (config space reads and writes; no DMA adapter yet), `IRP_MN_READ_CONFIG`/`WRITE_CONFIG`, power (always succeeds) |
+| Starting | `pnp.rs` | `AddDevice`, then `IRP_MN_QUERY_CAPABILITIES`, then `IRP_MN_START_DEVICE` with raw and translated `CM_RESOURCE_LIST`s: every BAR (memory, with the large forms past 4 GiB, and I/O ports) and the interrupt; then `IRP_MN_QUERY_PNP_DEVICE_STATE`. Each device gets its Enum key (`Device Parameters`, `Service`, `Driver`, `ClassGUID`) and a Class driver key |
+| Interrupts | `intr.rs`, `src/arch/interrupts.rs` | Each device gets its own vector (0x70 to 0x8F: IRQL 7 and 8), its MSI or MSI-X entry 0 pointed at it. `IoConnectInterruptEx` connects message-based, line-based (the same interrupt, without a message id) and fully specified routines. The vector's handler runs every connected routine at the vector's IRQL under its interrupt spin lock, then EOIs. `KeSynchronizeExecution`, `KeAcquire/ReleaseInterruptSpinLock` |
+| DPCs | `dpc.rs` | A DPC queued at DISPATCH_LEVEL or above sends this CPU an interrupt on vector 0x2D (priority class 2). The local APIC holds it until CR8 drops below 2 and then runs the DPC queue, as Windows' DISPATCH software interrupt does. K2 measures 1 µs from service routine to DPC (it was up to the next 1 ms tick) |
+| Device stacks and IRPs | `io.rs` | Attach and detach, the top and the base of a stack, opens reaching the top of the stack, `IoGetDeviceObjectPointer`, `IoEnumerateDeviceObjectList`, `IoBuildDeviceIoControlRequest` and `IoBuildSynchronousFsdRequest` (buffered, direct and neither; freed and copied back on completion), `IoForwardIrpSynchronously`, `IoCancelIrp` and the cancel spin lock, `PoCallDriver` |
+| The rest | `iox.rs`, `pnp.rs` | Remove locks, the error log (to the serial log), named notification and synchronization events, I/O timers, stack limits, device and driver registry keys, `IoQueryFullDriverPath`, device properties (Windows' list) and property data, device interfaces (links, enable and disable, lists, their registry keys), interface-change notifications (with the existing interfaces when asked), `PoRequestPowerIrp` (device power, sent down the stack), `ObOpenObjectByPointer`, and accepted-but-unused file system filter callbacks, WMI registration, relation invalidation and eject requests |
+| Terminal | `src/task/terminal.rs` | `DRIVER LOAD <path> [PCI IDs]`; `DRIVER` lists the devices Windows drivers run, with their vectors and interrupt counts |
+
+Exports: 477 functions (ntoskrnl 454, hal 4, ksecdd 15, netio 4) and 13
+data exports.
+
+### How it was tested
+
+In QEMU (WHPX, which runs VEILOS on one CPU), with two of QEMU's `edu`
+teaching devices (PCI 1234:11E8: registers, a factorial unit and an
+interrupt it raises on request, MSI capable).
+
+- **K2** (`win32/tests/k2`, built output in `storage/tests/`):
+  - `k2edu.sys` is a WDM PnP function driver built with MSVC against the
+    WDK, with `k2edu.inf` naming the device. Per device it checks 22
+    things: attaching above its PDO, device properties, registry keys,
+    its interface, the resources, the registers through
+    `MmMapIoSpaceEx`, config space through the bus interface and through
+    `IRP_MN_READ_CONFIG`, `IoConnectInterruptEx`, 8 interrupts each
+    reaching its service routine (at IRQL 7) and DPC, the DPC within
+    500 µs, a factorial finished by interrupt, `KeSynchronizeExecution` at
+    the device's IRQL, the remove lock, `PoRequestPowerIrp`, an I/O timer,
+    an IOCTL to the other device's driver through
+    `IoBuildDeviceIoControlRequest`, `IoCancelIrp`, interface
+    notifications, the error log and named events, stack limits and the
+    driver's path, and property data.
+  - `k2test.exe` opens `\\.\VeilEdu0` and `\\.\VeilEdu1`: all 22 pass on
+    both, the two have different PCI functions and vectors, and 5 more
+    interrupts raised on device 0 reach device 0's routine only. It
+    reports `0 failed`.
+  - Unload removes both stacks (`IRP_MN_REMOVE_DEVICE`), frees the
+    vectors and gives the devices back; loading again starts both again.
+  - `win32/tests/k1/layout.c` checks every new structure offset (resource
+    lists, `IO_CONNECT_INTERRUPT_PARAMETERS`, the message table, the bus
+    interface, capabilities, remove locks, the error log packet, stack
+    location parameters) against the WDK. All match. K1 still passes.
+- **Import census.** Every ntoskrnl, hal and ksecdd import of NVIDIA
+  581.80 `nvlddmkm.sys` and Intel Arc 32.0.101.9175 `igdkmdnd64.sys` and
+  `igdkmdn64.sys` now resolves.
+
+### Carried forward from W2
+
+- **Display adapters are VEILOS's.** `graphics::LFB_DISPLAY_DRIVER` binds
+  every display-class device at boot (or the firmware framebuffer stands in
+  for it), so a Windows display driver can't claim one yet. Handing a GPU
+  from VEILOS's framebuffer to its vendor driver is the POST-display
+  hand-over **W3** plans ([Several GPUs](#several-gpus)).
+- **One interrupt message per device.** A device gets one vector, through
+  MSI or MSI-X entry 0. GPUs that want several MSI-X messages (one per
+  engine) get one: **W4** shows whether a vendor driver minds.
+- **No line-based (INTx) interrupts.** VEILOS doesn't read ACPI's PCI
+  routing (`_PRT`), so a device without MSI gets no interrupt resource.
+  Every GPU of the last fifteen years has MSI.
+- **Interrupts go to the CPU that loaded the driver.** No spreading across
+  CPUs, and only tested on one CPU (WHPX). The test PC is the first
+  multi-core run.
+- **No DMA adapters.** `IoGetDmaAdapter` and the bus interface's
+  `GetDmaAdapter` give none; GPU drivers map their own memory, but **W5**
+  may need them.
+- **Power is D0 only.** Set and query power IRPs reach the driver and
+  succeed; wait-wake isn't supported, and nothing sleeps (runtime power is
+  W7's, for several GPUs).
+- **Hot-plug doesn't tell Windows drivers.** PCIe hot-removal of a device
+  a Windows driver runs marks it removed without `IRP_MN_SURPRISE_REMOVAL`.
+- **The .inf is read for IDs only.** Its `AddReg` and `CopyFiles` sections
+  (registry values display drivers read at start) are installation, **W4**
+  and **W7**.
+- **Opens by pointer stay open.** `IoGetDeviceObjectPointer`'s file object
+  isn't closed when the driver dereferences it (no reference counts yet).
 
 ## W1 record
 

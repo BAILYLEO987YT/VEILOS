@@ -1,5 +1,5 @@
 // =============================================================================
-// VEILOS: Windows kernel drivers (WDDM_DESIGN.md, stage W1)
+// VEILOS: Windows kernel drivers (WDDM_DESIGN.md, stages W1 and W2)
 // =============================================================================
 //
 // The kernel interface Windows drivers are written against, implemented by
@@ -28,6 +28,11 @@
 //     Ex timers; `misc`: queues, Ps, Po, Cm, Etw and Mm odds and ends.
 //   * `zw`: files on the VFS, devices, events, links, registry enumeration,
 //     system information, ZwLoadDriver.
+//   * `pnp`: Plug and Play: PCI devices handed to a driver's AddDevice
+//     (a PDO each, from VEILOS's own PCI bus driver) and started with
+//     their resources; `intr`: their interrupts (a vector per device, MSI)
+//     and IoConnectInterruptEx; `iox`: the rest PnP drivers call (remove
+//     locks, interfaces, notifications, power requests, registry keys).
 //   * `exports`: the name -> address tables of ntoskrnl.exe, hal.dll and
 //     the other modules drivers import from (netio.sys).
 //
@@ -38,9 +43,10 @@
 //
 // Calling convention: everything a driver calls is `extern "win64"`.
 //
-// What W1 covers is what a simple WDM driver needs (k1's test driver). The
-// import census (tools/import_census.py) lists what the GPU drivers need on
-// top; W2 adds PnP, PCI resources and interrupts.
+// W1 covers what a simple WDM driver needs (win32/tests/k1), W2 what a PnP
+// driver for a PCI device needs (win32/tests/k2). Every ntoskrnl, hal and
+// ksecdd import of the NVIDIA and Intel Arc kernel drivers resolves
+// (tools/import_census.py); dxgkrnl is next (W3).
 
 // Exported functions keep the names drivers link against.
 #![allow(non_snake_case)]
@@ -52,11 +58,14 @@ pub mod dpc;
 pub mod ex;
 pub mod exports;
 pub mod image;
+pub mod intr;
 pub mod io;
+pub mod iox;
 pub mod ke;
 pub mod misc;
 pub mod mm;
 pub mod ob;
+pub mod pnp;
 pub mod pool;
 pub mod ps;
 pub mod rtl;

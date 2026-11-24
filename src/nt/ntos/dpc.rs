@@ -1,11 +1,15 @@
 // DPCs (deferred procedure calls) and timers.
 //
 // A DPC queued at PASSIVE or APC level runs at once, at DISPATCH_LEVEL, as
-// Windows' would (its software interrupt fires as soon as IRQL allows);
-// one queued at DISPATCH or above (from a spinlock, another DPC, an ISR)
-// waits for the next 1 ms tick on the BSP (`tick`). Timers are checked on
-// that tick too: one that's due is signalled, queues its DPC, and is set
-// again if it's periodic.
+// Windows' would. One queued at DISPATCH or above (from a spinlock, another
+// DPC, an interrupt service routine) sends this CPU an interrupt on
+// `interrupts::DPC_VECTOR`, whose priority class is DISPATCH_LEVEL's: the
+// local APIC holds it until CR8 drops below 2, so the queue runs the moment
+// IRQL falls, as Windows' DISPATCH software interrupt does. (KeLowerIrql
+// and the WDK's inline CR8 writes need nothing more.) The BSP's 1 ms tick
+// (`tick`) also runs a waiting queue, as a fallback. Timers are checked on
+// that tick: one that's due is signalled, queues its DPC, and is set again
+// if it's periodic.
 //
 // KDPC (0x40): Type at 0, DeferredRoutine 0x18, DeferredContext 0x20,
 // SystemArgument1/2 0x28/0x30, DpcData 0x38 (non-null while queued).
@@ -76,10 +80,26 @@ pub extern "win64" fn KeInsertQueueDpc(dpc: *mut u8, arg1: u64, arg2: u64) -> u8
         q.push(dpc as usize);
         true
     });
-    if queued && ke::irql() < ke::DISPATCH_LEVEL {
-        drain();
+    if queued {
+        if ke::irql() < ke::DISPATCH_LEVEL {
+            drain();
+        } else {
+            crate::arch::smp::self_ipi(crate::arch::interrupts::DPC_VECTOR);
+        }
     }
     queued as u8
+}
+
+/// `interrupts::DPC_VECTOR`: IRQL has dropped below DISPATCH_LEVEL with
+/// DPCs queued. Runs them with interrupts on (device interrupts can come
+/// meanwhile, as at DISPATCH_LEVEL on Windows).
+pub fn software_interrupt() {
+    let on = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::enable();
+    drain();
+    if !on {
+        x86_64::instructions::interrupts::disable();
+    }
 }
 
 pub extern "win64" fn KeRemoveQueueDpc(dpc: *mut u8) -> u8 {

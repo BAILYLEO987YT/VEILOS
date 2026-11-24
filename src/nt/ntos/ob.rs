@@ -29,6 +29,8 @@ pub enum Object {
     Device(Arc<super::io::DeviceHandle>),
     /// A symbolic link: its target.
     Link(String),
+    /// Any other object a driver opened by pointer (ObOpenObjectByPointer).
+    Pointer(usize),
 }
 
 static HANDLES: Mutex<BTreeMap<u64, Object>> = Mutex::new(BTreeMap::new());
@@ -59,7 +61,7 @@ pub extern "win64" fn ZwClose(h: u64) -> NtStatus {
 /// Object*, HandleInformation*).
 pub extern "win64" fn ObReferenceObjectByHandle(h: u64, _access: u32, _ty: u64, _mode: u8, out: *mut u64, _info: *mut u8) -> NtStatus {
     match get(h) {
-        Some(Object::Dispatcher(p)) => {
+        Some(Object::Dispatcher(p)) | Some(Object::Pointer(p)) => {
             unsafe { out.write(p as u64) };
             STATUS_SUCCESS
         }

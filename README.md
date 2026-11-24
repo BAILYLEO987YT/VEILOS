@@ -42,7 +42,7 @@ VEILOS can currently do the following, in QEMU:
 | Area | What works |
 |---|---|
 | **Desktop** | Window manager with snapping and tiling, taskbar, launcher, notifications, terminal, file manager (browse and open), text editor, image viewer, multiple displays and runtime resolution |
-| **Windows compatibility** | Console and classic GUI programs: `cmd.exe`, Notepad, regedit, Git Bash, git, cargo, curl, and more. A real registry, GDI with TrueType text, common controls, dialogs and menus. Direct3D 9 / 11 and OpenGL are in progress. Windows kernel drivers (`.sys`) load and answer programs' requests, the first step toward running the GPU vendors' own drivers ([WDDM_DESIGN.md](WDDM_DESIGN.md)) |
+| **Windows compatibility** | Console and classic GUI programs: `cmd.exe`, Notepad, regedit, Git Bash, git, cargo, curl, and more. A real registry, GDI with TrueType text, common controls, dialogs and menus. Direct3D 9 / 11 and OpenGL are in progress. Windows kernel drivers (`.sys`) load, answer programs' requests and run PCI devices with their interrupts (Plug and Play), the first steps toward running the GPU vendors' own drivers ([WDDM_DESIGN.md](WDDM_DESIGN.md)) |
 | **Kernel** | Preemptive multitasking, SMP, per-process address spaces, threads, a user/role system with hashed passwords and a lock screen |
 | **Hardware** | SATA (AHCI) with GPT/MBR, FAT32 read/write, NTFS and exFAT read-only, virtio-net (with NIC bonding), Intel HD Audio, PCIe hot-plug |
 | **Networking** | DHCP, TCP/UDP, DNS and TLS |

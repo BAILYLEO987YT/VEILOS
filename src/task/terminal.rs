@@ -767,11 +767,21 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     history.push(String::from("DRIVER: administrators only"));
                 }
                 Some("LOAD") => match parts.get(2) {
-                    Some(p) => match crate::nt::ntos::image::load(&p.to_ascii_lowercase()) {
-                        Ok((name, st)) => history.push(alloc::format!("  {}: DriverEntry returned {:#010X}", name, st as u32)),
-                        Err(e) => history.push(alloc::format!("  DRIVER LOAD: {}", e)),
-                    },
-                    None => history.push(String::from("USAGE: DRIVER LOAD <path.sys>")),
+                    // Any further words are PCI hardware IDs (PCI\VEN_xxxx&DEV_xxxx)
+                    // for a PnP driver, besides those in its .inf.
+                    Some(p) => {
+                        let ids: Vec<String> = parts.iter().skip(3).map(|s| s.to_ascii_uppercase()).collect();
+                        match crate::nt::ntos::image::load_with(&p.to_ascii_lowercase(), &ids) {
+                            Ok((name, st, devices)) => {
+                                history.push(alloc::format!("  {}: DriverEntry returned {:#010X}", name, st as u32));
+                                if devices > 0 {
+                                    history.push(alloc::format!("  {}: {} device(s) started", name, devices));
+                                }
+                            }
+                            Err(e) => history.push(alloc::format!("  DRIVER LOAD: {}", e)),
+                        }
+                    }
+                    None => history.push(String::from("USAGE: DRIVER LOAD <path.sys> [PCI IDs]")),
                 },
                 Some("UNLOAD") => match parts.get(2) {
                     Some(n) => match crate::nt::ntos::image::unload(&n.to_ascii_lowercase()) {
@@ -814,7 +824,9 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     for d in list.iter() {
                         history.push(alloc::format!("  {}  {} at {:#X} ({} KiB)", d.name, d.path, d.base, d.size / 1024));
                     }
-                    history.push(String::from("  USAGE: DRIVER LOAD <path.sys> | UNLOAD <name> | OPEN <dev> | IOCTL <dev> <code> [text]"));
+                    drop(list);
+                    history.extend(crate::nt::ntos::pnp::describe());
+                    history.push(String::from("  USAGE: DRIVER LOAD <path.sys> [PCI IDs] | UNLOAD <name> | OPEN <dev> | IOCTL <dev> <code> [text]"));
                 }
             }
         }

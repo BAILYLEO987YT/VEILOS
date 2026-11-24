@@ -482,6 +482,27 @@ pub extern "win64" fn _wcsicmp(a: *const u16, b: *const u16) -> i32 {
     }
 }
 
+pub extern "win64" fn _wcsnicmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+    let low = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
+    for i in 0..n {
+        let (x, y) = unsafe { (low(a.add(i).read()), low(b.add(i).read())) };
+        if x != y || x == 0 {
+            return x as i32 - y as i32;
+        }
+    }
+    0
+}
+
+pub extern "win64" fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    for i in 0..n {
+        let (x, y) = unsafe { (a.add(i).read().to_ascii_lowercase(), b.add(i).read().to_ascii_lowercase()) };
+        if x != y || x == 0 {
+            return x as i32 - y as i32;
+        }
+    }
+    0
+}
+
 pub extern "win64" fn wcschr(s: *const u16, c: u16) -> *const u16 {
     let mut i = 0;
     loop {
