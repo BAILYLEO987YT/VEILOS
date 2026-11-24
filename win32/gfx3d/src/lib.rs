@@ -1,5 +1,5 @@
 //! What VEILOS's 3D DLLs (opengl32, d3d9) share (WIN32_DESIGN.md G5): the
-//! kernel rasterizer's ABI, from the kernel's own source (src/raster3d.rs,
+//! kernel rasterizer's ABI, from the kernel's own source (src/gfx/raster3d.rs,
 //! included by path, so the two can't drift apart), and VEIL_GPU3D.
 //!
 //! With `--features host` the DLLs run on Windows, next to its own OpenGL or
@@ -11,7 +11,7 @@
 
 extern crate alloc;
 
-#[path = "../../../src/raster3d.rs"]
+#[path = "../../../src/gfx/raster3d.rs"]
 #[allow(dead_code)]
 pub mod raster3d;
 

@@ -88,8 +88,8 @@ pub fn add_byte_and_process(byte: u8) {
             let dx = dx + PENDING_DX.swap(0, Ordering::Relaxed);
             let dy = dy + PENDING_DY.swap(0, Ordering::Relaxed);
             state.wheel += wheel + PENDING_WHEEL.swap(0, Ordering::Relaxed);
-            state.x = (state.x + dx).clamp(0, crate::ui::screen_w() as i32 - 1);
-            state.y = (state.y - dy).clamp(0, crate::ui::screen_h() as i32 - 1); // PS/2 Y is inverted
+            state.x = (state.x + dx).clamp(0, crate::gui::ui::screen_w() as i32 - 1);
+            state.y = (state.y - dy).clamp(0, crate::gui::ui::screen_h() as i32 - 1); // PS/2 Y is inverted
             state.left_button  = (flags & 0x01) != 0;
             state.right_button = (flags & 0x02) != 0;
         } else {
@@ -110,8 +110,8 @@ pub fn add_motion(dx: i32, dy: i32, left: bool, right: bool, wheel: i32) {
         // PENDING_DY holds PS/2 (upwards) units.
         let dy = dy - PENDING_DY.swap(0, Ordering::Relaxed);
         state.wheel += wheel + PENDING_WHEEL.swap(0, Ordering::Relaxed);
-        state.x = (state.x + dx).clamp(0, crate::ui::screen_w() as i32 - 1);
-        state.y = (state.y + dy).clamp(0, crate::ui::screen_h() as i32 - 1);
+        state.x = (state.x + dx).clamp(0, crate::gui::ui::screen_w() as i32 - 1);
+        state.y = (state.y + dy).clamp(0, crate::gui::ui::screen_h() as i32 - 1);
         state.left_button = left;
         state.right_button = right;
     } else {
@@ -131,14 +131,14 @@ const PS2_TIMEOUT_US: u64 = 500_000;
 /// Returns false on timeout — caller logs and continues rather than hanging.
 fn wait_input() -> bool {
     let mut port = Port::<u8>::new(0x64);
-    crate::time::spin_until(PS2_TIMEOUT_US, || unsafe { port.read() } & 0x02 == 0)
+    crate::arch::time::spin_until(PS2_TIMEOUT_US, || unsafe { port.read() } & 0x02 == 0)
 }
 
 /// Spins until the PS/2 controller output buffer has data ready to read.
 /// Returns false on timeout.
 fn wait_output() -> bool {
     let mut port = Port::<u8>::new(0x64);
-    crate::time::spin_until(PS2_TIMEOUT_US, || unsafe { port.read() } & 0x01 != 0)
+    crate::arch::time::spin_until(PS2_TIMEOUT_US, || unsafe { port.read() } & 0x01 != 0)
 }
 
 /// Sends a byte to the mouse (PS/2 second port).
@@ -191,7 +191,7 @@ async fn hw_init() {
     // 0. Mask IRQ12 for the whole init. Firmware may have left it unmasked,
     //    and if the mouse ISR runs during init it reads port 0x60 itself and
     //    swallows every ACK/self-test byte this sequence is polling for.
-    crate::interrupts::mask_irq(12);
+    crate::arch::interrupts::mask_irq(12);
 
     // No 8042 at all (newer boards; QEMU's i8042=off): the port reads as
     // 0xFF, which looks like a controller that is always busy and always has
@@ -220,7 +220,7 @@ async fn hw_init() {
     }
 
     // Yield so gui_refresh_task gets a tick while we pause between steps.
-    crate::interrupts::SleepFuture::new(5).await;
+    crate::arch::interrupts::SleepFuture::new(5).await;
 
     let config = unsafe {
         // 3. Read, patch, and write the Controller Configuration Byte.
@@ -246,14 +246,14 @@ async fn hw_init() {
         config
     };
 
-    crate::interrupts::SleepFuture::new(5).await;
+    crate::arch::interrupts::SleepFuture::new(5).await;
 
     // 5. Reset the mouse device and collect the three-byte response.
     crate::serial_println!("[MOUSE] Sending reset (0xFF)...");
     mouse_write(0xFF);
 
     // The mouse takes a few ms to self-test — yield instead of spinning.
-    crate::interrupts::SleepFuture::new(10).await;
+    crate::arch::interrupts::SleepFuture::new(10).await;
 
     let ack  = mouse_read_logged("reset ACK  (expect 0xFA)");
     let test = mouse_read_logged("self-test  (expect 0xAA)");
@@ -267,7 +267,7 @@ async fn hw_init() {
     }
     let _ = id; // logged above; value is informational only
 
-    crate::interrupts::SleepFuture::new(5).await;
+    crate::arch::interrupts::SleepFuture::new(5).await;
 
     // 6a. The IntelliMouse knock: sample rates 200, 100, 80, and a mouse with
     //     a wheel then reports device id 3 and sends 4-byte packets.
@@ -298,7 +298,7 @@ async fn hw_init() {
     mouse_write(0x03);
     mouse_read_logged("resolution value ACK");
 
-    crate::interrupts::SleepFuture::new(5).await;
+    crate::arch::interrupts::SleepFuture::new(5).await;
 
     // 8. Enable data reporting (start the packet stream).
     crate::serial_println!("[MOUSE] Enabling data reporting...");
@@ -319,7 +319,7 @@ async fn hw_init() {
         data_port.write(config | 0x02);
         crate::serial_println!("[MOUSE] Mouse IRQ enabled: config -> {:#04X}", config | 0x02);
     }
-    crate::interrupts::unmask_irq(12);
+    crate::arch::interrupts::unmask_irq(12);
 
     crate::serial_println!("[MOUSE] PS/2 init complete. IRQ12 unmasked.");
 }
@@ -361,7 +361,7 @@ pub async fn mouse_tick() {
         // 2. Queue is now empty. Sleep for 1ms instead of `yield_now`.
         // `yield_now()` immediately queues the task again, which would prevent
         // the executor's `is_empty()` check from ever succeeding, keeping CPU at 100%.
-        crate::interrupts::SleepFuture::new(1).await;
+        crate::arch::interrupts::SleepFuture::new(1).await;
     }
 }
 
@@ -378,8 +378,8 @@ fn process_packet(p: [u8; 3]) {
     let right = (flags & 0x02) != 0;
 
     let mut state = MOUSE_STATE.lock();
-    state.x = (state.x + dx).clamp(0, crate::ui::screen_w() as i32 - 1);
-    state.y = (state.y - dy).clamp(0, crate::ui::screen_h() as i32 - 1); // Y is inverted in PS/2
+    state.x = (state.x + dx).clamp(0, crate::gui::ui::screen_w() as i32 - 1);
+    state.y = (state.y - dy).clamp(0, crate::gui::ui::screen_h() as i32 - 1); // Y is inverted in PS/2
     state.left_button  = left;
     state.right_button = right;
     state.dx = state.dx.saturating_add(dx);

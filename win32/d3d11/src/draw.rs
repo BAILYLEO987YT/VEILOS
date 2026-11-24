@@ -2,7 +2,7 @@
 //! vertex shaders run here (vm.rs), clipping, the viewport (Direct3D 10's
 //! pixel centres at +0.5, as the kernel's), the rasterizer, depth-stencil
 //! and blend states as the kernel's group, and the pixel shader's planes
-//! per primitive (src/raster3d.rs runs it).
+//! per primitive (src/gfx/raster3d.rs runs it).
 
 use alloc::vec;
 use alloc::vec::Vec;

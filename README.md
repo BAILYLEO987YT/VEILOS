@@ -99,11 +99,33 @@ VEILOS's own `ntdll.dll`, `kernel32.dll`, `user32.dll` and the rest are built fr
 
 | Path | Contents |
 |---|---|
-| [`src/`](src) | The kernel: memory, scheduler, drivers, filesystems, network, window system, and the NT syscall layer (`nt_*.rs`) |
+| [`src/`](src) | The kernel (layout below) |
 | [`win32/`](win32) | The Windows system DLLs (Rust, built as real PE DLLs) and the Win32 test programs |
 | [`storage/`](storage) | The disk contents VEILOS boots with: system DLLs, config and themes, fonts, wallpapers, test programs |
 | [`tools/`](tools) | Disk-image builder, release packaging and boot-test scripts, launcher scripts that ship in the zip |
 | [`.github/workflows/`](.github/workflows) | CI: builds, boots the result in QEMU, and publishes the latest release |
+
+### The kernel (`src/`)
+
+| Path | Contents |
+|---|---|
+| [`main.rs`](src/main.rs) | Entry point, boot sequence, the print and serial macros |
+| [`arch/`](src/arch) | GDT, interrupts, I/O APIC, SMP bring-up, the timebase |
+| [`mm/`](src/mm) | Physical memory, the kernel heap, per-process address spaces, ASLR |
+| [`sched/`](src/sched) | Processes, kernel threads, the scheduler, the worker pool |
+| [`hal/`](src/hal) | The device model and driver binding, PCI, PCIe hot-plug |
+| [`drivers/`](src/drivers) | Storage (AHCI, IDE, NVMe), network (e1000, r8169, virtio-net, iwlwifi, WPA2), USB, audio |
+| [`fs/`](src/fs) | The VFS, the block layer, FAT, exFAT, NTFS |
+| [`net/`](src/net) | The network stack, TLS, the distributed mesh (task capsules, checkpoints) |
+| [`security/`](src/security) | Security Mode, execution policy, capabilities, sandboxing, users, credentials, encryption |
+| [`exec/`](src/exec) | PE parsing, the loaders, the DLL registry |
+| [`nt/`](src/nt) | The Windows NT personality: system services, objects, memory, threads, files, registry, consoles, `ntos/` (the kernel interface for Windows drivers) |
+| [`gfx/`](src/gfx) | Framebuffers, the GPU command model, 2D and 3D rendering, fonts, image decoders |
+| [`gui/`](src/gui) | Windows and the UI runtime, the widget toolkit, the compositor, the desktop, the clipboard |
+| [`vsh/`](src/vsh) | The VSH shell and its language |
+| [`sys/`](src/sys) | Kernel log, crash screen, power, profiler, debugger, stability tests, hypervisor, installer, compression |
+| [`userland/`](src/userland) | Native apps, the app repository, the package manager, SDKs, the native runtime, distribution |
+| [`task/`](src/task) | The async executor, keyboard and mouse input, the terminal |
 
 ## Documentation
 

@@ -33,11 +33,11 @@ every window a valid window procedure.
   formal specification below.
 - **Property (P)**: The correct observable outcome when the bug condition holds.
 - **Preservation**: All currently correct behaviors that must not change after the fix.
-- **`dispatch_win32_user_syscall`**: Function in `src/win32_user.rs` that routes Win32 syscalls
+- **`dispatch_win32_user_syscall`**: Function in `src/nt/win32_user.rs` that routes Win32 syscalls
   (`0x4001`–`0x401C`) arriving from user-mode thunks.
-- **`process_execution_task`**: Async function in `src/loader.rs` that launches a user-mode PE,
+- **`process_execution_task`**: Async function in `src/exec/loader.rs` that launches a user-mode PE,
   waits for it to return, and performs post-exit cleanup.
-- **`LAST_USER_MODE_TICK`**: `AtomicU64` in `src/interrupts.rs`; the timer ISR stores the current
+- **`LAST_USER_MODE_TICK`**: `AtomicU64` in `src/arch/interrupts.rs`; the timer ISR stores the current
   tick here whenever it observes ring-3 execution. Used to keep the display alive for 2000 ticks
   after a process runs. Reset to `0` by the fix to end the grace period immediately on exit.
 - **`recently_in_user_mode`**: Local boolean in the timer ISR, true when either the interrupted
@@ -255,7 +255,7 @@ existing class-registry lookup path identically.
 
 ### Changes Required
 
-**File:** `src/win32_user.rs`
+**File:** `src/nt/win32_user.rs`
 
 **Change 1 — Bug 1: Remove `.visible` filter in 0x4009 empty-queue synthesis**
 
@@ -301,7 +301,7 @@ caller throughout this match arm.
 
 ---
 
-**File:** `src/loader.rs`
+**File:** `src/exec/loader.rs`
 
 **Change 3 — Bug 2: Reset LAST_USER_MODE_TICK after cleanup**
 

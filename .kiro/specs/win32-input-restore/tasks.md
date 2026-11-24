@@ -73,7 +73,7 @@
 
 - [x] 3. Fix all three bugs
 
-  - [x] 3.1 Bug 1 fix — remove `&& w.visible` predicate in `0x4009` empty-queue synthesis (`src/win32_user.rs`)
+  - [x] 3.1 Bug 1 fix — remove `&& w.visible` predicate in `0x4009` empty-queue synthesis (`src/nt/win32_user.rs`)
     - In `dispatch_win32_user_syscall`, match arm `0x4009`, locate the synthesis block:
       ```rust
       if let Some(hwnd) = state.windows.iter()
@@ -92,7 +92,7 @@
     - _Preservation: fast path (non-empty queue) and WM_QUIT path are not touched by this change_
     - _Requirements: 2.1, 2.2_
 
-  - [x] 3.2 Bug 3 fix — add `wnd_proc` fallback in `0x4001` CreateWindowExW (`src/win32_user.rs`)
+  - [x] 3.2 Bug 3 fix — add `wnd_proc` fallback in `0x4001` CreateWindowExW (`src/nt/win32_user.rs`)
     - In `dispatch_win32_user_syscall`, match arm `0x4001`, locate the line:
       ```rust
       let wnd_proc = state.lookup_class_wndproc(&class_name);
@@ -113,7 +113,7 @@
     - _Preservation: if lookup_class_wndproc returns non-zero (name resolves), the else branch preserves the original value exactly — fallback is never entered_
     - _Requirements: 2.5, 2.6_
 
-  - [x] 3.3 Bug 2 fix — reset `LAST_USER_MODE_TICK` to `0` after cleanup in `on_process_exit` (`src/loader.rs`)
+  - [x] 3.3 Bug 2 fix — reset `LAST_USER_MODE_TICK` to `0` after cleanup in `on_process_exit` (`src/exec/loader.rs`)
     - In `on_process_exit`, locate the terminal re-focus block ending with `wm.focus(term_vid)` and the `release_process_memory` call, then find the `serial_println!` line:
       ```rust
       crate::serial_println!(

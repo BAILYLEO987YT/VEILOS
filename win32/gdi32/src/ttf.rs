@@ -1,4 +1,4 @@
-//! TrueType fonts: the kernel's font engine (src/font.rs, compiled in) over
+//! TrueType fonts: the kernel's font engine (src/gfx/font.rs, compiled in) over
 //! the .ttf files in C:\FONTS, and which face and size a LOGFONT gets.
 //!
 //! Windows' own fonts aren't here, so a request is matched by family name

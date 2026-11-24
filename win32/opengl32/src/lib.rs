@@ -3,7 +3,7 @@
 //! The vertex stage runs here, in user mode with real floating point:
 //! matrices, primitive assembly, clipping, culling and the viewport. What
 //! comes out is triangles in window space, in fixed point, which go to the
-//! kernel's rasterizer (src/raster3d.rs) in batches through one syscall,
+//! kernel's rasterizer (src/gfx/raster3d.rs) in batches through one syscall,
 //! VEIL_GPU3D; the kernel fills them on every CPU into a colour and depth
 //! buffer it keeps. Frames come back with a read and are drawn on the DC with
 //! SetDIBitsToDevice: at SwapBuffers for a double-buffered window, at
@@ -90,7 +90,7 @@ unsafe extern "system" {
     fn SetLastError(e: u32);
 }
 
-// -----| the kernel's ABI (src/raster3d.rs) |-----
+// -----| the kernel's ABI (src/gfx/raster3d.rs) |-----
 
 use gfx3d::raster3d::{
     self as k, ClearArgs, DrawArgs, Group as KGroup, PixelArgs, ReadArgs, Sampler, Stage, TexArgs, Tri as KTri, Vert as KVert, F_ALPHA_TEST, F_BLEND,

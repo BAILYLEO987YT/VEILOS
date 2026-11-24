@@ -3,7 +3,7 @@
 //! CryptUnprotectData); both DLLs forward here.
 //!
 //! The kernel keeps both under the signed-in user's master key (VEIL_CRED,
-//! src/credentials.rs), so they open only while that user is signed in.
+//! src/security/credentials.rs), so they open only while that user is signed in.
 //! A credential goes to the kernel as one record, laid out here:
 //!
 //!   [flags u32] [type u32] [persist u32] [last written u64]

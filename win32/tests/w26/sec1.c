@@ -1,4 +1,4 @@
-/* sec1: Security Mode (src/security.rs) as Windows programs see it.
+/* sec1: Security Mode (src/security/mode.rs) as Windows programs see it.
  *
  *   sec1            files, processes and sockets, printing what each call answered
  *   sec1 sleep      write this process's id to sec1.pid (beside it) and wait 60 s

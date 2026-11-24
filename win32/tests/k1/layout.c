@@ -1,6 +1,6 @@
 // Every structure offset src/ntos uses, checked against the WDK's headers
 // at compile time (build.sh compiles this; it makes no output file worth
-// keeping). Keep it in step with the constants in src/ntos/io.rs, ke.rs and
+// keeping). Keep it in step with the constants in src/nt/ntos/io.rs, ke.rs and
 // rtl.rs.
 #include <ntifs.h> // ntddk.h plus the file-system structures (SECURITY_DESCRIPTOR)
 #include <stddef.h>

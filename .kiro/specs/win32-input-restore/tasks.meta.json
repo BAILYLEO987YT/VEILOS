@@ -50,7 +50,7 @@
         "timestamp": 1788369145695
       }
     ],
-    "3.1 Implement fix in `src/desktop.rs` — `dispatch_key` function (4 targeted changes)": [
+    "3.1 Implement fix in `src/gui/desktop.rs` — `dispatch_key` function (4 targeted changes)": [
       {
         "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
         "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
@@ -67,7 +67,7 @@
         "timestamp": 1788369199716
       }
     ],
-    "3.2 Implement fix in `src/loader.rs` — `process_execution_task` post-exit cleanup (1 addition)": [
+    "3.2 Implement fix in `src/exec/loader.rs` — `process_execution_task` post-exit cleanup (1 addition)": [
       {
         "executionId": "c256332e-f4ab-412b-bc77-d4e02b294959",
         "chatSessionId": "sess_1b9b963f-aa27-4aa6-8a03-11f80c0a8835",
@@ -208,7 +208,7 @@
         "timestamp": 1791406624466
       }
     ],
-    "3.1 Bug 1 fix — remove `&& w.visible` predicate in `0x4009` empty-queue synthesis (`src/win32_user.rs`)": [
+    "3.1 Bug 1 fix — remove `&& w.visible` predicate in `0x4009` empty-queue synthesis (`src/nt/win32_user.rs`)": [
       {
         "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
         "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
@@ -225,7 +225,7 @@
         "timestamp": 1791406675434
       }
     ],
-    "3.2 Bug 3 fix — add `wnd_proc` fallback in `0x4001` CreateWindowExW (`src/win32_user.rs`)": [
+    "3.2 Bug 3 fix — add `wnd_proc` fallback in `0x4001` CreateWindowExW (`src/nt/win32_user.rs`)": [
       {
         "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
         "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",
@@ -242,7 +242,7 @@
         "timestamp": 1791407018430
       }
     ],
-    "3.3 Bug 2 fix — reset `LAST_USER_MODE_TICK` to `0` after cleanup in `on_process_exit` (`src/loader.rs`)": [
+    "3.3 Bug 2 fix — reset `LAST_USER_MODE_TICK` to `0` after cleanup in `on_process_exit` (`src/exec/loader.rs`)": [
       {
         "executionId": "97beb619-5a11-474e-a778-b46109945e3b",
         "chatSessionId": "sess_212a43d4-bd61-4a88-a454-1f43a099904c",

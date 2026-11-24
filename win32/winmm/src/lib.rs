@@ -1,8 +1,8 @@
 //! VEILOS `winmm.dll`: sound and the multimedia timer (V1_CHECKLIST.md
 //! audio; WIN32_DESIGN.md).
 //!
-//! Sound goes to the kernel's mixer (src/audio.rs) through VEIL_SOUND
-//! streams (src/nt_sound.rs), one per open waveOut device and one for
+//! Sound goes to the kernel's mixer (src/drivers/audio.rs) through VEIL_SOUND
+//! streams (src/nt/sound.rs), one per open waveOut device and one for
 //! PlaySound. The kernel takes 8- or 16-bit PCM, mono or stereo, at any rate
 //! from 1 to 192 kHz; other PCM (24/32-bit, float, more channels) is
 //! converted here first (`fmt.rs`). There is one output device and no input.
