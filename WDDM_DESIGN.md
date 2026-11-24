@@ -1,7 +1,8 @@
 # VEILOS: GPU drivers through WDDM
 
-**Status:** in progress (2026-11-21). W0 done. W1: import census run, and
-the first slice of the kernel driver host works (below).
+**Status:** in progress. W0 done. **W1 done (2026-11-21):** VEILOS loads
+and runs Windows kernel drivers, and Windows programs talk to them (see
+[W1 summary](#w1-summary)). Next: W2 (PnP, PCI resources and interrupts).
 
 ## Goal
 
@@ -23,17 +24,24 @@ Windows programs, so the user-mode half of a Windows driver fits what it has.
 - **No GPU is driven.** The display is the framebuffer the firmware set up
   (UEFI GOP or VBE) at the firmware's mode, or the Bochs/QEMU adapter. The GPU
   only scans that memory out to the monitor.
-- **All drawing is on the CPU.** The desktop, `gpu_driver.rs`'s command queue
-  and `lgpu.rs` (the "logical GPU": a renderer that splits pixel work over
-  every core) run on the CPU. So do Win32 Direct3D 9/11 and OpenGL
-  (`win32/d3d9`, `win32/d3d11`, `win32/opengl32` → `raster3d.rs`).
-- **`gfx_api.rs` is a stub.** It once claimed DXVK/vkd3d; neither exists.
+- **All drawing is on the CPU.** The desktop, `src/gfx/gpu_driver.rs`'s
+  command queue and `src/gfx/lgpu.rs` (the "logical GPU": a renderer that
+  splits pixel work over every core) run on the CPU. So do Win32 Direct3D
+  9/11 and OpenGL (`win32/d3d9`, `win32/d3d11`, `win32/opengl32` →
+  `src/gfx/raster3d.rs`).
+- **`src/gfx/gfx_api.rs` is a stub.** It once claimed DXVK/vkd3d; neither
+  exists.
 - Boot messages used to say "GPU-accelerated", "VRAM-backed swapchains",
   "D3D → VkIR → GPU". Stage W0 corrected them.
 - What helps: Windows user-mode programs run (PE loader, ntdll, kernel32,
   user32, gdi32, d3d9/11, opengl32 of VEILOS's own), an NT object/handle
-  model, a registry (`nt/registry.rs`), PCI with MSI/MSI-X (`pci.rs`), and a
-  PE image mapper (`modules.rs`).
+  model, a registry (`src/nt/registry.rs`), PCI with MSI/MSI-X
+  (`src/hal/pci.rs`), and a PE image mapper (`src/exec/modules.rs`).
+- **The kernel driver host exists (W1).** `src/nt/ntos/` loads `.sys`
+  images into ring 0 and provides the kernel interface they link against
+  (ntoskrnl, hal, ksecdd, netio). Of the NVIDIA and Intel Arc kernel
+  drivers' imports, all but 41 resolve; the 41 are W2's. No GPU driver has
+  been loaded yet: that's W4.
 
 ## What a Windows display driver needs
 
@@ -79,14 +87,105 @@ Each stage ends in something that works and can be tested on its own.
 
 | Stage | Contents | Done when | Tested on |
 |---|---|---|---|
-| **W0** | Honest status: boot messages, `gpu_driver.rs` / `gfx_api.rs` headers, this document | Nothing on screen claims GPU use that doesn't happen | Done |
-| **W1** | **Import census, then the kernel driver host.** A host tool lists every import of the vendors' `.sys` and UMD files (by DLL and function) and how many VEILOS provides, which sizes and orders the ntoskrnl work. Then: map a `.sys`, apply relocations, resolve imports (unresolved ones refuse the load and are listed), the security cookie, `DriverEntry`, `DRIVER_OBJECT`/`DEVICE_OBJECT`, IRPs (`IoCallDriver`, `IoCompleteRequest`), pool, IRQL and spinlocks, DPCs, timers, events, system threads | A sample WDM driver (built from Windows-driver-samples) loads, creates its device, answers IOCTLs from a Win32 program and unloads | QEMU |
-| **W2** | **PnP, resources and interrupts.** `AddDevice`, `IRP_MN_START_DEVICE` with a `CM_RESOURCE_LIST` from PCI (BARs, MSI), `IoConnectInterruptEx`, `MmMapIoSpaceEx`, contiguous DMA memory, power IRPs. Driver binding by PCI ID through the HAL (a "Windows driver" `hal::Driver`) | A sample PCI driver (or a small one of our own built with the WDK headers) drives a QEMU device through its interrupt | QEMU |
-| **W3** | **dxgkrnl, display only.** `DxgkInitialize` registration, adapter start, `QueryAdapterInfo`, child relations and status, EDID, the VidPN objects, `CommitVidPn`, `PresentDisplayOnly`. The desktop presents through it | Microsoft's KMDOD sample (a display-only driver over the firmware framebuffer, built from source) runs the VEILOS desktop | QEMU and both PCs |
+| **W0** | Honest status: boot messages, `gpu_driver.rs` / `gfx_api.rs` headers, this document | Nothing on screen claims GPU use that doesn't happen | ✅ Done |
+| **W1** | **Import census, then the kernel driver host.** A host tool lists every import of the vendors' `.sys` and UMD files (by DLL and function) and how many VEILOS provides, which sizes and orders the ntoskrnl work. Then: map a `.sys`, apply relocations, resolve imports (unresolved ones refuse the load and are listed), the security cookie, `DriverEntry`, `DRIVER_OBJECT`/`DEVICE_OBJECT`, IRPs (`IoCallDriver`, `IoCompleteRequest`), pool, IRQL and spinlocks, DPCs, timers, events, system threads | A sample WDM driver (built from Windows-driver-samples) loads, creates its device, answers IOCTLs from a Win32 program and unloads | ✅ Done 2026-11-21, QEMU. Met with K1, VEILOS's own WDM test driver built with MSVC against the WDK, rather than a Windows-driver-samples driver ([W1 summary](#w1-summary)) |
+| **W2** | **PnP, resources and interrupts.** `AddDevice`, `IRP_MN_START_DEVICE` with a `CM_RESOURCE_LIST` from PCI (BARs, MSI), `IoConnectInterruptEx`, power IRPs (`PoRequestPowerIrp`). Driver binding by PCI ID through the HAL (a "Windows driver" `hal::Driver`). The 41 imports the NVIDIA and Arc kernel drivers still lack after W1 are all here: device stacks (attach and detach, remove locks), device interfaces and properties, device registry keys, PnP notifications, the error log, `IoCancelIrp`, `ObOpenObjectByPointer`, `FsRtlRegisterFileSystemFilterCallbacks`. Also: DPCs queued from an interrupt run when IRQL drops, not on the next tick (W1's carried-forward list). `MmMapIoSpaceEx` and contiguous DMA memory already exist (W1) | A sample PCI driver (or a small one of our own built with the WDK headers) drives a QEMU device through its interrupt | QEMU |
+| **W3** | **dxgkrnl, display only.** `DxgkInitialize` registration, adapter start, `QueryAdapterInfo`, child relations and status, EDID, the VidPN objects, `CommitVidPn`, `PresentDisplayOnly`. The desktop presents through it | Microsoft's KMDOD sample (a display-only driver over the firmware framebuffer, built from source) runs the VEILOS desktop. Everything dxgkrnl keeps is per adapter from the start ([Several GPUs](#several-gpus)) | QEMU and both PCs |
 | **W4** | **A vendor driver, mode-setting.** Load a real vendor `.sys`, get through `DriverEntry`, `StartDevice` and `QueryAdapterInfo`, enumerate monitors, commit a mode, scan out the desktop. Everything it calls that VEILOS lacks shows up here | The desktop at a mode chosen at run time, through the vendor driver | Real hardware: the test PC (GTX 745, NVIDIA 580.x, the last Maxwell branch) or the main PC (Intel Arc) |
 | **W5** | **VidMm and VidSch.** Allocations, segments / GPU virtual memory, paging buffers, residency, monitored fences, contexts and submission, `DxgkDdiSubmitCommand`, interrupts → DPC → fence completion, TDR | A `D3DKMT`-level test program allocates, submits a vendor-built command buffer through the UMD and waits on its fence | Real hardware |
 | **W6** | **User mode.** `NtGdiDdDDI*` system calls; VEILOS's `d3d11`/`dxgi` drive the vendor UMD through the D3D11 DDI; present through dxgkrnl | A D3D11 triangle and the D3D test programs (`storage/tests/d3d*`, `dx*`) render on the GPU, matching their `.ref` images | Real hardware |
-| **W7** | D3D12 DDI; OpenGL ICD in `opengl32`; Vulkan loader and ICD; video decode; installing from the vendor's package; several GPUs | Games run on the GPU | Real hardware |
+| **W7** | D3D12 DDI; OpenGL ICD in `opengl32`; Vulkan loader and ICD; video decode; installing from the vendor's package; several GPUs working together: copies between adapters, and choosing a program's GPU ([Several GPUs](#several-gpus)) | Games run on the GPU | Real hardware |
+
+W1 to W3 need no GPU and run in QEMU. From W4 on, testing is on real
+hardware only: QEMU on a Windows host can't pass a GPU through. Logs go to
+the screen and the crash log on disk (`src/sys/crash.rs`).
+
+## W1 summary
+
+**Done 2026-11-21.** VEILOS has a host for Windows kernel drivers.
+`src/nt/ntos/` is VEILOS's own Rust implementation of the kernel interface
+drivers are written against, plus a loader for `.sys` images. Windows
+programs reach drivers the way they do on Windows.
+
+### What exists
+
+| Area | Where | What |
+|---|---|---|
+| Loader | `image.rs` | Maps a `.sys` into the upper half (PML4 slot 448, shared by every address space), relocates it, binds imports by name (a missing import refuses the load and lists every missing name), sets the /GS cookie, gives each section its own page rights (NX unless executable, read-only unless writable; CR0.WP on), runs `DriverEntry`. `DriverUnload` runs, then the image, `DRIVER_OBJECT` and extension are freed; a driver can be loaded again |
+| Exports | `exports.rs` | 422 functions (ntoskrnl 399, hal 4, ksecdd 15, netio 4) and 13 data exports (object types, `KdDebugger*`, `SeExports`, the `Mm*` address limits). `MmGetSystemRoutineAddress` looks names up in the same tables |
+| Kernel core | `ke.rs`, `dpc.rs`, `ps.rs` | IRQL as CR8 (as the WDK's inlines expect), spinlocks and queued spinlocks, events, semaphores, mutexes, waits with timeouts, kernel queues; DPCs, one-shot and periodic timers; system threads; work items. Waits below DISPATCH_LEVEL pause (another thread, or HLT) rather than spin. Time from the TSC |
+| Per-CPU state | `src/arch/smp.rs` | VEILOS's per-CPU block carries the KPCR/KPRCB fields drivers read through GS (Self, CurrentPrcb, Number, CurrentThread, ProcessorIndex) at Windows' offsets; kernel threads and DPCs run with GS on it |
+| Exceptions | `seh.rs` | `__try`/`__except`/`__finally` in drivers: CPU faults inside driver code and raised exceptions dispatch through the driver's `.pdata`; nothing handling one is bug check 0x1E |
+| Memory | `pool.rs`, `mm.rs` | Pool (always zeroed), lookaside lists; MDLs (build, probe and lock, map into system space or into the calling program, partial, pages for an MDL); contiguous memory under a limit and boundary; `MmMapIoSpace(Ex)` cached, write-combining or uncached; physical addresses |
+| I/O | `io.rs`, `ob.rs` | `DRIVER_OBJECT`, `DEVICE_OBJECT`, IRPs and stack locations, `IoCallDriver`, `IoCompleteRequest` with completion routines, device names and symbolic links, kernel handles |
+| Executive and Rtl | `ex.rs`, `rtl.rs`, `rtlx.rs`, `crt.rs` | ERESOURCE, fast and guarded mutexes, SLists, interlocked lists, callback objects, Ex timers, UUIDs; strings, numbers, bitmaps, generic tables, SIDs, ACLs, security descriptors, time fields, registry queries; the CRT ntoskrnl exports, with one MSVC-sized printf for it and `DbgPrint` |
+| Zw and Cm | `zw.rs`, `cm.rs` | Files on the VFS (`\??\C:\`, `\DosDevices\`, `\SystemRoot\`), devices by name, named events, links, handle duplication, LUIDs, the registry (open, create, query, set, enumerate), `ZwQuerySystemInformation` (basic, module list), `ZwLoadDriver`/`ZwUnloadDriver` from a Services key |
+| ksecdd, hal, netio | `bcrypt.rs`, `misc.rs` | BCrypt: random, SHA-1/2 and HMAC, AES decryption (ECB, CBC, GCM). PCI configuration through `HalGet/SetBusDataByOffset`, the performance counter, stall. The netio module registrar (accepted, nothing attaches) |
+| Programs to drivers | `src/nt/file.rs`, `src/nt/syscalls.rs`, ntdll, kernel32 | `CreateFile("\\.\Name")` sends IRP_MJ_CREATE with a real `FILE_OBJECT`; closing sends CLEANUP and CLOSE. `DeviceIoControl` is the `NtDeviceIoControlFile` system call: buffered, direct (the program's pages as an MDL) and neither |
+| Terminal | `src/task/terminal.rs` | `DRIVER LOAD <path>`, `UNLOAD <name>`, `OPEN <dev>`, `IOCTL <dev> <code> [text]` (administrators) |
+
+### How it was tested
+
+All in QEMU (WHPX), on 1 and 2 CPUs. Nothing has run on real hardware yet.
+
+- **K1** (`win32/tests/k1`, built output in `storage/tests/`):
+  - `veiltest.sys` is a WDM driver built with MSVC against the WDK, as
+    vendors build theirs. Its `DriverEntry` runs a 30-part self-test
+    covering every area above. It passes as `3fffffff of 3fffffff`, and
+    again after an unload and reload.
+  - `k1test.exe` is an ordinary Windows program. It opens `\\.\VeilTest`
+    and makes 45 checks through `DeviceIoControl`: every IOCTL method,
+    the self-test result, waits inside its own request (system thread,
+    timer, delay, work item, timer DPC), a driver page mapped into the
+    program, the KPCR fields seen from a request, and an unknown code
+    failing. It reports `0 failed`.
+  - `layout.c` asserts at compile time that every structure offset
+    `src/nt/ntos` uses matches the WDK headers. All match.
+- **Stage criterion.** "Done when" asked for a Windows-driver-samples
+  driver. K1 is VEILOS's own WDM driver instead, written to exercise
+  exactly what the vendor drivers import, and covers more than a sample
+  would. Windows-driver-samples is still the source for W3's KMDOD.
+- **Import census** (`tools/import_census.py`, vendor files read locally,
+  not kept): NVIDIA 581.80 `nvlddmkm.sys` and Intel Arc 32.0.101.9175
+  `igdkmdnd64.sys` needed 399 distinct ntoskrnl functions between them
+  before W1. After W1, 41 are missing, all listed under W2. Loading either
+  vendor driver is still refused until W2 provides them.
+
+### Carried forward from W1
+
+Known gaps, each with the stage that needs it:
+
+- **DPCs queued at DISPATCH_LEVEL or above wait for the next 1 ms tick on
+  the BSP.** `KeLowerIrql` only writes CR8, and the WDK inlines IRQL
+  changes as CR8 writes, so VEILOS can't run waiting DPCs when IRQL drops.
+  Windows uses a software interrupt at IRQL 2 for this. The equivalent
+  here is a self-IPI on a vector in priority class 2, which the local APIC
+  holds until CR8 drops below 2, then delivers on the CPU that queued it.
+  This is fine for K1, but an ISR's DPC runs on every GPU interrupt
+  (vblank, fence completion), so it's needed by **W2** (interrupts) and
+  matters for latency in **W5**.
+- **Not supported yet, returning `STATUS_NOT_SUPPORTED` and logged the first
+  time:** process virtual memory, sections, process and token queries and
+  power information through `Zw*`; BCrypt asymmetric keys, signature
+  checks and key derivation (no RSA or ECC in the kernel). The Arc driver
+  imports `BCryptImportKeyPair` and `BCryptVerifySignature`. What it checks
+  with them isn't known yet; if it verifies something at start-up, **W4**
+  on the Arc needs RSA/ECC.
+- **Accepted but never called:** process and image notifications, power
+  setting callbacks, ETW, registry callbacks and bug-check callbacks. A
+  driver that waits for one of these to fire will show it in **W4**.
+- **Work items** each get a thread of their own instead of a shared pool.
+  Fine at K1's rate; revisit if a GPU driver queues many.
+- **Thread records live in the kernel heap**, which by Windows' address
+  rules is in the user range. No driver seen so far checks this.
+- **Small differences from Windows:** opening a device after its driver
+  unloads fails with `ERROR_INVALID_NAME` (Windows: `ERROR_FILE_NOT_FOUND`).
+  The system time drivers see is 1970 until NTP has answered.
+
+## W1 record
+
+The notes written while W1 was built, in order. The summary above is the
+current state; these keep the detail and what each test found.
 
 ### W1 import census (2026-11-21)
 
@@ -134,7 +233,7 @@ The loader maps a `.sys`, relocates it, binds every import by name
 and calls `DriverEntry`.
 
 K1 (`win32/tests/k1`): a WDM driver built with clang-cl against the WDK.
-`layout.c` asserts every structure offset `src/ntos` uses against the WDK
+`layout.c` asserts every structure offset `src/nt/ntos` uses against the WDK
 headers at compile time (all matched). In QEMU, `DRIVER LOAD
 /tests/veiltest.sys` runs its DriverEntry (pool zeroed, IRQL 2 under its
 spinlock, event waits time out and succeed as they should, device and link
@@ -367,9 +466,72 @@ Opening a device after its driver unloads fails with `ERROR_INVALID_NAME`
 where Windows says `ERROR_FILE_NOT_FOUND`. The system time drivers see is
 VEILOS's wall clock, which is 1970 until NTP has answered.
 
-W1 to W3 need no GPU and run in QEMU. From W4 on, testing is on real
-hardware only: QEMU on a Windows host can't pass a GPU through. Logs go to
-the screen and the crash log on disk (`crash.rs`).
+## Several GPUs
+
+**Planned (agreed 2026-11-24).** A PC may have GPUs of different makes
+(for example an Intel Arc, an NVIDIA card and an AMD card) with each
+vendor's driver loaded at once. The aim is to use each card for what it's
+good at. How work is shared between GPUs and the CPU is the HAL's part:
+[HAL_DESIGN.md, Several GPUs](HAL_DESIGN.md#several-gpus-of-different-makes-planned).
+This section covers what the driver layer must do for it.
+
+On Linux, NVIDIA and Intel drivers have clashed over one shared OpenGL
+library, X11's one-driver-per-screen model and GPL-only buffer sharing.
+None of that applies here. WDDM was built for several adapters: Windows
+has run NVIDIA, AMD and Intel drivers side by side since Windows 7. Each
+vendor driver talks only to dxgkrnl, never to another vendor's driver, and
+each adapter has its own registry key, user-mode driver, memory manager
+and scheduler. VEILOS gets the same if its dxgkrnl keeps that separation.
+
+### Each GPU on its own (from W3)
+
+The drivers don't need to know about each other. VEILOS has to:
+
+- **Keep everything per adapter.** Adapter LUID, VidPN and monitors,
+  segments and allocations (VidMm), contexts, queues and fences (VidSch),
+  interrupts and DPCs, TDR, and the `D3DKMT` handles a program holds. No
+  global "the GPU". This is cheap to build in from W3 and costly to add
+  later. The current code has single-GPU assumptions to replace when
+  dxgkrnl arrives:
+  - `src/gfx/gpu_driver.rs`: `primary()` sends all submissions to one
+    device.
+  - `src/gfx/graphics.rs`: every display head after the first must use the
+    first one's mode. Monitors on different GPUs will often want different
+    modes.
+- **Hand over the firmware's display.** Only one GPU is the one the
+  firmware started (the POST adapter), and VEILOS draws on its framebuffer
+  until a driver takes over (`graphics::bind_firmware_framebuffer`, the
+  `"firmware"` head). Before that adapter's driver starts, VEILOS must stop
+  drawing there and drop the head, or both write the same memory. WDDM's
+  calls for this are `DxgkCbAcquirePostDisplayOwnership` and
+  `DxgkDdiStopDeviceAndReleasePostDisplayOwnership`. The other GPUs never
+  had the firmware display.
+- **Negotiate each driver's version separately.** An older driver (NVIDIA
+  580.x for the GTX 745) and a current one (Intel Arc) ask for different
+  `DXGKDDI_INTERFACE_VERSION`s. dxgkrnl answers each at the version it asks
+  for, and the Windows version VEILOS reports must satisfy every loaded
+  driver's checks.
+- **Accept shared failure.** Every vendor driver runs in ring 0, so one
+  crashing takes the others down, as on Windows. A hung GPU is recovered
+  by its own TDR without touching the others.
+
+### GPUs working together (W7)
+
+- **Copies between adapters.** A program renders on one GPU and its window
+  is on a monitor wired to another; or one GPU's results feed another. The
+  first version copies through system memory (GPU A to RAM, RAM to GPU B),
+  which is slow but works for any pair of vendors. WDDM's cross-adapter
+  resources are the faster path, later.
+- **Choosing a program's GPU.** Which adapter DXGI lists first, per
+  program, as Windows' per-app graphics preference does. A program that
+  creates a second device (for compute, say) can have it placed on a
+  different GPU. CUDA goes to NVIDIA on its own. This is the placement
+  policy the HAL describes.
+- **Power.** A GPU with no work should sleep. That needs WDDM's runtime
+  power management (`DxgkDdiSetPowerComponentFState` and related) and the
+  HAL's runtime power states for bound devices (HAL 7G covers only
+  unbound ones). Without it, extra cards cost idle power instead of saving
+  it.
 
 ## Rules
 

@@ -1,6 +1,6 @@
 # VEILOS HAL: design proposal (step 7)
 
-**Status:** done for this phase. 7A, 7B, 7D (with several displays), 7F (PCIe hot-plug) and 7G (power states) done; 7C done apart from Win32 surfaces (with the Win32 work) and a real-hardware re-measure; 7E logical NIC done, mesh GPU backend deferred (see the table).
+**Status:** done for this phase. 7A, 7B, 7D (with several displays), 7F (PCIe hot-plug) and 7G (power states) done; 7C done apart from Win32 surfaces (with the Win32 work) and a real-hardware re-measure; 7E logical NIC done, mesh GPU backend deferred (see the table). Next phase, planned: [several GPUs of different makes](#several-gpus-of-different-makes-planned) (MG1–MG4), on top of WDDM.
 
 ## Goal
 
@@ -82,3 +82,72 @@ work over are **CPU cores acting as software rasterisers** and **remote mesh nod
 - **Default split:** tile split.
 - **APs:** become a shared worker pool, running user processes and HAL jobs.
 - **Remote devices:** local first. The backend trait is shaped so mesh nodes fit in later (7E).
+
+## Several GPUs of different makes (planned)
+
+**Agreed 2026-11-24; nothing built yet.** Builds on WDDM, whose stage W1 is done
+([WDDM_DESIGN.md](WDDM_DESIGN.md)).
+
+The aim: a PC with GPUs of different makes uses each for what it's good at, for example an
+Intel Arc for rendering, an NVIDIA card for CUDA and simulation, and a low-power card for light
+work, with the CPU taking a share where that helps. This is the HAL's goal 2 ("one-device
+software uses many devices") with real GPUs as backends, not only CPU cores. The driver-level
+rules (everything per adapter, handing over the firmware display, copies between adapters) are in
+[WDDM_DESIGN.md, Several GPUs](WDDM_DESIGN.md#several-gpus).
+
+### Where work can be split
+
+A vendor's user-mode driver turns a program's D3D, OpenGL or Vulkan calls into command buffers
+for that one GPU's hardware. After that the work can't be split or moved to another make. So any
+splitting happens **above** the vendor drivers: in VEILOS's own `d3d11`/`d3d12`/`dxgi`/`opengl32`
+(WDDM W6, W7), or in VEILOS's own work formats (`lgpu`'s `Op` lists, compute jobs). VEILOS owns
+those runtimes, which Windows only allows Microsoft to do.
+
+### The kinds of sharing, most useful first
+
+| Part | What | How realistic | Needs |
+|---|---|---|---|
+| **MG1** | **Routing whole jobs to a GPU.** A program, or one of its devices, runs on the GPU best suited: rendering on one, CUDA, ML and simulation on another, video encode on the card with the better encoder, the desktop on the low-power card | Very. WDDM supports several adapters; each device lives on one GPU | WDDM W3–W7 per adapter; a placement policy (per program, set by the user, later learned, as `VEILOS_DESIGN.md` describes the kernel learning a program's GPU needs); copies between adapters for windows shown on another GPU's monitor |
+| **MG2** | **Splitting work that has no frame deadline** across GPUs and CPUs: still images and path tracing, image processing, video encoding in chunks, compute jobs. Pieces are independent and share little | Very. Blender's Cycles renders on CPU and GPU together this way | Changes to `lgpu` (below); GPU backends through the vendor's compute path |
+| **MG3** | **A game's simulation on another GPU.** Only work the game puts on a GPU can move: GPU compute (D3D compute, CUDA). Most game physics runs on the CPU (PhysX's CPU path, Havok, Jolt) and no OS can move it | Partly. NVIDIA's "dedicated PhysX card" did this for CUDA physics | MG1's placement applied to a program's second device; results are small, so copying them back each frame is cheap |
+| **MG4** | **Splitting a game's live frames** across GPUs of different makes (bands, or alternate frames) | An experiment. NVIDIA and AMD dropped SLI and CrossFire; DirectX 12's multi-adapter mode let games mix makes, and almost none shipped it | VEILOS's D3D runtime recording a frame and replaying it to each GPU's driver. Must beat one card in measurements before it's used |
+
+Why MG4 is likely slower than one card, so it's measured before it's relied on:
+- Every GPU needs every texture and buffer, so usable memory is the smallest card's, and each
+  upload crosses PCIe once per card.
+- Shadow maps and geometry are needed by every band, so each GPU repeats them.
+- Screen-space effects (ambient occlusion, bloom, reflections) read across band edges, and
+  temporal effects (TAA, motion blur) read the whole previous frame.
+- Makes differ in texture filtering, precision and shader compilers, which shows as seams where
+  bands meet. (CPU bands don't have this: `raster3d` gives bit-identical results in any band.)
+- A frame finishes when the slowest GPU does, plus the copy to the display GPU and the
+  synchronisation.
+
+### What `lgpu` needs for GPU backends (MG2, and MG4 if tried)
+
+- **Shares by measured speed.** `lgpu::execute` cuts the area into equal bands
+  (`rows.div_ceil(bands)`), which suits CPU cores of equal speed. A GPU can be 50–100 times
+  faster than a CPU at this work, so with equal shares everyone waits for the CPU. Each backend's
+  share has to come from how long its recent pieces took, adjusted as it runs. Mesh nodes (7E)
+  need the same.
+- **Pieces that finish later.** `Backend::render` returns when its band is drawn, into a
+  `Surface` the CPU can address. A GPU backend submits, finishes later (a fence), and its pixels
+  are copied back to the CPU or to the display GPU. The trait becomes submit plus wait, with the
+  copy as part of a piece's cost.
+- **Data on each device.** Sources (textures, images) must be on every backend that reads them.
+  The cost of putting them there counts when choosing shares.
+
+### Hardware limits to plan around
+
+- **Idle power.** Sending light work to the efficient card only saves power if the other cards
+  sleep when idle. That needs runtime power management of bound devices (7G covers unbound ones)
+  and WDDM's GPU power calls. Efficiency depends more on a card's generation than its make.
+- **PCIe lanes.** Consumer boards give one x16 slot plus chipset lanes; three cards usually run
+  at x8/x8/x4 or less, which slows copies between them (MG1's windows on another monitor, MG4).
+
+### Order
+
+MG1 follows WDDM W7. MG2's `lgpu` changes (shares by speed, submit plus wait) can come earlier,
+since they help mesh nodes (7E) too, and only need a GPU backend once WDDM W5–W6 give VEILOS a way
+to submit work. MG3 comes with MG1. MG4 is last, and only kept if it measures faster than the
+fastest single card.
