@@ -8,7 +8,10 @@
 [![OctoCounts](https://api.octocounts.com/badge/BAILYLEO987YT/VEILOS/branch/main)](https://octocounts.com/github/BAILYLEO987YT/VEILOS/tree/main)
 
 > [!WARNING]
-> VEILOS is an early, experimental project. It currently runs **only in the QEMU virtual machine** and has not been tested on real hardware. It boots with the legacy BIOS (not UEFI), so it won't start on most modern PCs yet. See [Status](#status) for what works and what doesn't.
+> VEILOS is an early, experimental project. It has checks and general case boundary's to not cause damage or harm to a test device and any already populated drives, though not every possibility is yet tested so it is advised when booting on hardware please ensure this hardware is designated test hardware or all data is backed up and replaceable.
+
+> [!WARNING]
+> VEILOS is currently under rapid development and there is no current version of a version update software so software versions can become outdated quickly and will require a re-install for an update, though files and data won't be lost each version with isolate you to that version until a self-update program is created at a later date.
 
 ## Why VEILOS?
 
@@ -44,10 +47,6 @@ VEILOS can currently do the following, in QEMU:
 | **Hardware** | SATA (AHCI) with GPT/MBR, FAT32 read/write, NTFS and exFAT read-only, virtio-net (with NIC bonding), Intel HD Audio, PCIe hot-plug |
 | **Networking** | DHCP, TCP/UDP, DNS and TLS |
 
-It hasn't run on real hardware yet. It now boots on BIOS and UEFI, from one disk or a USB stick, with USB keyboards and mice; the main gaps are NVMe, a real network card driver, ACPI power-off, an installer, a crash-safe filesystem and a web browser. [V1_CHECKLIST.md](V1_CHECKLIST.md) tracks every item with its status.
-
-Some modules are scaffolds, not finished features. These include the native app format, parts of Cluster Mode and the hypervisor and anti-cheat support. The audit notes ([AUDIT_2026-10.md](AUDIT_2026-10.md)) say honestly which pieces are real and which are not.
-
 ## Building from source
 
 You'll need:
@@ -81,6 +80,9 @@ To test the mesh/cluster networking, [`run_dual.ps1`](run_dual.ps1) starts two V
 
 ### Trying a change on a real PC
 
+> [!WARNING]
+> Test versions are not assured to work, though being double checked and used to test features it may or may not be stable for regular use. It is not advised to run a test build as a normal every day version.
+
 Every push to a branch other than `main` builds test disk images: the **Test images** workflow ([`test-images.yml`](.github/workflows/test-images.yml)), which also runs by hand from the Actions tab for any branch. Open the run, download the artifact under *Artifacts* (or `gh run download -R BAILYLEO987YT/VEILOS <run-id>`), and write one image to a USB stick with Rufus (DD mode) or `dd`:
 
 - `veilos-uefi-disk.img`: UEFI PCs, with Secure Boot off;
@@ -91,7 +93,7 @@ Nothing reaches `main` or the release until the branch is merged. To build the s
 
 ### Windows system DLLs
 
-VEILOS's own `ntdll.dll`, `kernel32.dll`, `user32.dll` and the rest are built from the [`win32/`](win32) workspace. Prebuilt copies are committed to [`storage/system`](storage/system), so you only need to rebuild them if you change that code. [`win32/build.sh`](win32/build.sh) does it. It's written for Git Bash on Windows and needs LLVM (`clang-cl`, `lld-link`) installed. The Win32 test programs are under [`win32/tests`](win32/tests), with prebuilt binaries in [`storage/tests`](storage/tests).
+VEILOS's own `ntdll.dll`, `kernel32.dll`, `user32.dll` and the rest are built from the [`win32/`](win32) workspace. Prebuilt copies are committed to [`storage/system`](storage/system), so you only need to rebuild them if you change that code. [`win32/build.sh`](win32/build.sh) does it. It's written for Git Bash on Windows and needs LLVM (`clang-cl`, `lld-link`) installed. The Win32 test programs are under [`win32/tests`](win32/tests), with prebuilt binaries in [`storage/tests`](storage/tests) (some tests are designed to cause errors to where if they do they count as passed, though its best to assume no errors is a pass).
 
 ## Repository layout
 
@@ -113,6 +115,7 @@ VEILOS's own `ntdll.dll`, `kernel32.dll`, `user32.dll` and the rest are built fr
 | [V1_CHECKLIST.md](V1_CHECKLIST.md) | What's left before VEILOS could be someone's everyday system |
 | [AUDIT_2026-10.md](AUDIT_2026-10.md) | A code audit from October 2026 |
 | [goal.md](goal.md), [ideas.txt](ideas.txt) | The original goals and the idea backlog |
+| [shell.vsh](storage/shell.vsh), [config.vsh](storage/config.vsh), [dark.vsh](storage/THEMES/dark.vsh) | documented examples of how to use the custom scripting language to control the OS customisation |
 
 ## Roadmap
 
