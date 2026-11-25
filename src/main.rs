@@ -300,6 +300,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Windows drivers' pool and image region: before any process exists, so
     // every address space shares its tables (ntos/pool.rs).
     crate::nt::ntos::init();
+    crate::nt::dxgk::init();
     println!("Heap Initialized with Physical RAM Paging.");
     // Without PIT channel 2 or a CPUID rate: the TSC against the HPET.
     crate::arch::time::calibrate_late();

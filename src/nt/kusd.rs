@@ -106,6 +106,23 @@ pub fn map_into(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator
     crate::mm::memory::map_page_checked(Page::containing_address(VirtAddr::new(ADDRESS)), frame, flags, mapper, fa)
 }
 
+/// Where kernel-mode code reads the page: Windows drivers (nt/ntos) read
+/// KUSER_SHARED_DATA at this fixed address directly (the WDK's
+/// KeQueryInterruptTime and SharedUserData macros), not at 0x7FFE0000.
+pub const KERNEL_ADDRESS: u64 = 0xFFFF_F780_0000_0000;
+
+/// Map the page read-only at `KERNEL_ADDRESS` in the kernel's address
+/// space. At boot, before any process exists: processes share the kernel's
+/// upper-half tables as they are when the process is made.
+pub fn map_kernel_view() -> Result<(), &'static str> {
+    ensure()?;
+    let frame = PhysFrame::containing_address(PhysAddr::new(FRAME.load(Ordering::Acquire)));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::GLOBAL | PageTableFlags::NO_EXECUTE;
+    let mut mapper = unsafe { crate::mm::memory::get_mapper() };
+    let mut fa = crate::mm::memory::GlobalFrameAllocator;
+    crate::mm::memory::map_page_checked(Page::containing_address(VirtAddr::new(KERNEL_ADDRESS)), frame, flags, &mut mapper, &mut fa)
+}
+
 /// The BSP's timer: update the clocks to kernel time `now_ms`.
 pub fn tick(now_ms: u64) {
     let Some(p) = page() else { return };

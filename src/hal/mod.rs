@@ -252,9 +252,40 @@ pub fn claim(id: usize, driver: &'static str) -> bool {
     true
 }
 
+/// Display adapters a Windows display driver took from VEILOS's own display
+/// driver: device id and that driver's name, for when it's given back.
+static TAKEN: Mutex<Vec<(usize, &'static str)>> = Mutex::new(Vec::new());
+
+/// A Windows display driver (nt/dxgk) takes display adapter `id` even if
+/// VEILOS's own display driver runs it: the desktop's head on it is handed
+/// over when the driver takes the POST display.
+pub fn claim_display(id: usize, driver: &'static str) -> bool {
+    let mut devices = DEVICES.lock();
+    let Some(d) = devices.get_mut(id) else { return false };
+    if d.class != DeviceClass::Display || d.state != DeviceState::Bound {
+        return false;
+    }
+    let Some(native) = d.driver.filter(|n| DRIVERS.iter().any(|drv| drv.name == *n)) else { return false };
+    TAKEN.lock().push((id, native));
+    d.driver = Some(driver);
+    crate::serial_println!("[HAL] {} {:?}: {} -> {} (Windows display driver)", d.location(), d.class, native, driver);
+    true
+}
+
 /// The Windows driver let device `id` go (or failed to start it: `why`).
 pub fn release(id: usize, why: Option<String>) {
+    let native = {
+        let mut t = TAKEN.lock();
+        let at = t.iter().position(|x| x.0 == id);
+        at.map(|i| t.remove(i).1)
+    };
     let mut devices = DEVICES.lock();
+    if let (Some(n), Some(d)) = (native, devices.get_mut(id)) {
+        // Back to VEILOS's own display driver, which never let it go.
+        d.driver = Some(n);
+        d.state = DeviceState::Bound;
+        return;
+    }
     if let Some(d) = devices.get_mut(id) {
         if d.state == DeviceState::Removed {
             return;

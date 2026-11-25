@@ -92,6 +92,9 @@ pub const STATUS_INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009Au32 as i32;
 /// the process is made, so the region's tables must already be there.
 pub fn init() {
     pool::init();
+    if let Err(e) = crate::nt::kusd::map_kernel_view() {
+        crate::serial_println!("[NTOS] KUSER_SHARED_DATA for drivers: {}", e);
+    }
     ex::init();
     misc::init();
 }

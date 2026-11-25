@@ -1,0 +1,35 @@
+; K3's driver package: a display-only driver (KMDOD) for any VGA-compatible
+; adapter, as Microsoft's KMDOD sample names them. VEILOS reads the PCI IDs
+; from it (nt/ntos/pnp.rs).
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %VEILOS%
+DriverVer   = 11/24/2026,1.0.0.0
+
+[Manufacturer]
+%VEILOS% = Veilos,NTamd64
+
+[Veilos.NTamd64]
+%K3Desc% = K3_Install, PCI\CC_0300
+
+[K3_Install.NT]
+CopyFiles = K3_Files
+FeatureScore = F9
+
+[K3_Install.NT.Services]
+AddService = k3dod, 0x00000002, K3_Service
+
+[K3_Service]
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\k3dod.sys
+
+[K3_Files]
+k3dod.sys
+
+[Strings]
+VEILOS = "VEILOS"
+K3Desc = "VEILOS K3 display-only driver"

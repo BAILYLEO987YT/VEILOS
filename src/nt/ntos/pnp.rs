@@ -154,7 +154,9 @@ pub fn inf_ids(text: &str) -> Vec<String> {
         let line = line.split(';').next().unwrap_or("");
         let up = line.to_ascii_uppercase();
         let mut rest = up.as_str();
-        while let Some(at) = rest.find("PCI\\VEN_") {
+        // PCI\VEN_... and class IDs (PCI\CC_0300: any VGA-compatible
+        // adapter, as display-only drivers name it).
+        while let Some(at) = [rest.find("PCI\\VEN_"), rest.find("PCI\\CC_")].into_iter().flatten().min() {
             let tail = &rest[at..];
             let end = tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '\\' || c == '_' || c == '&')).unwrap_or(tail.len());
             let id = &tail[..end];
@@ -599,7 +601,8 @@ pub fn start_driver(name: &str, drv: *mut u8, ids: &[String]) -> usize {
             continue;
         }
         let leaked: &'static str = Box::leak(String::from(name).into_boxed_str());
-        if !crate::hal::claim(dev.id, leaked) {
+        let display = crate::nt::dxgk::is_display_driver(drv) && dev.class == crate::hal::DeviceClass::Display;
+        if !crate::hal::claim(dev.id, leaked) && !(display && crate::hal::claim_display(dev.id, leaked)) {
             continue;
         }
         match add_device(name, drv, add, dev.id, &dev.pci, device_id, hw, compat) {

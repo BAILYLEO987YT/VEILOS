@@ -4,6 +4,7 @@ pub mod conbuf;
 pub mod console;
 pub mod console_calls;
 pub mod demand;
+pub mod dxgk;
 pub mod exception;
 pub mod file;
 pub mod gpu3d;

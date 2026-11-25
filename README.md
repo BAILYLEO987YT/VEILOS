@@ -42,7 +42,7 @@ VEILOS can currently do the following, in QEMU:
 | Area | What works |
 |---|---|
 | **Desktop** | Window manager with snapping and tiling, taskbar, launcher, notifications, terminal, file manager (browse and open), text editor, image viewer, multiple displays and runtime resolution |
-| **Windows compatibility** | Console and classic GUI programs: `cmd.exe`, Notepad, regedit, Git Bash, git, cargo, curl, and more. A real registry, GDI with TrueType text, common controls, dialogs and menus. Direct3D 9 / 11 and OpenGL are in progress. Windows kernel drivers (`.sys`) load, answer programs' requests and run PCI devices with their interrupts (Plug and Play), the first steps toward running the GPU vendors' own drivers ([WDDM_DESIGN.md](WDDM_DESIGN.md)) |
+| **Windows compatibility** | Console and classic GUI programs: `cmd.exe`, Notepad, regedit, Git Bash, git, cargo, curl, and more. A real registry, GDI with TrueType text, common controls, dialogs and menus. Direct3D 9 / 11 and OpenGL are in progress. Windows kernel drivers (`.sys`) load, answer programs' requests and run PCI devices with their interrupts (Plug and Play), and a Windows display-only driver can present the desktop through VEILOS's own dxgkrnl: the first steps toward running the GPU vendors' own drivers ([WDDM_DESIGN.md](WDDM_DESIGN.md)) |
 | **Kernel** | Preemptive multitasking, SMP, per-process address spaces, threads, a user/role system with hashed passwords and a lock screen |
 | **Hardware** | SATA (AHCI) with GPT/MBR, FAT32 read/write, NTFS and exFAT read-only, virtio-net (with NIC bonding), Intel HD Audio, PCIe hot-plug |
 | **Networking** | DHCP, TCP/UDP, DNS and TLS |
@@ -119,7 +119,7 @@ VEILOS's own `ntdll.dll`, `kernel32.dll`, `user32.dll` and the rest are built fr
 | [`net/`](src/net) | The network stack, TLS, the distributed mesh (task capsules, checkpoints) |
 | [`security/`](src/security) | Security Mode, execution policy, capabilities, sandboxing, users, credentials, encryption |
 | [`exec/`](src/exec) | PE parsing, the loaders, the DLL registry |
-| [`nt/`](src/nt) | The Windows NT personality: system services, objects, memory, threads, files, registry, consoles, `ntos/` (the kernel interface for Windows drivers) |
+| [`nt/`](src/nt) | The Windows NT personality: system services, objects, memory, threads, files, registry, consoles, `ntos/` (the kernel interface for Windows drivers), `dxgk/` (dxgkrnl, the display port driver Windows display drivers register with) |
 | [`gfx/`](src/gfx) | Framebuffers, the GPU command model, 2D and 3D rendering, fonts, image decoders |
 | [`gui/`](src/gui) | Windows and the UI runtime, the widget toolkit, the compositor, the desktop, the clipboard |
 | [`vsh/`](src/vsh) | The VSH shell and its language |
