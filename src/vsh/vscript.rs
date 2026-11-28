@@ -398,6 +398,9 @@ fn apply_theme_object(obj: &BTreeMap<String, VValue>) -> Result<(), String> {
     let mut p = ColorPalette::veil();
     let mut radius: u32 = 4;
     let mut unknown: Vec<String> = Vec::new();
+    // The kernel's own screens follow the theme's font (gui::text).
+    let mut family = String::from("default");
+    let mut size_px: i64 = 13;
 
     for (k, v) in obj {
         if let Some(slot) = palette_slot(&mut p, k) {
@@ -409,8 +412,8 @@ fn apply_theme_object(obj: &BTreeMap<String, VValue>) -> Result<(), String> {
             // Accepted for the theme contract; consumed by the element runtime
             // / font engine when those land, not by the palette.
             "surface_sunken" => { theme_color(k, v)?; }
-            "font_family" => { want_str("THEME[font_family]", v)?; }
-            "font_size" => { want_int("THEME[font_size]", v, 4, 128)?; }
+            "font_family" => { family = String::from(want_str("THEME[font_family]", v)?); }
+            "font_size" => { size_px = want_int("THEME[font_size]", v, 4, 128)?; }
             _ => unknown.push(k.clone()),
         }
     }
@@ -423,6 +426,7 @@ fn apply_theme_object(obj: &BTreeMap<String, VValue>) -> Result<(), String> {
         t.palette = p;
         t.corner_radius = radius;
     }
+    crate::gui::text::set_ui_font(&family, size_px as u32);
     crate::gui::desktop::DESKTOP_WM.lock().z_order_dirty = true;
     Ok(())
 }

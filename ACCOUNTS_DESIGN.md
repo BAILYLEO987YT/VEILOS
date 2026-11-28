@@ -36,7 +36,17 @@ account and file-owner functions, `login`/`logout`/`session_locked`/
 `session_unlocked` events, the user's own `/home/<name>/user.vsh` loaded at
 sign-in and unloaded at sign-out (the shell is rebuilt then), and the
 ready-made settings panel (`/SETTINGS.VSH`, opened from the Settings menu
-item). Next: A5 (TrueType text).
+item).
+
+**A5 done (2026-11-28):** `gui/text.rs` draws the kernel's own screens
+(login and lock screens, window titles, notifications, the panel, the file
+manager, launcher and other apps) in the theme's TrueType font, and the
+terminal and text editor in a monospaced face (Cascadia Mono) sized to their
+9-pixel character cell. Widths are measured (carets, centring, labels fitted
+with an ellipsis); `THEME[font_family]` and `font_size` now apply. Fonts load
+when the desktop starts, so the login screen has them; the bitmap font is
+the fallback (no fonts, early boot, the panic screen). Next: A6 (login and
+lock screens, looks, first-boot wizard).
 
 **Changed from the plan in A4:**
 - Scripts act with the signed-in account's rights (every call goes through

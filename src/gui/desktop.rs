@@ -156,7 +156,9 @@ impl DesktopWindow {
         // Title bar
         let tb = Rect::new(self.rect.x, self.rect.y, self.rect.w, title_h);
         r.fill_rect(tb, p.titlebar);
-        r.draw_text(&self.title, self.rect.x + 10, self.rect.y + (title_h as i32 - 8) / 2, p.titlebar_text);
+        // Up to the control buttons (three of them, ~90 px).
+        let title = r.fit_text(&self.title, self.rect.w as i32 - 110);
+        r.draw_text(&title, self.rect.x + 10, self.rect.y + (title_h as i32 - 8) / 2, p.titlebar_text);
 
         // Window control buttons
         let btn_y   = self.rect.y + (title_h as i32 - 20) / 2;
@@ -1125,14 +1127,11 @@ impl DesktopBackground {
                 r.stroke_rect(Rect::new(x + (spacing_x - icon_size) / 2, y, icon_size as u32, icon_size as u32), p.border);
             }
             
-            // Text truncation so it doesn't overlap
-            let mut label = entry.name.clone();
-            if label.len() > 10 {
-                label.truncate(8);
-                label.push_str("..");
-            }
-            // Draw text
-            r.draw_text(&label, x, y + icon_size as i32 + 4, p.text_primary);
+            // The name fitted to the icon's column (measured, with an
+            // ellipsis) and centred under the icon.
+            let label = r.fit_text(&entry.name, spacing_x - 4);
+            let lw = r.text_width(&label);
+            r.draw_text(&label, x + (spacing_x - lw) / 2, y + icon_size as i32 + 4, p.text_primary);
 
             y += spacing_y;
             if y + spacing_y > bottom {
@@ -1383,8 +1382,9 @@ impl NotificationSystem {
             // Left accent stripe
             r.fill_rect(Rect::new(x, y, 4, TOAST_H), accent);
             // Text
-            r.draw_text(&toast.title, x + 12, y + 10, tp);
-            r.draw_text(&toast.body,  x + 12, y + 28, ts);
+            let room = TOAST_W as i32 - 20;
+            r.draw_text(&r.fit_text(&toast.title, room), x + 12, y + 10, tp);
+            r.draw_text(&r.fit_text(&toast.body, room),  x + 12, y + 28, ts);
 
             y -= TOAST_H as i32 + 6;
         }
@@ -1792,7 +1792,7 @@ impl PendingRoleDialog {
     pub fn paint(&self) {
         if !self.visible { return; }
         
-        use crate::gui::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
+        use crate::gui::ui::{draw_rect_atomic, commit_dirty_rect};
         let sw = crate::gui::ui::screen_w();
         let sh = crate::gui::ui::screen_h();
         
@@ -1829,13 +1829,13 @@ impl PendingRoleDialog {
             crate::net::distributed::NodeType::Tenant => "Tenant",
             crate::net::distributed::NodeType::Unknown => "Unknown",
         };
-        draw_string_atomic("ROLE REQUEST", cx + 12, cy + 12, p.accent);
+        ui_text("ROLE REQUEST", cx + 12, cy + 12, p.accent);
         if self.proposed_type == crate::net::distributed::NodeType::Controller {
-            draw_string_atomic("Wants to become Controller", cx + 16, cy + 32, p.text_primary);
-            draw_string_atomic("(you would become Tenant)", cx + 16, cy + 48, p.text_secondary);
+            ui_text("Wants to become Controller", cx + 16, cy + 32, p.text_primary);
+            ui_text("(you would become Tenant)", cx + 16, cy + 48, p.text_secondary);
         } else {
-            draw_string_atomic(&alloc::format!("Wants you to become: {}", type_str), cx + 16, cy + 32, p.text_primary);
-            draw_string_atomic(&alloc::format!("From: {}", self.requestor_id.to_hex()), cx + 16, cy + 48, p.text_secondary);
+            ui_text(&alloc::format!("Wants you to become: {}", type_str), cx + 16, cy + 32, p.text_primary);
+            ui_text(&alloc::format!("From: {}", self.requestor_id.to_hex()), cx + 16, cy + 48, p.text_secondary);
         }
 
         // Buttons
@@ -1852,8 +1852,8 @@ impl PendingRoleDialog {
         draw_rect_atomic(cx + dlg_w - btn_w * 2 - 40, deny_y, btn_w, 1, p.text_primary);
         draw_rect_atomic(cx + dlg_w - btn_w * 2 - 40, deny_y + btn_h - 1, btn_w, 1, p.text_primary);
         
-        draw_string_atomic("ACCEPT", cx + dlg_w - btn_w - 10, cy + dlg_h - 30, p.text_primary);
-        draw_string_atomic("DENY", cx + dlg_w - btn_w * 2 - 24, cy + dlg_h - 30, p.text_primary);
+        ui_text("ACCEPT", cx + dlg_w - btn_w - 10, cy + dlg_h - 30, p.text_primary);
+        ui_text("DENY", cx + dlg_w - btn_w * 2 - 24, cy + dlg_h - 30, p.text_primary);
         
         commit_dirty_rect(0, 0, sw, sh);
     }
@@ -1886,6 +1886,25 @@ pub static PENDING_ROLE_DIALOG: Mutex<PendingRoleDialog> = Mutex::new(PendingRol
 
 // =====================================================================
 // -----| Login Screen (Phase 18) |-----
+// =====================================================================
+
+/// Text on the login, lock and dialog screens: the UI font (gui::text), the
+/// bitmap font until fonts are loaded.
+fn ui_text(s: &str, x: usize, y: usize, color: Color) {
+    crate::gui::text::draw(crate::gui::text::Face::Ui, s, x as i32, y as i32, color);
+}
+
+/// `ui_text` centred on `centre_x`.
+fn ui_text_centred(s: &str, centre_x: usize, y: usize, color: Color) {
+    let w = crate::gui::text::measure(crate::gui::text::Face::Ui, s).max(0) as usize;
+    ui_text(s, centre_x.saturating_sub(w / 2), y, color);
+}
+
+fn ui_text_width(s: &str) -> usize {
+    crate::gui::text::measure(crate::gui::text::Face::Ui, s).max(0) as usize
+}
+
+// =====================================================================
 // =====================================================================
 
 /// Which field has keyboard focus in the login form.
@@ -2064,7 +2083,7 @@ impl LoginScreen {
 
     /// Paint the login screen over the full framebuffer.
     pub fn paint(&self) {
-        use crate::gui::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
+        use crate::gui::ui::{draw_rect_atomic, commit_dirty_rect};
 
         let sw = screen_w();
         let sh = screen_h();
@@ -2095,9 +2114,9 @@ impl LoginScreen {
         draw_rect_atomic(card_x + card_w - 1, card_y, 1, card_h, Color { r: 40, g: 70, b: 140 });
 
         // Logo + title.
-        draw_string_atomic("VEILOS", card_x + 140, card_y + 22, Color { r: 80, g: 140, b: 255 });
-        draw_string_atomic("v0.1.0", card_x + 245, card_y + 22, Color { r: 60, g: 80, b: 130 });
-        draw_string_atomic("Sign in to continue", card_x + 100, card_y + 44, Color { r: 120, g: 140, b: 180 });
+        ui_text_centred("VEILOS", card_x + card_w / 2, card_y + 22, Color { r: 80, g: 140, b: 255 });
+        ui_text("v0.1.0", card_x + card_w - 24 - ui_text_width("v0.1.0"), card_y + 22, Color { r: 60, g: 80, b: 130 });
+        ui_text_centred("Sign in to continue", card_x + card_w / 2, card_y + 44, Color { r: 120, g: 140, b: 180 });
 
         // Divider.
         draw_rect_atomic(card_x + 24, card_y + 62, card_w - 48, 1, Color { r: 40, g: 55, b: 100 });
@@ -2106,7 +2125,7 @@ impl LoginScreen {
         let field_x = card_x + 24;
         let field_w = card_w - 48;
         let u_y = card_y + 76;
-        draw_string_atomic("Username", field_x, u_y, Color { r: 100, g: 130, b: 190 });
+        ui_text("Username", field_x, u_y, Color { r: 100, g: 130, b: 190 });
         let u_field_y = u_y + 16;
         let u_focused = self.focus == LoginFocus::Username;
         let field_bg = Color { r: 12, g: 18, b: 38 };
@@ -2115,16 +2134,16 @@ impl LoginScreen {
         draw_rect_atomic(field_x, u_field_y, field_w, 28, field_bg);
         draw_rect_atomic(field_x, u_field_y + 27, field_w, 1,
             if u_focused { border_active } else { border_idle });
-        draw_string_atomic(&self.username_buf, field_x + 6, u_field_y + 8,
+        ui_text(&self.username_buf, field_x + 6, u_field_y + 8,
             Color { r: 220, g: 230, b: 255 });
         if u_focused {
-            let cx = field_x + 6 + self.username_buf.len() * 8;
+            let cx = field_x + 6 + ui_text_width(&self.username_buf);
             draw_rect_atomic(cx, u_field_y + 6, 2, 16, border_active);
         }
 
         // Password field.
         let p_y = u_field_y + 44;
-        draw_string_atomic("Password", field_x, p_y, Color { r: 100, g: 130, b: 190 });
+        ui_text("Password", field_x, p_y, Color { r: 100, g: 130, b: 190 });
         let p_field_y = p_y + 16;
         let p_focused = self.focus == LoginFocus::Password;
         draw_rect_atomic(field_x, p_field_y, field_w, 28, field_bg);
@@ -2132,16 +2151,16 @@ impl LoginScreen {
             if p_focused { border_active } else { border_idle });
         // Show bullets for each password character.
         let bullets: String = self.password_buf.chars().map(|_| '*').collect();
-        draw_string_atomic(&bullets, field_x + 6, p_field_y + 8,
+        ui_text(&bullets, field_x + 6, p_field_y + 8,
             Color { r: 220, g: 230, b: 255 });
         if p_focused {
-            let cx = field_x + 6 + self.password_buf.len() * 8;
+            let cx = field_x + 6 + ui_text_width(&bullets);
             draw_rect_atomic(cx, p_field_y + 6, 2, 16, border_active);
         }
 
         // Error message.
         if !self.error_msg.is_empty() {
-            draw_string_atomic(&self.error_msg, field_x, p_field_y + 36,
+            ui_text(&self.error_msg, field_x, p_field_y + 36,
                 Color { r: 255, g: 80, b: 80 });
         }
 
@@ -2150,11 +2169,11 @@ impl LoginScreen {
         let btn_x = field_x;
         let btn_w = field_w;
         draw_rect_atomic(btn_x, btn_y, btn_w, 32, Color { r: 40, g: 80, b: 200 });
-        draw_string_atomic("SIGN IN  (Enter)", btn_x + btn_w / 2 - 64, btn_y + 10,
+        ui_text_centred("SIGN IN  (Enter)", btn_x + btn_w / 2, btn_y + 10,
             Color { r: 255, g: 255, b: 255 });
 
         // Guest session hint.
-        draw_string_atomic("Guest session: type 'guest' as username",
+        ui_text("Guest session: type 'guest' as username",
             card_x + 24, card_y + card_h - 20,
             Color { r: 60, g: 80, b: 130 });
 
@@ -2237,7 +2256,7 @@ impl LockScreen {
 
     /// Paint the lock screen over the full framebuffer.
     pub fn paint(&self, ms: u64) {
-        use crate::gui::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
+        use crate::gui::ui::{draw_rect_atomic, commit_dirty_rect};
 
         let sw = screen_w();
         let sh = screen_h();
@@ -2252,19 +2271,18 @@ impl LockScreen {
         let ss = total_secs % 60;
         let time_str = alloc::format!("{:02}:{:02}:{:02}", hh, mm, ss);
         // Draw big clock — 3x scaled by drawing each glyph as 3×3 blocks.
-        let clock_x = sw / 2 - time_str.len() * 12;
         let clock_y = sh / 2 - 100;
-        draw_string_atomic(&time_str, clock_x, clock_y, Color { r: 200, g: 220, b: 255 });
+        ui_text_centred(&time_str, sw / 2, clock_y, Color { r: 200, g: 220, b: 255 });
 
         // Locked indicator.
-        draw_string_atomic("SCREEN LOCKED", sw / 2 - 52, clock_y + 24,
+        ui_text_centred("SCREEN LOCKED", sw / 2, clock_y + 24,
             Color { r: 80, g: 100, b: 160 });
 
         // Get current username.
         let username = crate::security::users::SESSION.lock().username.clone();
-        draw_string_atomic(
+        ui_text_centred(
             &alloc::format!("Signed in as: {}", username),
-            sw / 2 - 80, clock_y + 48,
+            sw / 2, clock_y + 48,
             Color { r: 100, g: 120, b: 180 },
         );
 
@@ -2281,20 +2299,20 @@ impl LockScreen {
         } else {
             Color { r: 200, g: 210, b: 255 }
         };
-        draw_string_atomic(hint, box_x + 12, box_y + 10, hint_col);
+        ui_text(hint, box_x + 12, box_y + 10, hint_col);
         // Cursor blink.
         if (ms / 500) % 2 == 0 && !self.password_buf.is_empty() {
-            let cx = box_x + 12 + self.password_buf.len() * 8;
+            let cx = box_x + 12 + ui_text_width(&bullets);
             draw_rect_atomic(cx, box_y + 8, 2, 18, Color { r: 80, g: 140, b: 255 });
         }
 
         if !self.error_msg.is_empty() {
-            draw_string_atomic(&self.error_msg, box_x, box_y + 44,
+            ui_text(&self.error_msg, box_x, box_y + 44,
                 Color { r: 255, g: 80, b: 80 });
         }
 
-        draw_string_atomic("Press Enter to unlock  |  Super+L to lock",
-            sw / 2 - 168, sh - 30, Color { r: 40, g: 55, b: 100 });
+        ui_text_centred("Press Enter to unlock  |  Super+L to lock",
+            sw / 2, sh - 30, Color { r: 40, g: 55, b: 100 });
 
         commit_dirty_rect(0, 0, sw, sh);
     }
@@ -2937,6 +2955,10 @@ pub fn init() {
     // Load the last-used username hint for the login screen.
     LOGIN_SCREEN.lock().load_last_user();
 
+    // The TrueType fonts (gui::text), so the login screen has them from its
+    // first frame; the bitmap font until then, and if /FONTS has none.
+    crate::gfx::render2d_kernel::ensure_fonts();
+
     // Boot starts at the login screen, unless an account with no password
     // has auto-login on (users::UserDatabase::auto_login_user).
     DESKTOP_PHASE.store(DesktopPhase::Login as u8, Ordering::Release);
@@ -3182,7 +3204,7 @@ pub fn paint_desktop(ms: u64) {
                             Some(pos) => &state.source_path[pos + 1..],
                             None => &state.source_path,
                         };
-                        let w = (filename.len() * 8 + 16) as u32;
+                        let w = (r.text_width(filename) + 16) as u32;
                         r.fill_rect(crate::gui::gui_toolkit::Rect::new(mx + 10, my + 10, w, 24), crate::gfx::graphics::Color { r: 60, g: 100, b: 200 });
                         r.stroke_rect(crate::gui::gui_toolkit::Rect::new(mx + 10, my + 10, w, 24), crate::gfx::graphics::Color { r: 255, g: 255, b: 255 });
                         r.draw_text(filename, mx + 18, my + 16, crate::gfx::graphics::Color { r: 255, g: 255, b: 255 });

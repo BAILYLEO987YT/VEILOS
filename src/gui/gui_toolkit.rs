@@ -39,7 +39,7 @@ use alloc::string::String;
 use alloc::boxed::Box;
 use spin::Mutex;
 use crate::println;
-use crate::gui::ui::{draw_rect_atomic, draw_string_atomic};
+use crate::gui::ui::draw_rect_atomic;
 use crate::gfx::graphics::Color;
 
 // =====================================================================
@@ -339,10 +339,28 @@ impl Renderer {
         self.fill_rect(Rect::new(r.x + r.w as i32 - 1, r.y, 1, r.h), color);
     }
 
-    /// Draw text (left-aligned, single line).
+    /// Draw text (left-aligned, single line) in the UI font (gui::text),
+    /// its capitals centred where an 8-pixel bitmap line at `y` would be.
     pub fn draw_text(&self, text: &str, x: i32, y: i32, color: Color) {
         if x < 0 || y < 0 { return; }
-        draw_string_atomic(text, x as usize, y as usize, color);
+        crate::gui::text::draw(crate::gui::text::Face::Ui, text, x, y, color);
+    }
+
+    /// Draw text in the monospaced face: one character per
+    /// `gui::text::MONO_CELL_W` pixels (the terminal, the text editor).
+    pub fn draw_mono(&self, text: &str, x: i32, y: i32, color: Color) {
+        if x < 0 || y < 0 { return; }
+        crate::gui::text::draw(crate::gui::text::Face::Mono, text, x, y, color);
+    }
+
+    /// The width `draw_text` gives `text`, in pixels.
+    pub fn text_width(&self, text: &str) -> i32 {
+        crate::gui::text::measure(crate::gui::text::Face::Ui, text)
+    }
+
+    /// `text` shortened with an ellipsis to fit `max_w` pixels.
+    pub fn fit_text(&self, text: &str, max_w: i32) -> alloc::string::String {
+        crate::gui::text::fit(crate::gui::text::Face::Ui, text, max_w)
     }
 
     /// Draw a focus ring around a rect.
@@ -572,7 +590,7 @@ impl Widget for Label {
     fn rect(&self) -> Rect { self.rect }
 
     fn measure(&self, _: Size) -> Size {
-        Size { w: (self.text.len() as u32) * 8 + 4, h: 16 }
+        Size { w: crate::gui::text::measure(crate::gui::text::Face::Ui, &self.text).max(0) as u32 + 4, h: 16 }
     }
     fn layout(&mut self, rect: Rect) { self.rect = rect; }
 
@@ -614,7 +632,7 @@ impl Widget for Button {
     fn rect(&self) -> Rect { self.rect }
 
     fn measure(&self, _: Size) -> Size {
-        Size { w: (self.label.len() as u32) * 8 + 28, h: 30 }
+        Size { w: crate::gui::text::measure(crate::gui::text::Face::Ui, &self.label).max(0) as u32 + 28, h: 30 }
     }
     fn layout(&mut self, rect: Rect) { self.rect = rect; }
 
@@ -632,7 +650,7 @@ impl Widget for Button {
         r.fill_rounded(self.rect, bg, radius);
         if self.flags.focused { r.draw_focus_ring(self.rect); }
 
-        let tx = self.rect.x + (self.rect.w as i32 - self.label.len() as i32 * 8) / 2;
+        let tx = self.rect.x + (self.rect.w as i32 - crate::gui::text::measure(crate::gui::text::Face::Ui, &self.label)) / 2;
         let ty = self.rect.y + (self.rect.h as i32 - 8) / 2;
         r.draw_text(&self.label, tx, ty, text_c);
     }
@@ -709,7 +727,13 @@ impl Widget for TextInput {
 
         // Draw cursor when focused
         if self.flags.focused {
-            let cx = self.rect.x + 6 + (self.cursor_pos.min(self.text.len()) as i32) * 8;
+            // The caret after the text before it, measured (password: the `*`s).
+            let before: alloc::string::String = if self.password {
+                "*".repeat(self.cursor_pos.min(self.text.chars().count()))
+            } else {
+                self.text.chars().take(self.cursor_pos).collect()
+            };
+            let cx = self.rect.x + 6 + crate::gui::text::measure(crate::gui::text::Face::Ui, &before);
             r.fill_rect(Rect::new(cx, self.rect.y + 6, 2, 20), cc);
         }
     }
@@ -762,7 +786,7 @@ impl Widget for Checkbox {
     fn rect(&self) -> Rect { self.rect }
 
     fn measure(&self, _: Size) -> Size {
-        Size { w: (self.label.len() as u32) * 8 + 28, h: 22 }
+        Size { w: crate::gui::text::measure(crate::gui::text::Face::Ui, &self.label).max(0) as u32 + 28, h: 22 }
     }
     fn layout(&mut self, rect: Rect) { self.rect = rect; }
 

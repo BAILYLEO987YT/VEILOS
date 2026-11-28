@@ -267,17 +267,18 @@ impl TextEditorState {
             
             if row >= top && row < top + max_rows {
                 let sy = text_y + (row - top) * row_h;
-                let sx = cx + 8 + col * 8;
+                // A character grid: the monospaced face, one cell each.
+                let sx = cx + 8 + col * crate::gui::text::MONO_CELL_W;
 
                 // Draw selection highlight behind the character.
                 if i >= sel_lo && i < sel_hi {
-                    r.fill_rect(Rect::new(sx, sy, 9, row_h as u32), p.selection);
+                    r.fill_rect(Rect::new(sx, sy, crate::gui::text::MONO_CELL_W as u32, row_h as u32), p.selection);
                 }
 
                 let mut tmp = String::new();
                 tmp.push(c);
                 let text_color = if i >= sel_lo && i < sel_hi { p.text_primary } else { p.text_primary };
-                r.draw_text(&tmp, sx, sy, text_color);
+                r.draw_mono(&tmp, sx, sy + 4, text_color);
             }
             col += 1;
         }
@@ -287,7 +288,7 @@ impl TextEditorState {
 
         if cursor_r >= top && cursor_r < top + max_rows {
             let cy_pos = text_y + (cursor_r - top) * row_h;
-            let cx_pos = cx + 8 + cursor_c * 8;
+            let cx_pos = cx + 8 + cursor_c * crate::gui::text::MONO_CELL_W;
             r.fill_rect(Rect::new(cx_pos, cy_pos, 2, 14), p.cursor);
         }
         self.draw_bar(&r, area, p.surface, p.border, p.accent);
@@ -749,7 +750,9 @@ impl FileManagerState {
             let icon = if entry.is_dir { "[DIR] " } else { "[FILE]" };
             let tc   = if entry.is_dir { p.accent } else { p.text_primary };
             r.draw_text(icon,        cx + 8,  ey + 6, tc);
-            r.draw_text(&entry.name, cx + 60, ey + 6, p.text_primary);
+            // Up to the size column.
+            let name = r.fit_text(&entry.name, cw as i32 - 60 - 96 - bar_room);
+            r.draw_text(&name, cx + 60, ey + 6, p.text_primary);
             if !entry.is_dir && entry.size > 0 {
                 let size_str = if entry.size >= 1024*1024 {
                     alloc::format!("{} MB", entry.size / 1024 / 1024)
@@ -1077,7 +1080,8 @@ pub struct TerminalEmulator {
 
 const TERM_ROW_H: i32 = 16;
 /// A console cell's width: draw_text's pen moves 9 pixels a character.
-const TERM_CELL_W: i32 = 9;
+/// The terminal's character cell: the mono face's (gui::text).
+const TERM_CELL_W: i32 = crate::gui::text::MONO_CELL_W;
 /// The prompt's line and the margins round the output.
 const TERM_RESERVED_H: u32 = 28;
 
@@ -1218,7 +1222,7 @@ impl TerminalEmulator {
                 if attr & 0xF0 != 0 || attr & 0x4000 != 0 {
                     r.fill_rect(Rect::new(x0 + x as i32 * TERM_CELL_W, py, (end - x) as u32 * TERM_CELL_W as u32, TERM_ROW_H as u32), bg);
                 }
-                r.draw_text(&text, x0 + x as i32 * TERM_CELL_W, py + 2, fg);
+                r.draw_mono(&text, x0 + x as i32 * TERM_CELL_W, py + 2, fg);
                 if attr & 0x8000 != 0 {
                     r.fill_rect(Rect::new(x0 + x as i32 * TERM_CELL_W, py + TERM_ROW_H - 2, (end - x) as u32 * TERM_CELL_W as u32, 1), fg);
                 }
@@ -1294,7 +1298,7 @@ impl TerminalEmulator {
 
         let text_c = Color { r: 0, g: 240, b: 60 };
         for (i, line) in self.history.iter().enumerate().skip(start).take(area.rows) {
-            r.draw_text(line, cx + 8, area.y + (i - start) as i32 * row_h, text_c);
+            r.draw_mono(line, cx + 8, area.y + (i - start) as i32 * row_h, text_c);
         }
         self.draw_bar(&r, area, Color { r: 10, g: 18, b: 10 }, Color { r: 0, g: 120, b: 40 }, text_c);
 
@@ -1307,8 +1311,8 @@ impl TerminalEmulator {
             None => (String::from("> "), self.input_buf.clone()),
         };
         let input_x = cx + 8 + label.chars().count() as i32 * TERM_CELL_W;
-        r.draw_text(&label, cx + 8, prompt_y + 2, text_c);
-        r.draw_text(&shown, input_x, prompt_y + 2, Color { r: 255, g: 255, b: 255 });
+        r.draw_mono(&label, cx + 8, prompt_y + 2, text_c);
+        r.draw_mono(&shown, input_x, prompt_y + 2, Color { r: 255, g: 255, b: 255 });
 
         if self.cursor_blink {
             let cursor_x = input_x + shown.chars().count() as i32 * TERM_CELL_W;
@@ -1670,7 +1674,7 @@ impl AppLauncher {
         for (i, (lbl, col)) in qs_buttons.iter().enumerate() {
             let bx = cx + (i as u32 * qs_btn_w) as i32;
             r.fill_rect(Rect::new(bx + (qs_btn_w as i32 - 20) / 2, qs_y + 4, 20, 20), *col);
-            r.draw_text(lbl, bx + (qs_btn_w as i32 - lbl.len() as i32 * 8) / 2, qs_y + 28, p.text_primary);
+            r.draw_text(lbl, bx + (qs_btn_w as i32 - r.text_width(lbl)) / 2, qs_y + 28, p.text_primary);
         }
 
         // Search box
