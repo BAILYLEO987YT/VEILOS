@@ -1868,7 +1868,7 @@ pub fn handle_exec_request(data: &[u8]) -> Vec<u8> {
             println!("[DIST/EXEC] Remote task: {} {}", task.command, task.args);
             let mut output: Vec<alloc::string::String> = Vec::new();
             let cmd = alloc::format!("{} {}", task.command, task.args).to_uppercase();
-            crate::task::terminal::execute_command_pub(&cmd, &mut output);
+            crate::task::terminal::execute_remote_command(&cmd, &mut output);
             let stdout: alloc::string::String = output.join("\n");
             encode_message(MessageType::ExecComplete, stdout.as_bytes())
         }
@@ -2028,7 +2028,7 @@ fn handle_task_capsule(payload: &[u8]) -> crate::net::task_capsule::TaskResult {
     );
 
     let mut output: Vec<alloc::string::String> = Vec::new();
-    crate::task::terminal::execute_command_pub(&command_str, &mut output);
+    crate::task::terminal::execute_remote_command(&command_str, &mut output);
     let stdout = output.join("\n");
 
     // 5. Checkpoint — native threads only.

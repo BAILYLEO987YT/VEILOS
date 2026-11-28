@@ -132,8 +132,10 @@ impl Host for KernelHost {
                 notify(NotifCategory::Info, "VSCRIPT", &out);
                 Some(Ok(VValue::None))
             }
-            // time, launch, focus_window, lock_session, shutdown, restart, destroy
-            _ => crate::vsh::shell::host_call(name, args),
+            // Accounts, policy, file owners (accounts_api.rs), then time,
+            // launch, focus_window, lock_session, shutdown, restart, destroy.
+            _ => crate::vsh::accounts_api::host_call(name, args)
+                .or_else(|| crate::vsh::shell::host_call(name, args)),
         }
     }
 
@@ -223,6 +225,11 @@ fn want_int_list(name: &str, v: &VValue, min: i64, max: i64) -> Result<Vec<u32>,
 }
 
 fn apply_system_setting(name: &str, v: &VValue) -> Result<(), String> {
+    // Account policy (LOCK_IDLE_TIMEOUT, LOGIN_*, ...): users::policy_set,
+    // with the signed-in user's rights.
+    if let Some(r) = crate::vsh::accounts_api::set_policy_setting(name, v) {
+        return r;
+    }
     match name {
         "THEME" => match v {
             VValue::Object(obj) => apply_theme_object(obj),
@@ -391,6 +398,9 @@ fn apply_theme_object(obj: &BTreeMap<String, VValue>) -> Result<(), String> {
     let mut p = ColorPalette::veil();
     let mut radius: u32 = 4;
     let mut unknown: Vec<String> = Vec::new();
+    // The kernel's own screens follow the theme's font (gui::text).
+    let mut family = String::from("default");
+    let mut size_px: i64 = 13;
 
     for (k, v) in obj {
         if let Some(slot) = palette_slot(&mut p, k) {
@@ -402,8 +412,8 @@ fn apply_theme_object(obj: &BTreeMap<String, VValue>) -> Result<(), String> {
             // Accepted for the theme contract; consumed by the element runtime
             // / font engine when those land, not by the palette.
             "surface_sunken" => { theme_color(k, v)?; }
-            "font_family" => { want_str("THEME[font_family]", v)?; }
-            "font_size" => { want_int("THEME[font_size]", v, 4, 128)?; }
+            "font_family" => { family = String::from(want_str("THEME[font_family]", v)?); }
+            "font_size" => { size_px = want_int("THEME[font_size]", v, 4, 128)?; }
             _ => unknown.push(k.clone()),
         }
     }
@@ -416,6 +426,7 @@ fn apply_theme_object(obj: &BTreeMap<String, VValue>) -> Result<(), String> {
         t.palette = p;
         t.corner_radius = radius;
     }
+    crate::gui::text::set_ui_font(&family, size_px as u32);
     crate::gui::desktop::DESKTOP_WM.lock().z_order_dirty = true;
     Ok(())
 }

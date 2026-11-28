@@ -267,17 +267,18 @@ impl TextEditorState {
             
             if row >= top && row < top + max_rows {
                 let sy = text_y + (row - top) * row_h;
-                let sx = cx + 8 + col * 8;
+                // A character grid: the monospaced face, one cell each.
+                let sx = cx + 8 + col * crate::gui::text::MONO_CELL_W;
 
                 // Draw selection highlight behind the character.
                 if i >= sel_lo && i < sel_hi {
-                    r.fill_rect(Rect::new(sx, sy, 9, row_h as u32), p.selection);
+                    r.fill_rect(Rect::new(sx, sy, crate::gui::text::MONO_CELL_W as u32, row_h as u32), p.selection);
                 }
 
                 let mut tmp = String::new();
                 tmp.push(c);
                 let text_color = if i >= sel_lo && i < sel_hi { p.text_primary } else { p.text_primary };
-                r.draw_text(&tmp, sx, sy, text_color);
+                r.draw_mono(&tmp, sx, sy + 4, text_color);
             }
             col += 1;
         }
@@ -287,7 +288,7 @@ impl TextEditorState {
 
         if cursor_r >= top && cursor_r < top + max_rows {
             let cy_pos = text_y + (cursor_r - top) * row_h;
-            let cx_pos = cx + 8 + cursor_c * 8;
+            let cx_pos = cx + 8 + cursor_c * crate::gui::text::MONO_CELL_W;
             r.fill_rect(Rect::new(cx_pos, cy_pos, 2, 14), p.cursor);
         }
         self.draw_bar(&r, area, p.surface, p.border, p.accent);
@@ -339,6 +340,11 @@ impl TextEditorState {
 
         let save_rect = Rect::new(cx + cw as i32 - 70, cy + 4, 60, 20);
         if save_rect.contains(x, y) {
+            // Only where the signed-in user may write (security::access).
+            if !crate::security::access::user_may(&self.path, crate::security::access::Op::Write) {
+                return;
+            }
+            crate::security::access::note_created(crate::security::access::session_uid(), &self.path);
             match crate::fs::vfs::VFS.write_file(&self.path, self.content.as_bytes()) {
                 Ok(_) => { notify(NotifCategory::Success, "SAVED", &self.path); },
                 Err(_) => { notify(NotifCategory::Warning, "ERROR", "Could not save file"); },
@@ -663,6 +669,11 @@ impl FileManagerState {
         if self.cwd != "/" {
             self.entries.push(FileEntry { name: String::from(".."), size: 0, is_dir: true });
         }
+        // Another user's folder (security::access): shown as no access.
+        if !crate::security::access::user_may_quiet(&self.cwd, crate::security::access::Op::Read) {
+            self.entries.push(FileEntry { name: String::from("(no access)"), size: 0, is_dir: false });
+            return;
+        }
         match VFS.list_dir(&self.cwd) {
             Ok(list) => {
                 for e in list {
@@ -739,7 +750,9 @@ impl FileManagerState {
             let icon = if entry.is_dir { "[DIR] " } else { "[FILE]" };
             let tc   = if entry.is_dir { p.accent } else { p.text_primary };
             r.draw_text(icon,        cx + 8,  ey + 6, tc);
-            r.draw_text(&entry.name, cx + 60, ey + 6, p.text_primary);
+            // Up to the size column.
+            let name = r.fit_text(&entry.name, cw as i32 - 60 - 96 - bar_room);
+            r.draw_text(&name, cx + 60, ey + 6, p.text_primary);
             if !entry.is_dir && entry.size > 0 {
                 let size_str = if entry.size >= 1024*1024 {
                     alloc::format!("{} MB", entry.size / 1024 / 1024)
@@ -885,6 +898,10 @@ impl FrequentFiles {
 pub static FREQUENT_FILES: Mutex<FrequentFiles> = Mutex::new(FrequentFiles::new());
 
 pub fn open_file_absolute(path: &str, name: &str) {
+    // Opening or running it needs read access (security::access).
+    if !crate::security::access::user_may(path, crate::security::access::Op::Read) {
+        return;
+    }
         FREQUENT_FILES.lock().record(path);
         if name.ends_with(".exe") || name.ends_with(".EXE") {
             // It's an executable, so attempt to load and spawn it.
@@ -1056,11 +1073,15 @@ pub struct TerminalEmulator {
     pub console_view: Option<usize>,
     /// The grid size the console was last given (the window's, in cells).
     grid: (usize, usize),
+    /// Asking for passwords (PASSWD, USERADD, KEYS RELINK): typed input is
+    /// shown as `*` and never reaches the history.
+    secret: Option<SecretPrompt>,
 }
 
 const TERM_ROW_H: i32 = 16;
 /// A console cell's width: draw_text's pen moves 9 pixels a character.
-const TERM_CELL_W: i32 = 9;
+/// The terminal's character cell: the mono face's (gui::text).
+const TERM_CELL_W: i32 = crate::gui::text::MONO_CELL_W;
 /// The prompt's line and the margins round the output.
 const TERM_RESERVED_H: u32 = 28;
 
@@ -1119,6 +1140,7 @@ impl TerminalEmulator {
             console: None,
             console_view: None,
             grid: (0, 0),
+            secret: None,
         }
     }
 
@@ -1130,6 +1152,10 @@ impl TerminalEmulator {
     /// terminal (its output appears here, typed lines go to it); a GUI
     /// program opens its own window.
     fn run_program(&mut self, path: &str, args: &str) {
+        if !crate::security::access::user_may(path, crate::security::access::Op::Read) {
+            self.history.push(alloc::format!("ERROR: '{}': permission denied", path));
+            return;
+        }
         let name = path.rsplit('/').next().unwrap_or(path);
         let mut frame_allocator = crate::mm::memory::GlobalFrameAllocator;
         match crate::exec::loader::load_and_spawn_pe_with_args(path, args, &mut frame_allocator) {
@@ -1196,7 +1222,7 @@ impl TerminalEmulator {
                 if attr & 0xF0 != 0 || attr & 0x4000 != 0 {
                     r.fill_rect(Rect::new(x0 + x as i32 * TERM_CELL_W, py, (end - x) as u32 * TERM_CELL_W as u32, TERM_ROW_H as u32), bg);
                 }
-                r.draw_text(&text, x0 + x as i32 * TERM_CELL_W, py + 2, fg);
+                r.draw_mono(&text, x0 + x as i32 * TERM_CELL_W, py + 2, fg);
                 if attr & 0x8000 != 0 {
                     r.fill_rect(Rect::new(x0 + x as i32 * TERM_CELL_W, py + TERM_ROW_H - 2, (end - x) as u32 * TERM_CELL_W as u32, 1), fg);
                 }
@@ -1272,18 +1298,24 @@ impl TerminalEmulator {
 
         let text_c = Color { r: 0, g: 240, b: 60 };
         for (i, line) in self.history.iter().enumerate().skip(start).take(area.rows) {
-            r.draw_text(line, cx + 8, area.y + (i - start) as i32 * row_h, text_c);
+            r.draw_mono(line, cx + 8, area.y + (i - start) as i32 * row_h, text_c);
         }
         self.draw_bar(&r, area, Color { r: 10, g: 18, b: 10 }, Color { r: 0, g: 120, b: 40 }, text_c);
 
         // Prompt + input
         let prompt_y = cy + ch as i32 - row_h - 4;
         r.fill_rect(Rect::new(cx, prompt_y, cw, row_h as u32 + 2), Color { r: 10, g: 18, b: 10 });
-        r.draw_text("> ", cx + 8, prompt_y + 2, text_c);
-        r.draw_text(&self.input_buf, cx + 24, prompt_y + 2, Color { r: 255, g: 255, b: 255 });
+        // Asking for a password: its question instead of "> ", and `*`s.
+        let (label, shown) = match &self.secret {
+            Some(sp) => (alloc::format!("{}: ", sp.question()), "*".repeat(self.input_buf.chars().count())),
+            None => (String::from("> "), self.input_buf.clone()),
+        };
+        let input_x = cx + 8 + label.chars().count() as i32 * TERM_CELL_W;
+        r.draw_mono(&label, cx + 8, prompt_y + 2, text_c);
+        r.draw_mono(&shown, input_x, prompt_y + 2, Color { r: 255, g: 255, b: 255 });
 
         if self.cursor_blink {
-            let cursor_x = cx + 24 + self.input_buf.len() as i32 * TERM_CELL_W;
+            let cursor_x = input_x + shown.chars().count() as i32 * TERM_CELL_W;
             r.fill_rect(Rect::new(cursor_x, prompt_y + 2, 6, 12), text_c);
         }
         let _ = p; // suppress unused warning
@@ -1311,16 +1343,37 @@ impl TerminalEmulator {
             ]);
             return;
         }
+        // Answering a password question: hidden, Esc cancels.
+        if self.secret.is_some() {
+            self.secret_key(ch);
+            return;
+        }
         match ch {
             '\n' | '\r' => {
+                // PASSWD, USERADD <name> [role], KEYS RELINK: ask for the
+                // passwords instead of taking them on the command line.
+                if let Some(start) = secret_prompt_for(&self.input_buf) {
+                    self.history.push(alloc::format!("> {}", self.input_buf.trim()));
+                    match start {
+                        Ok(sp) => {
+                            self.history.push(String::from("  (typing is hidden; Esc cancels)"));
+                            self.secret = Some(sp);
+                        }
+                        Err(msg) => self.history.push(msg),
+                    }
+                    self.input_buf.clear();
+                    return;
+                }
                 let mut cmd = self.input_buf.trim().to_uppercase();
-                // Passwords and user names keep their case.
-                if cmd.starts_with("PASSWD ") {
-                    cmd = alloc::format!("PASSWD {}", self.input_buf.trim()[7..].trim());
+                // Passwords and user names keep their case, and the passwords
+                // are hidden in the echoed line.
+                let mut echo = self.input_buf.clone();
+                if let Some((kept, masked)) = account_command(&self.input_buf) {
+                    cmd = kept;
+                    echo = masked;
                 }
                 // WIFI CONNECT: the network name and password as typed, and
                 // the password hidden in the echoed line.
-                let mut echo = self.input_buf.clone();
                 if cmd.starts_with("WIFI ") {
                     cmd = alloc::format!("WIFI {}", self.input_buf.trim()[5..].trim());
                     if cmd[5..].trim_start().to_ascii_uppercase().starts_with("CONNECT ") {
@@ -1337,9 +1390,47 @@ impl TerminalEmulator {
                     crate::task::terminal::execute_command_pub(&cmd, &mut self.history);
                 }
                 self.input_buf.clear();
+                // LOGOUT ran here: desktop::sign_out couldn't clear this
+                // terminal (its lock is held while it runs), so it clears
+                // itself; its window is already closed.
+                if !crate::security::users::SESSION.lock().logged_in {
+                    *self = TerminalEmulator::new_const();
+                }
             }
             '\x08' => { self.input_buf.pop(); }
             c if !c.is_control() => { self.input_buf.push(c); }
+            _ => {}
+        }
+    }
+
+    /// A key while a password question is up.
+    fn secret_key(&mut self, ch: char) {
+        match ch {
+            '\n' | '\r' => {
+                let answer = core::mem::take(&mut self.input_buf);
+                let Some(sp) = self.secret.as_mut() else { return };
+                self.history.push(alloc::format!("  {}: (hidden)", sp.question()));
+                sp.answers.push(answer);
+                if sp.answers.len() == sp.questions().len() {
+                    if let Some(sp) = self.secret.take() {
+                        let lines = sp.finish();
+                        self.history.extend(lines);
+                    }
+                }
+            }
+            '\x1b' => {
+                if let Some(mut sp) = self.secret.take() {
+                    sp.wipe();
+                }
+                wipe(&mut self.input_buf);
+                self.history.push(String::from("  cancelled; nothing changed"));
+            }
+            '\x08' => { self.input_buf.pop(); }
+            c if !c.is_control() => {
+                if self.input_buf.chars().count() < crate::security::users::PASSWORD_MAX {
+                    self.input_buf.push(c);
+                }
+            }
             _ => {}
         }
     }
@@ -1352,6 +1443,34 @@ pub const MAX_TERMINALS: usize = 4;
 /// Each call to `open_terminal()` claims a free slot (or reuses the least-recently-used
 /// one if all slots are taken). Instances are completely isolated — they have their own
 /// history, input buffer, cursor state and window ID.
+/// At sign-out (desktop::sign_out): end console programs still running in
+/// terminals and empty the terminals, text editors and file managers, so
+/// nothing of one user's is left for the next. A slot that is busy (the
+/// terminal running LOGOUT) is skipped; it clears itself (on_key).
+pub fn clear_session_apps() {
+    for slot in &TERMINAL_POOL {
+        if let Some(mut t) = slot.try_lock() {
+            if let Some(console) = t.console.clone().filter(|c| c.is_live()) {
+                if let Some(proc) = crate::sched::process::PROCESSOR.lock().find(console.pid()) {
+                    proc.terminate(0xC000_013Au32 as i32);
+                }
+                crate::exec::loader::request_kill(console.pid());
+            }
+            *t = TerminalEmulator::new_const();
+        }
+    }
+    for slot in &TEXT_EDITOR_POOL {
+        if let Some(mut e) = slot.try_lock() {
+            *e = TextEditorState::new_const();
+        }
+    }
+    for slot in &FILE_MANAGER_POOL {
+        if let Some(mut f) = slot.try_lock() {
+            *f = FileManagerState::new_const();
+        }
+    }
+}
+
 pub static TERMINAL_POOL: [Mutex<TerminalEmulator>; MAX_TERMINALS] = [
     Mutex::new(TerminalEmulator::new_const()),
     Mutex::new(TerminalEmulator::new_const()),
@@ -1365,6 +1484,17 @@ pub static TERMINAL_EMU: Mutex<TerminalEmulator> = Mutex::new(TerminalEmulator::
 
 /// Open a new terminal window and bind it to a free pool slot.
 /// Returns the pool index so the caller can route input/paint to that slot.
+/// A terminal with `line` typed in; `run`: press Enter (VSH
+/// request_password_change runs PASSWD, so its hidden prompts start).
+pub fn open_terminal_with(line: &str, run: bool) {
+    let (_id, idx) = open_terminal(80, 80, 550, 380, 0);
+    let mut term = TERMINAL_POOL[idx].lock();
+    term.input_buf = String::from(line);
+    if run {
+        term.on_key('\n');
+    }
+}
+
 pub fn open_terminal(x: i32, y: i32, w: u32, h: u32, z: u32) -> (u32, usize) {
     let id = crate::gui::desktop::DESKTOP_WM.lock().open("TERMINAL", x, y, w, h, z);
 
@@ -1544,7 +1674,7 @@ impl AppLauncher {
         for (i, (lbl, col)) in qs_buttons.iter().enumerate() {
             let bx = cx + (i as u32 * qs_btn_w) as i32;
             r.fill_rect(Rect::new(bx + (qs_btn_w as i32 - 20) / 2, qs_y + 4, 20, 20), *col);
-            r.draw_text(lbl, bx + (qs_btn_w as i32 - lbl.len() as i32 * 8) / 2, qs_y + 28, p.text_primary);
+            r.draw_text(lbl, bx + (qs_btn_w as i32 - r.text_width(lbl)) / 2, qs_y + 28, p.text_primary);
         }
 
         // Search box
@@ -1674,9 +1804,7 @@ impl AppLauncher {
                     notify(NotifCategory::Info, "LOCKED", "Desktop locked");
                 }
                 5 => {
-                    crate::security::users::SESSION.lock().logout();
-                    crate::gui::desktop::DESKTOP_PHASE.store(crate::gui::desktop::DesktopPhase::Login as u8, core::sync::atomic::Ordering::Release);
-                    notify(NotifCategory::Info, "LOGOUT", "Signed out successfully");
+                    crate::gui::desktop::sign_out();
                 }
                 _ => {}
             }
@@ -1761,16 +1889,28 @@ impl AppLauncher {
                         notify(NotifCategory::Info, "Terminal", "Opened");
                     }
                     "POLICY TOGGLE" => {
+                        let mode = crate::security::policy::POLICY.lock().get_mode();
+                        // Performance relaxes protections: policy.switch only
+                        // (users::authorize locks SESSION and USER_DB, so
+                        // POLICY is not held across it).
+                        if mode == crate::security::policy::PolicyMode::Security {
+                            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::EnterPerformanceMode) {
+                                notify(NotifCategory::Warning, "Mode Not Changed", e);
+                                return;
+                            }
+                        }
                         let mut pol = crate::security::policy::POLICY.lock();
                         match pol.get_mode() {
                             crate::security::policy::PolicyMode::Security => {
                                 pol.set_mode(crate::security::policy::PolicyMode::Performance);
                                 drop(pol);
+                                crate::security::access::seclog("switched to Performance Mode");
                                 notify(NotifCategory::Warning, "Mode Changed", "Switched to Performance");
                             }
                             crate::security::policy::PolicyMode::Performance => {
                                 pol.set_mode(crate::security::policy::PolicyMode::Security);
                                 drop(pol);
+                                crate::security::access::seclog("switched to Security Mode");
                                 notify(NotifCategory::Success, "Mode Changed", "Switched to Security");
                             }
                         }
@@ -2291,10 +2431,15 @@ pub fn load_config_vsh() {
                     for e in &errs {
                         crate::serial_println!("[VSCRIPT] {}", e);
                     }
-                    let errs2 = eng.trigger_event("start", None);
+                    // Its own `start` only: a user's script (loaded at sign-in,
+                    // which can come first) has had its `start` already.
+                    let errs2 = eng.trigger_source("/config.vsh", "start");
                     for e in &errs2 {
                         crate::serial_println!("[VSCRIPT] start: {}", e);
                     }
+                    drop(eng);
+                    // The shell it chose is the system's (sign-out returns to it).
+                    crate::vsh::shell::mark_system_shell();
                     crate::serial_println!("[VSCRIPT] /config.vsh loaded and 'start' event fired.");
                     crate::println!("[VSCRIPT] Desktop configured from /config.vsh");
                 }
@@ -2321,6 +2466,154 @@ fn console_colours(attr: u16) -> (Color, Color) {
 
 /// "WIFI CONNECT <ssid> <password>" with the password as asterisks (the
 /// SSID may be "quoted" and contain spaces).
+/// The account commands, whose arguments are user names: the command to
+/// run (command word upper-case, arguments as typed) and the line to echo.
+/// None for any other command, which is upper-cased whole as before.
+/// Passwords are asked for with hidden input (secret_prompt_for), not typed
+/// on the command line; if one is typed there anyway (an old habit) it is
+/// still hidden in the echo:
+///
+///   USERADD <name> <password> <role>      password hidden
+///   PASSWD <a> <b>                        both hidden
+///   KEYS RELINK <old> <current>           both hidden
+fn account_command(line: &str) -> Option<(String, String)> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let first = words.first()?.to_ascii_uppercase();
+    // How many leading words are the command, and which arguments to hide.
+    let (head, hidden): (usize, &[usize]) = match first.as_str() {
+        "USERADD" if words.len() >= 4 => (1, &[2]),
+        "PASSWD" if words.len() >= 3 => (1, &[1, 2]),
+        "USERADD" | "PASSWD" | "USERDEL" | "UNLOCK" | "USERMOD" => (1, &[]),
+        "KEYS" if words.get(1).is_some_and(|w| w.eq_ignore_ascii_case("RELINK")) => (2, &[2, 3]),
+        _ => return None,
+    };
+    let mut cmd = Vec::new();
+    let mut echo = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        let word = if i < head { w.to_ascii_uppercase() } else { String::from(*w) };
+        echo.push(if hidden.contains(&i) { "*".repeat(w.chars().count()) } else { word.clone() });
+        cmd.push(word);
+    }
+    Some((cmd.join(" "), echo.join(" ")))
+}
+
+/// Overwrite a secret's bytes before it is dropped (zero bytes are valid
+/// UTF-8, so the String stays well-formed).
+fn wipe(s: &mut String) {
+    // SAFETY: zeroes are valid UTF-8.
+    unsafe { s.as_bytes_mut().fill(0) };
+    s.clear();
+}
+
+/// What a password question is for.
+enum SecretFlow {
+    /// PASSWD: your own password.
+    OwnPassword,
+    /// PASSWD <name>: an admin sets another account's (its stored name).
+    Reset(String),
+    /// USERADD <name> [role]: the new account's password (empty: none).
+    Create(String, crate::security::users::UserRole),
+    /// KEYS RELINK: the old and current passwords.
+    Relink,
+    /// KEYS RECOVER: the recovery key and the current password.
+    Recover,
+    /// KEYS RECOVERY|ADMINSLOT ON|OFF: the user's password.
+    KeySlot(crate::task::terminal::KeySlotChange),
+}
+
+/// A command waiting for its passwords, asked one at a time with hidden
+/// input. The account_* functions in task/terminal.rs do the work.
+struct SecretPrompt {
+    flow: SecretFlow,
+    answers: Vec<String>,
+}
+
+impl SecretPrompt {
+    fn new(flow: SecretFlow) -> Self {
+        Self { flow, answers: Vec::new() }
+    }
+
+    fn questions(&self) -> Vec<String> {
+        match &self.flow {
+            SecretFlow::OwnPassword => alloc::vec![
+                String::from("Current password (Enter if none)"),
+                String::from("New password"),
+                String::from("Repeat the new password"),
+            ],
+            SecretFlow::Reset(t) => alloc::vec![alloc::format!("New password for {}", t), String::from("Repeat it")],
+            SecretFlow::Create(n, _) => alloc::vec![alloc::format!("Password for {} (Enter for none)", n), String::from("Repeat it")],
+            SecretFlow::Relink => alloc::vec![String::from("Old password"), String::from("Current password")],
+            SecretFlow::Recover => alloc::vec![String::from("Recovery key"), String::from("Current password (Enter if none)")],
+            SecretFlow::KeySlot(_) => alloc::vec![String::from("Your password (Enter if none)")],
+        }
+    }
+
+    /// The question being answered now.
+    fn question(&self) -> String {
+        self.questions().get(self.answers.len()).cloned().unwrap_or_default()
+    }
+
+    /// All answered: do it, and return the lines to show.
+    fn finish(mut self) -> Vec<String> {
+        use crate::task::terminal as t;
+        let a = &self.answers;
+        let mismatch = || alloc::vec![String::from("  the two passwords don't match; nothing changed")];
+        let out = match &self.flow {
+            SecretFlow::OwnPassword if a[1] != a[2] => mismatch(),
+            SecretFlow::OwnPassword => t::account_change_own_password(&a[0], &a[1]),
+            SecretFlow::Reset(_) | SecretFlow::Create(..) if a[0] != a[1] => mismatch(),
+            SecretFlow::Reset(target) => t::account_reset_password(target, &a[0]),
+            SecretFlow::Create(name, role) => t::account_create(name, *role, &a[0]),
+            SecretFlow::Relink => t::account_relink_keys(&a[0], &a[1]),
+            SecretFlow::Recover => t::account_recover_keys(&a[0], &a[1]),
+            SecretFlow::KeySlot(change) => t::account_key_slot(*change, &a[0]),
+        };
+        self.wipe();
+        out
+    }
+
+    fn wipe(&mut self) {
+        for s in self.answers.iter_mut() {
+            wipe(s);
+        }
+    }
+}
+
+/// Does this command line ask for passwords? None: no, run it as usual.
+/// Some(Err): refused before asking (not allowed, bad name).
+fn secret_prompt_for(line: &str) -> Option<Result<SecretPrompt, String>> {
+    use crate::task::terminal as t;
+    let w: Vec<&str> = line.split_whitespace().collect();
+    let first = w.first()?.to_ascii_uppercase();
+    match (first.as_str(), w.len()) {
+        ("PASSWD", 1) => Some(Ok(SecretPrompt::new(SecretFlow::OwnPassword))),
+        ("PASSWD", 2) => {
+            let me = crate::security::users::SESSION.lock().username.clone();
+            if w[1].eq_ignore_ascii_case(&me) {
+                Some(Ok(SecretPrompt::new(SecretFlow::OwnPassword)))
+            } else {
+                Some(t::account_prepare_reset(w[1]).map(|target| SecretPrompt::new(SecretFlow::Reset(target))))
+            }
+        }
+        ("USERADD", 2 | 3) => Some(t::account_prepare_create(w[1], w.get(2).copied())
+            .map(|(name, role)| SecretPrompt::new(SecretFlow::Create(name, role)))),
+        ("KEYS", 2) if w[1].eq_ignore_ascii_case("RELINK") => Some(Ok(SecretPrompt::new(SecretFlow::Relink))),
+        ("KEYS", 2) if w[1].eq_ignore_ascii_case("RECOVER") => Some(Ok(SecretPrompt::new(SecretFlow::Recover))),
+        ("KEYS", 3) => {
+            use crate::task::terminal::KeySlotChange as K;
+            let change = match (w[1].to_ascii_uppercase().as_str(), w[2].to_ascii_uppercase().as_str()) {
+                ("RECOVERY", "ON") => K::RecoveryOn,
+                ("RECOVERY", "OFF") => K::RecoveryOff,
+                ("ADMINSLOT", "ON") => K::AdminSlotOn,
+                ("ADMINSLOT", "OFF") => K::AdminSlotOff,
+                _ => return None,
+            };
+            Some(Ok(SecretPrompt::new(SecretFlow::KeySlot(change))))
+        }
+        _ => None,
+    }
+}
+
 fn mask_wifi_password(line: &str) -> String {
     let t = line.trim_start();
     let mut i = 0;

@@ -209,43 +209,47 @@ pub fn system_path(path: &str) -> bool {
     ["/system", "/etc"].iter().any(|d| p == *d || p.starts_with(&alloc::format!("{}/", d)))
 }
 
-/// Changing `path`: in Security Mode a system folder needs the root
-/// account's programs (kernel.module), and the change is audited.
-pub fn require_change(proc: &Process, path: &str) -> Result<(), NtStatus> {
-    if crate::security::policy::performance() || !system_path(path) {
+/// A Windows program doing `op` to `path`: who owns it decides
+/// (security::access::may_access), in Security and Performance Mode alike.
+/// Performance Mode used to open /system and /etc to every program.
+/// Denials are logged and shown like a missing capability; changes to
+/// system folders are audited.
+pub fn require_access(proc: &Process, path: &str, op: crate::security::access::Op) -> Result<(), NtStatus> {
+    use crate::security::access::{self, Op};
+    if access::may_access(access::process_actor(proc), path, op) {
+        if op != Op::Read && system_path(path) {
+            audit(proc.pid, &alloc::format!("changes {}", path));
+        }
         return Ok(());
     }
-    require(proc, Capability::KernelModule, "changing system files")?;
-    audit(proc.pid, &alloc::format!("changes {}", path));
-    Ok(())
-}
-
-/// The desktop changing `path` for the signed-in user (drag-and-drop copies
-/// and moves in desktop.rs): what that user's programs could do. A role
-/// without fs.write (or fs.modify, to delete) can't, and in Security Mode
-/// the system folders need the root account. False is shown as a
-/// notification, once per call.
-pub fn user_may_change(path: &str, deleting: bool) -> bool {
-    let (user, logged_in) = {
-        let s = crate::security::users::SESSION.lock();
-        (s.username.clone(), s.logged_in)
+    let what = match op { Op::Read => "opening", Op::Write => "changing", Op::Delete => "deleting" };
+    let first = {
+        let mut d = DENIED.lock();
+        d.insert((proc.pid, 1u64 << 63 | op as u64))
     };
-    if !logged_in {
-        return true;
-    }
-    let caps = crate::security::users::USER_DB.lock().capability_set_for(&user);
-    let cap = if deleting { Capability::FsModify } else { Capability::FsWrite };
-    let ok = caps.has(cap)
-        && (crate::security::policy::performance() || !system_path(path) || caps.has(Capability::KernelModule));
-    if !ok {
-        audit(0, &alloc::format!("desktop: {} may not change {}", user, path));
+    audit(proc.pid, &alloc::format!("denied {} {} (owner)", what, path));
+    if first {
+        crate::serial_println!("[SECURITY] pid {}: {} {} denied (not its user's)", proc.pid, what, path);
         crate::gui::desktop::notify(
             crate::gui::desktop::NotifCategory::Warning,
             "SECURITY",
-            &alloc::format!("{} can't change {}", user, path),
+            &alloc::format!("A program was denied {} {}", what, path),
         );
     }
-    ok
+    Err(status::ACCESS_DENIED)
+}
+
+/// Changing `path` (creating, writing, renaming to it): require_access.
+pub fn require_change(proc: &Process, path: &str) -> Result<(), NtStatus> {
+    require_access(proc, path, crate::security::access::Op::Write)
+}
+
+/// The desktop changing `path` for the signed-in user (drag-and-drop copies
+/// and moves in desktop.rs): security::access::user_may (their account's
+/// capability and who owns it). False is shown as a notification.
+pub fn user_may_change(path: &str, deleting: bool) -> bool {
+    use crate::security::access::{user_may, Op};
+    user_may(path, if deleting { Op::Delete } else { Op::Write })
 }
 
 // -----| W^X (Security Mode) |-----

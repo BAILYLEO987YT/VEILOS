@@ -368,11 +368,26 @@ pub fn cen_hash(data: &[u8], algorithm: HashAlgorithm) -> Vec<u8> {
 // =====================================================================
 //
 // Each user has a random master key, kept in /etc/keys/<user>/master.vmk
-// encrypted with a key derived from their sign-in password (PBKDF2-SHA256,
-// a random salt). It is unwrapped at sign-in and forgotten at sign-out, so
-// a user's saved keys can only be read while they're signed in.
+// in KEY SLOTS: independent copies of it, each wrapped by a different
+// secret (ACCOUNTS_DESIGN.md, section 4):
 //
-//   master.vmk:  "VMK1" [salt 32] [rounds u32] [nonce 12] [AES-GCM(master) 48]
+//   sign-in    the sign-in password (PBKDF2-SHA256, random salt). A password
+//              change rewrites only this slot.
+//   recovery   a one-time recovery key shown to the user (optional).
+//   system     the system key, /etc/keys/system.key (the "admin slot",
+//              optional; the only slot of an account with no password).
+//              An admin password reset re-wraps from it instead of removing
+//              the keys.
+//
+// It is unwrapped at sign-in and forgotten at sign-out, so a user's saved
+// keys can only be read while they're signed in. It is never replaced
+// silently: a slot that doesn't open leaves the file as it was.
+//
+//   master.vmk v2: "VMK2" [count u8], then per slot:
+//       [kind u8] [id_len u8] [id] [salt 32] [rounds u32] [len u32]
+//       [nonce 12] [AES-GCM(master) 48]
+//   master.vmk v1: "VMK1" [salt 32] [rounds u32] [nonce 12] [AES-GCM(master)]
+//       (read as one sign-in slot; rewritten as v2 at the next change)
 //   <feature>.vkl: "VKLY" [version 2], then records:
 //       [payload_len u32] [nonce 12] [AES-GCM(master, payload)]
 //   payload: [id u64] [algorithm u8] [level u8] [feature_len u8] [feature]
@@ -380,7 +395,8 @@ pub fn cen_hash(data: &[u8], algorithm: HashAlgorithm) -> Vec<u8> {
 //
 // Nonces are random: handles start again at every boot, so they can't be.
 
-const MASTER_MAGIC: &[u8; 4] = b"VMK1";
+const MASTER_MAGIC_V1: &[u8; 4] = b"VMK1";
+const MASTER_MAGIC: &[u8; 4] = b"VMK2";
 const MASTER_FILE: &str = "master.vmk";
 
 fn user_dir(user: &str) -> String {
@@ -442,69 +458,214 @@ fn wrap_key(password: &str, salt: &[u8], rounds: u32) -> [u8; 32] {
     k
 }
 
-/// Write `master` to the user's master.vmk, wrapped by `password`.
-fn write_master(user: &str, master: &[u8; 32], password: &str) -> Result<(), CenError> {
-    let vfs = &crate::fs::vfs::VFS;
-    let _ = vfs.create_dir(LEDGER_DIR.trim_end_matches('/'));
-    let _ = vfs.create_dir(user_dir(user).trim_end_matches('/'));
-    let salt: [u8; KDF_SALT_LEN] = random();
-    let rounds = PBKDF2_ROUNDS_STANDARD;
-    let mut wk = wrap_key(password, &salt, rounds);
-    let sealed = seal(&wk, master).ok_or(CenError::EncryptionFailed);
-    wk.iter_mut().for_each(|b| *b = 0);
-    let mut file = MASTER_MAGIC.to_vec();
-    file.extend_from_slice(&salt);
-    file.extend_from_slice(&rounds.to_le_bytes());
-    file.extend(sealed?);
-    vfs.write_file(&format!("{}{}", user_dir(user), MASTER_FILE), &file)
-        .map_err(|_| CenError::LedgerIo("master key write failed"))
+/// The system key (the admin slot's secret): 32 random bytes, made the
+/// first time an account needs it.
+const SYSTEM_KEY_PATH: &str = "/etc/keys/system.key";
+/// The sign-in slot's id: the password of the first sign-in step.
+const PASSWORD_SLOT: &str = "password";
+
+/// What opens a key slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotKind {
+    /// A sign-in secret.
+    SignIn,
+    /// The user's recovery key.
+    Recovery,
+    /// The system key (admin slot).
+    System,
 }
 
-/// The user's master key from master.vmk, if `password` opens it.
-fn read_master(user: &str, password: &str) -> Option<Result<[u8; 32], CenError>> {
-    let file = crate::fs::vfs::VFS.read_file(&format!("{}{}", user_dir(user), MASTER_FILE)).ok()?;
-    if file.len() < 4 + KDF_SALT_LEN + 4 || &file[..4] != MASTER_MAGIC {
-        return Some(Err(CenError::InvalidLedger));
+impl SlotKind {
+    fn byte(self) -> u8 {
+        match self { SlotKind::SignIn => 1, SlotKind::Recovery => 2, SlotKind::System => 3 }
     }
-    let salt = &file[4..4 + KDF_SALT_LEN];
-    let at = 4 + KDF_SALT_LEN;
-    let rounds = u32::from_le_bytes([file[at], file[at + 1], file[at + 2], file[at + 3]]);
-    let mut wk = wrap_key(password, salt, rounds);
-    let plain = open(&wk, &file[at + 4..]);
+    fn from_byte(b: u8) -> Option<Self> {
+        match b { 1 => Some(SlotKind::SignIn), 2 => Some(SlotKind::Recovery), 3 => Some(SlotKind::System), _ => None }
+    }
+}
+
+/// One wrapped copy of the master key.
+#[derive(Clone)]
+struct Slot {
+    kind: SlotKind,
+    id: String,
+    salt: [u8; KDF_SALT_LEN],
+    rounds: u32,
+    sealed: Vec<u8>,
+}
+
+/// What unlocks a user's saved keys at sign-in.
+#[derive(Clone, Copy, Debug)]
+pub enum Unlock<'a> {
+    /// The sign-in secret (the password).
+    Secret(&'a str),
+    /// The system key: an account with no password.
+    System,
+}
+
+fn master_path(user: &str) -> String {
+    format!("{}{}", user_dir(user), MASTER_FILE)
+}
+
+/// The system key, made (and saved) if `create` and there is none.
+fn system_key(create: bool) -> Option<[u8; 32]> {
+    let vfs = &crate::fs::vfs::VFS;
+    if let Ok(k) = vfs.read_file(SYSTEM_KEY_PATH) {
+        if k.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&k);
+            return Some(key);
+        }
+        crate::serial_println!("[CEN] {} is damaged; not replaced", SYSTEM_KEY_PATH);
+        return None;
+    }
+    if !create {
+        return None;
+    }
+    let key: [u8; 32] = random();
+    let _ = vfs.create_dir(LEDGER_DIR.trim_end_matches('/'));
+    vfs.write_file(SYSTEM_KEY_PATH, &key).ok()?;
+    crate::serial_println!("[CEN] system key made");
+    Some(key)
+}
+
+/// A new slot holding `master`, wrapped by `secret`.
+fn make_slot(kind: SlotKind, id: &str, master: &[u8; 32], secret: &[u8]) -> Result<Slot, CenError> {
+    let salt: [u8; KDF_SALT_LEN] = random();
+    // The system key is already 32 random bytes: one round is enough.
+    let rounds = if kind == SlotKind::System { 1 } else { PBKDF2_ROUNDS_STANDARD };
+    let mut wk = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(secret, &salt, rounds, &mut wk);
+    let sealed = seal(&wk, master).ok_or(CenError::EncryptionFailed);
     wk.iter_mut().for_each(|b| *b = 0);
-    Some(match plain {
+    Ok(Slot { kind, id: String::from(id), salt, rounds, sealed: sealed? })
+}
+
+/// The master key, if `secret` opens `slot`.
+fn open_slot(slot: &Slot, secret: &[u8]) -> Option<[u8; 32]> {
+    let mut wk = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(secret, &slot.salt, slot.rounds, &mut wk);
+    let plain = open(&wk, &slot.sealed);
+    wk.iter_mut().for_each(|b| *b = 0);
+    match plain {
         Some(p) if p.len() == 32 => {
             let mut m = [0u8; 32];
             m.copy_from_slice(&p);
-            Ok(m)
+            Some(m)
         }
-        _ => Err(CenError::DecryptionFailed),
-    })
+        _ => None,
+    }
 }
 
-/// At sign-in: unwrap (or, the first time, create) the user's master key
-/// and load every key they saved. Returns how many keys were loaded.
-pub fn cen_unlock_user(user: &str, password: &str) -> Result<usize, CenError> {
-    let master = match read_master(user, password) {
-        Some(Ok(m)) => m,
-        Some(Err(e)) => {
-            // Not this password's: the password was reset by an admin, which
-            // can't carry the old key over. Start again; the old ledgers
-            // stay on disk, unreadable, until cen_forget_user removes them.
-            crate::serial_println!("[CEN] {}: saved master key unreadable ({}); a new one is made", user, e);
-            let m: [u8; 32] = random();
-            write_master(user, &m, password)?;
-            m
-        }
-        None => {
-            let m: [u8; 32] = random();
-            write_master(user, &m, password)?;
-            crate::serial_println!("[CEN] {}: new master key", user);
-            m
-        }
-    };
-    *MASTER.lock() = Some((master, String::from(user)));
+/// Try every slot of `kind` with `secret`.
+fn open_kind(slots: &[Slot], kind: SlotKind, secret: &[u8]) -> Option<[u8; 32]> {
+    slots.iter().filter(|s| s.kind == kind).find_map(|s| open_slot(s, secret))
+}
 
+/// The master key through the system slot, if there is one and the system
+/// key opens it.
+fn open_system(slots: &[Slot]) -> Option<[u8; 32]> {
+    if !slots.iter().any(|s| s.kind == SlotKind::System) {
+        return None;
+    }
+    let key = system_key(false)?;
+    open_kind(slots, SlotKind::System, &key)
+}
+
+/// The user's slots: None if they have no master key file; Err if it is
+/// damaged (it is then left alone). The bool: the file is v1.
+fn read_slots(user: &str) -> Option<Result<(Vec<Slot>, bool), CenError>> {
+    let file = crate::fs::vfs::VFS.read_file(&master_path(user)).ok()?;
+    let u32_at = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes([*file.get(at)?, *file.get(at + 1)?, *file.get(at + 2)?, *file.get(at + 3)?]))
+    };
+    if file.len() >= 4 && &file[..4] == MASTER_MAGIC_V1 {
+        if file.len() < 4 + KDF_SALT_LEN + 4 {
+            return Some(Err(CenError::InvalidLedger));
+        }
+        let mut salt = [0u8; KDF_SALT_LEN];
+        salt.copy_from_slice(&file[4..4 + KDF_SALT_LEN]);
+        let at = 4 + KDF_SALT_LEN;
+        let rounds = u32_at(at).unwrap_or(0);
+        let slot = Slot { kind: SlotKind::SignIn, id: String::from(PASSWORD_SLOT), salt, rounds, sealed: file[at + 4..].to_vec() };
+        return Some(Ok((vec![slot], true)));
+    }
+    if file.len() < 5 || &file[..4] != MASTER_MAGIC {
+        return Some(Err(CenError::InvalidLedger));
+    }
+    let mut slots = Vec::new();
+    let mut at = 5;
+    for _ in 0..file[4] {
+        let parse = || -> Option<(Slot, usize)> {
+            let kind = SlotKind::from_byte(*file.get(at)?)?;
+            let id_len = *file.get(at + 1)? as usize;
+            let id = core::str::from_utf8(file.get(at + 2..at + 2 + id_len)?).ok()?;
+            let mut p = at + 2 + id_len;
+            let mut salt = [0u8; KDF_SALT_LEN];
+            salt.copy_from_slice(file.get(p..p + KDF_SALT_LEN)?);
+            p += KDF_SALT_LEN;
+            let rounds = u32_at(p)?;
+            let len = u32_at(p + 4)? as usize;
+            p += 8;
+            let sealed = file.get(p..p + len)?.to_vec();
+            Some((Slot { kind, id: String::from(id), salt, rounds, sealed }, p + len))
+        };
+        match parse() {
+            Some((slot, next)) => {
+                slots.push(slot);
+                at = next;
+            }
+            None => return Some(Err(CenError::InvalidLedger)),
+        }
+    }
+    Some(Ok((slots, false)))
+}
+
+/// Write the user's slots (v2), replacing the file.
+fn write_slots(user: &str, slots: &[Slot]) -> Result<(), CenError> {
+    let vfs = &crate::fs::vfs::VFS;
+    let _ = vfs.create_dir(LEDGER_DIR.trim_end_matches('/'));
+    let _ = vfs.create_dir(user_dir(user).trim_end_matches('/'));
+    let mut file = MASTER_MAGIC.to_vec();
+    file.push(slots.len() as u8);
+    for s in slots {
+        file.push(s.kind.byte());
+        file.push(s.id.len() as u8);
+        file.extend_from_slice(s.id.as_bytes());
+        file.extend_from_slice(&s.salt);
+        file.extend_from_slice(&s.rounds.to_le_bytes());
+        file.extend_from_slice(&(s.sealed.len() as u32).to_le_bytes());
+        file.extend_from_slice(&s.sealed);
+    }
+    vfs.write_file(&master_path(user), &file)
+        .map_err(|_| CenError::LedgerIo("master key write failed"))
+}
+
+/// `slots` with the sign-in password slot replaced by one for `password`.
+fn with_password_slot(mut slots: Vec<Slot>, master: &[u8; 32], password: &str) -> Result<Vec<Slot>, CenError> {
+    slots.retain(|s| !(s.kind == SlotKind::SignIn && s.id == PASSWORD_SLOT));
+    slots.push(make_slot(SlotKind::SignIn, PASSWORD_SLOT, master, password.as_bytes())?);
+    Ok(slots)
+}
+
+/// `slots` with the system slot added (`on`) or removed.
+fn with_system_slot(mut slots: Vec<Slot>, master: &[u8; 32], on: bool) -> Result<Vec<Slot>, CenError> {
+    slots.retain(|s| s.kind != SlotKind::System);
+    if on {
+        let key = system_key(true).ok_or(CenError::LedgerIo("the system key can't be read or made"))?;
+        slots.push(make_slot(SlotKind::System, "system", master, &key)?);
+    }
+    Ok(slots)
+}
+
+/// The signed-in `user`'s master key, from memory.
+fn master_of_signed_in(user: &str) -> Result<[u8; 32], CenError> {
+    MASTER.lock().as_ref().filter(|(_, u)| u == user).map(|(m, _)| *m)
+        .ok_or(CenError::LedgerIo("the saved keys aren't open (sign in again)"))
+}
+
+/// Load every key `user` saved (with MASTER set). Returns how many.
+fn load_all_ledgers(user: &str) -> usize {
     let mut loaded = 0;
     if let Ok(entries) = crate::fs::vfs::VFS.list_dir(user_dir(user).trim_end_matches('/')) {
         for e in entries {
@@ -516,8 +677,95 @@ pub fn cen_unlock_user(user: &str, password: &str) -> Result<usize, CenError> {
             }
         }
     }
+    loaded
+}
+
+/// At sign-in: open (or, the first time, create) the user's master key and
+/// load every key they saved. Returns how many keys were loaded.
+///
+/// If nothing opens it, the file is KEPT and Err(DecryptionFailed) says so:
+/// it used to be replaced, silently losing every saved key. The user can
+/// re-wrap it (cen_relink with the old password, cen_recover with the
+/// recovery key). Until then nothing is loaded and keys can't be saved.
+pub fn cen_unlock_user(user: &str, with: Unlock) -> Result<usize, CenError> {
+    let master = match read_slots(user) {
+        None => {
+            // First sign-in: a new master key in one slot.
+            let m: [u8; 32] = random();
+            let slots = match with {
+                Unlock::Secret(s) => vec![make_slot(SlotKind::SignIn, PASSWORD_SLOT, &m, s.as_bytes())?],
+                Unlock::System => with_system_slot(Vec::new(), &m, true)?,
+            };
+            write_slots(user, &slots)?;
+            crate::serial_println!("[CEN] {}: new master key", user);
+            m
+        }
+        Some(Err(e)) => {
+            crate::serial_println!("[CEN] {}: master key file not read ({}); kept, nothing loaded", user, e);
+            return Err(e);
+        }
+        Some(Ok((slots, v1))) => {
+            let opened = match with {
+                Unlock::Secret(s) => open_kind(&slots, SlotKind::SignIn, s.as_bytes()),
+                // No password: the system slot, or (made before slots) a
+                // sign-in slot wrapped by the empty password, which then
+                // becomes a system slot.
+                Unlock::System => open_system(&slots).or_else(|| {
+                    let m = open_kind(&slots, SlotKind::SignIn, b"")?;
+                    let moved = with_system_slot(slots.iter().filter(|s| s.kind != SlotKind::SignIn).cloned().collect(), &m, true).ok()?;
+                    write_slots(user, &moved).ok()?;
+                    Some(m)
+                }),
+            };
+            let Some(m) = opened else {
+                crate::serial_println!("[CEN] {}: no key slot opened; the file is kept, nothing loaded", user);
+                return Err(CenError::DecryptionFailed);
+            };
+            if v1 {
+                write_slots(user, &slots)?;
+                crate::serial_println!("[CEN] {}: master key file moved to key slots (v2)", user);
+            }
+            m
+        }
+    };
+    *MASTER.lock() = Some((master, String::from(user)));
+    let loaded = load_all_ledgers(user);
     crate::serial_println!("[CEN] {}: unlocked, {} saved key(s) loaded", user, loaded);
     Ok(loaded)
+}
+
+/// The saved keys are wrapped with an older password (cen_unlock_user
+/// refused them at sign-in): open them with `old_password`, put the current
+/// password in the sign-in slot, then unlock. The caller checks that
+/// `current_password` is the user's password.
+pub fn cen_relink(user: &str, old_password: &str, current_password: &str) -> Result<usize, CenError> {
+    if MASTER.lock().is_some() {
+        return Err(CenError::LedgerIo("the saved keys are already open"));
+    }
+    let (slots, _) = read_slots(user).ok_or(CenError::LedgerIo("there are no saved keys"))??;
+    let master = open_kind(&slots, SlotKind::SignIn, old_password.as_bytes()).ok_or(CenError::DecryptionFailed)?;
+    write_slots(user, &with_password_slot(slots, &master, current_password)?)?;
+    crate::serial_println!("[CEN] {}: sign-in slot re-wrapped with the current password", user);
+    cen_unlock_user(user, Unlock::Secret(current_password))
+}
+
+/// The recovery key opens the saved keys after a forgotten password (or an
+/// admin reset without an admin slot): open them with `code`, put the
+/// current sign-in in its slot, then unlock. The caller checks `current`.
+pub fn cen_recover(user: &str, code: &str, current: Unlock) -> Result<usize, CenError> {
+    if MASTER.lock().is_some() {
+        return Err(CenError::LedgerIo("the saved keys are already open"));
+    }
+    let (slots, _) = read_slots(user).ok_or(CenError::LedgerIo("there are no saved keys"))??;
+    let norm = normalize_recovery_key(code);
+    let master = open_kind(&slots, SlotKind::Recovery, norm.as_bytes()).ok_or(CenError::DecryptionFailed)?;
+    let slots = match current {
+        Unlock::Secret(p) => with_password_slot(slots, &master, p)?,
+        Unlock::System => with_system_slot(slots, &master, true)?,
+    };
+    write_slots(user, &slots)?;
+    crate::serial_println!("[CEN] {}: opened with the recovery key and re-wrapped", user);
+    cen_unlock_user(user, current)
 }
 
 /// At sign-out: forget the master key and every saved key in memory.
@@ -531,23 +779,134 @@ pub fn cen_lock_user() {
     }
 }
 
-/// After a password change: wrap the user's master key with the new
-/// password. The old one opens it if the user isn't signed in.
-pub fn cen_change_password(user: &str, old_password: &str, new_password: &str) -> Result<(), CenError> {
-    let current = MASTER.lock().as_ref().filter(|(_, u)| u == user).map(|(m, _)| *m);
-    let master = match current {
-        Some(m) => m,
-        None => match read_master(user, old_password) {
-            Some(Ok(m)) => m,
-            Some(Err(e)) => return Err(e),
-            None => return Ok(()), // nothing saved yet
-        },
+/// After a password change: put the new password in the sign-in slot
+/// (other slots stay). The old one opens the key if the user isn't signed
+/// in. `keep_system`: whether the account keeps its system (admin) slot;
+/// an account that had no password had one only because of that.
+pub fn cen_change_password(user: &str, old_password: &str, new_password: &str, keep_system: bool) -> Result<(), CenError> {
+    let Some(read) = read_slots(user) else { return Ok(()) }; // nothing saved yet
+    let (slots, _) = read?;
+    let master = match master_of_signed_in(user) {
+        Ok(m) => m,
+        Err(_) => open_kind(&slots, SlotKind::SignIn, old_password.as_bytes())
+            .or_else(|| if old_password.is_empty() { open_system(&slots) } else { None })
+            .ok_or(CenError::DecryptionFailed)?,
     };
-    write_master(user, &master, new_password)
+    let mut slots = with_password_slot(slots, &master, new_password)?;
+    if !keep_system {
+        slots = with_system_slot(slots, &master, false)?;
+    }
+    write_slots(user, &slots)
 }
 
-/// An admin reset the user's password: their saved keys can't be opened
-/// any more, so remove them.
+/// What an admin password reset did to the user's saved keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetOutcome {
+    /// Nothing was saved.
+    NothingSaved,
+    /// Re-wrapped for the new password through the admin slot.
+    Rewrapped,
+    /// Kept: the user opens them with their recovery key (KEYS RECOVER).
+    KeptForRecovery,
+    /// No admin slot or recovery key: they couldn't be opened again, so
+    /// they were removed.
+    Removed,
+}
+
+/// An admin set the user's password without the old one.
+pub fn cen_reset_password(user: &str, new_password: &str) -> Result<ResetOutcome, CenError> {
+    let Some(read) = read_slots(user) else { return Ok(ResetOutcome::NothingSaved) };
+    let (slots, _) = read?;
+    if let Some(master) = open_system(&slots) {
+        write_slots(user, &with_password_slot(slots, &master, new_password)?)?;
+        crate::serial_println!("[CEN] {}: password reset; keys re-wrapped through the admin slot", user);
+        return Ok(ResetOutcome::Rewrapped);
+    }
+    if slots.iter().any(|s| s.kind == SlotKind::Recovery) {
+        crate::serial_println!("[CEN] {}: password reset; keys kept for the recovery key", user);
+        return Ok(ResetOutcome::KeptForRecovery);
+    }
+    cen_forget_user(user);
+    Ok(ResetOutcome::Removed)
+}
+
+/// The signed-in user turns their admin slot on or off.
+pub fn cen_set_system_slot(user: &str, on: bool) -> Result<(), CenError> {
+    let master = master_of_signed_in(user)?;
+    let slots = match read_slots(user) {
+        Some(r) => r?.0,
+        None => Vec::new(),
+    };
+    if !on && !slots.iter().any(|s| s.kind != SlotKind::System) {
+        return Err(CenError::LedgerIo("the admin slot is the only way in (no password); set a password first"));
+    }
+    write_slots(user, &with_system_slot(slots, &master, on)?)
+}
+
+/// Crockford base32: no I, L, O or U to misread.
+const RECOVERY_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A recovery key as typed: upper case, without dashes or spaces, with the
+/// look-alike letters read as digits.
+fn normalize_recovery_key(code: &str) -> String {
+    code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| match c.to_ascii_uppercase() {
+        'O' => '0',
+        'I' | 'L' => '1',
+        c => c,
+    }).collect()
+}
+
+/// The signed-in user gets a new recovery key (any old one stops working).
+/// Returns it, to be shown once: 40 characters (200 bits) in groups of 5.
+pub fn cen_new_recovery_key(user: &str) -> Result<String, CenError> {
+    let master = master_of_signed_in(user)?;
+    let bytes: [u8; 40] = random();
+    let code: String = bytes.iter().map(|b| RECOVERY_ALPHABET[(*b & 31) as usize] as char).collect();
+    let mut slots = match read_slots(user) {
+        Some(r) => r?.0,
+        None => Vec::new(),
+    };
+    slots.retain(|s| s.kind != SlotKind::Recovery);
+    slots.push(make_slot(SlotKind::Recovery, "recovery", &master, code.as_bytes())?);
+    write_slots(user, &slots)?;
+    let groups: Vec<&str> = (0..code.len()).step_by(5).map(|i| &code[i..i + 5]).collect();
+    Ok(groups.join("-"))
+}
+
+/// The signed-in user removes their recovery key.
+pub fn cen_remove_recovery_key(user: &str) -> Result<(), CenError> {
+    let _ = master_of_signed_in(user)?;
+    let Some(read) = read_slots(user) else { return Ok(()) };
+    let (mut slots, _) = read?;
+    slots.retain(|s| s.kind != SlotKind::Recovery);
+    write_slots(user, &slots)
+}
+
+/// Which slots a user's saved keys have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlotInfo {
+    /// A master key file exists.
+    pub exists: bool,
+    pub sign_in: usize,
+    pub recovery: bool,
+    pub system: bool,
+}
+
+pub fn cen_slot_info(user: &str) -> SlotInfo {
+    match read_slots(user) {
+        Some(Ok((slots, _))) => SlotInfo {
+            exists: true,
+            sign_in: slots.iter().filter(|s| s.kind == SlotKind::SignIn).count(),
+            recovery: slots.iter().any(|s| s.kind == SlotKind::Recovery),
+            system: slots.iter().any(|s| s.kind == SlotKind::System),
+        },
+        Some(Err(_)) => SlotInfo { exists: true, ..SlotInfo::default() },
+        None => SlotInfo::default(),
+    }
+}
+
+/// Remove the user's saved keys and master key (a reset with no admin slot
+/// or recovery key, which can't carry them over).
 pub fn cen_forget_user(user: &str) {
     let dir = user_dir(user);
     if let Ok(entries) = crate::fs::vfs::VFS.list_dir(dir.trim_end_matches('/')) {

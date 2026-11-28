@@ -4,5 +4,6 @@ pub mod clipboard;
 pub mod compositor;
 pub mod desktop;
 pub mod gui_toolkit;
+pub mod text;
 pub mod ui;
 pub mod ui_runtime;

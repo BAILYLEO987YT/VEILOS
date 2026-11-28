@@ -161,6 +161,11 @@ pub enum Capability {
     /// an inconsistent state after a partial remote execution.
     MeshOffload     = 1 << 37,
 
+    // ----- Accounts -----
+    /// Manage other accounts: create, delete, reset, unlock, change roles
+    /// (security::users::authorize). The Admin role has it.
+    UserManage      = 1 << 38,
+
 }
 
 impl Capability {
@@ -206,6 +211,7 @@ impl Capability {
             Self::PolicySwitch    => "policy.switch",
             Self::SystemPower     => "system.power",
             Self::MeshOffload     => "mesh.offload",
+            Self::UserManage      => "user.manage",
         }
     }
 }
@@ -319,7 +325,7 @@ impl CapabilitySet {
             Capability::KernelModule, Capability::KernelMmio, Capability::KernelPortIo,
             Capability::KernelPageTable, Capability::KernelOverride,
             Capability::PolicySwitch, Capability::SystemPower,
-            Capability::MeshOffload,
+            Capability::MeshOffload, Capability::UserManage,
         ];
         caps.iter().filter(|&&c| self.has(c)).map(|c| c.name()).collect()
     }

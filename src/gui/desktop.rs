@@ -156,7 +156,9 @@ impl DesktopWindow {
         // Title bar
         let tb = Rect::new(self.rect.x, self.rect.y, self.rect.w, title_h);
         r.fill_rect(tb, p.titlebar);
-        r.draw_text(&self.title, self.rect.x + 10, self.rect.y + (title_h as i32 - 8) / 2, p.titlebar_text);
+        // Up to the control buttons (three of them, ~90 px).
+        let title = r.fit_text(&self.title, self.rect.w as i32 - 110);
+        r.draw_text(&title, self.rect.x + 10, self.rect.y + (title_h as i32 - 8) / 2, p.titlebar_text);
 
         // Window control buttons
         let btn_y   = self.rect.y + (title_h as i32 - 20) / 2;
@@ -1125,14 +1127,11 @@ impl DesktopBackground {
                 r.stroke_rect(Rect::new(x + (spacing_x - icon_size) / 2, y, icon_size as u32, icon_size as u32), p.border);
             }
             
-            // Text truncation so it doesn't overlap
-            let mut label = entry.name.clone();
-            if label.len() > 10 {
-                label.truncate(8);
-                label.push_str("..");
-            }
-            // Draw text
-            r.draw_text(&label, x, y + icon_size as i32 + 4, p.text_primary);
+            // The name fitted to the icon's column (measured, with an
+            // ellipsis) and centred under the icon.
+            let label = r.fit_text(&entry.name, spacing_x - 4);
+            let lw = r.text_width(&label);
+            r.draw_text(&label, x + (spacing_x - lw) / 2, y + icon_size as i32 + 4, p.text_primary);
 
             y += spacing_y;
             if y + spacing_y > bottom {
@@ -1383,8 +1382,9 @@ impl NotificationSystem {
             // Left accent stripe
             r.fill_rect(Rect::new(x, y, 4, TOAST_H), accent);
             // Text
-            r.draw_text(&toast.title, x + 12, y + 10, tp);
-            r.draw_text(&toast.body,  x + 12, y + 28, ts);
+            let room = TOAST_W as i32 - 20;
+            r.draw_text(&r.fit_text(&toast.title, room), x + 12, y + 10, tp);
+            r.draw_text(&r.fit_text(&toast.body, room),  x + 12, y + 28, ts);
 
             y -= TOAST_H as i32 + 6;
         }
@@ -1792,7 +1792,7 @@ impl PendingRoleDialog {
     pub fn paint(&self) {
         if !self.visible { return; }
         
-        use crate::gui::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
+        use crate::gui::ui::{draw_rect_atomic, commit_dirty_rect};
         let sw = crate::gui::ui::screen_w();
         let sh = crate::gui::ui::screen_h();
         
@@ -1829,13 +1829,13 @@ impl PendingRoleDialog {
             crate::net::distributed::NodeType::Tenant => "Tenant",
             crate::net::distributed::NodeType::Unknown => "Unknown",
         };
-        draw_string_atomic("ROLE REQUEST", cx + 12, cy + 12, p.accent);
+        ui_text("ROLE REQUEST", cx + 12, cy + 12, p.accent);
         if self.proposed_type == crate::net::distributed::NodeType::Controller {
-            draw_string_atomic("Wants to become Controller", cx + 16, cy + 32, p.text_primary);
-            draw_string_atomic("(you would become Tenant)", cx + 16, cy + 48, p.text_secondary);
+            ui_text("Wants to become Controller", cx + 16, cy + 32, p.text_primary);
+            ui_text("(you would become Tenant)", cx + 16, cy + 48, p.text_secondary);
         } else {
-            draw_string_atomic(&alloc::format!("Wants you to become: {}", type_str), cx + 16, cy + 32, p.text_primary);
-            draw_string_atomic(&alloc::format!("From: {}", self.requestor_id.to_hex()), cx + 16, cy + 48, p.text_secondary);
+            ui_text(&alloc::format!("Wants you to become: {}", type_str), cx + 16, cy + 32, p.text_primary);
+            ui_text(&alloc::format!("From: {}", self.requestor_id.to_hex()), cx + 16, cy + 48, p.text_secondary);
         }
 
         // Buttons
@@ -1852,8 +1852,8 @@ impl PendingRoleDialog {
         draw_rect_atomic(cx + dlg_w - btn_w * 2 - 40, deny_y, btn_w, 1, p.text_primary);
         draw_rect_atomic(cx + dlg_w - btn_w * 2 - 40, deny_y + btn_h - 1, btn_w, 1, p.text_primary);
         
-        draw_string_atomic("ACCEPT", cx + dlg_w - btn_w - 10, cy + dlg_h - 30, p.text_primary);
-        draw_string_atomic("DENY", cx + dlg_w - btn_w * 2 - 24, cy + dlg_h - 30, p.text_primary);
+        ui_text("ACCEPT", cx + dlg_w - btn_w - 10, cy + dlg_h - 30, p.text_primary);
+        ui_text("DENY", cx + dlg_w - btn_w * 2 - 24, cy + dlg_h - 30, p.text_primary);
         
         commit_dirty_rect(0, 0, sw, sh);
     }
@@ -1886,6 +1886,25 @@ pub static PENDING_ROLE_DIALOG: Mutex<PendingRoleDialog> = Mutex::new(PendingRol
 
 // =====================================================================
 // -----| Login Screen (Phase 18) |-----
+// =====================================================================
+
+/// Text on the login, lock and dialog screens: the UI font (gui::text), the
+/// bitmap font until fonts are loaded.
+fn ui_text(s: &str, x: usize, y: usize, color: Color) {
+    crate::gui::text::draw(crate::gui::text::Face::Ui, s, x as i32, y as i32, color);
+}
+
+/// `ui_text` centred on `centre_x`.
+fn ui_text_centred(s: &str, centre_x: usize, y: usize, color: Color) {
+    let w = crate::gui::text::measure(crate::gui::text::Face::Ui, s).max(0) as usize;
+    ui_text(s, centre_x.saturating_sub(w / 2), y, color);
+}
+
+fn ui_text_width(s: &str) -> usize {
+    crate::gui::text::measure(crate::gui::text::Face::Ui, s).max(0) as usize
+}
+
+// =====================================================================
 // =====================================================================
 
 /// Which field has keyboard focus in the login form.
@@ -1931,10 +1950,10 @@ impl LoginScreen {
 
     /// Handle a character from the keyboard.
     pub fn on_key(&mut self, ch: char) {
-        let now_ms = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
-        if self.locked_until_ms > now_ms {
-            return; // Still in lockout period.
-        }
+        // Keys are never swallowed: during a sign-in delay the fields stay
+        // editable and only signing in waits (User::authenticate). Ignoring
+        // every key here, Backspace and Tab included, made the screen look
+        // frozen.
         match ch {
             '\n' | '\r' => {
                 if self.focus == LoginFocus::Username {
@@ -1963,7 +1982,7 @@ impl LoginScreen {
                         }
                     }
                     LoginFocus::Password => {
-                        if self.password_buf.len() < 128 {
+                        if self.password_buf.chars().count() < crate::security::users::PASSWORD_MAX {
                             self.password_buf.push(c);
                         }
                     }
@@ -1974,58 +1993,81 @@ impl LoginScreen {
     }
 
     /// Attempt to log in with the current username/password buffers.
+    /// (One field, so one sign-in step; accounts with several steps sign in
+    /// once the new login screen asks for each, stage A6.)
     fn attempt_login(&mut self) {
-        let now_ms = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
-        if self.locked_until_ms > now_ms {
-            self.error_msg = alloc::format!(
-                "Too many attempts. Wait {} s.",
-                (self.locked_until_ms - now_ms) / 1_000
-            );
-            return;
-        }
+        use crate::security::users::{self, AuthError};
 
-        // Guest session shortcut.
-        if self.username_buf.eq_ignore_ascii_case("guest") {
-            crate::security::users::SESSION.lock().login("guest");
-            DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
-            self.clear_buffers();
-            notify(NotifCategory::Info, "Welcome", "Logged in as guest");
-            return;
-        }
-
+        // Guest is an ordinary account now (no password, can be turned off).
         let result = {
-            let mut db = crate::security::users::USER_DB.lock();
-            let user = db.find_mut(&self.username_buf);
-            match user {
-                None => Err("Unknown username"),
-                Some(u) => u.authenticate(&self.password_buf),
+            let mut db = users::USER_DB.lock();
+            let r = match db.find_mut(&self.username_buf) {
+                None => {
+                    // As long as checking a password, so the time taken
+                    // doesn't say whether the account exists.
+                    users::spend_verify_time(&self.password_buf);
+                    Err(AuthError::Incorrect)
+                }
+                // The account's own spelling: names match ignoring case, but
+                // the session, home folder and saved keys use the stored one.
+                Some(u) => u.authenticate(&[self.password_buf.as_str()])
+                    .map(|_| (u.username.clone(), u.has_secret(), u.must_change, u.role)),
+            };
+            if r.is_ok() || db.find(&self.username_buf).is_some() {
+                db.save(); // failed sign-ins in a row survive a restart
             }
+            let needs_setup = match &r {
+                Ok((name, ..)) => db.find(name).is_some_and(|u| u.must_change || !db.meets_role_rule(u)),
+                Err(_) => false,
+            };
+            r.map(|(name, has_secret, _, role)| (name, has_secret, needs_setup, role))
         };
 
         match result {
-            Ok(()) => {
-                let username = self.username_buf.clone();
+            Ok((username, has_secret, needs_setup, role)) => {
                 crate::security::users::SESSION.lock().login(&username);
-                // The user's saved keys (encryption.rs): unlocked by this password.
-                if let Err(e) = crate::security::encryption::cen_unlock_user(&username, &self.password_buf) {
+                session_started(&username, "signed in");
+                // The user's saved keys (encryption.rs, key slots): opened by
+                // this password, or, for an account with no password, by
+                // the system key (whatever was typed).
+                use crate::security::encryption::{self as cen, Unlock};
+                let with = if has_secret { Unlock::Secret(self.password_buf.as_str()) } else { Unlock::System };
+                let keys = if role == users::UserRole::Guest {
+                    Ok(0) // the guest keeps nothing
+                } else {
+                    cen::cen_unlock_user(&username, with)
+                };
+                if let Err(e) = keys {
                     crate::serial_println!("[CEN] {}: keys not unlocked: {}", username, e);
+                    // The saved keys were kept, not replaced (encryption.rs,
+                    // cen_unlock_user): say how to get them back.
+                    let msg = match e {
+                        cen::CenError::DecryptionFailed if cen::cen_slot_info(&username).recovery =>
+                            "Kept, not opened: terminal KEYS RECOVER",
+                        cen::CenError::DecryptionFailed =>
+                            "Kept, not opened: terminal KEYS RELINK",
+                        _ => "Not opened (serial log); kept",
+                    };
+                    notify(NotifCategory::Warning, "SAVED KEYS", msg);
                 }
                 DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
                 self.clear_buffers();
                 notify(NotifCategory::Success, "Welcome",
                     &alloc::format!("Logged in as {}", username));
-                crate::security::users::USER_DB.lock().save();
+                if needs_setup {
+                    // The setup screen arrives with the new login screen (A6).
+                    notify(NotifCategory::Warning, "ACCOUNT",
+                        "Your role needs a password: PASSWD");
+                }
             }
-            Err(msg) => {
+            Err(e) => {
                 self.failed_count += 1;
                 self.password_buf.clear();
-                self.error_msg = String::from(msg);
-                // Exponential back-off: lock for (2^attempts - 1) seconds.
-                if self.failed_count >= 3 {
-                    let wait_secs: u64 = (1u64 << (self.failed_count - 2)).min(60);
-                    self.locked_until_ms = now_ms + wait_secs * 1_000;
-                }
-                println!("[LOGIN] Failed attempt {} for '{}'", self.failed_count, self.username_buf);
+                self.error_msg = e.message();
+                // The name as typed (printable, at most 32 characters).
+                let typed: String = self.username_buf.chars().filter(|c| !c.is_control()).take(32).collect();
+                crate::security::access::seclog_line(&typed, &alloc::format!("sign-in refused ({:?})", e));
+                println!("[LOGIN] Failed sign-in for '{}': {:?}", self.username_buf, e);
             }
         }
     }
@@ -2041,7 +2083,7 @@ impl LoginScreen {
 
     /// Paint the login screen over the full framebuffer.
     pub fn paint(&self) {
-        use crate::gui::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
+        use crate::gui::ui::{draw_rect_atomic, commit_dirty_rect};
 
         let sw = screen_w();
         let sh = screen_h();
@@ -2072,9 +2114,9 @@ impl LoginScreen {
         draw_rect_atomic(card_x + card_w - 1, card_y, 1, card_h, Color { r: 40, g: 70, b: 140 });
 
         // Logo + title.
-        draw_string_atomic("VEILOS", card_x + 140, card_y + 22, Color { r: 80, g: 140, b: 255 });
-        draw_string_atomic("v0.1.0", card_x + 245, card_y + 22, Color { r: 60, g: 80, b: 130 });
-        draw_string_atomic("Sign in to continue", card_x + 100, card_y + 44, Color { r: 120, g: 140, b: 180 });
+        ui_text_centred("VEILOS", card_x + card_w / 2, card_y + 22, Color { r: 80, g: 140, b: 255 });
+        ui_text("v0.1.0", card_x + card_w - 24 - ui_text_width("v0.1.0"), card_y + 22, Color { r: 60, g: 80, b: 130 });
+        ui_text_centred("Sign in to continue", card_x + card_w / 2, card_y + 44, Color { r: 120, g: 140, b: 180 });
 
         // Divider.
         draw_rect_atomic(card_x + 24, card_y + 62, card_w - 48, 1, Color { r: 40, g: 55, b: 100 });
@@ -2083,7 +2125,7 @@ impl LoginScreen {
         let field_x = card_x + 24;
         let field_w = card_w - 48;
         let u_y = card_y + 76;
-        draw_string_atomic("Username", field_x, u_y, Color { r: 100, g: 130, b: 190 });
+        ui_text("Username", field_x, u_y, Color { r: 100, g: 130, b: 190 });
         let u_field_y = u_y + 16;
         let u_focused = self.focus == LoginFocus::Username;
         let field_bg = Color { r: 12, g: 18, b: 38 };
@@ -2092,16 +2134,16 @@ impl LoginScreen {
         draw_rect_atomic(field_x, u_field_y, field_w, 28, field_bg);
         draw_rect_atomic(field_x, u_field_y + 27, field_w, 1,
             if u_focused { border_active } else { border_idle });
-        draw_string_atomic(&self.username_buf, field_x + 6, u_field_y + 8,
+        ui_text(&self.username_buf, field_x + 6, u_field_y + 8,
             Color { r: 220, g: 230, b: 255 });
         if u_focused {
-            let cx = field_x + 6 + self.username_buf.len() * 8;
+            let cx = field_x + 6 + ui_text_width(&self.username_buf);
             draw_rect_atomic(cx, u_field_y + 6, 2, 16, border_active);
         }
 
         // Password field.
         let p_y = u_field_y + 44;
-        draw_string_atomic("Password", field_x, p_y, Color { r: 100, g: 130, b: 190 });
+        ui_text("Password", field_x, p_y, Color { r: 100, g: 130, b: 190 });
         let p_field_y = p_y + 16;
         let p_focused = self.focus == LoginFocus::Password;
         draw_rect_atomic(field_x, p_field_y, field_w, 28, field_bg);
@@ -2109,16 +2151,16 @@ impl LoginScreen {
             if p_focused { border_active } else { border_idle });
         // Show bullets for each password character.
         let bullets: String = self.password_buf.chars().map(|_| '*').collect();
-        draw_string_atomic(&bullets, field_x + 6, p_field_y + 8,
+        ui_text(&bullets, field_x + 6, p_field_y + 8,
             Color { r: 220, g: 230, b: 255 });
         if p_focused {
-            let cx = field_x + 6 + self.password_buf.len() * 8;
+            let cx = field_x + 6 + ui_text_width(&bullets);
             draw_rect_atomic(cx, p_field_y + 6, 2, 16, border_active);
         }
 
         // Error message.
         if !self.error_msg.is_empty() {
-            draw_string_atomic(&self.error_msg, field_x, p_field_y + 36,
+            ui_text(&self.error_msg, field_x, p_field_y + 36,
                 Color { r: 255, g: 80, b: 80 });
         }
 
@@ -2127,11 +2169,11 @@ impl LoginScreen {
         let btn_x = field_x;
         let btn_w = field_w;
         draw_rect_atomic(btn_x, btn_y, btn_w, 32, Color { r: 40, g: 80, b: 200 });
-        draw_string_atomic("SIGN IN  (Enter)", btn_x + btn_w / 2 - 64, btn_y + 10,
+        ui_text_centred("SIGN IN  (Enter)", btn_x + btn_w / 2, btn_y + 10,
             Color { r: 255, g: 255, b: 255 });
 
         // Guest session hint.
-        draw_string_atomic("Guest session: type 'guest' as username",
+        ui_text("Guest session: type 'guest' as username",
             card_x + 24, card_y + card_h - 20,
             Color { r: 60, g: 80, b: 130 });
 
@@ -2171,7 +2213,7 @@ impl LockScreen {
             '\n' | '\r' => self.attempt_unlock(),
             '\x08' => { self.password_buf.pop(); }
             c if !c.is_control() => {
-                if self.password_buf.len() < 128 {
+                if self.password_buf.chars().count() < crate::security::users::PASSWORD_MAX {
                     self.password_buf.push(c);
                 }
             }
@@ -2186,9 +2228,11 @@ impl LockScreen {
         // lock held), then re-lock SESSION to flip the flag.  This matches
         // the USER_DB → SESSION ordering used everywhere else and avoids the
         // previous inversion (SESSION locked → USER_DB acquired inside).
+        // The same check and back-off as signing in. An account with no
+        // password unlocks on Enter (the lock is a screensaver for it).
         let result = {
             let session = crate::security::users::SESSION.lock();
-            session.verify_unlock_password(&pwd)
+            session.verify_unlock(&[pwd.as_str()]).map_err(|e| e.message())
         };  // SESSION lock released here before we re-acquire below.
 
         match result {
@@ -2198,17 +2242,21 @@ impl LockScreen {
                 crate::security::users::SESSION.lock().complete_unlock();
                 DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
                 notify(NotifCategory::Success, "Unlocked", "Welcome back");
+                crate::security::access::seclog("unlocked the screen");
+                let name = crate::security::users::SESSION.lock().username.clone();
+                crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Unlocked(name));
             }
             Err(msg) => {
                 self.password_buf.clear();
-                self.error_msg = String::from(msg);
+                crate::security::access::seclog(&alloc::format!("screen unlock refused ({})", msg));
+                self.error_msg = msg;
             }
         }
     }
 
     /// Paint the lock screen over the full framebuffer.
     pub fn paint(&self, ms: u64) {
-        use crate::gui::ui::{draw_rect_atomic, draw_string_atomic, commit_dirty_rect};
+        use crate::gui::ui::{draw_rect_atomic, commit_dirty_rect};
 
         let sw = screen_w();
         let sh = screen_h();
@@ -2223,19 +2271,18 @@ impl LockScreen {
         let ss = total_secs % 60;
         let time_str = alloc::format!("{:02}:{:02}:{:02}", hh, mm, ss);
         // Draw big clock — 3x scaled by drawing each glyph as 3×3 blocks.
-        let clock_x = sw / 2 - time_str.len() * 12;
         let clock_y = sh / 2 - 100;
-        draw_string_atomic(&time_str, clock_x, clock_y, Color { r: 200, g: 220, b: 255 });
+        ui_text_centred(&time_str, sw / 2, clock_y, Color { r: 200, g: 220, b: 255 });
 
         // Locked indicator.
-        draw_string_atomic("SCREEN LOCKED", sw / 2 - 52, clock_y + 24,
+        ui_text_centred("SCREEN LOCKED", sw / 2, clock_y + 24,
             Color { r: 80, g: 100, b: 160 });
 
         // Get current username.
         let username = crate::security::users::SESSION.lock().username.clone();
-        draw_string_atomic(
+        ui_text_centred(
             &alloc::format!("Signed in as: {}", username),
-            sw / 2 - 80, clock_y + 48,
+            sw / 2, clock_y + 48,
             Color { r: 100, g: 120, b: 180 },
         );
 
@@ -2252,20 +2299,20 @@ impl LockScreen {
         } else {
             Color { r: 200, g: 210, b: 255 }
         };
-        draw_string_atomic(hint, box_x + 12, box_y + 10, hint_col);
+        ui_text(hint, box_x + 12, box_y + 10, hint_col);
         // Cursor blink.
         if (ms / 500) % 2 == 0 && !self.password_buf.is_empty() {
-            let cx = box_x + 12 + self.password_buf.len() * 8;
+            let cx = box_x + 12 + ui_text_width(&bullets);
             draw_rect_atomic(cx, box_y + 8, 2, 18, Color { r: 80, g: 140, b: 255 });
         }
 
         if !self.error_msg.is_empty() {
-            draw_string_atomic(&self.error_msg, box_x, box_y + 44,
+            ui_text(&self.error_msg, box_x, box_y + 44,
                 Color { r: 255, g: 80, b: 80 });
         }
 
-        draw_string_atomic("Press Enter to unlock  |  Super+L to lock",
-            sw / 2 - 168, sh - 30, Color { r: 40, g: 55, b: 100 });
+        ui_text_centred("Press Enter to unlock  |  Super+L to lock",
+            sw / 2, sh - 30, Color { r: 40, g: 55, b: 100 });
 
         commit_dirty_rect(0, 0, sw, sh);
     }
@@ -2302,13 +2349,88 @@ impl DesktopPhase {
 
 pub static DESKTOP_PHASE: AtomicU8 = AtomicU8::new(0); // 0 = Login
 
+/// Just after a sign-in (SESSION.login done, no lock held): the user's own
+/// clipboard, and the security log.
+pub fn session_started(name: &str, how: &str) {
+    let (home, guest) = {
+        let db = crate::security::users::USER_DB.lock();
+        db.find(name).map_or((None, false), |u| (Some(u.home_dir.clone()), u.role == crate::security::users::UserRole::Guest))
+    };
+    crate::gui::clipboard::CLIPBOARD.lock().start_session(if guest { None } else { home });
+    crate::security::access::seclog_line(name, how);
+    // Their own script and the `login` event (vsh::shell, from the GUI loop).
+    crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Login(String::from(name)));
+}
+
+/// Delete everything under `dir` (not `dir` itself).
+fn remove_contents(dir: &str) {
+    let vfs = &crate::fs::vfs::VFS;
+    let Ok(entries) = vfs.list_dir(dir) else { return };
+    for e in entries {
+        let p = alloc::format!("{}/{}", dir.trim_end_matches('/'), e.name);
+        if e.file_type == crate::fs::vfs::FileType::Directory {
+            remove_contents(&p);
+        }
+        let _ = vfs.delete_file(&p);
+    }
+}
+
+/// Sign the user out: end their programs, close every window and clear the
+/// apps' contents, so the next person to sign in sees nothing of theirs
+/// (signing out used to leave the last user's terminal, with its history,
+/// on the next user's desktop). Then the login screen.
+///
+/// Must not be called with DESKTOP_WM held. Safe from inside a terminal's
+/// key handling (its own slot is skipped there and clears itself).
+pub fn sign_out() {
+    // Every window and the program behind it (pid 0: the kernel's own apps).
+    let wins: alloc::vec::Vec<(u32, u32)> = {
+        let wm = DESKTOP_WM.lock();
+        wm.windows.iter().map(|w| (w.id, w.owner_pid)).collect()
+    };
+    for &(_, pid) in &wins {
+        if pid > 0 {
+            if let Some(proc) = crate::sched::process::PROCESSOR.lock().find(pid) {
+                proc.terminate(0);
+            }
+            crate::exec::loader::request_kill(pid);
+        }
+    }
+    {
+        let mut wm = DESKTOP_WM.lock();
+        for &(id, _) in &wins {
+            wm.close_silent(id);
+        }
+        wm.focused_id = None;
+    }
+    crate::userland::apps::clear_session_apps();
+    // Their clipboard is kept in their home and forgotten here.
+    crate::gui::clipboard::CLIPBOARD.lock().end_session();
+    let name = crate::security::users::SESSION.lock().username.clone();
+    let guest = crate::security::users::USER_DB.lock().find(&name)
+        .is_some_and(|u| u.role == crate::security::users::UserRole::Guest);
+    if guest {
+        // The guest leaves nothing behind.
+        remove_contents(crate::security::users::GUEST_HOME);
+    }
+    crate::security::access::seclog("signed out");
+    crate::security::access::end_session();
+    crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Logout(name.clone()));
+    crate::security::users::SESSION.lock().logout();
+    DESKTOP_PHASE.store(DesktopPhase::Login as u8, Ordering::Release);
+}
+
 /// Lock the desktop from anywhere (e.g. Super+L shortcut).
 pub fn lock_desktop() {
-    let logged_in = crate::security::users::SESSION.lock().logged_in;
+    let (logged_in, name) = {
+        let s = crate::security::users::SESSION.lock();
+        (s.logged_in, s.username.clone())
+    };
     if logged_in {
         crate::security::users::SESSION.lock().lock();
         LOCK_SCREEN.lock().on_show();
         DESKTOP_PHASE.store(DesktopPhase::Locked as u8, Ordering::Release);
+        crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Locked(name));
     }
 }
 
@@ -2494,9 +2616,11 @@ pub fn poll_input() {
                         ContextAction::CopyToDesktop(src) => {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
-                            if !crate::security::mode::user_may_change(&dest, false) {
+                            if !crate::security::access::user_may(&src, crate::security::access::Op::Read)
+                                || !crate::security::mode::user_may_change(&dest, false) {
                                 // (told in a notification)
                             } else if let Ok(data) = crate::fs::vfs::VFS.read_file(&src) {
+                                crate::security::access::note_created(crate::security::access::session_uid(), &dest);
                                 let _ = crate::fs::vfs::VFS.write_file(&dest, &data);
                             }
                         }
@@ -2504,9 +2628,11 @@ pub fn poll_input() {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
                             let vfs = &crate::fs::vfs::VFS;
-                            if !crate::security::mode::user_may_change(&dest, false) || !crate::security::mode::user_may_change(&src, true) {
+                            if !crate::security::access::user_may(&src, crate::security::access::Op::Read)
+                                || !crate::security::mode::user_may_change(&dest, false) || !crate::security::mode::user_may_change(&src, true) {
                                 // (told in a notification)
                             } else if let Ok(data) = vfs.read_file(&src) {
+                                crate::security::access::note_created(crate::security::access::session_uid(), &dest);
                                 if vfs.write_file(&dest, &data).is_ok() {
                                     let _ = vfs.delete_file(&src);
                                 }
@@ -2719,7 +2845,10 @@ pub fn handle_drop(source_path: alloc::string::String, x: i32, y: i32) {
                 alloc::format!("{}/{}", target_cwd, source_filename)
             };
             
-            if target_path != source_path && crate::security::mode::user_may_change(&target_path, false) {
+            if target_path != source_path
+                && crate::security::access::user_may(&source_path, crate::security::access::Op::Read)
+                && crate::security::mode::user_may_change(&target_path, false) {
+                crate::security::access::note_created(crate::security::access::session_uid(), &target_path);
                 let vfs = &crate::fs::vfs::VFS;
                 if let Ok(data) = vfs.read_file(&source_path) {
                     if vfs.write_file(&target_path, &data).is_ok() {
@@ -2826,11 +2955,27 @@ pub fn init() {
     // Load the last-used username hint for the login screen.
     LOGIN_SCREEN.lock().load_last_user();
 
-    // Boot always starts at the login screen.
+    // The TrueType fonts (gui::text), so the login screen has them from its
+    // first frame; the bitmap font until then, and if /FONTS has none.
+    crate::gfx::render2d_kernel::ensure_fonts();
+
+    // Boot starts at the login screen, unless an account with no password
+    // has auto-login on (users::UserDatabase::auto_login_user).
     DESKTOP_PHASE.store(DesktopPhase::Login as u8, Ordering::Release);
+    let auto = crate::security::users::USER_DB.lock().auto_login_user();
+    if let Some(name) = auto {
+        crate::security::users::SESSION.lock().login(&name);
+        if let Err(e) = crate::security::encryption::cen_unlock_user(&name, crate::security::encryption::Unlock::System) {
+            crate::serial_println!("[CEN] {}: keys not unlocked: {}", name, e);
+        }
+        DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
+        session_started(&name, "signed in automatically");
+        println!("[DE]   Signed in automatically as '{}'", name);
+    }
 
     println!("[DE] Desktop environment initialised.");
-    println!("[DE]   Boot phase: LoginScreen");
+    let on_desktop = DESKTOP_PHASE.load(Ordering::Acquire) == DesktopPhase::Desktop as u8;
+    println!("[DE]   Boot phase: {}", if on_desktop { "Desktop (auto-login)" } else { "LoginScreen" });
     println!("[DE]   Window manager: drag, resize, minimize, maximize, Z-order");
     println!("[DE]   Panel: clock, taskbar, policy toggle, launcher");
     println!("[DE]   Notifications: {} toast slots, {}ms TTL", MAX_TOASTS, TOAST_TTL_MS);
@@ -2895,6 +3040,8 @@ pub fn paint_desktop(ms: u64) {
     if phase == DesktopPhase::Desktop {
         let should_lock = crate::security::users::SESSION.lock().tick();
         if should_lock {
+            let name = crate::security::users::SESSION.lock().username.clone();
+            crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Locked(name));
             LOCK_SCREEN.lock().on_show();
             DESKTOP_PHASE.store(DesktopPhase::Locked as u8, Ordering::Release);
             LOCK_SCREEN.lock().paint(ms);
@@ -3057,7 +3204,7 @@ pub fn paint_desktop(ms: u64) {
                             Some(pos) => &state.source_path[pos + 1..],
                             None => &state.source_path,
                         };
-                        let w = (filename.len() * 8 + 16) as u32;
+                        let w = (r.text_width(filename) + 16) as u32;
                         r.fill_rect(crate::gui::gui_toolkit::Rect::new(mx + 10, my + 10, w, 24), crate::gfx::graphics::Color { r: 60, g: 100, b: 200 });
                         r.stroke_rect(crate::gui::gui_toolkit::Rect::new(mx + 10, my + 10, w, 24), crate::gfx::graphics::Color { r: 255, g: 255, b: 255 });
                         r.draw_text(filename, mx + 18, my + 16, crate::gfx::graphics::Color { r: 255, g: 255, b: 255 });

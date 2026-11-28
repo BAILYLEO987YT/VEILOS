@@ -401,7 +401,10 @@ impl VfsManager {
             return Err(VfsError::GenericError);
         }
         m.writable()?;
-        m.fs.rename(&*m.device, &f, &t)
+        m.fs.rename(&*m.device, &f, &t)?;
+        // Its owner (security::access) goes with it.
+        crate::security::access::note_renamed(from, to);
+        Ok(())
     }
 
     /// Create or overwrite a file at `path`. Routes to the mounted filesystem
@@ -415,10 +418,16 @@ impl VfsManager {
 
     /// Delete a file (or empty directory) at `path`. Routes to the mounted filesystem.
     pub fn delete_file(&self, path: &str) -> Result<(), VfsError> {
-        match self.resolve(path) {
+        let result = match self.resolve(path) {
             Some((m, rel)) => m.writable().and_then(|_| m.fs.delete_file(&*m.device, &rel)),
             None => Err(VfsError::FileNotFound),
+        };
+        // Its owner goes too (security::access): a file made again at this
+        // path belongs to whoever makes it.
+        if result.is_ok() {
+            crate::security::access::note_deleted(path);
         }
+        result
     }
 
     /// Create a directory at `path` (its parent must exist).

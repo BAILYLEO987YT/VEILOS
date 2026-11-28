@@ -1,9 +1,66 @@
 # VEILOS: accounts, sign-in and permissions
 
-**Status:** design agreed (2026-11-26), nothing built yet. Replaces the
-placeholder login screen, the seeded `root`/`admin` accounts and the
-unchecked account commands with a first-boot wizard, real user profiles,
-per-user file ownership and a sign-in system that can grow new methods.
+**Status:** in progress on one branch, merged when every stage is done.
+**A0 done (2026-11-28):** idle lock counts all input; account commands,
+Performance Mode and the admin tasks go through `users::authorize`; mesh
+commands can't run them; saved keys are never silently replaced
+(`KEYS RELINK`); random salts; username rules. **A1 done (2026-11-28):**
+accounts v2 in `/etc/users2.vdb` (the v1 file is read once and left for
+older builds), sign-in steps and methods, length rules, per-account
+back-off instead of lockout, built-in guest that can be turned off, `root`
+can't sign in, `user.manage`, `USERMOD`/`GUEST`, auto-login, and passwords
+asked for with hidden input instead of on the command line. **A2 done
+(2026-11-28):** saved keys in key slots (sign-in, recovery key, admin slot
+through the system key); a password change rewrites only its slot; an admin
+reset re-wraps through the admin slot or keeps the keys for the recovery
+key; accounts with no password use the system key; `KEYS STATUS`,
+`KEYS RECOVERY ON|OFF`, `KEYS ADMINSLOT ON|OFF`, `KEYS RECOVER`. Sign-out
+also closes the user's windows. **A3 done (2026-11-28):** file owners
+(`security/access.rs`, `/etc/owners.vdb`), one `may_access` for every way
+in and in both modes, processes run as a uid, `OWNER`/`CHOWN`/`GRANT`, the
+security log (`/etc/log/security.log`), a per-user clipboard, the guest's
+home emptied at sign-out. Next: A4 (VSH interface).
+
+**Changed from the plan in A3:** "system" files outside `/system` and `/etc`
+can be changed by admins, not only by root. With root-only, admins could
+no longer write anywhere outside the homes and shared folders on a new
+install (everything there is the system's), which broke Windows programs
+saving at `/`. `/system`, `/etc` and the sensitive files stay root-only.
+
+**A4 done (2026-11-28):** the VSH interface (`vsh/accounts_api.rs`): the
+account policy (idle lock, sign-in delays, PIN/password minimums, which
+roles need a password, guest, auto-login) kept in `/etc/policy.vdb` and
+read and changed from scripts (`policy()`, `policy_set`, `set NAME = value`),
+a per-user idle lock (`my_lock_timeout`, never longer than the system's),
+account and file-owner functions, `login`/`logout`/`session_locked`/
+`session_unlocked` events, the user's own `/home/<name>/user.vsh` loaded at
+sign-in and unloaded at sign-out (the shell is rebuilt then), and the
+ready-made settings panel (`/SETTINGS.VSH`, opened from the Settings menu
+item).
+
+**A5 done (2026-11-28):** `gui/text.rs` draws the kernel's own screens
+(login and lock screens, window titles, notifications, the panel, the file
+manager, launcher and other apps) in the theme's TrueType font, and the
+terminal and text editor in a monospaced face (Cascadia Mono) sized to their
+9-pixel character cell. Widths are measured (carets, centring, labels fitted
+with an ellipsis); `THEME[font_family]` and `font_size` now apply. Fonts load
+when the desktop starts, so the login screen has them; the bitmap font is
+the fallback (no fonts, early boot, the panic screen). Next: A6 (login and
+lock screens, looks, first-boot wizard).
+
+**Changed from the plan in A4:**
+- Scripts act with the signed-in account's rights (every call goes through
+  `authorize`), instead of the interpreter tracking a "system" and a "user"
+  level per script. Functions share one namespace, so a per-user script
+  could replace a system script's helper and run with its level; account
+  rights can't be borrowed that way. Where scripts live is protected by A3:
+  `/config.vsh` and `/SHELL.VSH` are the system's, a user's script is theirs.
+- The settings live in `/etc/policy.vdb`, written by the kernel, not in a
+  system script: they are changed from the panel or `policy_set` and kept.
+- Until the new screens (A6), the password dialogs are the terminal's hidden
+  prompts, opened by `request_password_change()` and `user_create_dialog()`.
+- Standard users have `system.power` (restart and shut down); the guest
+  doesn't, and VSH `shutdown()`/`restart()` check it.
 
 ## Goal
 
