@@ -15,7 +15,17 @@ through the system key); a password change rewrites only its slot; an admin
 reset re-wraps through the admin slot or keeps the keys for the recovery
 key; accounts with no password use the system key; `KEYS STATUS`,
 `KEYS RECOVERY ON|OFF`, `KEYS ADMINSLOT ON|OFF`, `KEYS RECOVER`. Sign-out
-also closes the user's windows. Next: A3 (ownership).
+also closes the user's windows. **A3 done (2026-11-28):** file owners
+(`security/access.rs`, `/etc/owners.vdb`), one `may_access` for every way
+in and in both modes, processes run as a uid, `OWNER`/`CHOWN`/`GRANT`, the
+security log (`/etc/log/security.log`), a per-user clipboard, the guest's
+home emptied at sign-out. Next: A4 (VSH interface).
+
+**Changed from the plan in A3:** "system" files outside `/system` and `/etc`
+can be changed by admins, not only by root. With root-only, admins could
+no longer write anywhere outside the homes and shared folders on a new
+install (everything there is the system's), which broke Windows programs
+saving at `/`. `/system`, `/etc` and the sensitive files stay root-only.
 
 ## Goal
 
