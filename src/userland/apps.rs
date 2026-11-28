@@ -339,6 +339,11 @@ impl TextEditorState {
 
         let save_rect = Rect::new(cx + cw as i32 - 70, cy + 4, 60, 20);
         if save_rect.contains(x, y) {
+            // Only where the signed-in user may write (security::access).
+            if !crate::security::access::user_may(&self.path, crate::security::access::Op::Write) {
+                return;
+            }
+            crate::security::access::note_created(crate::security::access::session_uid(), &self.path);
             match crate::fs::vfs::VFS.write_file(&self.path, self.content.as_bytes()) {
                 Ok(_) => { notify(NotifCategory::Success, "SAVED", &self.path); },
                 Err(_) => { notify(NotifCategory::Warning, "ERROR", "Could not save file"); },
@@ -663,6 +668,11 @@ impl FileManagerState {
         if self.cwd != "/" {
             self.entries.push(FileEntry { name: String::from(".."), size: 0, is_dir: true });
         }
+        // Another user's folder (security::access): shown as no access.
+        if !crate::security::access::user_may_quiet(&self.cwd, crate::security::access::Op::Read) {
+            self.entries.push(FileEntry { name: String::from("(no access)"), size: 0, is_dir: false });
+            return;
+        }
         match VFS.list_dir(&self.cwd) {
             Ok(list) => {
                 for e in list {
@@ -885,6 +895,10 @@ impl FrequentFiles {
 pub static FREQUENT_FILES: Mutex<FrequentFiles> = Mutex::new(FrequentFiles::new());
 
 pub fn open_file_absolute(path: &str, name: &str) {
+    // Opening or running it needs read access (security::access).
+    if !crate::security::access::user_may(path, crate::security::access::Op::Read) {
+        return;
+    }
         FREQUENT_FILES.lock().record(path);
         if name.ends_with(".exe") || name.ends_with(".EXE") {
             // It's an executable, so attempt to load and spawn it.
@@ -1134,6 +1148,10 @@ impl TerminalEmulator {
     /// terminal (its output appears here, typed lines go to it); a GUI
     /// program opens its own window.
     fn run_program(&mut self, path: &str, args: &str) {
+        if !crate::security::access::user_may(path, crate::security::access::Op::Read) {
+            self.history.push(alloc::format!("ERROR: '{}': permission denied", path));
+            return;
+        }
         let name = path.rsplit('/').next().unwrap_or(path);
         let mut frame_allocator = crate::mm::memory::GlobalFrameAllocator;
         match crate::exec::loader::load_and_spawn_pe_with_args(path, args, &mut frame_allocator) {
@@ -1871,11 +1889,13 @@ impl AppLauncher {
                             crate::security::policy::PolicyMode::Security => {
                                 pol.set_mode(crate::security::policy::PolicyMode::Performance);
                                 drop(pol);
+                                crate::security::access::seclog("switched to Performance Mode");
                                 notify(NotifCategory::Warning, "Mode Changed", "Switched to Performance");
                             }
                             crate::security::policy::PolicyMode::Performance => {
                                 pol.set_mode(crate::security::policy::PolicyMode::Security);
                                 drop(pol);
+                                crate::security::access::seclog("switched to Security Mode");
                                 notify(NotifCategory::Success, "Mode Changed", "Switched to Security");
                             }
                         }

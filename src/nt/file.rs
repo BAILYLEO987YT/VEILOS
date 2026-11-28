@@ -339,10 +339,21 @@ pub fn create_file(proc: &crate::sched::process::Process, out: u64, access: u64,
                 }
             }
         }
-        if creates || writes || deletes {
-            if let Err(s) = crate::security::mode::require_change(proc, &path) {
-                return s;
+        // Who owns it (security::access): opening at all needs read,
+        // creating or writing write, deleting delete.
+        use crate::security::access::Op;
+        let ops = [(true, Op::Read), (creates || writes, Op::Write), (deletes, Op::Delete)];
+        for (needed, op) in ops {
+            if needed {
+                if let Err(s) = crate::security::mode::require_access(proc, &path, op) {
+                    return s;
+                }
             }
+        }
+        // A new file belongs to whoever made it (where nothing more
+        // specific says otherwise).
+        if creates && existing.is_none() {
+            crate::security::access::note_created(proc.uid.load(core::sync::atomic::Ordering::Relaxed), &path);
         }
     }
 

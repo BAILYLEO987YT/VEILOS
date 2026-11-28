@@ -301,6 +301,7 @@ fn load_and_spawn_pe_inner(
     process_inner.parent_pid.store(options.parent_pid, core::sync::atomic::Ordering::Relaxed);
     // Security Mode: the parent's capabilities, or the signed-in user's (security/mode.rs).
     *process_inner.capabilities.lock() = crate::security::mode::caps_for_new(options.parent_pid);
+    process_inner.uid.store(crate::security::access::uid_for_new(options.parent_pid), core::sync::atomic::Ordering::Relaxed);
     // Security Mode: heaps and VirtualAlloc start at a random place, or
     // where the parent's did (aslr.rs).
     {

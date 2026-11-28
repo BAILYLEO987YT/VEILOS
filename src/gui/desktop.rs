@@ -2007,6 +2007,7 @@ impl LoginScreen {
         match result {
             Ok((username, has_secret, needs_setup, role)) => {
                 crate::security::users::SESSION.lock().login(&username);
+                session_started(&username, "signed in");
                 // The user's saved keys (encryption.rs, key slots): opened by
                 // this password, or, for an account with no password, by
                 // the system key (whatever was typed).
@@ -2044,6 +2045,9 @@ impl LoginScreen {
                 self.failed_count += 1;
                 self.password_buf.clear();
                 self.error_msg = e.message();
+                // The name as typed (printable, at most 32 characters).
+                let typed: String = self.username_buf.chars().filter(|c| !c.is_control()).take(32).collect();
+                crate::security::access::seclog_line(&typed, &alloc::format!("sign-in refused ({:?})", e));
                 println!("[LOGIN] Failed sign-in for '{}': {:?}", self.username_buf, e);
             }
         }
@@ -2219,9 +2223,11 @@ impl LockScreen {
                 crate::security::users::SESSION.lock().complete_unlock();
                 DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
                 notify(NotifCategory::Success, "Unlocked", "Welcome back");
+                crate::security::access::seclog("unlocked the screen");
             }
             Err(msg) => {
                 self.password_buf.clear();
+                crate::security::access::seclog(&alloc::format!("screen unlock refused ({})", msg));
                 self.error_msg = msg;
             }
         }
@@ -2323,6 +2329,30 @@ impl DesktopPhase {
 
 pub static DESKTOP_PHASE: AtomicU8 = AtomicU8::new(0); // 0 = Login
 
+/// Just after a sign-in (SESSION.login done, no lock held): the user's own
+/// clipboard, and the security log.
+pub fn session_started(name: &str, how: &str) {
+    let (home, guest) = {
+        let db = crate::security::users::USER_DB.lock();
+        db.find(name).map_or((None, false), |u| (Some(u.home_dir.clone()), u.role == crate::security::users::UserRole::Guest))
+    };
+    crate::gui::clipboard::CLIPBOARD.lock().start_session(if guest { None } else { home });
+    crate::security::access::seclog_line(name, how);
+}
+
+/// Delete everything under `dir` (not `dir` itself).
+fn remove_contents(dir: &str) {
+    let vfs = &crate::fs::vfs::VFS;
+    let Ok(entries) = vfs.list_dir(dir) else { return };
+    for e in entries {
+        let p = alloc::format!("{}/{}", dir.trim_end_matches('/'), e.name);
+        if e.file_type == crate::fs::vfs::FileType::Directory {
+            remove_contents(&p);
+        }
+        let _ = vfs.delete_file(&p);
+    }
+}
+
 /// Sign the user out: end their programs, close every window and clear the
 /// apps' contents, so the next person to sign in sees nothing of theirs
 /// (signing out used to leave the last user's terminal, with its history,
@@ -2352,6 +2382,17 @@ pub fn sign_out() {
         wm.focused_id = None;
     }
     crate::userland::apps::clear_session_apps();
+    // Their clipboard is kept in their home and forgotten here.
+    crate::gui::clipboard::CLIPBOARD.lock().end_session();
+    let name = crate::security::users::SESSION.lock().username.clone();
+    let guest = crate::security::users::USER_DB.lock().find(&name)
+        .is_some_and(|u| u.role == crate::security::users::UserRole::Guest);
+    if guest {
+        // The guest leaves nothing behind.
+        remove_contents(crate::security::users::GUEST_HOME);
+    }
+    crate::security::access::seclog("signed out");
+    crate::security::access::end_session();
     crate::security::users::SESSION.lock().logout();
     DESKTOP_PHASE.store(DesktopPhase::Login as u8, Ordering::Release);
 }
@@ -2548,9 +2589,11 @@ pub fn poll_input() {
                         ContextAction::CopyToDesktop(src) => {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
-                            if !crate::security::mode::user_may_change(&dest, false) {
+                            if !crate::security::access::user_may(&src, crate::security::access::Op::Read)
+                                || !crate::security::mode::user_may_change(&dest, false) {
                                 // (told in a notification)
                             } else if let Ok(data) = crate::fs::vfs::VFS.read_file(&src) {
+                                crate::security::access::note_created(crate::security::access::session_uid(), &dest);
                                 let _ = crate::fs::vfs::VFS.write_file(&dest, &data);
                             }
                         }
@@ -2558,9 +2601,11 @@ pub fn poll_input() {
                             let file_name = src.split('/').last().unwrap_or("file");
                             let dest = alloc::format!("/Desktop/{}", file_name);
                             let vfs = &crate::fs::vfs::VFS;
-                            if !crate::security::mode::user_may_change(&dest, false) || !crate::security::mode::user_may_change(&src, true) {
+                            if !crate::security::access::user_may(&src, crate::security::access::Op::Read)
+                                || !crate::security::mode::user_may_change(&dest, false) || !crate::security::mode::user_may_change(&src, true) {
                                 // (told in a notification)
                             } else if let Ok(data) = vfs.read_file(&src) {
+                                crate::security::access::note_created(crate::security::access::session_uid(), &dest);
                                 if vfs.write_file(&dest, &data).is_ok() {
                                     let _ = vfs.delete_file(&src);
                                 }
@@ -2773,7 +2818,10 @@ pub fn handle_drop(source_path: alloc::string::String, x: i32, y: i32) {
                 alloc::format!("{}/{}", target_cwd, source_filename)
             };
             
-            if target_path != source_path && crate::security::mode::user_may_change(&target_path, false) {
+            if target_path != source_path
+                && crate::security::access::user_may(&source_path, crate::security::access::Op::Read)
+                && crate::security::mode::user_may_change(&target_path, false) {
+                crate::security::access::note_created(crate::security::access::session_uid(), &target_path);
                 let vfs = &crate::fs::vfs::VFS;
                 if let Ok(data) = vfs.read_file(&source_path) {
                     if vfs.write_file(&target_path, &data).is_ok() {
@@ -2890,6 +2938,7 @@ pub fn init() {
             crate::serial_println!("[CEN] {}: keys not unlocked: {}", name, e);
         }
         DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
+        session_started(&name, "signed in automatically");
         println!("[DE]   Signed in automatically as '{}'", name);
     }
 

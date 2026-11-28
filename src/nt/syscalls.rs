@@ -256,7 +256,7 @@ fn permitted(proc: &Arc<Process>, id: u32, a0: u64, a1: u64, a2: u64, a3: u64) -
         sys::NT_DELETE_FILE => {
             require(proc, C::FsModify, "deleting a file")?;
             match crate::nt::file::read_object_name(a0).and_then(|n| crate::nt::file::vfs_path(&n)) {
-                Some(path) => crate::security::mode::require_change(proc, &path),
+                Some(path) => crate::security::mode::require_access(proc, &path, crate::security::access::Op::Delete),
                 None => Ok(()),
             }
         }

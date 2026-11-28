@@ -1,5 +1,6 @@
 //! Security: capabilities, sandboxing, execution policy, users and crypto.
 
+pub mod access;
 pub mod anticheat;
 pub mod capability;
 pub mod credentials;

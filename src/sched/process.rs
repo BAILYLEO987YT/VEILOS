@@ -98,6 +98,10 @@ pub struct Process {
     /// Torn down: its handles are signalled.
     pub ended: core::sync::atomic::AtomicBool,
     pub parent_pid: core::sync::atomic::AtomicU32,
+    /// The account it runs as (security::access): its parent's, else the
+    /// signed-in user's; 0 for the kernel and programs started with nobody
+    /// signed in.
+    pub uid: core::sync::atomic::AtomicU32,
 
     // -----| Lifecycle |-----
     pub exit_code: Mutex<Option<i32>>,
@@ -154,6 +158,7 @@ impl Process {
             dying: core::sync::atomic::AtomicBool::new(false),
             ended: core::sync::atomic::AtomicBool::new(false),
             parent_pid: core::sync::atomic::AtomicU32::new(0),
+            uid: core::sync::atomic::AtomicU32::new(0),
             exit_code:   Mutex::new(None),
         }
     }
@@ -236,6 +241,7 @@ impl ProcessManager {
             dying: core::sync::atomic::AtomicBool::new(false),
             ended: core::sync::atomic::AtomicBool::new(false),
             parent_pid: core::sync::atomic::AtomicU32::new(0),
+            uid: core::sync::atomic::AtomicU32::new(0),
             exit_code: Mutex::new(None),
         });
         self.processes.push(kernel_process);

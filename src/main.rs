@@ -423,6 +423,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     crate::userland::pkgmgr::init();
     serial_println!("[BOOT] >> security::users::init ...");
     crate::security::users::init();
+    crate::security::access::init();
     serial_println!("[BOOT] >> gui::gui_toolkit::init ...");
     crate::gui::gui_toolkit::init();
     serial_println!("[BOOT] >> gui::desktop::init ...");

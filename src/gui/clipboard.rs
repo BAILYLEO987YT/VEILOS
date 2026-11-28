@@ -128,6 +128,11 @@ pub struct ClipboardManager {
     pub history: Vec<ClipboardEntry>,
     pub max_history: usize,
     pub storage_path: String,
+    /// The signed-in user's home: their permanent entries are kept there
+    /// (clipboard.dat), not in the shared `storage_path`, so one user's
+    /// copies never reach the next. None: nobody, or the guest (kept only
+    /// in memory).
+    pub user_home: Option<String>,
     pub file_size_limit: usize,
     pub max_entry_size: usize,
     pub active_channel: ClipboardChannel,
@@ -140,11 +145,39 @@ impl ClipboardManager {
             history: Vec::new(),
             max_history: 20,
             storage_path: String::new(),
+            user_home: None,
             file_size_limit: 2048,
             max_entry_size: 2048,
             active_channel: ClipboardChannel::Public,
             default_storage: ClipboardStorage::Permanent,
         }
+    }
+
+    /// Where permanent entries are kept: the signed-in user's home, else
+    /// nowhere while someone without one (the guest) is signed in, else the
+    /// configured storage_path.
+    fn file_path(&self) -> Option<String> {
+        match &self.user_home {
+            Some(home) => Some(alloc::format!("{}/clipboard.dat", home.trim_end_matches('/'))),
+            None if crate::security::users::SESSION.lock().logged_in => None,
+            None if self.storage_path.is_empty() => None,
+            None => Some(self.storage_path.clone()),
+        }
+    }
+
+    /// At sign-in: this user's clipboard (`home` None for the guest).
+    pub fn start_session(&mut self, home: Option<String>) {
+        self.history.clear();
+        self.user_home = home;
+        self.load_persisted();
+    }
+
+    /// At sign-out: keep this user's permanent entries in their home, then
+    /// forget everything, so the next user can't paste it.
+    pub fn end_session(&mut self) {
+        self.persist();
+        self.history.clear();
+        self.user_home = None;
     }
 
     pub fn push(&mut self, entry: ClipboardEntry) {
@@ -278,7 +311,7 @@ impl ClipboardManager {
 
     /// Write PERMANENT entries to disk at the configured storage_path.
     pub fn persist(&self) {
-        if self.storage_path.is_empty() { return; }
+        let Some(path) = self.file_path() else { return };
         // Serialize: each entry as a line "CHANNEL|TIMESTAMP|PREVIEW"
         // For v1 we persist only plaintext PUBLIC entries.
         let mut buf = Vec::new();
@@ -321,13 +354,13 @@ impl ClipboardManager {
                 _ => {}
             }
         }
-        let _ = crate::fs::vfs::VFS.write_file(&self.storage_path, &buf);
+        let _ = crate::fs::vfs::VFS.write_file(&path, &buf);
     }
 
     /// Load persisted entries from disk on boot.
     pub fn load_persisted(&mut self) {
-        if self.storage_path.is_empty() { return; }
-        let data = match crate::fs::vfs::VFS.read_file(&self.storage_path) {
+        let Some(path) = self.file_path() else { return };
+        let data = match crate::fs::vfs::VFS.read_file(&path) {
             Ok(d) => d,
             Err(_) => return,
         };

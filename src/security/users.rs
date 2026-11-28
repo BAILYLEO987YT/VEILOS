@@ -741,11 +741,14 @@ pub struct UserDatabase {
     /// The first-boot wizard (no accounts yet) or the upgrade step (moved
     /// over from v1) hasn't run: stage A6 shows it. Saved in the file.
     pub setup_pending: bool,
+    /// There was no user file at all this boot: VEILOS was just installed
+    /// (access.rs: files already on the disk are then the system's).
+    pub fresh_install: bool,
 }
 
 impl UserDatabase {
     pub const fn new() -> Self {
-        Self { users: Vec::new(), setup_pending: false }
+        Self { users: Vec::new(), setup_pending: false, fresh_install: false }
     }
 
     /// Load /etc/users2.vdb; else move /etc/users.vdb (v1) over, leaving
@@ -789,6 +792,7 @@ impl UserDatabase {
             println!("[USERS] No user database: seeding the default admin until first-boot setup exists");
             self.users.push(User::new("admin", "veilos", UserRole::Admin));
             self.setup_pending = true;
+            self.fresh_install = true;
         }
         self.ensure_builtin();
         self.save();
