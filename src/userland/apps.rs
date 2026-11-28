@@ -1480,6 +1480,17 @@ pub static TERMINAL_EMU: Mutex<TerminalEmulator> = Mutex::new(TerminalEmulator::
 
 /// Open a new terminal window and bind it to a free pool slot.
 /// Returns the pool index so the caller can route input/paint to that slot.
+/// A terminal with `line` typed in; `run`: press Enter (VSH
+/// request_password_change runs PASSWD, so its hidden prompts start).
+pub fn open_terminal_with(line: &str, run: bool) {
+    let (_id, idx) = open_terminal(80, 80, 550, 380, 0);
+    let mut term = TERMINAL_POOL[idx].lock();
+    term.input_buf = String::from(line);
+    if run {
+        term.on_key('\n');
+    }
+}
+
 pub fn open_terminal(x: i32, y: i32, w: u32, h: u32, z: u32) -> (u32, usize) {
     let id = crate::gui::desktop::DESKTOP_WM.lock().open("TERMINAL", x, y, w, h, z);
 
@@ -2416,10 +2427,15 @@ pub fn load_config_vsh() {
                     for e in &errs {
                         crate::serial_println!("[VSCRIPT] {}", e);
                     }
-                    let errs2 = eng.trigger_event("start", None);
+                    // Its own `start` only: a user's script (loaded at sign-in,
+                    // which can come first) has had its `start` already.
+                    let errs2 = eng.trigger_source("/config.vsh", "start");
                     for e in &errs2 {
                         crate::serial_println!("[VSCRIPT] start: {}", e);
                     }
+                    drop(eng);
+                    // The shell it chose is the system's (sign-out returns to it).
+                    crate::vsh::shell::mark_system_shell();
                     crate::serial_println!("[VSCRIPT] /config.vsh loaded and 'start' event fired.");
                     crate::println!("[VSCRIPT] Desktop configured from /config.vsh");
                 }

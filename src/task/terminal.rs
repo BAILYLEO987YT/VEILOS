@@ -336,10 +336,19 @@ fn ownership_command(cmd: &str, args: &[&str]) -> Vec<String> {
 /// NAME <display name> | AUTOLOGIN ON|OFF
 fn usermod(args: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
+    out.push(match account_modify(args) {
+        Ok(msg) => alloc::format!("usermod: {}", msg),
+        Err(e) => alloc::format!("usermod: {}", e),
+    });
+    out
+}
+
+/// USERMOD's work, for the terminal and VSH (vsh/accounts_api.rs): checked
+/// by users::authorize, logged. Ok: what changed.
+pub fn account_modify(args: &[&str]) -> Result<String, String> {
     let usage = || String::from("USAGE: USERMOD <username> ROLE <role> | ENABLE | DISABLE | HIDE | SHOW | NAME <display name> | AUTOLOGIN ON|OFF");
     let (Some(&target), Some(what)) = (args.first(), args.get(1).map(|w| w.to_ascii_uppercase())) else {
-        out.push(usage());
-        return out;
+        return Err(usage());
     };
     let result: Result<String, String> = match what.as_str() {
         "ROLE" => match args.get(2).and_then(|r| UserRole::parse(r)) {
@@ -407,11 +416,7 @@ fn usermod(args: &[&str]) -> Vec<String> {
     if let Ok(msg) = &result {
         crate::security::access::seclog(&alloc::format!("usermod {}: {}", target, msg));
     }
-    out.push(match result {
-        Ok(msg) => alloc::format!("usermod: {}", msg),
-        Err(e) => alloc::format!("usermod: {}", e),
-    });
-    out
+    result
 }
 
 /// Public entry point used by the native terminal emulator app.

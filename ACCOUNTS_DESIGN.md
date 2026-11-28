@@ -27,6 +27,31 @@ no longer write anywhere outside the homes and shared folders on a new
 install (everything there is the system's), which broke Windows programs
 saving at `/`. `/system`, `/etc` and the sensitive files stay root-only.
 
+**A4 done (2026-11-28):** the VSH interface (`vsh/accounts_api.rs`): the
+account policy (idle lock, sign-in delays, PIN/password minimums, which
+roles need a password, guest, auto-login) kept in `/etc/policy.vdb` and
+read and changed from scripts (`policy()`, `policy_set`, `set NAME = value`),
+a per-user idle lock (`my_lock_timeout`, never longer than the system's),
+account and file-owner functions, `login`/`logout`/`session_locked`/
+`session_unlocked` events, the user's own `/home/<name>/user.vsh` loaded at
+sign-in and unloaded at sign-out (the shell is rebuilt then), and the
+ready-made settings panel (`/SETTINGS.VSH`, opened from the Settings menu
+item). Next: A5 (TrueType text).
+
+**Changed from the plan in A4:**
+- Scripts act with the signed-in account's rights (every call goes through
+  `authorize`), instead of the interpreter tracking a "system" and a "user"
+  level per script. Functions share one namespace, so a per-user script
+  could replace a system script's helper and run with its level; account
+  rights can't be borrowed that way. Where scripts live is protected by A3:
+  `/config.vsh` and `/SHELL.VSH` are the system's, a user's script is theirs.
+- The settings live in `/etc/policy.vdb`, written by the kernel, not in a
+  system script: they are changed from the panel or `policy_set` and kept.
+- Until the new screens (A6), the password dialogs are the terminal's hidden
+  prompts, opened by `request_password_change()` and `user_create_dialog()`.
+- Standard users have `system.power` (restart and shut down); the guest
+  doesn't, and VSH `shutdown()`/`restart()` check it.
+
 ## Goal
 
 - A first-boot wizard creates the first account. No built-in `root` or

@@ -132,8 +132,10 @@ impl Host for KernelHost {
                 notify(NotifCategory::Info, "VSCRIPT", &out);
                 Some(Ok(VValue::None))
             }
-            // time, launch, focus_window, lock_session, shutdown, restart, destroy
-            _ => crate::vsh::shell::host_call(name, args),
+            // Accounts, policy, file owners (accounts_api.rs), then time,
+            // launch, focus_window, lock_session, shutdown, restart, destroy.
+            _ => crate::vsh::accounts_api::host_call(name, args)
+                .or_else(|| crate::vsh::shell::host_call(name, args)),
         }
     }
 
@@ -223,6 +225,11 @@ fn want_int_list(name: &str, v: &VValue, min: i64, max: i64) -> Result<Vec<u32>,
 }
 
 fn apply_system_setting(name: &str, v: &VValue) -> Result<(), String> {
+    // Account policy (LOCK_IDLE_TIMEOUT, LOGIN_*, ...): users::policy_set,
+    // with the signed-in user's rights.
+    if let Some(r) = crate::vsh::accounts_api::set_policy_setting(name, v) {
+        return r;
+    }
     match name {
         "THEME" => match v {
             VValue::Object(obj) => apply_theme_object(obj),

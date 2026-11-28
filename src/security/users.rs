@@ -140,6 +140,7 @@ impl UserRole {
                 | GpuSubmit.bit() | GpuShader.bit()
                 | NetConnect.bit()
                 | ProcFork.bit() | ProcKill.bit()
+                | SystemPower.bit()
             }
             UserRole::Guest => {
                 // Read-only filesystem, no network, no IPC broadcast.
@@ -280,11 +281,14 @@ pub struct AccountPolicy {
     /// The fewest sign-in steps each role needs: Root, Admin, Standard,
     /// Guest. 0 allows an account with no password.
     pub min_steps: [u8; 4],
+    /// Lock the screen after this long without input, in seconds; 0 never.
+    /// Everyone's default and longest: a user may only choose shorter.
+    pub lock_idle_secs: u64,
 }
 
 impl AccountPolicy {
     pub const fn new() -> Self {
-        Self { backoff_after: 3, backoff_max_secs: 60, password_min: 4, pin_min: 4, min_steps: [0; 4] }
+        Self { backoff_after: 3, backoff_max_secs: 60, password_min: 4, pin_min: 4, min_steps: [0; 4], lock_idle_secs: DEFAULT_IDLE_TIMEOUT_MS / 1_000 }
     }
 
     pub fn min_steps_for(&self, role: UserRole) -> usize {
@@ -304,6 +308,181 @@ impl AccountPolicy {
 }
 
 pub static POLICY: Mutex<AccountPolicy> = Mutex::new(AccountPolicy::new());
+
+/// Where the account policy is kept (written by the kernel only).
+pub const POLICY_PATH: &str = "/etc/policy.vdb";
+
+/// A policy value, as scripts and the terminal give it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PolicyValue {
+    Int(i64),
+    Bool(bool),
+    Text(String),
+}
+
+/// The policy settings, by the names scripts use (`set NAME = value`,
+/// policy_set). LOGIN_GUEST and LOGIN_AUTO_USER live on the accounts.
+pub const POLICY_NAMES: &[&str] = &[
+    "LOCK_IDLE_TIMEOUT", "LOGIN_BACKOFF_AFTER", "LOGIN_BACKOFF_MAX", "PIN_MIN_LENGTH",
+    "PASSWORD_MIN_LENGTH", "MIN_STEPS_ADMIN", "MIN_STEPS_STANDARD", "LOGIN_GUEST", "LOGIN_AUTO_USER",
+];
+
+/// Every policy setting and its value now.
+pub fn policy_values() -> Vec<(&'static str, PolicyValue)> {
+    let p = *POLICY.lock();
+    let (guest, auto) = {
+        let db = USER_DB.lock();
+        (db.find("guest").is_some_and(|u| u.enabled), db.auto_login_user().unwrap_or_default())
+    };
+    alloc::vec![
+        ("LOCK_IDLE_TIMEOUT", PolicyValue::Int(p.lock_idle_secs as i64)),
+        ("LOGIN_BACKOFF_AFTER", PolicyValue::Int(p.backoff_after as i64)),
+        ("LOGIN_BACKOFF_MAX", PolicyValue::Int(p.backoff_max_secs as i64)),
+        ("PIN_MIN_LENGTH", PolicyValue::Int(p.pin_min as i64)),
+        ("PASSWORD_MIN_LENGTH", PolicyValue::Int(p.password_min as i64)),
+        ("MIN_STEPS_ADMIN", PolicyValue::Int(p.min_steps[UserRole::Admin.index()] as i64)),
+        ("MIN_STEPS_STANDARD", PolicyValue::Int(p.min_steps[UserRole::Standard.index()] as i64)),
+        ("LOGIN_GUEST", PolicyValue::Bool(guest)),
+        ("LOGIN_AUTO_USER", PolicyValue::Text(auto)),
+    ]
+}
+
+/// Change a policy setting (admins: user.manage). Saved at once; the
+/// signed-in session's idle lock follows. Returns a line to show.
+pub fn policy_set(name: &str, value: PolicyValue) -> Result<String, String> {
+    authorize(Action::SetPolicy).map_err(String::from)?;
+    let int = |lo: i64, hi: i64| -> Result<i64, String> {
+        match value {
+            PolicyValue::Int(i) if (lo..=hi).contains(&i) => Ok(i),
+            PolicyValue::Int(i) => Err(format!("{} must be {} to {}, got {}", name, lo, hi, i)),
+            _ => Err(format!("{} expects a whole number", name)),
+        }
+    };
+    match name {
+        "LOGIN_GUEST" => {
+            let PolicyValue::Bool(on) = value else { return Err(format!("{} expects true or false", name)) };
+            let mut db = USER_DB.lock();
+            if let Some(g) = db.find_mut("guest") {
+                g.enabled = on;
+            }
+            db.save();
+        }
+        "LOGIN_AUTO_USER" => {
+            let PolicyValue::Text(user) = &value else { return Err(format!("{} expects a username (\"\" for none)", name)) };
+            let mut db = USER_DB.lock();
+            if user.is_empty() {
+                let current = db.auto_login_user();
+                if let Some(cur) = current {
+                    db.set_auto_login(&cur, false)?;
+                }
+            } else {
+                db.set_auto_login(user, true)?;
+            }
+        }
+        _ => {
+            let mut p = POLICY.lock();
+            match name {
+                "LOCK_IDLE_TIMEOUT" => p.lock_idle_secs = int(0, 86_400)? as u64,
+                "LOGIN_BACKOFF_AFTER" => p.backoff_after = int(1, 20)? as u32,
+                "LOGIN_BACKOFF_MAX" => p.backoff_max_secs = int(1, 3_600)? as u64,
+                "PIN_MIN_LENGTH" => p.pin_min = int(SECRET_MIN_FLOOR as i64, PIN_MAX as i64)? as usize,
+                "PASSWORD_MIN_LENGTH" => p.password_min = int(SECRET_MIN_FLOOR as i64, PASSWORD_MAX as i64)? as usize,
+                "MIN_STEPS_ADMIN" => p.min_steps[UserRole::Admin.index()] = int(0, 4)? as u8,
+                "MIN_STEPS_STANDARD" => p.min_steps[UserRole::Standard.index()] = int(0, 4)? as u8,
+                other => return Err(format!("no policy setting '{}'", other)),
+            }
+            drop(p);
+            save_policy();
+        }
+    }
+    refresh_session_idle();
+    Ok(format!("{} = {}", name, match value {
+        PolicyValue::Int(i) => format!("{}", i),
+        PolicyValue::Bool(b) => format!("{}", b),
+        PolicyValue::Text(t) => format!("\"{}\"", t),
+    }))
+}
+
+/// Write the policy to /etc/policy.vdb.
+pub fn save_policy() {
+    let p = *POLICY.lock();
+    let text = format!(
+        "# VEILOS account policy - written by the kernel\nlock_idle={}\nbackoff_after={}\nbackoff_max={}\npin_min={}\npassword_min={}\nmin_steps={},{},{},{}\n",
+        p.lock_idle_secs, p.backoff_after, p.backoff_max_secs, p.pin_min, p.password_min,
+        p.min_steps[0], p.min_steps[1], p.min_steps[2], p.min_steps[3],
+    );
+    if crate::fs::vfs::VFS.write_file(POLICY_PATH, text.as_bytes()).is_err() {
+        println!("[USERS] {} could not be written", POLICY_PATH);
+    }
+}
+
+/// Read /etc/policy.vdb (defaults for anything missing or out of range).
+pub fn load_policy() {
+    let Ok(bytes) = crate::fs::vfs::VFS.read_file(POLICY_PATH) else { return };
+    let text = core::str::from_utf8(&bytes).unwrap_or("");
+    let mut p = POLICY.lock();
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let n = |lo: u64, hi: u64| v.trim().parse::<u64>().ok().filter(|x| (lo..=hi).contains(x));
+        match k.trim() {
+            "lock_idle" => if let Some(x) = n(0, 86_400) { p.lock_idle_secs = x },
+            "backoff_after" => if let Some(x) = n(1, 20) { p.backoff_after = x as u32 },
+            "backoff_max" => if let Some(x) = n(1, 3_600) { p.backoff_max_secs = x },
+            "pin_min" => if let Some(x) = n(SECRET_MIN_FLOOR as u64, PIN_MAX as u64) { p.pin_min = x as usize },
+            "password_min" => if let Some(x) = n(SECRET_MIN_FLOOR as u64, PASSWORD_MAX as u64) { p.password_min = x as usize },
+            "min_steps" => {
+                for (i, s) in v.split(',').enumerate().take(4) {
+                    if let Ok(x) = s.trim().parse::<u8>() {
+                        p.min_steps[i] = x.min(4);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The idle lock for `user`, in ms (0 = never): their own choice if shorter
+/// than the policy's, else the policy's.
+pub fn idle_timeout_ms_for(user: &User) -> u64 {
+    let sys = POLICY.lock().lock_idle_secs;
+    let mine = user.idle_secs;
+    let secs = if mine > 0 && (sys == 0 || mine < sys) { mine } else { sys };
+    secs * 1_000
+}
+
+/// The signed-in user's idle lock follows a policy or preference change.
+fn refresh_session_idle() {
+    let name = SESSION.lock().username.clone();
+    let ms = USER_DB.lock().find(&name).map(idle_timeout_ms_for);
+    if let Some(ms) = ms {
+        SESSION.lock().idle_timeout_ms = ms;
+    }
+}
+
+/// The signed-in user picks their own idle lock (seconds; 0 = the policy's).
+/// Never longer than the policy's.
+pub fn my_lock_timeout(secs: u64) -> Result<String, String> {
+    let name = SESSION.lock().username.clone();
+    if name.is_empty() {
+        return Err(String::from("nobody is signed in"));
+    }
+    let sys = POLICY.lock().lock_idle_secs;
+    if secs > 86_400 {
+        return Err(String::from("at most 86400 seconds (a day)"));
+    }
+    if secs > 0 && sys > 0 && secs > sys {
+        return Err(format!("At most {} min (the system's limit)", sys / 60));
+    }
+    {
+        let mut db = USER_DB.lock();
+        let u = db.find_mut(&name).ok_or_else(|| String::from("user not found"))?;
+        u.idle_secs = secs;
+        db.save();
+    }
+    refresh_session_idle();
+    Ok(if secs == 0 { String::from("lock after the system's time") } else { format!("lock after {} s idle", secs) })
+}
 
 /// What kind of secret.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -495,6 +674,9 @@ pub struct User {
     /// Saved-key choices (stage A2): an admin slot, a recovery key.
     pub admin_slot:      bool,
     pub recovery_key:    bool,
+    /// Their own idle lock, in seconds (0: the policy's); never longer than
+    /// the policy's.
+    pub idle_secs:       u64,
 }
 
 impl User {
@@ -529,6 +711,7 @@ impl User {
             caps_removed:    0,
             admin_slot:      false,
             recovery_key:    false,
+            idle_secs:       0,
         }
     }
 
@@ -662,10 +845,10 @@ impl User {
         if self.admin_slot { keys.push('a'); }
         if self.recovery_key { keys.push('r'); }
         format!(
-            "user={}\tuid={}\trole={}\tname={}\thome={}\tflags={}\tsteps={}\tfails={}\tcreated={}\tlast={}\tcaps+={:x}\tcaps-={:x}\tkeys={}",
+            "user={}\tuid={}\trole={}\tname={}\thome={}\tflags={}\tsteps={}\tfails={}\tcreated={}\tlast={}\tcaps+={:x}\tcaps-={:x}\tkeys={}\tidle={}",
             self.username, self.uid, self.role.name(), self.display_name, self.home_dir,
             self.flags(), steps.join(";"), self.failed_attempts, self.created, self.last_login,
-            self.caps_extra, self.caps_removed, keys,
+            self.caps_extra, self.caps_removed, keys, self.idle_secs,
         )
     }
 
@@ -704,6 +887,7 @@ impl User {
                     u.admin_slot = v.contains('a');
                     u.recovery_key = v.contains('r');
                 }
+                "idle" => u.idle_secs = v.parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -951,6 +1135,7 @@ pub static USER_DB: Mutex<UserDatabase> = Mutex::new(UserDatabase::new());
 
 /// Called from kernel_main after the heap and VFS are ready.
 pub fn init() {
+    load_policy();
     USER_DB.lock().load();
     println!("[USERS] User account system ready.");
 }
@@ -989,6 +1174,8 @@ pub enum Action<'a> {
     /// Switch to Performance Mode, which relaxes protections. (Switching
     /// back to Security Mode only tightens them, so anyone may.)
     EnterPerformanceMode,
+    /// Change the account policy (users::policy_set).
+    SetPolicy,
 }
 
 /// May the signed-in user do `action`? Ok, or a reason to show them.
@@ -1039,7 +1226,7 @@ pub fn authorize(action: Action) -> Result<(), &'static str> {
     }
 
     match action {
-        Action::AdminTask | Action::ListAllUsers => Ok(()),
+        Action::AdminTask | Action::ListAllUsers | Action::SetPolicy => Ok(()),
         Action::CreateUser(role) => {
             if role == UserRole::Root && !is_root {
                 return Err("only root can create a root account");
@@ -1144,7 +1331,7 @@ impl Session {
         // using just the mouse locked the screen after the timeout.
         let last = self.last_active.max(LAST_INPUT_MS.load(Ordering::Relaxed));
         let idle_ms = now.saturating_sub(last);
-        if idle_ms >= self.idle_timeout_ms {
+        if self.idle_timeout_ms > 0 && idle_ms >= self.idle_timeout_ms {
             self.lock();
             return true;
         }
@@ -1166,6 +1353,9 @@ impl Session {
 
         let (caps, home, guest) = {
             let mut db = USER_DB.lock();
+            if let Some(u) = db.find(username) {
+                self.idle_timeout_ms = idle_timeout_ms_for(u);
+            }
             let caps = db.capability_set_for(username);
             let (home, guest) = match db.find_mut(username) {
                 Some(u) => {

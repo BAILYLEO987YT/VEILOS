@@ -777,6 +777,10 @@ async fn gui_refresh_task() {
         }
         // crate::gui::compositor::COMPOSITOR.lock().tick(ms); // Disabled: competing with new Desktop WM and causing lag.
 
+        // Sign-in, sign-out, lock and unlock: the user's script and the VSH
+        // events (vsh::shell), with no lock held.
+        crate::vsh::shell::drain_session_events();
+
         let phase = crate::gui::desktop::DesktopPhase::from_u8(
             crate::gui::desktop::DESKTOP_PHASE.load(core::sync::atomic::Ordering::Acquire)
         );

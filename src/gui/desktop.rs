@@ -2224,6 +2224,8 @@ impl LockScreen {
                 DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
                 notify(NotifCategory::Success, "Unlocked", "Welcome back");
                 crate::security::access::seclog("unlocked the screen");
+                let name = crate::security::users::SESSION.lock().username.clone();
+                crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Unlocked(name));
             }
             Err(msg) => {
                 self.password_buf.clear();
@@ -2338,6 +2340,8 @@ pub fn session_started(name: &str, how: &str) {
     };
     crate::gui::clipboard::CLIPBOARD.lock().start_session(if guest { None } else { home });
     crate::security::access::seclog_line(name, how);
+    // Their own script and the `login` event (vsh::shell, from the GUI loop).
+    crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Login(String::from(name)));
 }
 
 /// Delete everything under `dir` (not `dir` itself).
@@ -2393,17 +2397,22 @@ pub fn sign_out() {
     }
     crate::security::access::seclog("signed out");
     crate::security::access::end_session();
+    crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Logout(name.clone()));
     crate::security::users::SESSION.lock().logout();
     DESKTOP_PHASE.store(DesktopPhase::Login as u8, Ordering::Release);
 }
 
 /// Lock the desktop from anywhere (e.g. Super+L shortcut).
 pub fn lock_desktop() {
-    let logged_in = crate::security::users::SESSION.lock().logged_in;
+    let (logged_in, name) = {
+        let s = crate::security::users::SESSION.lock();
+        (s.logged_in, s.username.clone())
+    };
     if logged_in {
         crate::security::users::SESSION.lock().lock();
         LOCK_SCREEN.lock().on_show();
         DESKTOP_PHASE.store(DesktopPhase::Locked as u8, Ordering::Release);
+        crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Locked(name));
     }
 }
 
@@ -3009,6 +3018,8 @@ pub fn paint_desktop(ms: u64) {
     if phase == DesktopPhase::Desktop {
         let should_lock = crate::security::users::SESSION.lock().tick();
         if should_lock {
+            let name = crate::security::users::SESSION.lock().username.clone();
+            crate::vsh::shell::queue_session_event(crate::vsh::shell::SessionEvent::Locked(name));
             LOCK_SCREEN.lock().on_show();
             DESKTOP_PHASE.store(DesktopPhase::Locked as u8, Ordering::Release);
             LOCK_SCREEN.lock().paint(ms);

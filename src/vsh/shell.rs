@@ -72,6 +72,107 @@ enum OsAction {
     Lock,
     Shutdown,
     Restart,
+    /// A terminal with this line typed in; true: run it (Enter). How
+    /// scripts reach the kernel's hidden password prompts.
+    Terminal(String, bool),
+}
+
+/// Open a terminal with `line` typed in (run if `run`): request_password_change
+/// and user_create_dialog (vsh/accounts_api.rs). Done by pump.
+pub fn request_terminal(line: &str, run: bool) {
+    PENDING.lock().push(OsAction::Terminal(String::from(line), run));
+}
+
+// =====================================================================
+// -----| sessions: events, the user's own script |-----
+// =====================================================================
+//
+// Sign-in, sign-out, lock and unlock are queued where they happen (often
+// with locks held) and handled by `drain_session_events`, from the GUI loop
+// with no lock held, in every phase:
+//   login(user)              the user's /home/<user>/user.vsh is loaded first
+//   logout(user)             then their script is unloaded, and the system's
+//                            shell is started again: nothing a user's script
+//                            drew stays for the next person
+//   session_locked(user), session_unlocked(user)
+
+#[derive(Clone, Debug)]
+pub enum SessionEvent {
+    Login(String),
+    Logout(String),
+    Locked(String),
+    Unlocked(String),
+}
+
+static SESSION_EVENTS: Mutex<Vec<SessionEvent>> = Mutex::new(Vec::new());
+/// The signed-in user's script, while loaded.
+static USER_SCRIPT: Mutex<Option<String>> = Mutex::new(None);
+/// The shell the system's own scripts chose (not one a user's script asked
+/// for): what sign-out goes back to.
+static SYSTEM_SHELL: Mutex<String> = Mutex::new(String::new());
+
+/// The file of `user`'s own script.
+pub fn user_script_path(user: &str) -> String {
+    format!("/home/{}/user.vsh", user)
+}
+
+/// /config.vsh just ran: the shell it asked for (`set SHELL`) is the
+/// system's, whatever user script is loaded.
+pub fn mark_system_shell() {
+    if let Some(path) = START_REQUEST.lock().clone() {
+        *SYSTEM_SHELL.lock() = path;
+    }
+}
+
+pub fn queue_session_event(e: SessionEvent) {
+    SESSION_EVENTS.lock().push(e);
+}
+
+fn fire(name: &str, user: &str) {
+    let mut payload = BTreeMap::new();
+    payload.insert(String::from("user"), VValue::String(String::from(user)));
+    let errs = crate::vsh::vscript::GLOBAL_ENGINE.lock().trigger_event_with(name, None, &payload);
+    log_errors(&errs);
+}
+
+/// From the GUI loop, every frame, with no lock held.
+pub fn drain_session_events() {
+    let events = core::mem::take(&mut *SESSION_EVENTS.lock());
+    for e in events {
+        match e {
+            SessionEvent::Login(user) => {
+                let path = user_script_path(&user);
+                if let Ok(text) = read_text(&path) {
+                    let errs = crate::vsh::vscript::GLOBAL_ENGINE.lock().execute_named(&path, &text);
+                    log_errors(&errs);
+                    *USER_SCRIPT.lock() = Some(path.clone());
+                    crate::serial_println!("[SHELL] {}'s script {} loaded", user, path);
+                    let errs = crate::vsh::vscript::GLOBAL_ENGINE.lock().trigger_source(&path, "start");
+                    log_errors(&errs);
+                }
+                fire("login", &user);
+            }
+            SessionEvent::Logout(user) => {
+                fire("logout", &user);
+                let had = USER_SCRIPT.lock().take();
+                if let Some(path) = had {
+                    crate::vsh::vscript::GLOBAL_ENGINE.lock().unload(&path);
+                    crate::serial_println!("[SHELL] {} unloaded", path);
+                }
+                // The system's shell again, rebuilt: nothing the user's
+                // script added or changed carries over.
+                let system = SYSTEM_SHELL.lock().clone();
+                if is_active() && !system.is_empty() {
+                    match start(&system) {
+                        Ok(m) => crate::serial_println!("[SHELL] after sign-out: {}", m),
+                        Err(e) => crate::serial_println!("[SHELL] after sign-out: {}", e),
+                    }
+                }
+            }
+            SessionEvent::Locked(user) => fire("session_locked", &user),
+            SessionEvent::Unlocked(user) => fire("session_unlocked", &user),
+        }
+    }
 }
 
 /// App names `launch()` understands.
@@ -246,13 +347,17 @@ pub fn host_call(name: &str, args: &[CallArg]) -> Option<Result<VValue, String>>
             PENDING.lock().push(OsAction::Lock);
             Ok(VValue::None)
         }
-        "shutdown" => {
-            PENDING.lock().push(OsAction::Shutdown);
-            Ok(VValue::None)
-        }
-        "restart" => {
-            PENDING.lock().push(OsAction::Restart);
-            Ok(VValue::None)
+        // Power needs system.power (the guest has none).
+        "shutdown" | "restart" => {
+            let me = crate::security::users::SESSION.lock().username.clone();
+            let may = me.is_empty() || crate::security::users::USER_DB.lock()
+                .capability_set_for(&me).has(crate::security::capability::Capability::SystemPower);
+            if may {
+                PENDING.lock().push(if name == "shutdown" { OsAction::Shutdown } else { OsAction::Restart });
+            } else {
+                crate::gui::desktop::notify(crate::gui::desktop::NotifCategory::Warning, "POWER", "This account can't restart or shut down");
+            }
+            Ok(VValue::Boolean(may))
         }
         _ => return None,
     })
@@ -356,6 +461,11 @@ fn cpu_usage(sec: u64) -> Option<f64> {
 /// the ISR). Returns true when the screen needs repainting.
 pub fn pump(ms: u64) -> bool {
     if let Some(path) = START_REQUEST.lock().take() {
+        // Asked for with no user script loaded (the terminal's SHELL ON, a
+        // system script): the shell sign-out returns to.
+        if USER_SCRIPT.lock().is_none() && SYSTEM_SHELL.lock().is_empty() {
+            *SYSTEM_SHELL.lock() = path.clone();
+        }
         match start(&path) {
             Ok(m) => crate::serial_println!("[SHELL] {}", m),
             Err(e) => crate::serial_println!("[SHELL] could not start: {}", e),
@@ -516,6 +626,7 @@ fn run_action(a: OsAction) {
             }
         }
         OsAction::Lock => crate::gui::desktop::lock_desktop(),
+        OsAction::Terminal(line, run) => crate::userland::apps::open_terminal_with(&line, run),
         OsAction::Shutdown => power_off(),
         OsAction::Restart => crate::sys::power::reboot(crate::sys::power::Method::Any),
     }

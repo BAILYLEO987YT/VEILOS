@@ -238,6 +238,12 @@ var TrayDivider: element.divider = {
 };
 
 
+// The settings panel (accounts, sign-in policy, idle lock). It
+// builds on the bases above; settings_build() adds it in Section 8
+// and the Settings menu item opens it.
+import "/SETTINGS.VSH";
+
+
 // =============================================================
 //  SECTION 4 - Taskbar
 //
@@ -440,7 +446,7 @@ var MenuTerminal: element.button = {
 var MenuSettings: element.button = {
     ...MenuItem,
     label:    "Settings",
-    on_click: { handle_launch("settings"); },
+    on_click: { handle_settings(); },
 };
 
 var MenuDivider: element.divider = {
@@ -683,6 +689,9 @@ on_event start {
     add element.button(MenuLock,       parent: menu_ref);
     add element.button(MenuRestart,    parent: menu_ref);
     add element.button(MenuShutdown,   parent: menu_ref);
+
+    // The settings panel (SETTINGS.VSH): hidden until opened.
+    settings_build(desktop_ref);
 
     // 7. Optionally open one window on first boot so the user
     //    lands somewhere useful. Comment out to start with an
