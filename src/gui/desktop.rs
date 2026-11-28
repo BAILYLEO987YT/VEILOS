@@ -1931,10 +1931,10 @@ impl LoginScreen {
 
     /// Handle a character from the keyboard.
     pub fn on_key(&mut self, ch: char) {
-        let now_ms = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
-        if self.locked_until_ms > now_ms {
-            return; // Still in lockout period.
-        }
+        // Keys are never swallowed: during a sign-in delay the fields stay
+        // editable and only signing in waits (User::authenticate). Ignoring
+        // every key here, Backspace and Tab included, made the screen look
+        // frozen.
         match ch {
             '\n' | '\r' => {
                 if self.focus == LoginFocus::Username {
@@ -1963,7 +1963,7 @@ impl LoginScreen {
                         }
                     }
                     LoginFocus::Password => {
-                        if self.password_buf.len() < 128 {
+                        if self.password_buf.chars().count() < crate::security::users::PASSWORD_MAX {
                             self.password_buf.push(c);
                         }
                     }
@@ -1974,41 +1974,49 @@ impl LoginScreen {
     }
 
     /// Attempt to log in with the current username/password buffers.
+    /// (One field, so one sign-in step; accounts with several steps sign in
+    /// once the new login screen asks for each, stage A6.)
     fn attempt_login(&mut self) {
-        let now_ms = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
-        if self.locked_until_ms > now_ms {
-            self.error_msg = alloc::format!(
-                "Too many attempts. Wait {} s.",
-                (self.locked_until_ms - now_ms) / 1_000
-            );
-            return;
-        }
+        use crate::security::users::{self, AuthError};
 
-        // Guest session shortcut.
-        if self.username_buf.eq_ignore_ascii_case("guest") {
-            crate::security::users::SESSION.lock().login("guest");
-            DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
-            self.clear_buffers();
-            notify(NotifCategory::Info, "Welcome", "Logged in as guest");
-            return;
-        }
-
+        // Guest is an ordinary account now (no password, can be turned off).
         let result = {
-            let mut db = crate::security::users::USER_DB.lock();
-            let user = db.find_mut(&self.username_buf);
-            match user {
-                None => Err("Unknown username"),
+            let mut db = users::USER_DB.lock();
+            let r = match db.find_mut(&self.username_buf) {
+                None => {
+                    // As long as checking a password, so the time taken
+                    // doesn't say whether the account exists.
+                    users::spend_verify_time(&self.password_buf);
+                    Err(AuthError::Incorrect)
+                }
                 // The account's own spelling: names match ignoring case, but
                 // the session, home folder and saved keys use the stored one.
-                Some(u) => u.authenticate(&self.password_buf).map(|_| u.username.clone()),
+                Some(u) => u.authenticate(&[self.password_buf.as_str()])
+                    .map(|_| (u.username.clone(), u.has_secret(), u.must_change, u.role)),
+            };
+            if r.is_ok() || db.find(&self.username_buf).is_some() {
+                db.save(); // failed sign-ins in a row survive a restart
             }
+            let needs_setup = match &r {
+                Ok((name, ..)) => db.find(name).is_some_and(|u| u.must_change || !db.meets_role_rule(u)),
+                Err(_) => false,
+            };
+            r.map(|(name, has_secret, _, role)| (name, has_secret, needs_setup, role))
         };
 
         match result {
-            Ok(username) => {
+            Ok((username, has_secret, needs_setup, role)) => {
                 crate::security::users::SESSION.lock().login(&username);
-                // The user's saved keys (encryption.rs): unlocked by this password.
-                if let Err(e) = crate::security::encryption::cen_unlock_user(&username, &self.password_buf) {
+                // The user's saved keys (encryption.rs): unlocked by this
+                // password. An account with no password wraps them with an
+                // empty one, whatever was typed.
+                let key_secret = if has_secret { self.password_buf.as_str() } else { "" };
+                let keys = if role == users::UserRole::Guest {
+                    Ok(0) // the guest keeps nothing
+                } else {
+                    crate::security::encryption::cen_unlock_user(&username, key_secret)
+                };
+                if let Err(e) = keys {
                     crate::serial_println!("[CEN] {}: keys not unlocked: {}", username, e);
                     // The saved keys were kept, not replaced (encryption.rs,
                     // cen_unlock_user): say how to get them back.
@@ -2023,18 +2031,17 @@ impl LoginScreen {
                 self.clear_buffers();
                 notify(NotifCategory::Success, "Welcome",
                     &alloc::format!("Logged in as {}", username));
-                crate::security::users::USER_DB.lock().save();
+                if needs_setup {
+                    // The setup screen arrives with the new login screen (A6).
+                    notify(NotifCategory::Warning, "ACCOUNT",
+                        "Your sign-in needs setting up (a password your role requires): terminal PASSWD");
+                }
             }
-            Err(msg) => {
+            Err(e) => {
                 self.failed_count += 1;
                 self.password_buf.clear();
-                self.error_msg = String::from(msg);
-                // Exponential back-off: lock for (2^attempts - 1) seconds.
-                if self.failed_count >= 3 {
-                    let wait_secs: u64 = (1u64 << (self.failed_count - 2)).min(60);
-                    self.locked_until_ms = now_ms + wait_secs * 1_000;
-                }
-                println!("[LOGIN] Failed attempt {} for '{}'", self.failed_count, self.username_buf);
+                self.error_msg = e.message();
+                println!("[LOGIN] Failed sign-in for '{}': {:?}", self.username_buf, e);
             }
         }
     }
@@ -2180,7 +2187,7 @@ impl LockScreen {
             '\n' | '\r' => self.attempt_unlock(),
             '\x08' => { self.password_buf.pop(); }
             c if !c.is_control() => {
-                if self.password_buf.len() < 128 {
+                if self.password_buf.chars().count() < crate::security::users::PASSWORD_MAX {
                     self.password_buf.push(c);
                 }
             }
@@ -2195,9 +2202,11 @@ impl LockScreen {
         // lock held), then re-lock SESSION to flip the flag.  This matches
         // the USER_DB → SESSION ordering used everywhere else and avoids the
         // previous inversion (SESSION locked → USER_DB acquired inside).
+        // The same check and back-off as signing in. An account with no
+        // password unlocks on Enter (the lock is a screensaver for it).
         let result = {
             let session = crate::security::users::SESSION.lock();
-            session.verify_unlock_password(&pwd)
+            session.verify_unlock(&[pwd.as_str()]).map_err(|e| e.message())
         };  // SESSION lock released here before we re-acquire below.
 
         match result {
@@ -2210,7 +2219,7 @@ impl LockScreen {
             }
             Err(msg) => {
                 self.password_buf.clear();
-                self.error_msg = String::from(msg);
+                self.error_msg = msg;
             }
         }
     }
@@ -2835,11 +2844,22 @@ pub fn init() {
     // Load the last-used username hint for the login screen.
     LOGIN_SCREEN.lock().load_last_user();
 
-    // Boot always starts at the login screen.
+    // Boot starts at the login screen, unless an account with no password
+    // has auto-login on (users::UserDatabase::auto_login_user).
     DESKTOP_PHASE.store(DesktopPhase::Login as u8, Ordering::Release);
+    let auto = crate::security::users::USER_DB.lock().auto_login_user();
+    if let Some(name) = auto {
+        crate::security::users::SESSION.lock().login(&name);
+        if let Err(e) = crate::security::encryption::cen_unlock_user(&name, "") {
+            crate::serial_println!("[CEN] {}: keys not unlocked: {}", name, e);
+        }
+        DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
+        println!("[DE]   Signed in automatically as '{}'", name);
+    }
 
     println!("[DE] Desktop environment initialised.");
-    println!("[DE]   Boot phase: LoginScreen");
+    let on_desktop = DESKTOP_PHASE.load(Ordering::Acquire) == DesktopPhase::Desktop as u8;
+    println!("[DE]   Boot phase: {}", if on_desktop { "Desktop (auto-login)" } else { "LoginScreen" });
     println!("[DE]   Window manager: drag, resize, minimize, maximize, Z-order");
     println!("[DE]   Panel: clock, taskbar, policy toggle, launcher");
     println!("[DE]   Notifications: {} toast slots, {}ms TTL", MAX_TOASTS, TOAST_TTL_MS);

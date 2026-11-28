@@ -1,9 +1,16 @@
 # VEILOS: accounts, sign-in and permissions
 
-**Status:** design agreed (2026-11-26), nothing built yet. Replaces the
-placeholder login screen, the seeded `root`/`admin` accounts and the
-unchecked account commands with a first-boot wizard, real user profiles,
-per-user file ownership and a sign-in system that can grow new methods.
+**Status:** in progress on one branch, merged when every stage is done.
+**A0 done (2026-11-28):** idle lock counts all input; account commands,
+Performance Mode and the admin tasks go through `users::authorize`; mesh
+commands can't run them; saved keys are never silently replaced
+(`KEYS RELINK`); random salts; username rules. **A1 done (2026-11-28):**
+accounts v2 in `/etc/users2.vdb` (the v1 file is read once and left for
+older builds), sign-in steps and methods, length rules, per-account
+back-off instead of lockout, built-in guest that can be turned off, `root`
+can't sign in, `user.manage`, `USERMOD`/`GUEST`, auto-login, and passwords
+asked for with hidden input instead of on the command line. Next: A2 (key
+slots).
 
 ## Goal
 

@@ -2,6 +2,7 @@ use crate::fs::vfs::VFS;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+use crate::security::users::{self, Action, UserRole};
 
 // -----| path helpers |-----
 
@@ -29,6 +30,207 @@ pub async fn terminal_task() {
     }
 }
 
+// =====================================================================
+// -----| Accounts (ACCOUNTS_DESIGN.md) |-----
+// =====================================================================
+//
+// What the account commands do once the terminal app has asked for their
+// passwords with hidden input (userland/apps.rs, SecretPrompt). Each returns
+// the lines to show. The prepare_* functions run first, so nobody is asked
+// for a password only to be refused afterwards.
+
+/// USERADD <name> [role], before its password is asked for: the checked
+/// name and role, or why not.
+pub fn account_prepare_create(name: &str, role: Option<&str>) -> Result<(String, UserRole), String> {
+    let role = match role {
+        None => UserRole::Standard,
+        Some(r) => UserRole::parse(r).filter(|r| *r != UserRole::Root)
+            .ok_or_else(|| alloc::format!("useradd: no role '{}' (admin, standard or guest)", r))?,
+    };
+    users::authorize(Action::CreateUser(role)).map_err(|e| alloc::format!("useradd: {}", e))?;
+    let name = name.to_ascii_lowercase();
+    users::validate_username(&name).map_err(|e| alloc::format!("useradd: {}", e))?;
+    if users::USER_DB.lock().find(&name).is_some() {
+        return Err(alloc::format!("useradd: '{}' already exists", name));
+    }
+    Ok((name, role))
+}
+
+/// USERADD's account, with its password (empty: none, where the role
+/// allows that).
+pub fn account_create(name: &str, role: UserRole, password: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Err(e) = users::authorize(Action::CreateUser(role)) {
+        out.push(alloc::format!("useradd: {}", e));
+        return out;
+    }
+    if !password.is_empty() {
+        if let Err(e) = users::validate_secret(users::SecretKind::Password, password) {
+            out.push(alloc::format!("useradd: {}", e));
+            return out;
+        }
+    }
+    match users::USER_DB.lock().add(users::User::new(name, password, role)) {
+        Ok(()) => {
+            out.push(alloc::format!("useradd: created '{}' ({})", name, role.name()));
+            if password.is_empty() {
+                out.push(String::from("useradd: no password: anyone at this computer can sign in as it"));
+            }
+        }
+        Err(e) => out.push(alloc::format!("useradd: {}", e)),
+    }
+    out
+}
+
+/// PASSWD <name> for another account, before the new password is asked
+/// for: that account's stored name, or why not.
+pub fn account_prepare_reset(target: &str) -> Result<String, String> {
+    users::authorize(Action::ResetPassword(target)).map_err(|e| alloc::format!("passwd: {}", e))?;
+    users::USER_DB.lock().find(target).map(|u| u.username.clone())
+        .ok_or_else(|| String::from("passwd: user not found"))
+}
+
+/// An admin sets another account's password.
+pub fn account_reset_password(target: &str, new: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Err(e) = users::authorize(Action::ResetPassword(target)) {
+        out.push(alloc::format!("passwd: {}", e));
+        return out;
+    }
+    let mut db = users::USER_DB.lock();
+    match db.find_mut(target).map(|u| u.reset_password(new)) {
+        Some(Ok(())) => {
+            db.save();
+            out.push(alloc::format!("passwd: password reset for '{}'", target));
+            out.push(String::from("passwd: their saved keys were removed (a reset can't carry them over yet)"));
+        }
+        Some(Err(e)) => out.push(alloc::format!("passwd: {}", e)),
+        None => out.push(String::from("passwd: user not found")),
+    }
+    out
+}
+
+/// The signed-in user changes their own password.
+pub fn account_change_own_password(old: &str, new: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let me = users::SESSION.lock().username.clone();
+    if me.is_empty() {
+        out.push(String::from("passwd: nobody is signed in"));
+        return out;
+    }
+    let mut db = users::USER_DB.lock();
+    match db.find_mut(&me).map(|u| u.change_password(old, new)) {
+        Some(Ok(())) => {
+            if let Some(u) = db.find_mut(&me) {
+                u.must_change = false;
+            }
+            db.save();
+            out.push(String::from("passwd: password changed"));
+        }
+        Some(Err(e)) => out.push(alloc::format!("passwd: {}", e)),
+        None => out.push(String::from("passwd: this account has no password to change")),
+    }
+    out
+}
+
+/// KEYS RELINK: the saved keys were left wrapped with an older password, so
+/// sign-in couldn't open them (it keeps them instead of replacing them).
+/// Wrap them with the current password.
+pub fn account_relink_keys(old: &str, current: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let me = users::SESSION.lock().username.clone();
+    let current_ok = !me.is_empty()
+        && users::USER_DB.lock().find(&me).is_some_and(|u| u.first_step_accepts(current));
+    if !current_ok {
+        out.push(String::from("keys: that is not your current password"));
+        return out;
+    }
+    match crate::security::encryption::cen_relink(&me, old, current) {
+        Ok(n) => out.push(alloc::format!("keys: saved keys re-locked with your current password; {} loaded", n)),
+        Err(e) => out.push(alloc::format!("keys: {}", e)),
+    }
+    out
+}
+
+/// USERMOD <name> ROLE <role> | ENABLE | DISABLE | HIDE | SHOW |
+/// NAME <display name> | AUTOLOGIN ON|OFF
+fn usermod(args: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let usage = || String::from("USAGE: USERMOD <username> ROLE <role> | ENABLE | DISABLE | HIDE | SHOW | NAME <display name> | AUTOLOGIN ON|OFF");
+    let (Some(&target), Some(what)) = (args.first(), args.get(1).map(|w| w.to_ascii_uppercase())) else {
+        out.push(usage());
+        return out;
+    };
+    let result: Result<String, String> = match what.as_str() {
+        "ROLE" => match args.get(2).and_then(|r| UserRole::parse(r)) {
+            Some(role) => users::authorize(Action::SetRole(target, role)).map_err(String::from).and_then(|_| {
+                let mut db = users::USER_DB.lock();
+                if role != UserRole::Guest && db.find(target).is_some_and(|u| u.steps.len() < users::POLICY.lock().min_steps_for(role)) {
+                    return Err(alloc::format!("{} accounts need a password: set one first (PASSWD {})", role.name(), target));
+                }
+                let u = db.find_mut(target).ok_or_else(|| String::from("user not found"))?;
+                u.role = role;
+                let name = u.username.clone();
+                db.save();
+                Ok(alloc::format!("'{}' is now {}", name, role.name()))
+            }),
+            None => Err(String::from("ROLE needs admin, standard or guest")),
+        },
+        "ENABLE" | "DISABLE" => {
+            let on = what == "ENABLE";
+            users::authorize(Action::SetEnabled(target, on)).map_err(String::from).and_then(|_| {
+                let mut db = users::USER_DB.lock();
+                let u = db.find_mut(target).ok_or_else(|| String::from("user not found"))?;
+                u.enabled = on;
+                let name = u.username.clone();
+                db.save();
+                Ok(alloc::format!("'{}' is turned {}", name, if on { "on" } else { "off" }))
+            })
+        }
+        "HIDE" | "SHOW" => {
+            let hide = what == "HIDE";
+            users::authorize(Action::SetHidden(target)).map_err(String::from).and_then(|_| {
+                let mut db = users::USER_DB.lock();
+                let u = db.find_mut(target).ok_or_else(|| String::from("user not found"))?;
+                u.hidden = hide;
+                let name = u.username.clone();
+                db.save();
+                Ok(alloc::format!("'{}' is {} on the login screen", name, if hide { "hidden" } else { "shown" }))
+            })
+        }
+        "NAME" => {
+            let display = users::clean_display_name(&args[2..].join(" "));
+            if display.is_empty() {
+                Err(String::from("NAME needs a display name"))
+            } else {
+                users::authorize(Action::SetDisplayName(target)).map_err(String::from).and_then(|_| {
+                    let mut db = users::USER_DB.lock();
+                    let u = db.find_mut(target).ok_or_else(|| String::from("user not found"))?;
+                    u.display_name = display.clone();
+                    db.save();
+                    Ok(alloc::format!("display name set to \"{}\"", display))
+                })
+            }
+        }
+        "AUTOLOGIN" => match args.get(2).map(|w| w.to_ascii_uppercase()).as_deref() {
+            Some(v @ ("ON" | "OFF")) => {
+                let on = v == "ON";
+                users::authorize(Action::SetAutoLogin(target)).map_err(String::from).and_then(|_| {
+                    users::USER_DB.lock().set_auto_login(target, on)
+                        .map(|_| alloc::format!("auto-login {} for '{}'", if on { "on" } else { "off" }, target))
+                })
+            }
+            _ => Err(String::from("AUTOLOGIN needs ON or OFF")),
+        },
+        _ => Err(usage()),
+    };
+    out.push(match result {
+        Ok(msg) => alloc::format!("usermod: {}", msg),
+        Err(e) => alloc::format!("usermod: {}", e),
+    });
+    out
+}
+
 /// Public entry point used by the native terminal emulator app.
 pub fn execute_command_pub(cmd: &str, history: &mut Vec<String>) {
     execute_command(cmd, history);
@@ -37,7 +239,11 @@ pub fn execute_command_pub(cmd: &str, history: &mut Vec<String>) {
 /// Commands that act with the signed-in user's account rights. Another
 /// machine on the mesh must not run them: it would act as whoever is signed
 /// in here, an admin included.
-const LOCAL_ONLY: &[&str] = &["USERADD", "USERDEL", "PASSWD", "UNLOCK", "LOGOUT", "MODE", "KEYS"];
+const LOCAL_ONLY: &[&str] = &[
+    "USERADD", "USERDEL", "USERMOD", "USERS", "PASSWD", "UNLOCK", "GUEST", "LOGOUT", "MODE", "KEYS",
+    // Admin tasks: with an admin signed in, a peer would run these as them.
+    "DRIVER", "INSTALL", "UPDATE", "CRASH",
+];
 
 /// A command sent by another machine on the mesh (net/distributed.rs exec
 /// requests and task capsules, sched/scheduler.rs capsules). Account,
@@ -70,7 +276,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from(" SDK:     SDK INFO  SDK HEADERS"));
             history.push(String::from(" STAB:    FUZZ [KERNEL|SYSCALL]  AUDIT  STRESS DRIVERS"));
             history.push(String::from(" DIST:    UPDATE [CHECK|APPLY|STATUS]  DOCS [LIST|READ path]"));
-            history.push(String::from(" USERS:   WHOAMI  USERS  USERADD  USERDEL  PASSWD  UNLOCK  LOGOUT"));
+            history.push(String::from(" USERS:   WHOAMI  USERS  USERADD  USERDEL  USERMOD  PASSWD  UNLOCK  GUEST ON|OFF  LOGOUT  KEYS RELINK"));
             history.push(String::from(" UTIL:    ECHO  DATE  UPTIME  FREE  NET STATUS  PEERS  DMESG [TEXT]"));
             history.push(String::from(" WI-FI:   WIFI [STATUS|UP|SCAN]"));
             history.push(String::from(" POWER:   REBOOT  REBOOT [ACPI|CF9|KBD|TRIPLE]  (one reset method, to check a machine)"));
@@ -418,10 +624,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             // UPDATE STATUS: how far that is (the installer's status), and
             // the update channel's. UPDATE alone: the disks it could update.
             // CHECK, APPLY and ENROLL-LTS: the update channel (distribution.rs).
-            let admin = {
-                let user = crate::security::users::SESSION.lock().username.clone();
-                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
-            };
+            let admin = users::authorize(Action::AdminTask).is_ok();
             match parts.get(1).copied() {
                 Some("CHECK")      => { crate::userland::distribution::UPDATE_SYSTEM.lock().check(); history.push(String::from("UPDATE CHECK COMPLETE")); }
                 Some("APPLY")      => { crate::userland::distribution::UPDATE_SYSTEM.lock().apply(); history.push(String::from("UPDATE APPLIED")); }
@@ -534,13 +737,12 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "WHOAMI" => {
             let s = crate::security::users::SESSION.lock();
             if s.logged_in {
-                history.push(alloc::format!("  {} ({})",
-                    s.username,
-                    crate::security::users::USER_DB.lock()
-                        .find(&s.username)
-                        .map(|u| u.role.name())
-                        .unwrap_or("unknown"),
-                ));
+                let db = crate::security::users::USER_DB.lock();
+                match db.find(&s.username) {
+                    Some(u) => history.push(alloc::format!("  {} \"{}\" (uid {}, {})",
+                        u.username, u.display_name, u.uid, u.role.name())),
+                    None => history.push(alloc::format!("  {} (unknown)", s.username)),
+                }
             } else {
                 history.push(String::from("  not logged in"));
             }
@@ -554,124 +756,80 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from("Logged out."));
         }
         // Account commands are checked by users::authorize (the signed-in
-        // user's role), before USER_DB is locked: authorize locks it itself.
+        // user's rights), before USER_DB is locked: authorize locks it itself.
+        // Passwords are never typed on the command line: the terminal app asks
+        // for them with hidden input (userland/apps.rs, SecretPrompt) and calls
+        // the account_* functions below.
         "USERADD" => {
-            // USERADD <username> <password> [role]
-            if parts.len() < 3 {
-                history.push(String::from("USAGE: USERADD <username> <password> [admin|standard|guest]"));
-                return;
-            }
-            let role = match parts.get(3).map(|r| r.to_ascii_lowercase()).as_deref().unwrap_or("standard") {
-                "admin"  => crate::security::users::UserRole::Admin,
-                "guest"  => crate::security::users::UserRole::Guest,
-                _        => crate::security::users::UserRole::Standard,
-            };
-            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::CreateUser(role)) {
-                history.push(alloc::format!("useradd: {}", e));
-                return;
-            }
-            let name = parts[1].to_ascii_lowercase();
-            if let Err(e) = crate::security::users::validate_username(&name) {
-                history.push(alloc::format!("useradd: {}", e));
-                return;
-            }
-            let user = crate::security::users::User::new(&name, parts[2], role);
-            match crate::security::users::USER_DB.lock().add(user) {
-                Ok(_)  => history.push(alloc::format!("useradd: created '{}' ({})", name, role.name())),
-                Err(e) => history.push(alloc::format!("useradd: {}", e)),
-            }
+            history.push(String::from("USAGE: USERADD <username> [admin|standard|guest]"));
+            history.push(String::from("  type it in a terminal window: the password is asked for, hidden"));
+        }
+        "PASSWD" => {
+            history.push(String::from("USAGE: PASSWD             change your own password"));
+            history.push(String::from("       PASSWD <username>  reset another account's (admins)"));
+            history.push(String::from("  passwords are asked for, hidden, not typed on the command line"));
         }
         "USERDEL" => {
-            if parts.len() < 2 {
+            if parts.len() != 2 {
                 history.push(String::from("USAGE: USERDEL <username>"));
                 return;
             }
-            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::DeleteUser(parts[1])) {
+            if let Err(e) = users::authorize(Action::DeleteUser(parts[1])) {
                 history.push(alloc::format!("userdel: {}", e));
                 return;
             }
-            match crate::security::users::USER_DB.lock().remove(parts[1]) {
+            match users::USER_DB.lock().remove(parts[1]) {
                 Ok(_)  => history.push(alloc::format!("userdel: removed '{}'", parts[1])),
                 Err(e) => history.push(alloc::format!("userdel: {}", e)),
             }
         }
-        "PASSWD" => {
-            // PASSWD <username> <newpassword>  (admin reset of another account) or
-            // PASSWD <oldpassword> <newpassword>  (your own)
-            if parts.len() < 3 {
-                history.push(String::from("USAGE: PASSWD <username|oldpwd> <newpwd>"));
-                return;
-            }
-            let me = crate::security::users::SESSION.lock().username.clone();
-            if me.is_empty() {
-                history.push(String::from("passwd: nobody is signed in"));
-                return;
-            }
-            // parts[1] names another existing account: an admin reset.
-            let other = {
-                let db = crate::security::users::USER_DB.lock();
-                db.find(parts[1])
-                    .filter(|u| !u.username.eq_ignore_ascii_case(&me))
-                    .map(|u| u.username.clone())
-            };
-            if let Some(target) = other {
-                if let Err(e) = crate::security::users::authorize(crate::security::users::Action::ResetPassword(&target)) {
-                    history.push(alloc::format!("passwd: {}", e));
-                    // A non-admin may have meant their own password.
-                    if e.starts_with("permission denied") {
-                        history.push(String::from("passwd: to change your own password: PASSWD <old> <new>"));
-                    }
-                    return;
-                }
-                let mut db = crate::security::users::USER_DB.lock();
-                if let Some(u) = db.find_mut(&target) {
-                    u.reset_password(parts[2]);
-                    db.save();
-                    history.push(alloc::format!("passwd: password reset for '{}'", target));
-                    history.push(String::from("passwd: their saved keys were removed (a reset can't carry them over)"));
-                }
-                return;
-            }
-            let mut db = crate::security::users::USER_DB.lock();
-            if let Some(u) = db.find_mut(&me) {
-                // Self-change: parts[1] = old, parts[2] = new
-                match u.change_password(parts[1], parts[2]) {
-                    Ok(_)  => {
-                        history.push(String::from("passwd: password updated"));
-                        db.save();
-                    }
-                    Err(e) => history.push(alloc::format!("passwd: {}", e)),
-                }
-            } else {
-                history.push(String::from("passwd: user not found"));
-            }
-        }
         "UNLOCK" => {
-            if parts.len() < 2 {
+            // Clears failed sign-ins and the delay they brought.
+            if parts.len() != 2 {
                 history.push(String::from("USAGE: UNLOCK <username>"));
                 return;
             }
-            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::UnlockUser(parts[1])) {
+            if let Err(e) = users::authorize(Action::UnlockUser(parts[1])) {
                 history.push(alloc::format!("unlock: {}", e));
                 return;
             }
-            let mut db = crate::security::users::USER_DB.lock();
+            let mut db = users::USER_DB.lock();
             if let Some(u) = db.find_mut(parts[1]) {
                 u.unlock();
+                let name = u.username.clone();
                 db.save();
-                history.push(alloc::format!("unlock: '{}' account unlocked", parts[1]));
+                history.push(alloc::format!("unlock: '{}' can sign in again without waiting", name));
             } else {
                 history.push(alloc::format!("unlock: user '{}' not found", parts[1]));
             }
         }
+        "USERMOD" => history.extend(usermod(&parts[1..])),
+        "GUEST" => {
+            // GUEST ON|OFF: the built-in guest account (admins).
+            let on = match parts.get(1).map(|w| w.to_ascii_uppercase()).as_deref() {
+                Some("ON") => true,
+                Some("OFF") => false,
+                _ => {
+                    let state = users::USER_DB.lock().find("guest").is_some_and(|u| u.enabled);
+                    history.push(alloc::format!("  guest account: {}  (GUEST ON|OFF)", if state { "on" } else { "off" }));
+                    return;
+                }
+            };
+            history.extend(usermod(&["guest", if on { "ENABLE" } else { "DISABLE" }]));
+        }
         "USERS" => {
-            history.push(String::from("  USERNAME        ROLE       LOCKED  FAILS"));
-            let db = crate::security::users::USER_DB.lock();
-            for u in &db.users {
-                history.push(alloc::format!("  {:<15} {:<10} {}       {}",
-                    u.username, u.role.name(),
-                    if u.locked { "yes" } else { "no " },
-                    u.failed_attempts,
+            // Admins see every account; anyone else only their own.
+            let me = users::SESSION.lock().username.clone();
+            let all = users::authorize(Action::ListAllUsers).is_ok();
+            history.push(String::from("  USERNAME        UID   ROLE      STATE     STEPS FAILS LAST SIGN-IN"));
+            let db = users::USER_DB.lock();
+            for u in db.users.iter().filter(|u| all || u.username.eq_ignore_ascii_case(&me)) {
+                let mut state = String::from(if u.enabled { "on" } else { "off" });
+                if u.hidden { state.push_str(",hid"); }
+                if u.auto_login { state.push_str(",auto"); }
+                history.push(alloc::format!("  {:<15} {:<5} {:<9} {:<9} {:<5} {:<5} {}",
+                    u.username, u.uid, u.role.name(), state, u.steps.len(), u.failed_attempts,
+                    if u.last_login.is_empty() { "never" } else { u.last_login.as_str() },
                 ));
             }
         }
@@ -728,30 +886,9 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     }
                 }
                 Some("RELINK") => {
-                    // KEYS RELINK <old password> <current password>: the saved
-                    // keys were left wrapped with an older password, so sign-in
-                    // couldn't open them (it keeps them instead of replacing
-                    // them). Wrap them with the current password.
-                    match (parts.get(2), parts.get(3)) {
-                        (Some(old), Some(current)) => {
-                            let current_ok = crate::security::users::USER_DB.lock().find(&me).is_some_and(|u| {
-                                if u.password_hash.is_empty() {
-                                    current.is_empty()
-                                } else {
-                                    crate::security::users::verify_password(current, &u.password_hash)
-                                }
-                            });
-                            if me.is_empty() || !current_ok {
-                                out.push(String::from("keys: that is not your current password"));
-                            } else {
-                                match cen::cen_relink(&me, old, current) {
-                                    Ok(n) => out.push(alloc::format!("keys: saved keys re-locked with your current password; {} loaded", n)),
-                                    Err(e) => out.push(alloc::format!("keys: {}", e)),
-                                }
-                            }
-                        }
-                        _ => out.push(String::from("USAGE: KEYS RELINK <old password> <current password>")),
-                    }
+                    // The passwords are asked for, hidden, by the terminal app
+                    // (account_relink_keys).
+                    out.push(String::from("USAGE: KEYS RELINK  (the old and current passwords are asked for, hidden)"));
                 }
                 Some("CHECK") => {
                     let enc = crate::fs::vfs::VFS.read_file(&file).unwrap_or_default();
@@ -812,10 +949,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "INSTALL" => {
             // INSTALL: disks VEILOS could go on. INSTALL <DISK> ERASE: put
             // this system on it (install.rs). INSTALL STATUS: how far it is.
-            let admin = {
-                let user = crate::security::users::SESSION.lock().username.clone();
-                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
-            };
+            let admin = users::authorize(Action::AdminTask).is_ok();
             match (parts.get(1).copied(), parts.get(2).copied()) {
                 (Some("STATUS"), _) => {
                     let s = crate::sys::install::state();
@@ -844,10 +978,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         }
         "DRIVER" => {
             // Windows kernel drivers (ntos, WDDM_DESIGN.md W1).
-            let admin = {
-                let user = crate::security::users::SESSION.lock().username.clone();
-                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
-            };
+            let admin = users::authorize(Action::AdminTask).is_ok();
             match parts.get(1).copied() {
                 Some("LOAD") | Some("UNLOAD") | Some("IOCTL") | Some("OPEN") if !admin => {
                     history.push(String::from("DRIVER: administrators only"));
@@ -1195,10 +1326,7 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "CRASH" => {
             // CRASH TEST: stop the system on purpose, to see the crash screen
             // and the saved log (crash.rs). Administrators only.
-            let admin = {
-                let user = crate::security::users::SESSION.lock().username.clone();
-                crate::security::users::USER_DB.lock().find(&user).is_some_and(|u| matches!(u.role, crate::security::users::UserRole::Admin | crate::security::users::UserRole::Root))
-            };
+            let admin = users::authorize(Action::AdminTask).is_ok();
             match parts.get(1).copied() {
                 Some("TEST") if admin => panic!("CRASH TEST typed in the terminal"),
                 Some("TEST") => history.push(String::from("CRASH TEST: administrators only")),
