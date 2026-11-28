@@ -1270,7 +1270,7 @@ impl OffloadBroker {
         };
 
         let mut output: Vec<alloc::string::String> = Vec::new();
-        crate::task::terminal::execute_command_pub(&command_str, &mut output);
+        crate::task::terminal::execute_remote_command(&command_str, &mut output);
         let stdout = output.join("\n");
 
         if is_native {

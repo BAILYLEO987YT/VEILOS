@@ -1998,17 +1998,26 @@ impl LoginScreen {
             let user = db.find_mut(&self.username_buf);
             match user {
                 None => Err("Unknown username"),
-                Some(u) => u.authenticate(&self.password_buf),
+                // The account's own spelling: names match ignoring case, but
+                // the session, home folder and saved keys use the stored one.
+                Some(u) => u.authenticate(&self.password_buf).map(|_| u.username.clone()),
             }
         };
 
         match result {
-            Ok(()) => {
-                let username = self.username_buf.clone();
+            Ok(username) => {
                 crate::security::users::SESSION.lock().login(&username);
                 // The user's saved keys (encryption.rs): unlocked by this password.
                 if let Err(e) = crate::security::encryption::cen_unlock_user(&username, &self.password_buf) {
                     crate::serial_println!("[CEN] {}: keys not unlocked: {}", username, e);
+                    // The saved keys were kept, not replaced (encryption.rs,
+                    // cen_unlock_user): say how to get them back.
+                    let msg = match e {
+                        crate::security::encryption::CenError::DecryptionFailed =>
+                            "Not opened with this password; kept. Terminal: KEYS RELINK <old password> <current password>",
+                        _ => "Saved keys not opened (see the serial log); they were kept",
+                    };
+                    notify(NotifCategory::Warning, "SAVED KEYS", msg);
                 }
                 DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);
                 self.clear_buffers();

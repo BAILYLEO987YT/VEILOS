@@ -599,6 +599,9 @@ async fn gui_refresh_task() {
                     Some(s) => s,
                     None    => break,
                 };
+                // Every key event (PS/2 and USB, presses, releases and
+                // modifiers alone) is activity for the idle lock.
+                crate::security::users::note_input();
                 // Detect extended prefix (0xE0) for Super/arrow keys. The
                 // decoder needs it too, or End, the arrows and the other
                 // grey keys decode as their numeric-keypad twins.
@@ -678,7 +681,13 @@ async fn gui_refresh_task() {
                     filters.insert(alloc::string::String::from("key"), alloc::string::String::from(key_name));
                     filters.insert(alloc::string::String::from("action"), alloc::string::String::from(action_name));
                     
-                    {
+                    // Scripts get key events on the desktop only: on the login
+                    // and lock screens they could count and time the keys of
+                    // a password being typed.
+                    let on_desktop = crate::gui::desktop::DesktopPhase::from_u8(
+                        crate::gui::desktop::DESKTOP_PHASE.load(core::sync::atomic::Ordering::Acquire),
+                    ) == crate::gui::desktop::DesktopPhase::Desktop;
+                    if on_desktop {
                         let mut eng = crate::vsh::vscript::GLOBAL_ENGINE.lock();
                         let _ = eng.trigger_event("key_event", Some(&filters));
                     }

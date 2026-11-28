@@ -488,13 +488,16 @@ pub fn cen_unlock_user(user: &str, password: &str) -> Result<usize, CenError> {
     let master = match read_master(user, password) {
         Some(Ok(m)) => m,
         Some(Err(e)) => {
-            // Not this password's: the password was reset by an admin, which
-            // can't carry the old key over. Start again; the old ledgers
-            // stay on disk, unreadable, until cen_forget_user removes them.
-            crate::serial_println!("[CEN] {}: saved master key unreadable ({}); a new one is made", user, e);
-            let m: [u8; 32] = random();
-            write_master(user, &m, password)?;
-            m
+            // This password doesn't open the saved master key (it is wrapped
+            // with another password, or the file is damaged). It used to be
+            // replaced here with a new one, silently losing every saved key.
+            // Now it is kept: the user is told, and `cen_relink` re-wraps it
+            // given the password that does open it. Until then nothing is
+            // loaded and keys can't be saved (MASTER stays empty).
+            // (An admin reset removes the file first, in cen_forget_user, so
+            // a reset account gets a new master key through `None` below.)
+            crate::serial_println!("[CEN] {}: saved master key not opened ({}); kept, nothing loaded", user, e);
+            return Err(e);
         }
         None => {
             let m: [u8; 32] = random();
@@ -518,6 +521,25 @@ pub fn cen_unlock_user(user: &str, password: &str) -> Result<usize, CenError> {
     }
     crate::serial_println!("[CEN] {}: unlocked, {} saved key(s) loaded", user, loaded);
     Ok(loaded)
+}
+
+/// The signed-in user's saved master key is wrapped with an older password
+/// (`cen_unlock_user` refused it at sign-in): open it with `old_password`,
+/// wrap it again with `current_password`, then unlock as at sign-in.
+/// The caller checks that `current_password` is the user's password.
+/// Returns how many saved keys were loaded.
+pub fn cen_relink(user: &str, old_password: &str, current_password: &str) -> Result<usize, CenError> {
+    if MASTER.lock().is_some() {
+        return Err(CenError::LedgerIo("the saved keys are already open"));
+    }
+    let master = match read_master(user, old_password) {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => return Err(e),
+        None => return Err(CenError::LedgerIo("there are no saved keys")),
+    };
+    write_master(user, &master, current_password)?;
+    crate::serial_println!("[CEN] {}: master key re-wrapped with the current password", user);
+    cen_unlock_user(user, current_password)
 }
 
 /// At sign-out: forget the master key and every saved key in memory.

@@ -1314,13 +1314,15 @@ impl TerminalEmulator {
         match ch {
             '\n' | '\r' => {
                 let mut cmd = self.input_buf.trim().to_uppercase();
-                // Passwords and user names keep their case.
-                if cmd.starts_with("PASSWD ") {
-                    cmd = alloc::format!("PASSWD {}", self.input_buf.trim()[7..].trim());
+                // Passwords and user names keep their case, and the passwords
+                // are hidden in the echoed line.
+                let mut echo = self.input_buf.clone();
+                if let Some((kept, masked)) = account_command(&self.input_buf) {
+                    cmd = kept;
+                    echo = masked;
                 }
                 // WIFI CONNECT: the network name and password as typed, and
                 // the password hidden in the echoed line.
-                let mut echo = self.input_buf.clone();
                 if cmd.starts_with("WIFI ") {
                     cmd = alloc::format!("WIFI {}", self.input_buf.trim()[5..].trim());
                     if cmd[5..].trim_start().to_ascii_uppercase().starts_with("CONNECT ") {
@@ -1761,6 +1763,16 @@ impl AppLauncher {
                         notify(NotifCategory::Info, "Terminal", "Opened");
                     }
                     "POLICY TOGGLE" => {
+                        let mode = crate::security::policy::POLICY.lock().get_mode();
+                        // Performance relaxes protections: policy.switch only
+                        // (users::authorize locks SESSION and USER_DB, so
+                        // POLICY is not held across it).
+                        if mode == crate::security::policy::PolicyMode::Security {
+                            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::EnterPerformanceMode) {
+                                notify(NotifCategory::Warning, "Mode Not Changed", e);
+                                return;
+                            }
+                        }
                         let mut pol = crate::security::policy::POLICY.lock();
                         match pol.get_mode() {
                             crate::security::policy::PolicyMode::Security => {
@@ -2321,6 +2333,37 @@ fn console_colours(attr: u16) -> (Color, Color) {
 
 /// "WIFI CONNECT <ssid> <password>" with the password as asterisks (the
 /// SSID may be "quoted" and contain spaces).
+/// The account commands, whose arguments are user names and passwords: the
+/// command to run (command word upper-case, arguments as typed) and the line
+/// to echo (passwords as `*`). None for any other command, which is upper-cased
+/// whole as before.
+///
+///   USERADD <name> <password> [role]      password hidden
+///   PASSWD <name|old> <new>               both hidden (the first may be
+///                                         the old password)
+///   KEYS RELINK <old> <current>           both hidden
+///   USERDEL <name>, UNLOCK <name>         nothing hidden
+fn account_command(line: &str) -> Option<(String, String)> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let first = words.first()?.to_ascii_uppercase();
+    // How many leading words are the command, and which arguments to hide.
+    let (head, hidden): (usize, &[usize]) = match first.as_str() {
+        "USERADD" => (1, &[2]),
+        "PASSWD" => (1, &[1, 2]),
+        "USERDEL" | "UNLOCK" => (1, &[]),
+        "KEYS" if words.get(1).is_some_and(|w| w.eq_ignore_ascii_case("RELINK")) => (2, &[2, 3]),
+        _ => return None,
+    };
+    let mut cmd = Vec::new();
+    let mut echo = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        let word = if i < head { w.to_ascii_uppercase() } else { String::from(*w) };
+        echo.push(if hidden.contains(&i) { "*".repeat(w.chars().count()) } else { word.clone() });
+        cmd.push(word);
+    }
+    Some((cmd.join(" "), echo.join(" ")))
+}
+
 fn mask_wifi_password(line: &str) -> String {
     let t = line.trim_start();
     let mut i = 0;

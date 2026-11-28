@@ -70,6 +70,9 @@ pub fn add_byte_and_process(byte: u8) {
         ISR_IDX += 1;
         if ISR_IDX < PACKET_SIZE.load(Ordering::Relaxed) { return; } // Packet not yet complete.
         ISR_IDX = 0;               // Reset for next packet.
+        // A whole packet is movement, a button or the wheel: activity for
+        // the idle lock (an atomic store, safe here in the interrupt).
+        crate::security::users::note_input();
         let wheel = if PACKET_SIZE.load(Ordering::Relaxed) == 4 { ISR_PACKET[3] as i8 as i32 } else { 0 };
 
         let flags = ISR_PACKET[0];
@@ -105,6 +108,11 @@ pub fn add_byte_and_process(byte: u8) {
 /// mouse fills. `dy` is positive downwards (screen direction), `wheel`
 /// positive towards the user. From an interrupt: never waits for the lock.
 pub fn add_motion(dx: i32, dy: i32, left: bool, right: bool, wheel: i32) {
+    // Idle lock (see add_byte_and_process). Only real input counts: some USB
+    // mice repeat an unchanged report, which must not keep the session awake.
+    if dx != 0 || dy != 0 || wheel != 0 || left || right {
+        crate::security::users::note_input();
+    }
     if let Some(mut state) = MOUSE_STATE.try_lock() {
         let dx = dx + PENDING_DX.swap(0, Ordering::Relaxed);
         // PENDING_DY holds PS/2 (upwards) units.

@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Sha256, Digest};
 use crate::println;
 use crate::security::capability::{Capability, CapabilitySet};
@@ -175,18 +175,57 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     diff == 0
 }
 
-/// Derive a deterministic "salt" from a username + a 32-bit seed.
-/// Used when creating accounts so every install gets unique salts
-/// even without a true hardware RNG.
-pub fn derive_salt(username: &str, seed: u32) -> [u8; SALT_LEN] {
-    let mut h = Sha256::new();
-    h.update(username.as_bytes());
-    h.update(&seed.to_le_bytes());
-    h.update(b"veilos-salt-kdf-v1");
-    let result = h.finalize();
+/// A fresh random salt for a password hash (security::entropy). It used to
+/// be derived from the username and the tick count, which two accounts
+/// created at the same moment, or the same account on two machines, could
+/// share.
+fn new_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&result[..SALT_LEN]);
+    crate::security::entropy::fill(&mut salt);
     salt
+}
+
+// =====================================================================
+// -----| Usernames |-----
+// =====================================================================
+
+/// Names no new account may take: the built-in accounts, and `system`,
+/// which owns system files (ACCOUNTS_DESIGN.md, section 2).
+const RESERVED_NAMES: &[&str] = &["root", "guest", "system"];
+
+/// A new username: 1-32 of `a-z 0-9 . _ -`, starting with a letter, and not
+/// reserved. `:` in particular would break /etc/users.vdb, which is split
+/// on it.
+pub fn validate_username(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.len() > 32 {
+        return Err("a username is 1 to 32 characters");
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err("a username starts with a letter (a-z)");
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')) {
+        return Err("a username uses only a-z, 0-9, '.', '_' and '-'");
+    }
+    if RESERVED_NAMES.contains(&name) {
+        return Err("that username is reserved");
+    }
+    Ok(())
+}
+
+// =====================================================================
+// -----| Input activity (idle lock) |-----
+// =====================================================================
+
+/// When the last key or mouse event arrived (TICKS, ms). An atomic, not a
+/// field of SESSION, because the mouse drivers record it from their
+/// interrupts, where taking the SESSION lock could deadlock.
+pub static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Any keyboard or mouse input: resets the idle-lock timer. Safe from an
+/// interrupt (one atomic load and store, no locks).
+pub fn note_input() {
+    let now = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
+    LAST_INPUT_MS.store(now, Ordering::Relaxed);
 }
 
 // =====================================================================
@@ -212,13 +251,10 @@ pub struct User {
 
 impl User {
     pub fn new(username: &str, password: &str, role: UserRole) -> Self {
-        // Derive a salt from username + a boot-time seed.
-        let seed = crate::arch::interrupts::TICKS.load(Ordering::Relaxed) as u32;
-        let salt = derive_salt(username, seed);
         let hash = if password.is_empty() {
             String::new()
         } else {
-            hash_password(password, &salt)
+            hash_password(password, &new_salt())
         };
         Self {
             username:        String::from(username),
@@ -270,21 +306,22 @@ impl User {
         {
             return Err("Current password is incorrect");
         }
-        let seed = crate::arch::interrupts::TICKS.load(Ordering::Relaxed) as u32;
-        let salt = derive_salt(&self.username, seed);
-        self.password_hash = hash_password(new_password, &salt);
-        // The saved keys' master key goes with the password.
+        // The saved keys' master key is re-wrapped with the new password
+        // FIRST. If that fails the password stays as it was: storing the
+        // new hash anyway left the master key wrapped with the old password,
+        // and the next sign-in then could not open the saved keys.
         if let Err(e) = crate::security::encryption::cen_change_password(&self.username, old_password, new_password) {
             crate::serial_println!("[CEN] {}: master key not re-wrapped: {}", self.username, e);
+            return Err("Saved keys could not be re-locked with the new password; password not changed \
+                        (if sign-in said they weren't opened, run KEYS RELINK first)");
         }
+        self.password_hash = hash_password(new_password, &new_salt());
         Ok(())
     }
 
     /// Force-set a new password without verifying the old one (admin reset).
     pub fn reset_password(&mut self, new_password: &str) {
-        let seed = crate::arch::interrupts::TICKS.load(Ordering::Relaxed) as u32;
-        let salt = derive_salt(&self.username, seed);
-        self.password_hash = hash_password(new_password, &salt);
+        self.password_hash = hash_password(new_password, &new_salt());
         self.locked = false;
         self.failed_attempts = 0;
         // Without the old password their saved keys can't be opened again.
@@ -379,15 +416,22 @@ impl UserDatabase {
         vfs.write_file(USERS_VDB_PATH, text.as_bytes())
     }
 
+    /// Usernames are matched ignoring case: they are unique ignoring case
+    /// (`add`), and accounts made before names were checked may be in
+    /// capitals (the terminal used to upper-case USERADD's arguments).
     pub fn find(&self, username: &str) -> Option<&User> {
-        self.users.iter().find(|u| u.username == username)
+        self.users.iter().find(|u| u.username.eq_ignore_ascii_case(username))
     }
 
     pub fn find_mut(&mut self, username: &str) -> Option<&mut User> {
-        self.users.iter_mut().find(|u| u.username == username)
+        self.users.iter_mut().find(|u| u.username.eq_ignore_ascii_case(username))
     }
 
+    /// A new account. The name must pass `validate_username` and be unique
+    /// ignoring case. (The seeded first-boot accounts are pushed by `load`
+    /// directly.)
     pub fn add(&mut self, user: User) -> Result<(), &'static str> {
+        validate_username(&user.username)?;
         if self.find(&user.username).is_some() {
             return Err("Username already exists");
         }
@@ -418,6 +462,102 @@ impl UserDatabase {
 }
 
 pub static USER_DB: Mutex<UserDatabase> = Mutex::new(UserDatabase::new());
+
+// =====================================================================
+// -----| Authorization |-----
+// =====================================================================
+
+/// Something only some accounts may do. Checked by `authorize`, the one
+/// place these rules live (ACCOUNTS_DESIGN.md, section 1).
+#[derive(Clone, Copy, Debug)]
+pub enum Action<'a> {
+    /// Create an account with this role.
+    CreateUser(UserRole),
+    /// Delete this account.
+    DeleteUser(&'a str),
+    /// Set this account's password without knowing the old one.
+    ResetPassword(&'a str),
+    /// Clear this account's failed-attempt lock.
+    UnlockUser(&'a str),
+    /// Switch to Performance Mode, which relaxes protections. (Switching
+    /// back to Security Mode only tightens them, so anyone may.)
+    EnterPerformanceMode,
+}
+
+/// May the signed-in user do `action`? Ok, or a reason to show them.
+///
+///   Root      everything, except deleting their own account.
+///   Admin     create Standard, Admin and Guest accounts; delete, reset
+///             and unlock any account but root's and their own; never the
+///             last admin.
+///   Standard, Guest: none of these.
+///   Performance Mode: whoever has policy.switch (Root and Admin roles).
+///
+/// Nobody signed in: denied. Commands from other machines on the mesh
+/// never reach here (terminal::execute_remote_command refuses them).
+///
+/// LOCK ORDER: takes SESSION, releases it, then takes USER_DB. Callers must
+/// hold neither.
+pub fn authorize(action: Action) -> Result<(), &'static str> {
+    let (me, logged_in) = {
+        let s = SESSION.lock();
+        (s.username.clone(), s.logged_in)
+    };
+    if !logged_in || me.is_empty() {
+        return Err("nobody is signed in");
+    }
+    let db = USER_DB.lock();
+    // The guest session has no entry in the database: Guest.
+    let my_role = db.find(&me).map(|u| u.role).unwrap_or(UserRole::Guest);
+
+    if let Action::EnterPerformanceMode = action {
+        return if db.capability_set_for(&me).has(Capability::PolicySwitch) {
+            Ok(())
+        } else {
+            Err("switching to Performance Mode needs an admin account (policy.switch)")
+        };
+    }
+
+    if !matches!(my_role, UserRole::Root | UserRole::Admin) {
+        return Err("permission denied: only an admin can do that");
+    }
+    let is_root = my_role == UserRole::Root;
+
+    match action {
+        Action::CreateUser(role) => {
+            if role == UserRole::Root && !is_root {
+                return Err("only root can create a root account");
+            }
+            Ok(())
+        }
+        Action::DeleteUser(target) | Action::ResetPassword(target) | Action::UnlockUser(target) => {
+            let t = db.find(target).ok_or("user not found")?;
+            if t.role == UserRole::Root && !is_root {
+                return Err("only root can change the root account");
+            }
+            let is_self = t.username.eq_ignore_ascii_case(&me);
+            match action {
+                Action::DeleteUser(_) => {
+                    if is_self {
+                        return Err("you can't delete the account you are signed in as");
+                    }
+                    let other_admins = db.users.iter()
+                        .filter(|u| u.role == UserRole::Admin && !u.username.eq_ignore_ascii_case(&t.username))
+                        .count();
+                    if t.role == UserRole::Admin && other_admins == 0 {
+                        return Err("you can't delete the last admin account");
+                    }
+                }
+                Action::ResetPassword(_) if is_self => {
+                    return Err("to change your own password: PASSWD <old> <new>");
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        Action::EnterPerformanceMode => unreachable!(),
+    }
+}
 
 /// Called from kernel_main after the heap and VFS are ready.
 pub fn init() {
@@ -466,7 +606,12 @@ impl Session {
     pub fn tick(&mut self) -> bool {
         if !self.logged_in || self.locked { return false; }
         let now = crate::arch::interrupts::TICKS.load(Ordering::Relaxed);
-        let idle_ms = now.saturating_sub(self.last_active);
+        // Activity is the latest of `touch()` (sign-in, characters typed)
+        // and LAST_INPUT_MS (every key event and mouse movement or click,
+        // from the drivers). It used to be keyboard characters only, so
+        // using just the mouse locked the screen after the timeout.
+        let last = self.last_active.max(LAST_INPUT_MS.load(Ordering::Relaxed));
+        let idle_ms = now.saturating_sub(last);
         if idle_ms >= self.idle_timeout_ms {
             self.lock();
             return true;

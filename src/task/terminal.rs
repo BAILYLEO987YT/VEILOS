@@ -34,6 +34,25 @@ pub fn execute_command_pub(cmd: &str, history: &mut Vec<String>) {
     execute_command(cmd, history);
 }
 
+/// Commands that act with the signed-in user's account rights. Another
+/// machine on the mesh must not run them: it would act as whoever is signed
+/// in here, an admin included.
+const LOCAL_ONLY: &[&str] = &["USERADD", "USERDEL", "PASSWD", "UNLOCK", "LOGOUT", "MODE", "KEYS"];
+
+/// A command sent by another machine on the mesh (net/distributed.rs exec
+/// requests and task capsules, sched/scheduler.rs capsules). Account,
+/// sign-in, mode and key commands are refused; everything else runs as
+/// before.
+pub fn execute_remote_command(cmd: &str, history: &mut Vec<String>) {
+    let name = cmd.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    if LOCAL_ONLY.contains(&name.as_str()) {
+        crate::serial_println!("[TERM] {} refused: sent from another machine", name);
+        history.push(alloc::format!("{}: not allowed from another machine", name));
+        return;
+    }
+    execute_command(cmd, history);
+}
+
 fn execute_command(cmd: &str, history: &mut Vec<String>) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() { return; }
@@ -534,20 +553,31 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             );
             history.push(String::from("Logged out."));
         }
+        // Account commands are checked by users::authorize (the signed-in
+        // user's role), before USER_DB is locked: authorize locks it itself.
         "USERADD" => {
             // USERADD <username> <password> [role]
             if parts.len() < 3 {
                 history.push(String::from("USAGE: USERADD <username> <password> [admin|standard|guest]"));
                 return;
             }
-            let role = match parts.get(3).copied().unwrap_or("standard") {
+            let role = match parts.get(3).map(|r| r.to_ascii_lowercase()).as_deref().unwrap_or("standard") {
                 "admin"  => crate::security::users::UserRole::Admin,
                 "guest"  => crate::security::users::UserRole::Guest,
                 _        => crate::security::users::UserRole::Standard,
             };
-            let user = crate::security::users::User::new(parts[1], parts[2], role);
+            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::CreateUser(role)) {
+                history.push(alloc::format!("useradd: {}", e));
+                return;
+            }
+            let name = parts[1].to_ascii_lowercase();
+            if let Err(e) = crate::security::users::validate_username(&name) {
+                history.push(alloc::format!("useradd: {}", e));
+                return;
+            }
+            let user = crate::security::users::User::new(&name, parts[2], role);
             match crate::security::users::USER_DB.lock().add(user) {
-                Ok(_)  => history.push(alloc::format!("useradd: created '{}'", parts[1])),
+                Ok(_)  => history.push(alloc::format!("useradd: created '{}' ({})", name, role.name())),
                 Err(e) => history.push(alloc::format!("useradd: {}", e)),
             }
         }
@@ -556,28 +586,54 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                 history.push(String::from("USAGE: USERDEL <username>"));
                 return;
             }
+            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::DeleteUser(parts[1])) {
+                history.push(alloc::format!("userdel: {}", e));
+                return;
+            }
             match crate::security::users::USER_DB.lock().remove(parts[1]) {
                 Ok(_)  => history.push(alloc::format!("userdel: removed '{}'", parts[1])),
                 Err(e) => history.push(alloc::format!("userdel: {}", e)),
             }
         }
         "PASSWD" => {
-            // PASSWD <username> <newpassword>  (admin) or
-            // PASSWD <oldpassword> <newpassword>  (self-change)
+            // PASSWD <username> <newpassword>  (admin reset of another account) or
+            // PASSWD <oldpassword> <newpassword>  (your own)
             if parts.len() < 3 {
                 history.push(String::from("USAGE: PASSWD <username|oldpwd> <newpwd>"));
                 return;
             }
             let me = crate::security::users::SESSION.lock().username.clone();
-            let mut db = crate::security::users::USER_DB.lock();
-            // If parts[1] looks like a username that exists, do admin reset.
-            if db.find(parts[1]).is_some() && parts[1] != me {
-                if let Some(u) = db.find_mut(parts[1]) {
-                    u.reset_password(parts[2]);
-                    history.push(alloc::format!("passwd: password changed for '{}'", parts[1]));
-                    db.save();
+            if me.is_empty() {
+                history.push(String::from("passwd: nobody is signed in"));
+                return;
+            }
+            // parts[1] names another existing account: an admin reset.
+            let other = {
+                let db = crate::security::users::USER_DB.lock();
+                db.find(parts[1])
+                    .filter(|u| !u.username.eq_ignore_ascii_case(&me))
+                    .map(|u| u.username.clone())
+            };
+            if let Some(target) = other {
+                if let Err(e) = crate::security::users::authorize(crate::security::users::Action::ResetPassword(&target)) {
+                    history.push(alloc::format!("passwd: {}", e));
+                    // A non-admin may have meant their own password.
+                    if e.starts_with("permission denied") {
+                        history.push(String::from("passwd: to change your own password: PASSWD <old> <new>"));
+                    }
+                    return;
                 }
-            } else if let Some(u) = db.find_mut(&me) {
+                let mut db = crate::security::users::USER_DB.lock();
+                if let Some(u) = db.find_mut(&target) {
+                    u.reset_password(parts[2]);
+                    db.save();
+                    history.push(alloc::format!("passwd: password reset for '{}'", target));
+                    history.push(String::from("passwd: their saved keys were removed (a reset can't carry them over)"));
+                }
+                return;
+            }
+            let mut db = crate::security::users::USER_DB.lock();
+            if let Some(u) = db.find_mut(&me) {
                 // Self-change: parts[1] = old, parts[2] = new
                 match u.change_password(parts[1], parts[2]) {
                     Ok(_)  => {
@@ -593,6 +649,10 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
         "UNLOCK" => {
             if parts.len() < 2 {
                 history.push(String::from("USAGE: UNLOCK <username>"));
+                return;
+            }
+            if let Err(e) = crate::security::users::authorize(crate::security::users::Action::UnlockUser(parts[1])) {
+                history.push(alloc::format!("unlock: {}", e));
                 return;
             }
             let mut db = crate::security::users::USER_DB.lock();
@@ -665,6 +725,32 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                             out.push(alloc::format!("keys: saved a key; {} bytes encrypted to {} ({})", enc.len(), file, if ok { "written" } else { "write failed" }));
                         }
                         Err(e) => out.push(alloc::format!("keys: {}", e)),
+                    }
+                }
+                Some("RELINK") => {
+                    // KEYS RELINK <old password> <current password>: the saved
+                    // keys were left wrapped with an older password, so sign-in
+                    // couldn't open them (it keeps them instead of replacing
+                    // them). Wrap them with the current password.
+                    match (parts.get(2), parts.get(3)) {
+                        (Some(old), Some(current)) => {
+                            let current_ok = crate::security::users::USER_DB.lock().find(&me).is_some_and(|u| {
+                                if u.password_hash.is_empty() {
+                                    current.is_empty()
+                                } else {
+                                    crate::security::users::verify_password(current, &u.password_hash)
+                                }
+                            });
+                            if me.is_empty() || !current_ok {
+                                out.push(String::from("keys: that is not your current password"));
+                            } else {
+                                match cen::cen_relink(&me, old, current) {
+                                    Ok(n) => out.push(alloc::format!("keys: saved keys re-locked with your current password; {} loaded", n)),
+                                    Err(e) => out.push(alloc::format!("keys: {}", e)),
+                                }
+                            }
+                        }
+                        _ => out.push(String::from("USAGE: KEYS RELINK <old password> <current password>")),
                     }
                 }
                 Some("CHECK") => {
@@ -1057,8 +1143,15 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                     history.push(String::from("Switched to SECURITY mode."));
                 }
                 "PERFORMANCE" => {
-                    crate::security::policy::POLICY.lock().set_mode(crate::security::policy::PolicyMode::Performance);
-                    history.push(String::from("Switched to PERFORMANCE mode."));
+                    // Relaxes protections: needs policy.switch. (SECURITY
+                    // only tightens them, so anyone may switch back.)
+                    match crate::security::users::authorize(crate::security::users::Action::EnterPerformanceMode) {
+                        Ok(()) => {
+                            crate::security::policy::POLICY.lock().set_mode(crate::security::policy::PolicyMode::Performance);
+                            history.push(String::from("Switched to PERFORMANCE mode."));
+                        }
+                        Err(e) => history.push(alloc::format!("mode: {}", e)),
+                    }
                 }
                 _ => {
                     let mode = crate::security::policy::POLICY.lock().get_mode();
