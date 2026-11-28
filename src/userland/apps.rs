@@ -1368,6 +1368,12 @@ impl TerminalEmulator {
                     crate::task::terminal::execute_command_pub(&cmd, &mut self.history);
                 }
                 self.input_buf.clear();
+                // LOGOUT ran here: desktop::sign_out couldn't clear this
+                // terminal (its lock is held while it runs), so it clears
+                // itself; its window is already closed.
+                if !crate::security::users::SESSION.lock().logged_in {
+                    *self = TerminalEmulator::new_const();
+                }
             }
             '\x08' => { self.input_buf.pop(); }
             c if !c.is_control() => { self.input_buf.push(c); }
@@ -1415,6 +1421,34 @@ pub const MAX_TERMINALS: usize = 4;
 /// Each call to `open_terminal()` claims a free slot (or reuses the least-recently-used
 /// one if all slots are taken). Instances are completely isolated — they have their own
 /// history, input buffer, cursor state and window ID.
+/// At sign-out (desktop::sign_out): end console programs still running in
+/// terminals and empty the terminals, text editors and file managers, so
+/// nothing of one user's is left for the next. A slot that is busy (the
+/// terminal running LOGOUT) is skipped; it clears itself (on_key).
+pub fn clear_session_apps() {
+    for slot in &TERMINAL_POOL {
+        if let Some(mut t) = slot.try_lock() {
+            if let Some(console) = t.console.clone().filter(|c| c.is_live()) {
+                if let Some(proc) = crate::sched::process::PROCESSOR.lock().find(console.pid()) {
+                    proc.terminate(0xC000_013Au32 as i32);
+                }
+                crate::exec::loader::request_kill(console.pid());
+            }
+            *t = TerminalEmulator::new_const();
+        }
+    }
+    for slot in &TEXT_EDITOR_POOL {
+        if let Some(mut e) = slot.try_lock() {
+            *e = TextEditorState::new_const();
+        }
+    }
+    for slot in &FILE_MANAGER_POOL {
+        if let Some(mut f) = slot.try_lock() {
+            *f = FileManagerState::new_const();
+        }
+    }
+}
+
 pub static TERMINAL_POOL: [Mutex<TerminalEmulator>; MAX_TERMINALS] = [
     Mutex::new(TerminalEmulator::new_const()),
     Mutex::new(TerminalEmulator::new_const()),
@@ -1737,9 +1771,7 @@ impl AppLauncher {
                     notify(NotifCategory::Info, "LOCKED", "Desktop locked");
                 }
                 5 => {
-                    crate::security::users::SESSION.lock().logout();
-                    crate::gui::desktop::DESKTOP_PHASE.store(crate::gui::desktop::DesktopPhase::Login as u8, core::sync::atomic::Ordering::Release);
-                    notify(NotifCategory::Info, "LOGOUT", "Signed out successfully");
+                    crate::gui::desktop::sign_out();
                 }
                 _ => {}
             }

@@ -748,12 +748,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             }
         }
         "LOGOUT" => {
-            crate::security::users::SESSION.lock().logout();
-            crate::gui::desktop::DESKTOP_PHASE.store(
-                crate::gui::desktop::DesktopPhase::Login as u8,
-                Ordering::Release,
-            );
-            history.push(String::from("Logged out."));
+            // Ends this user's programs and closes their windows too.
+            crate::gui::desktop::sign_out();
         }
         // Account commands are checked by users::authorize (the signed-in
         // user's rights), before USER_DB is locked: authorize locks it itself.

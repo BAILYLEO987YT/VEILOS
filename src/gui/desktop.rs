@@ -2320,6 +2320,39 @@ impl DesktopPhase {
 
 pub static DESKTOP_PHASE: AtomicU8 = AtomicU8::new(0); // 0 = Login
 
+/// Sign the user out: end their programs, close every window and clear the
+/// apps' contents, so the next person to sign in sees nothing of theirs
+/// (signing out used to leave the last user's terminal, with its history,
+/// on the next user's desktop). Then the login screen.
+///
+/// Must not be called with DESKTOP_WM held. Safe from inside a terminal's
+/// key handling (its own slot is skipped there and clears itself).
+pub fn sign_out() {
+    // Every window and the program behind it (pid 0: the kernel's own apps).
+    let wins: alloc::vec::Vec<(u32, u32)> = {
+        let wm = DESKTOP_WM.lock();
+        wm.windows.iter().map(|w| (w.id, w.owner_pid)).collect()
+    };
+    for &(_, pid) in &wins {
+        if pid > 0 {
+            if let Some(proc) = crate::sched::process::PROCESSOR.lock().find(pid) {
+                proc.terminate(0);
+            }
+            crate::exec::loader::request_kill(pid);
+        }
+    }
+    {
+        let mut wm = DESKTOP_WM.lock();
+        for &(id, _) in &wins {
+            wm.close_silent(id);
+        }
+        wm.focused_id = None;
+    }
+    crate::userland::apps::clear_session_apps();
+    crate::security::users::SESSION.lock().logout();
+    DESKTOP_PHASE.store(DesktopPhase::Login as u8, Ordering::Release);
+}
+
 /// Lock the desktop from anywhere (e.g. Super+L shortcut).
 pub fn lock_desktop() {
     let logged_in = crate::security::users::SESSION.lock().logged_in;

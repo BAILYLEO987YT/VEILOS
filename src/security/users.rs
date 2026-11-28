@@ -554,9 +554,6 @@ impl User {
         if self.role == UserRole::Root {
             return Err(AuthError::SystemAccount);
         }
-        if !self.enabled {
-            return Err(AuthError::Disabled);
-        }
         let now = now_ticks();
         if self.backoff_until > now {
             return Err(AuthError::Wait((self.backoff_until - now).div_ceil(1_000)));
@@ -579,6 +576,11 @@ impl User {
         if ok {
             self.failed_attempts = 0;
             self.backoff_until = 0;
+            // Turned off: said only once the secrets were right, so a wrong
+            // guess doesn't learn that the account exists.
+            if !self.enabled {
+                return Err(AuthError::Disabled);
+            }
             Ok(())
         } else {
             self.failed_attempts = self.failed_attempts.saturating_add(1);
