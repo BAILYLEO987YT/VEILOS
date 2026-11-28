@@ -2475,6 +2475,10 @@ enum SecretFlow {
     Create(String, crate::security::users::UserRole),
     /// KEYS RELINK: the old and current passwords.
     Relink,
+    /// KEYS RECOVER: the recovery key and the current password.
+    Recover,
+    /// KEYS RECOVERY|ADMINSLOT ON|OFF: the user's password.
+    KeySlot(crate::task::terminal::KeySlotChange),
 }
 
 /// A command waiting for its passwords, asked one at a time with hidden
@@ -2499,6 +2503,8 @@ impl SecretPrompt {
             SecretFlow::Reset(t) => alloc::vec![alloc::format!("New password for {}", t), String::from("Repeat it")],
             SecretFlow::Create(n, _) => alloc::vec![alloc::format!("Password for {} (Enter for none)", n), String::from("Repeat it")],
             SecretFlow::Relink => alloc::vec![String::from("Old password"), String::from("Current password")],
+            SecretFlow::Recover => alloc::vec![String::from("Recovery key"), String::from("Current password (Enter if none)")],
+            SecretFlow::KeySlot(_) => alloc::vec![String::from("Your password (Enter if none)")],
         }
     }
 
@@ -2519,6 +2525,8 @@ impl SecretPrompt {
             SecretFlow::Reset(target) => t::account_reset_password(target, &a[0]),
             SecretFlow::Create(name, role) => t::account_create(name, *role, &a[0]),
             SecretFlow::Relink => t::account_relink_keys(&a[0], &a[1]),
+            SecretFlow::Recover => t::account_recover_keys(&a[0], &a[1]),
+            SecretFlow::KeySlot(change) => t::account_key_slot(*change, &a[0]),
         };
         self.wipe();
         out
@@ -2550,6 +2558,18 @@ fn secret_prompt_for(line: &str) -> Option<Result<SecretPrompt, String>> {
         ("USERADD", 2 | 3) => Some(t::account_prepare_create(w[1], w.get(2).copied())
             .map(|(name, role)| SecretPrompt::new(SecretFlow::Create(name, role)))),
         ("KEYS", 2) if w[1].eq_ignore_ascii_case("RELINK") => Some(Ok(SecretPrompt::new(SecretFlow::Relink))),
+        ("KEYS", 2) if w[1].eq_ignore_ascii_case("RECOVER") => Some(Ok(SecretPrompt::new(SecretFlow::Recover))),
+        ("KEYS", 3) => {
+            use crate::task::terminal::KeySlotChange as K;
+            let change = match (w[1].to_ascii_uppercase().as_str(), w[2].to_ascii_uppercase().as_str()) {
+                ("RECOVERY", "ON") => K::RecoveryOn,
+                ("RECOVERY", "OFF") => K::RecoveryOff,
+                ("ADMINSLOT", "ON") => K::AdminSlotOn,
+                ("ADMINSLOT", "OFF") => K::AdminSlotOff,
+                _ => return None,
+            };
+            Some(Ok(SecretPrompt::new(SecretFlow::KeySlot(change))))
+        }
         _ => None,
     }
 }

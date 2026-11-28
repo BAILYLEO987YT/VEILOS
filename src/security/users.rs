@@ -616,24 +616,24 @@ impl User {
         // FIRST. If that fails the password stays as it was: storing the
         // new hash anyway left the master key wrapped with the old password,
         // and the next sign-in then could not open the saved keys.
-        if let Err(e) = crate::security::encryption::cen_change_password(&self.username, old_password, new_password) {
+        if let Err(e) = crate::security::encryption::cen_change_password(&self.username, old_password, new_password, self.admin_slot) {
             crate::serial_println!("[CEN] {}: master key not re-wrapped: {}", self.username, e);
-            return Err(String::from("Saved keys could not be re-locked with the new password; password not changed \
-                                     (if sign-in said they weren't opened, run KEYS RELINK first)"));
+            return Err(String::from("saved keys not re-locked; password not changed"));
         }
         self.set_first_step_method(Method::password(new_password));
         Ok(())
     }
 
     /// Set a new password without the old one (admin reset). Clears the
-    /// back-off. The saved keys can't be carried over (until key slots,
-    /// stage A2), so they are removed.
-    pub fn reset_password(&mut self, new_password: &str) -> Result<(), String> {
+    /// back-off. Says what happened to the saved keys: re-wrapped through
+    /// the admin slot, kept for the recovery key, or (neither) removed.
+    pub fn reset_password(&mut self, new_password: &str) -> Result<crate::security::encryption::ResetOutcome, String> {
         validate_secret(SecretKind::Password, new_password)?;
+        let outcome = crate::security::encryption::cen_reset_password(&self.username, new_password)
+            .map_err(|e| format!("saved keys: {}; password not changed", e))?;
         self.set_first_step_method(Method::password(new_password));
         self.unlock();
-        crate::security::encryption::cen_forget_user(&self.username);
-        Ok(())
+        Ok(outcome)
     }
 
     /// Clear the failed sign-ins and any delay (admin action).
@@ -1023,7 +1023,7 @@ pub fn authorize(action: Action) -> Result<(), &'static str> {
             return if caps.has(Capability::PolicySwitch) {
                 Ok(())
             } else {
-                Err("switching to Performance Mode needs an admin account (policy.switch)")
+                Err("Performance Mode needs an admin account")
             };
         }
         Action::SetDisplayName(t) | Action::SetAutoLogin(t) if own(t) => return Ok(()),

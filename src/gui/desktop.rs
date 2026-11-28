@@ -2007,23 +2007,26 @@ impl LoginScreen {
         match result {
             Ok((username, has_secret, needs_setup, role)) => {
                 crate::security::users::SESSION.lock().login(&username);
-                // The user's saved keys (encryption.rs): unlocked by this
-                // password. An account with no password wraps them with an
-                // empty one, whatever was typed.
-                let key_secret = if has_secret { self.password_buf.as_str() } else { "" };
+                // The user's saved keys (encryption.rs, key slots): opened by
+                // this password, or, for an account with no password, by
+                // the system key (whatever was typed).
+                use crate::security::encryption::{self as cen, Unlock};
+                let with = if has_secret { Unlock::Secret(self.password_buf.as_str()) } else { Unlock::System };
                 let keys = if role == users::UserRole::Guest {
                     Ok(0) // the guest keeps nothing
                 } else {
-                    crate::security::encryption::cen_unlock_user(&username, key_secret)
+                    cen::cen_unlock_user(&username, with)
                 };
                 if let Err(e) = keys {
                     crate::serial_println!("[CEN] {}: keys not unlocked: {}", username, e);
                     // The saved keys were kept, not replaced (encryption.rs,
                     // cen_unlock_user): say how to get them back.
                     let msg = match e {
-                        crate::security::encryption::CenError::DecryptionFailed =>
-                            "Not opened with this password; kept. Terminal: KEYS RELINK <old password> <current password>",
-                        _ => "Saved keys not opened (see the serial log); they were kept",
+                        cen::CenError::DecryptionFailed if cen::cen_slot_info(&username).recovery =>
+                            "Kept, not opened: terminal KEYS RECOVER",
+                        cen::CenError::DecryptionFailed =>
+                            "Kept, not opened: terminal KEYS RELINK",
+                        _ => "Not opened (serial log); kept",
                     };
                     notify(NotifCategory::Warning, "SAVED KEYS", msg);
                 }
@@ -2034,7 +2037,7 @@ impl LoginScreen {
                 if needs_setup {
                     // The setup screen arrives with the new login screen (A6).
                     notify(NotifCategory::Warning, "ACCOUNT",
-                        "Your sign-in needs setting up (a password your role requires): terminal PASSWD");
+                        "Your role needs a password: PASSWD");
                 }
             }
             Err(e) => {
@@ -2883,7 +2886,7 @@ pub fn init() {
     let auto = crate::security::users::USER_DB.lock().auto_login_user();
     if let Some(name) = auto {
         crate::security::users::SESSION.lock().login(&name);
-        if let Err(e) = crate::security::encryption::cen_unlock_user(&name, "") {
+        if let Err(e) = crate::security::encryption::cen_unlock_user(&name, crate::security::encryption::Unlock::System) {
             crate::serial_println!("[CEN] {}: keys not unlocked: {}", name, e);
         }
         DESKTOP_PHASE.store(DesktopPhase::Desktop as u8, Ordering::Release);

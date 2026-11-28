@@ -9,8 +9,13 @@ accounts v2 in `/etc/users2.vdb` (the v1 file is read once and left for
 older builds), sign-in steps and methods, length rules, per-account
 back-off instead of lockout, built-in guest that can be turned off, `root`
 can't sign in, `user.manage`, `USERMOD`/`GUEST`, auto-login, and passwords
-asked for with hidden input instead of on the command line. Next: A2 (key
-slots).
+asked for with hidden input instead of on the command line. **A2 done
+(2026-11-28):** saved keys in key slots (sign-in, recovery key, admin slot
+through the system key); a password change rewrites only its slot; an admin
+reset re-wraps through the admin slot or keeps the keys for the recovery
+key; accounts with no password use the system key; `KEYS STATUS`,
+`KEYS RECOVERY ON|OFF`, `KEYS ADMINSLOT ON|OFF`, `KEYS RECOVER`. Sign-out
+also closes the user's windows. Next: A3 (ownership).
 
 ## Goal
 

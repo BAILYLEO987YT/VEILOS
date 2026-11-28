@@ -74,7 +74,7 @@ pub fn account_create(name: &str, role: UserRole, password: &str) -> Vec<String>
         Ok(()) => {
             out.push(alloc::format!("useradd: created '{}' ({})", name, role.name()));
             if password.is_empty() {
-                out.push(String::from("useradd: no password: anyone at this computer can sign in as it"));
+                out.push(String::from("useradd: no password - anyone here can sign in as it"));
             }
         }
         Err(e) => out.push(alloc::format!("useradd: {}", e)),
@@ -99,10 +99,16 @@ pub fn account_reset_password(target: &str, new: &str) -> Vec<String> {
     }
     let mut db = users::USER_DB.lock();
     match db.find_mut(target).map(|u| u.reset_password(new)) {
-        Some(Ok(())) => {
+        Some(Ok(outcome)) => {
+            use crate::security::encryption::ResetOutcome;
             db.save();
             out.push(alloc::format!("passwd: password reset for '{}'", target));
-            out.push(String::from("passwd: their saved keys were removed (a reset can't carry them over yet)"));
+            out.push(String::from(match outcome {
+                ResetOutcome::NothingSaved => "passwd: they had no saved keys",
+                ResetOutcome::Rewrapped => "passwd: their saved keys were kept (admin slot)",
+                ResetOutcome::KeptForRecovery => "passwd: their keys were kept: they use KEYS RECOVER",
+                ResetOutcome::Removed => "passwd: their saved keys were removed (nothing kept them)",
+            }));
         }
         Some(Err(e)) => out.push(alloc::format!("passwd: {}", e)),
         None => out.push(String::from("passwd: user not found")),
@@ -146,7 +152,94 @@ pub fn account_relink_keys(old: &str, current: &str) -> Vec<String> {
         return out;
     }
     match crate::security::encryption::cen_relink(&me, old, current) {
-        Ok(n) => out.push(alloc::format!("keys: saved keys re-locked with your current password; {} loaded", n)),
+        Ok(n) => out.push(alloc::format!("keys: re-locked; {} saved key(s) loaded", n)),
+        Err(e) => out.push(alloc::format!("keys: {}", e)),
+    }
+    out
+}
+
+/// KEYS STATUS: which slots the signed-in user's saved keys have.
+pub fn account_key_status() -> Vec<String> {
+    let mut out = Vec::new();
+    let me = users::SESSION.lock().username.clone();
+    let info = crate::security::encryption::cen_slot_info(&me);
+    let open = crate::security::encryption::signed_in().is_some_and(|(_, u)| u == me);
+    if !info.exists {
+        out.push(String::from("keys: no saved keys yet (made at your next sign-in)"));
+        return out;
+    }
+    out.push(alloc::format!("keys: {} for this session", if open { "open" } else { "NOT open (KEYS RELINK or KEYS RECOVER)" }));
+    out.push(alloc::format!("  sign-in slots: {}", info.sign_in));
+    out.push(alloc::format!("  recovery key:  {}", if info.recovery { "yes" } else { "no  (KEYS RECOVERY ON)" }));
+    out.push(alloc::format!("  admin slot:    {}", if info.system { "yes (admins can open them)" } else { "no" }));
+    out
+}
+
+/// A change to the signed-in user's key slots, after their password.
+#[derive(Clone, Copy, Debug)]
+pub enum KeySlotChange {
+    RecoveryOn,
+    RecoveryOff,
+    AdminSlotOn,
+    AdminSlotOff,
+}
+
+/// KEYS RECOVERY ON|OFF, KEYS ADMINSLOT ON|OFF, once the user's password
+/// has been asked for (hidden): someone at an unlocked desktop can't add a
+/// way in.
+pub fn account_key_slot(change: KeySlotChange, password: &str) -> Vec<String> {
+    use crate::security::encryption as cen;
+    let mut out = Vec::new();
+    let me = users::SESSION.lock().username.clone();
+    let ok = !me.is_empty() && users::USER_DB.lock().find(&me).is_some_and(|u| u.first_step_accepts(password));
+    if !ok {
+        out.push(String::from("keys: that is not your password; nothing changed"));
+        return out;
+    }
+    let result = match change {
+        KeySlotChange::RecoveryOn => cen::cen_new_recovery_key(&me).map(|code| {
+            out.push(String::from("keys: your recovery key - shown ONCE, write it down:"));
+            out.push(alloc::format!("  {}", code));
+            out.push(String::from("keys: forgot your password? KEYS RECOVER opens them"));
+        }),
+        KeySlotChange::RecoveryOff => cen::cen_remove_recovery_key(&me).map(|_| out.push(String::from("keys: recovery key removed"))),
+        KeySlotChange::AdminSlotOn => cen::cen_set_system_slot(&me, true).map(|_| out.push(String::from("keys: admin slot on (a reset keeps them; admins can open them)"))),
+        KeySlotChange::AdminSlotOff => cen::cen_set_system_slot(&me, false).map(|_| out.push(String::from("keys: admin slot off (a reset can't keep them)"))),
+    };
+    match result {
+        Ok(()) => {
+            let mut db = users::USER_DB.lock();
+            if let Some(u) = db.find_mut(&me) {
+                match change {
+                    KeySlotChange::RecoveryOn => u.recovery_key = true,
+                    KeySlotChange::RecoveryOff => u.recovery_key = false,
+                    KeySlotChange::AdminSlotOn => u.admin_slot = true,
+                    KeySlotChange::AdminSlotOff => u.admin_slot = false,
+                }
+            }
+            db.save();
+        }
+        Err(e) => out.push(alloc::format!("keys: {}", e)),
+    }
+    out
+}
+
+/// KEYS RECOVER: open the saved keys with the recovery key, after a
+/// forgotten password or an admin reset. `current`: the password now.
+pub fn account_recover_keys(code: &str, current: &str) -> Vec<String> {
+    use crate::security::encryption as cen;
+    let mut out = Vec::new();
+    let me = users::SESSION.lock().username.clone();
+    let (ok, has_secret) = users::USER_DB.lock().find(&me)
+        .map_or((false, false), |u| (u.first_step_accepts(current), u.has_secret()));
+    if me.is_empty() || !ok {
+        out.push(String::from("keys: that is not your current password"));
+        return out;
+    }
+    let with = if has_secret { cen::Unlock::Secret(current) } else { cen::Unlock::System };
+    match cen::cen_recover(&me, code, with) {
+        Ok(n) => out.push(alloc::format!("keys: recovered; {} saved key(s) loaded", n)),
+        Err(cen::CenError::DecryptionFailed) => out.push(String::from("keys: that recovery key doesn't open them")),
         Err(e) => out.push(alloc::format!("keys: {}", e)),
     }
     out
@@ -276,7 +369,8 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
             history.push(String::from(" SDK:     SDK INFO  SDK HEADERS"));
             history.push(String::from(" STAB:    FUZZ [KERNEL|SYSCALL]  AUDIT  STRESS DRIVERS"));
             history.push(String::from(" DIST:    UPDATE [CHECK|APPLY|STATUS]  DOCS [LIST|READ path]"));
-            history.push(String::from(" USERS:   WHOAMI  USERS  USERADD  USERDEL  USERMOD  PASSWD  UNLOCK  GUEST ON|OFF  LOGOUT  KEYS RELINK"));
+            history.push(String::from(" USERS:   WHOAMI  USERS  USERADD  USERDEL  USERMOD  PASSWD  UNLOCK  GUEST ON|OFF  LOGOUT"));
+            history.push(String::from(" KEYS:    KEYS STATUS  KEYS RECOVERY ON|OFF  KEYS ADMINSLOT ON|OFF  KEYS RECOVER  KEYS RELINK"));
             history.push(String::from(" UTIL:    ECHO  DATE  UPTIME  FREE  NET STATUS  PEERS  DMESG [TEXT]"));
             history.push(String::from(" WI-FI:   WIFI [STATUS|UP|SCAN]"));
             history.push(String::from(" POWER:   REBOOT  REBOOT [ACPI|CF9|KBD|TRIPLE]  (one reset method, to check a machine)"));
@@ -881,11 +975,16 @@ fn execute_command(cmd: &str, history: &mut Vec<String>) {
                         Err(e) => out.push(alloc::format!("keys: {}", e)),
                     }
                 }
-                Some("RELINK") => {
+                Some("RELINK") | Some("RECOVER") | Some("RECOVERY") | Some("ADMINSLOT") => {
                     // The passwords are asked for, hidden, by the terminal app
-                    // (account_relink_keys).
-                    out.push(String::from("USAGE: KEYS RELINK  (the old and current passwords are asked for, hidden)"));
+                    // (account_relink_keys, account_recover_keys,
+                    // account_key_slot).
+                    out.push(String::from("USAGE: KEYS RELINK              old password -> current (asked for, hidden)"));
+                    out.push(String::from("       KEYS RECOVER             open them with your recovery key"));
+                    out.push(String::from("       KEYS RECOVERY ON|OFF     make a recovery key (shown once) / remove it"));
+                    out.push(String::from("       KEYS ADMINSLOT ON|OFF    let an admin reset keep your keys / not"));
                 }
+                Some("STATUS") => out.extend(account_key_status()),
                 Some("CHECK") => {
                     let enc = crate::fs::vfs::VFS.read_file(&file).unwrap_or_default();
                     let keys = cen::cen_load_keys(cen::FeatureTag::new("selftest")).unwrap_or_default();
